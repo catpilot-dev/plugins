@@ -208,10 +208,55 @@ PYEOF
   echo "[c3_compat] Patched panda library with STM32F4 (Dos board) support"
 fi
 
+# 8b. Panda: skip packet version checks for F4 panda
+#     F4 firmware is v16 but the v0.10.3 library expects v17 for health,
+#     v5 for CAN health, etc. The struct layouts are compatible — only the
+#     version counter changed. Without this patch pandad crash-loops calling
+#     health() and eventually hangs the device.
+if [ -f "$PANDA_INIT" ] && ! grep -q 'c3_compat.*version' "$PANDA_INIT"; then
+  python3 - "$PANDA_INIT" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+# Patch ensure_version to skip check for F4 devices
+old_ensure = '''def ensure_version(desc, lib_field, panda_field, fn):
+  @wraps(fn)
+  def wrapper(self, *args, **kwargs):
+    lib_version = getattr(self, lib_field)
+    panda_version = getattr(self, panda_field)
+    if lib_version != panda_version:
+      raise RuntimeError(f"{desc} packet version mismatch: panda\'s firmware v{panda_version}, library v{lib_version}. Reflash panda.")
+    return fn(self, *args, **kwargs)
+  return wrapper'''
+
+new_ensure = '''def ensure_version(desc, lib_field, panda_field, fn):
+  @wraps(fn)
+  def wrapper(self, *args, **kwargs):
+    # c3_compat: skip version check for F4 panda (firmware v16, library v17)
+    from panda.python.constants import McuType
+    if getattr(self, '_mcu_type', None) == McuType.F4:
+      return fn(self, *args, **kwargs)
+    lib_version = getattr(self, lib_field)
+    panda_version = getattr(self, panda_field)
+    if lib_version != panda_version:
+      raise RuntimeError(f"{desc} packet version mismatch: panda\'s firmware v{panda_version}, library v{lib_version}. Reflash panda.")
+    return fn(self, *args, **kwargs)
+  return wrapper'''
+
+if old_ensure in content:
+    content = content.replace(old_ensure, new_ensure)
+    with open(path, 'w') as f:
+        f.write(content)
+PYEOF
+  echo "[c3_compat] Patched panda version check to skip for F4"
+fi
+
 # 9. Pandad: skip firmware flashing for F4 panda (BMW plugin handles firmware)
 #    Without this, pandad would try to flash non-existent panda.bin.signed
 PANDAD_FILE="$OPENPILOT_DIR/selfdrive/pandad/pandad.py"
-if [ -f "$PANDAD_FILE" ] && ! grep -q 'c3_compat' "$PANDAD_FILE"; then
+if [ -f "$PANDAD_FILE" ] && ! grep -q 'BOARDD_SKIP_FW_CHECK' "$PANDAD_FILE"; then
   python3 - "$PANDAD_FILE" << 'PYEOF'
 import sys
 path = sys.argv[1]
@@ -245,8 +290,19 @@ new_sig = '''  # c3_compat: skip firmware flashing for F4 panda (BMW plugin hand
 
 if old_sig in content:
     content = content.replace(old_sig, new_sig)
-    with open(path, 'w') as f:
-        f.write(content)
+
+# c3_compat: set BOARDD_SKIP_FW_CHECK for F4 panda so C++ pandad doesn't abort
+# The C++ binary checks up_to_date() which compares firmware signatures,
+# but F4 firmware files (panda.bin.signed) don't exist in v0.10.3.
+old_launch = '''    process = subprocess.Popen(["./pandad", *panda_serials], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))'''
+new_launch = '''    # c3_compat: skip C++ firmware check for F4 panda
+    os.environ["BOARDD_SKIP_FW_CHECK"] = "1"
+    process = subprocess.Popen(["./pandad", *panda_serials], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))'''
+if old_launch in content and 'BOARDD_SKIP_FW_CHECK' not in content:
+    content = content.replace(old_launch, new_launch)
+
+with open(path, 'w') as f:
+    f.write(content)
 PYEOF
   echo "[c3_compat] Patched pandad.py to skip F4 firmware flashing"
 fi
