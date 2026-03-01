@@ -99,11 +99,12 @@ if [ -f "$VENV_SYNC" ] && [ -f /data/openpilot/uv.lock ]; then
 fi
 
 # 2c. DRM raylib: AGNOS 12.8 venv has Wayland raylib, but C3 uses DRM backend
-#     Copy DRM-built raylib from /data/pip_packages into venv (overwrites Wayland version)
-if [ -d /data/pip_packages/raylib ] && ! /usr/local/venv/bin/python3 -c "import raylib" 2>&1 | grep -q 'DRM\|STATIC'; then
+#     Copy DRM-built raylib from plugin's raylib_drm/ into venv (overwrites Wayland version)
+RAYLIB_DRM="/data/plugins/c3_compat/raylib_drm"
+if [ -d "$RAYLIB_DRM/raylib" ] && ! /usr/local/venv/bin/python3 -c "import raylib" 2>&1 | grep -q 'DRM\|STATIC'; then
   [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
-  sudo cp -rf /data/pip_packages/raylib/* "$VENV_SITE/raylib/"
-  sudo cp -rf /data/pip_packages/pyray/* "$VENV_SITE/pyray/" 2>/dev/null || true
+  sudo cp -rf "$RAYLIB_DRM/raylib/"* "$VENV_SITE/raylib/"
+  sudo cp -rf "$RAYLIB_DRM/pyray/"* "$VENV_SITE/pyray/" 2>/dev/null || true
   _venv_patched=1
   echo "[c3_compat] Installed DRM raylib to venv"
 fi
