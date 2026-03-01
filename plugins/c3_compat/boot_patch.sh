@@ -49,6 +49,18 @@ PYEOF
   echo "[c3_compat] Patched amplifier.py with tici config"
 fi
 
+# 1b. Cache directories: symlink ~/.cache/pip and ~/.cache/tinygrad to /data/
+#     /home is a 100MB overlay that fills up fast. tinygrad cache (model compilation)
+#     and pip cache (venv_sync) need to live on /data/ (16GB+ available).
+CACHE_DIR="/home/comma/.cache"
+for subdir in pip tinygrad; do
+  if [ ! -L "$CACHE_DIR/$subdir" ]; then
+    mkdir -p "/data/cache/$subdir"
+    rm -rf "$CACHE_DIR/$subdir"
+    ln -sfn "/data/cache/$subdir" "$CACHE_DIR/$subdir"
+  fi
+done
+
 # 2. Venv patching: install missing tools and packages directly into the venv
 #    AGNOS 12.8 root is read-only — remount rw, patch venv, remount ro.
 #    This avoids fragile PYTHONPATH juggling with /data/pip_packages + c3_compat/site-packages.
@@ -79,7 +91,7 @@ fi
 for pkg in kaitaistruct; do
   if ! /usr/local/venv/bin/python3 -c "import $pkg" 2>/dev/null; then
     [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
-    /usr/local/venv/bin/pip install --target "$VENV_SITE" "$pkg" -q 2>/dev/null || true
+    sudo -E /usr/local/venv/bin/pip install --no-cache-dir "$pkg" -q 2>/dev/null || true
     _venv_patched=1
     echo "[c3_compat] Installed AGNOS shim: $pkg"
   fi
@@ -133,13 +145,28 @@ fi
 #    Must stop Weston so raylib can get DRM master on /dev/dri/card0
 sudo systemctl stop weston 2>/dev/null || true
 
-# 6. PYTHONPATH: make venv packages visible to scons (system Python)
+# 6. PATH + PYTHONPATH: make venv tools and packages visible to scons
 #    scons at /usr/bin/scons uses #!/usr/bin/python3 which can't see venv packages.
-#    All packages (raylib, jeepney, etc.) now live directly in the venv — just add it.
+#    scons also shells out to cythonize, which lives in /usr/local/venv/bin/.
+#    DBC generator imports 'opendbc' — needs opendbc_repo on PYTHONPATH.
 LAUNCH_FILE="$OPENPILOT_DIR/launch_chffrplus.sh"
 if [ -f "$LAUNCH_FILE" ] && ! grep -q 'c3_compat' "$LAUNCH_FILE"; then
-  sed -i "s|export PYTHONPATH=\"\$PWD\"|export PYTHONPATH=\"\$PWD:$VENV_SITE\"|" "$LAUNCH_FILE"
-  echo "[c3_compat] Patched launch_chffrplus.sh PYTHONPATH (venv site-packages for scons)"
+  python3 - "$LAUNCH_FILE" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+# Add venv/bin to PATH (for cythonize, scons tools)
+content = content.replace(
+    'export PYTHONPATH="$PWD"',
+    '# c3_compat: venv bin for cythonize, venv site-packages + opendbc_repo for scons\n'
+    'export PATH="/usr/local/venv/bin:$PATH"\n'
+    'export PYTHONPATH="$PWD:$PWD/opendbc_repo:/usr/local/venv/lib/python3.12/site-packages"'
+)
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+  echo "[c3_compat] Patched launch_chffrplus.sh PATH + PYTHONPATH"
 fi
 
 # 7. launch_env.sh: remove Wayland env vars (DRM backend uses /dev/dri/card0 directly)
