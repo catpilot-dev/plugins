@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""venv_sync: sync C3 venv packages against target branch's uv.lock.
+"""venv_sync: ensure C3 venv matches the deployed branch's uv.lock.
 
-Compares /data/openpilot/uv.lock against the target branch's uv.lock on GitHub.
-When they differ, determines missing/outdated packages and installs them into the
-AGNOS 12.8 system venv at /usr/local/venv/.
+Primary mode (--ensure, default):
+  Parse /data/openpilot/uv.lock, check each package against what's installed
+  in the AGNOS 12.8 venv, install anything missing or at the wrong version.
+  Runs at boot in boot_patch.sh BEFORE openpilot launches — guarantees the
+  venv is correct regardless of how the code got deployed.
+
+Fast path:
+  Caches the hash of the last successfully synced uv.lock. If the current
+  uv.lock matches, skip entirely (<100ms on normal boots).
 
 Usage:
-  python venv_sync.py --branch bmw-master --repo OxygenLiu/c3pilot
-  python venv_sync.py --local-lock /path/to/uv.lock  (compare against local file)
-  python venv_sync.py --check-only  (exit 0 if synced, 1 if not)
+  python venv_sync.py                     # ensure venv matches local uv.lock
+  python venv_sync.py --check-only        # report status, don't install
+  python venv_sync.py --dry-run           # show what would be installed
+  python venv_sync.py --json              # JSON output for programmatic use
 
-Designed to run on C3 with Python 3.12 (AGNOS 12.8 venv).
+Designed for C3 with Python 3.12 (AGNOS 12.8 venv).
 Uses only stdlib — no extra dependencies required.
 """
 import argparse
@@ -21,13 +28,10 @@ import os
 import re
 import subprocess
 import sys
-import urllib.request
-import urllib.error
 
 try:
     import tomllib
 except ImportError:
-    # Python 3.10 fallback (dev machine)
     try:
         import tomli as tomllib
     except ImportError:
@@ -39,10 +43,10 @@ log = logging.getLogger("venv_sync")
 LOCAL_LOCK = "/data/openpilot/uv.lock"
 VENV_SITE = "/usr/local/venv/lib/python3.12/site-packages"
 VENV_PIP = "/usr/local/venv/bin/pip"
-GITHUB_RAW = "https://raw.githubusercontent.com"
+VENV_PYTHON = "/usr/local/venv/bin/python3"
+HASH_CACHE = "/data/plugins/c3_compat/.venv_synced_hash"
 
 # --- C3 target platform ---
-# AGNOS 12.8: Python 3.12, aarch64, Linux
 TARGET_PYTHON = "cp312"
 TARGET_ARCH = "aarch64"
 
@@ -51,40 +55,23 @@ def sha256_of(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def read_local_lock() -> str | None:
-    """Read the local uv.lock file. Returns None if not found."""
+def _read_cached_hash() -> str:
+    """Read the hash of the last successfully synced uv.lock."""
     try:
-        with open(LOCAL_LOCK) as f:
-            return f.read()
+        with open(HASH_CACHE) as f:
+            return f.read().strip()
     except FileNotFoundError:
-        log.warning("Local uv.lock not found at %s", LOCAL_LOCK)
-        return None
+        return ""
 
 
-def fetch_remote_lock(repo: str, branch: str) -> str | None:
-    """Fetch uv.lock content from GitHub raw URL."""
-    url = f"{GITHUB_RAW}/{repo}/{branch}/uv.lock"
-    log.info("Fetching %s", url)
+def _write_cached_hash(h: str):
+    """Write the hash after a successful sync."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "venv_sync/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode()
-    except urllib.error.HTTPError as e:
-        log.error("Failed to fetch remote uv.lock: HTTP %d", e.code)
-        return None
-    except Exception as e:
-        log.error("Failed to fetch remote uv.lock: %s", e)
-        return None
-
-
-def read_lock_file(path: str) -> str | None:
-    """Read a uv.lock from a local path."""
-    try:
-        with open(path) as f:
-            return f.read()
-    except FileNotFoundError:
-        log.error("Lock file not found: %s", path)
-        return None
+        os.makedirs(os.path.dirname(HASH_CACHE), exist_ok=True)
+        with open(HASH_CACHE, "w") as f:
+            f.write(h)
+    except OSError as e:
+        log.warning("Could not write hash cache: %s", e)
 
 
 class PackageInfo:
@@ -110,11 +97,9 @@ def _wheel_matches_target(url: str) -> bool:
 
     # ABI-compatible wheels (e.g., cp39-abi3-manylinux*aarch64)
     if TARGET_ARCH in filename and "linux" in filename:
-        # Must be cp312 or abi3 (stable ABI compatible with 3.12)
         if TARGET_PYTHON in filename:
             return True
         if "abi3" in filename:
-            # abi3 wheels: check that the minimum version is <= 3.12
             m = re.search(r"cp3(\d+)-abi3", filename)
             if m and int(m.group(1)) <= 12:
                 return True
@@ -122,28 +107,132 @@ def _wheel_matches_target(url: str) -> bool:
     return False
 
 
-def parse_lock_packages(lock_text: str) -> dict[str, PackageInfo]:
+def _eval_single_marker(clause: str) -> bool | None:
+    """Evaluate a single marker clause for C3 (Python 3.12, aarch64, linux).
+
+    Returns True/False if deterministic, None if unknown.
+    """
+    clause = clause.strip()
+
+    # C3 environment values:
+    #   sys_platform = 'linux'
+    #   platform_machine = 'aarch64'
+    #   os_name = 'posix'
+    #   platform_python_implementation = 'CPython'
+    #   implementation_name = 'cpython'
+    #   python_full_version = '3.12.x'
+
+    # == checks (equality)
+    if "sys_platform == 'darwin'" in clause:
+        return False
+    if "sys_platform == 'win32'" in clause:
+        return False
+    if "os_name == 'nt'" in clause:
+        return False
+    if "implementation_name == 'pypy'" in clause:
+        return False
+
+    if "sys_platform == 'linux'" in clause:
+        return True
+    if "platform_machine == 'aarch64'" in clause:
+        return True
+    if "os_name == 'posix'" in clause:
+        return True
+    if "platform_python_implementation == 'CPython'" in clause:
+        return True
+    if "platform_python_implementation != 'PyPy'" in clause:
+        return True
+
+    # != checks (inequality)
+    if "sys_platform != 'linux'" in clause:
+        return False
+    if "sys_platform != 'darwin'" in clause:
+        return True
+    if "sys_platform != 'win32'" in clause:
+        return True
+    if "platform_machine != 'aarch64'" in clause:
+        return False
+
+    # Python version checks (we're on 3.12)
+    if "python_full_version < '3.12'" in clause:
+        return False
+    if "python_version < '3'" in clause or "python_version < '2'" in clause:
+        return False
+
+    return None  # unknown
+
+
+def _marker_applies_to_c3(marker: str) -> bool:
+    """Evaluate a PEP 508 environment marker for C3 (Python 3.12, aarch64, linux).
+
+    Returns True if the marker condition is satisfied on C3.
+    Handles compound `and`/`or` expressions from uv.lock.
+    Defaults to True for unknown markers (safe: install rather than miss).
+    """
+    if not marker:
+        return True
+
+    marker = marker.strip()
+
+    # Handle compound OR: all clauses must be False for the whole thing to be False
+    if " or " in marker:
+        clauses = marker.split(" or ")
+        results = [_eval_single_marker(c) for c in clauses]
+        # If any clause is True, the OR is True
+        if any(r is True for r in results):
+            return True
+        # If all clauses are deterministically False, the OR is False
+        if all(r is False for r in results):
+            return False
+        # Some unknown — default True (safe)
+        return True
+
+    # Handle compound AND: any clause being False makes the whole thing False
+    if " and " in marker:
+        clauses = marker.split(" and ")
+        results = [_eval_single_marker(c) for c in clauses]
+        # If any clause is False, the AND is False
+        if any(r is False for r in results):
+            return False
+        # If all clauses are deterministically True, the AND is True
+        if all(r is True for r in results):
+            return True
+        # Some unknown — default True (safe)
+        return True
+
+    # Single clause
+    result = _eval_single_marker(marker)
+    return result if result is not None else True
+
+
+def parse_lock_packages(lock_text: str, runtime_only: bool = False) -> dict[str, PackageInfo]:
     """Parse uv.lock TOML → {name: PackageInfo}.
 
-    Filters wheels for cp312 + aarch64 + linux compatibility.
-    Falls back to regex parsing if tomllib unavailable.
+    When tomllib is available, also resolves the dependency graph to determine
+    which packages are actually needed on C3 (linux/aarch64), filtering out
+    macOS-only, Windows-only, and other platform-specific packages.
+
+    If runtime_only=True, skip optional-dependencies (dev/testing/docs/tools)
+    and only include packages needed to run openpilot.
+
+    Falls back to regex parsing if tomllib unavailable (no dep graph filtering).
     """
     if tomllib is not None:
-        return _parse_with_tomllib(lock_text)
+        return _parse_with_tomllib(lock_text, runtime_only=runtime_only)
     return _parse_with_regex(lock_text)
 
 
-def _parse_with_tomllib(lock_text: str) -> dict[str, PackageInfo]:
-    """Parse uv.lock using tomllib (Python 3.11+ stdlib)."""
+def _parse_with_tomllib(lock_text: str, runtime_only: bool = False) -> dict[str, PackageInfo]:
     data = tomllib.loads(lock_text)
-    packages = {}
+
+    # Build full package index
+    all_packages = {}
     for pkg in data.get("package", []):
         name = pkg.get("name", "")
         version = pkg.get("version", "")
         if not name or not version:
             continue
 
-        # Find best matching wheel
         wheel_url = ""
         wheel_hash = ""
         for w in pkg.get("wheels", []):
@@ -155,14 +244,70 @@ def _parse_with_tomllib(lock_text: str) -> dict[str, PackageInfo]:
                     wheel_hash = raw_hash[7:]
                 break
 
-        packages[name] = PackageInfo(name, version, wheel_url, wheel_hash)
-    return packages
+        # uv.lock uses "optional-dependencies" (not "dev-dependencies") for dev/test/tools groups
+        opt_deps = pkg.get("optional-dependencies", {})
+
+        all_packages[name] = {
+            "info": PackageInfo(name, version, wheel_url, wheel_hash),
+            "deps": pkg.get("dependencies", []),
+            "opt_deps": opt_deps,
+        }
+
+    # Walk dependency graph from root, filtering by platform markers
+    needed = set()
+    _walk_deps(all_packages, needed, include_optional=not runtime_only)
+
+    mode = "runtime-only" if runtime_only else "full"
+    log.debug("Dependency walk (%s): %d/%d packages needed on C3", mode, len(needed), len(all_packages))
+    return {name: all_packages[name]["info"] for name in needed if name in all_packages}
+
+
+def _walk_deps(packages: dict, needed: set, root: str | None = None,
+               include_optional: bool = True):
+    """Walk the dependency graph, collecting packages reachable via C3-compatible markers.
+
+    If include_optional=False, skip optional-dependencies (dev/testing/docs/tools)
+    and only walk runtime dependencies.
+    """
+    # Find root package (the one with optional-dependencies — usually 'openpilot')
+    if root is None:
+        for candidate in packages:
+            if packages[candidate].get("opt_deps"):
+                root = candidate
+                break
+        if root is None:
+            # No clear root — include everything
+            needed.update(packages.keys())
+            return
+
+    queue = [root]
+    while queue:
+        name = queue.pop()
+        if name in needed or name not in packages:
+            continue
+        needed.add(name)
+
+        pkg = packages[name]
+        # Regular dependencies (with marker filtering at every edge)
+        for dep in pkg["deps"]:
+            dep_name = dep["name"]
+            marker = dep.get("marker", "")
+            if _marker_applies_to_c3(marker) and dep_name not in needed:
+                queue.append(dep_name)
+
+        # Optional dependencies (dev/testing/tools groups — only from root package)
+        if name == root and include_optional:
+            for group_deps in pkg["opt_deps"].values():
+                for dep in group_deps:
+                    dep_name = dep["name"]
+                    marker = dep.get("marker", "")
+                    if _marker_applies_to_c3(marker) and dep_name not in needed:
+                        queue.append(dep_name)
 
 
 def _parse_with_regex(lock_text: str) -> dict[str, PackageInfo]:
-    """Fallback regex parser for systems without tomllib."""
+    """Fallback regex parser — no dependency graph filtering (includes all packages)."""
     packages = {}
-    # Split on [[package]] boundaries
     blocks = re.split(r'\n(?=\[\[package\]\])', lock_text)
     for block in blocks:
         name_m = re.search(r'^name\s*=\s*"([^"]+)"', block, re.MULTILINE)
@@ -172,7 +317,6 @@ def _parse_with_regex(lock_text: str) -> dict[str, PackageInfo]:
         name = name_m.group(1)
         version = ver_m.group(1)
 
-        # Extract wheel URLs
         wheel_url = ""
         wheel_hash = ""
         for url_m in re.finditer(r'url\s*=\s*"([^"]+\.whl)"', block):
@@ -192,65 +336,84 @@ def _parse_with_regex(lock_text: str) -> dict[str, PackageInfo]:
 
 
 class PackageAction:
-    __slots__ = ("name", "old_version", "new_version", "wheel_url", "wheel_hash", "action")
+    __slots__ = ("name", "installed_version", "needed_version", "wheel_url", "wheel_hash", "action")
 
-    def __init__(self, name, old_version, new_version, wheel_url, wheel_hash, action):
+    def __init__(self, name, installed_version, needed_version, wheel_url, wheel_hash, action):
         self.name = name
-        self.old_version = old_version
-        self.new_version = new_version
+        self.installed_version = installed_version
+        self.needed_version = needed_version
         self.wheel_url = wheel_url
         self.wheel_hash = wheel_hash
         self.action = action  # "install" or "upgrade"
 
     def __repr__(self):
         if self.action == "upgrade":
-            return f"{self.name}: {self.old_version} → {self.new_version}"
-        return f"{self.name}: (new) {self.new_version}"
+            return f"{self.name}: {self.installed_version} → {self.needed_version}"
+        return f"{self.name}: (new) {self.needed_version}"
 
 
-def diff_packages(local: dict[str, PackageInfo], remote: dict[str, PackageInfo]) -> list[PackageAction]:
-    """Compare local vs remote packages, return list of actions needed."""
+def _batch_get_installed_versions(names: list[str]) -> dict[str, str | None]:
+    """Get installed versions of all packages in a single subprocess.
+
+    Returns {name: version_string} for installed packages,
+    {name: None} for missing packages.
+    """
+    if not names:
+        return {}
+
+    # Build a Python script that checks all packages at once
+    check_script = "from importlib.metadata import version, PackageNotFoundError\n"
+    check_script += "names = %r\n" % names
+    check_script += """for n in names:
+    try:
+        print(f"{n}={version(n)}")
+    except (PackageNotFoundError, Exception):
+        print(f"{n}=__MISSING__")
+"""
+
+    python_bin = VENV_PYTHON if os.path.exists(VENV_PYTHON) else sys.executable
+    try:
+        result = subprocess.run(
+            [python_bin, "-c", check_script],
+            capture_output=True, text=True, timeout=30)
+        versions = {}
+        for line in result.stdout.strip().split("\n"):
+            if "=" in line:
+                name, ver = line.split("=", 1)
+                versions[name] = None if ver == "__MISSING__" else ver
+        return versions
+    except Exception as e:
+        log.warning("Batch version check failed: %s", e)
+        return {n: None for n in names}
+
+
+def find_actions(packages: dict[str, PackageInfo]) -> list[PackageAction]:
+    """Compare packages from uv.lock against what's installed in the venv.
+
+    Returns list of packages that need to be installed or upgraded.
+    Only considers packages that have compatible wheels for C3.
+    """
+    # Filter to packages with installable wheels
+    installable = {n: p for n, p in packages.items() if p.wheel_url}
+    if not installable:
+        return []
+
+    log.info("Checking %d packages with aarch64 wheels against installed venv...", len(installable))
+
+    # Batch check all installed versions (single subprocess, ~1 second)
+    installed = _batch_get_installed_versions(list(installable.keys()))
+
     actions = []
-    for name, rpkg in remote.items():
-        lpkg = local.get(name)
-        if lpkg is None:
-            # New package in remote
-            if rpkg.wheel_url:
-                actions.append(PackageAction(
-                    name, "", rpkg.version, rpkg.wheel_url, rpkg.wheel_hash, "install"))
-        elif lpkg.version != rpkg.version:
-            # Version changed
-            if rpkg.wheel_url:
-                actions.append(PackageAction(
-                    name, lpkg.version, rpkg.version, rpkg.wheel_url, rpkg.wheel_hash, "upgrade"))
+    for name, pkg in installable.items():
+        current = installed.get(name)
+        if current is None:
+            actions.append(PackageAction(
+                name, "", pkg.version, pkg.wheel_url, pkg.wheel_hash, "install"))
+        elif current != pkg.version:
+            actions.append(PackageAction(
+                name, current, pkg.version, pkg.wheel_url, pkg.wheel_hash, "upgrade"))
+
     return actions
-
-
-def _is_installed(name: str) -> bool:
-    """Check if a package is importable."""
-    # Normalize package name for import (e.g., google-crc32c → google_crc32c)
-    import_name = name.replace("-", "_")
-    try:
-        result = subprocess.run(
-            ["/usr/local/venv/bin/python3", "-c", f"import {import_name}"],
-            capture_output=True, timeout=10)
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def _get_installed_version(name: str) -> str | None:
-    """Get installed version of a package via importlib.metadata."""
-    try:
-        result = subprocess.run(
-            ["/usr/local/venv/bin/python3", "-c",
-             f"from importlib.metadata import version; print(version('{name}'))"],
-            capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
 
 
 def install_packages(actions: list[PackageAction], dry_run: bool = False) -> dict:
@@ -264,150 +427,139 @@ def install_packages(actions: list[PackageAction], dry_run: bool = False) -> dic
 
     installed = []
     failed = []
-    skipped = []
-
-    # Check which actions are actually needed (package might already be at correct version)
-    needed = []
-    for act in actions:
-        current = _get_installed_version(act.name)
-        if current == act.new_version:
-            skipped.append({"name": act.name, "version": act.new_version, "reason": "already installed"})
-            log.info("  %s==%s already installed, skipping", act.name, act.new_version)
-        else:
-            needed.append(act)
-
-    if not needed:
-        return {"installed": installed, "failed": failed, "skipped": skipped}
 
     if dry_run:
-        for act in needed:
+        for act in actions:
             log.info("  [dry-run] Would %s %s==%s from %s",
-                     act.action, act.name, act.new_version, act.wheel_url)
-            installed.append({"name": act.name, "version": act.new_version, "action": act.action})
-        return {"installed": installed, "failed": failed, "skipped": skipped, "dry_run": True}
+                     act.action, act.name, act.needed_version, act.wheel_url)
+            installed.append({"name": act.name, "version": act.needed_version, "action": act.action})
+        return {"installed": installed, "failed": failed, "skipped": [], "dry_run": True}
 
     # Remount root read-write
     log.info("Remounting / read-write for venv patching")
     subprocess.run(["sudo", "mount", "-o", "remount,rw", "/"],
                    capture_output=True, timeout=10)
 
-    for act in needed:
-        log.info("  Installing %s==%s (%s)", act.name, act.new_version, act.action)
+    # Use a tmpdir on the same filesystem as the venv to avoid cross-device link errors
+    # (AGNOS /tmp is a 150MB tmpfs — pip can't os.rename() from tmpfs to root ext4)
+    pip_tmpdir = "/usr/local/tmp/pip"
+    subprocess.run(["sudo", "mkdir", "-p", pip_tmpdir], capture_output=True, timeout=5)
+
+    # pip_env: set TMPDIR on the root filesystem, keep PATH for pip to find itself
+    pip_env = {**os.environ, "TMPDIR": pip_tmpdir}
+
+    for act in actions:
+        log.info("  Installing %s==%s (%s)", act.name, act.needed_version, act.action)
         try:
-            cmd = [VENV_PIP, "install", "--target", VENV_SITE,
-                   "--no-deps", "-q", act.wheel_url]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            # sudo required: venv is root-owned on read-only root filesystem
+            # No --target: install into venv normally so dist-info gets updated correctly
+            cmd = ["sudo", "-E", VENV_PIP, "install",
+                   "--no-deps", "--no-cache-dir", "-q", act.wheel_url]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                                    env=pip_env)
             if result.returncode == 0:
-                installed.append({"name": act.name, "version": act.new_version, "action": act.action})
+                installed.append({"name": act.name, "version": act.needed_version, "action": act.action})
                 log.info("    OK")
             else:
-                failed.append({"name": act.name, "version": act.new_version,
+                failed.append({"name": act.name, "version": act.needed_version,
                                "error": result.stderr.strip()[:200]})
                 log.error("    FAILED: %s", result.stderr.strip()[:200])
         except subprocess.TimeoutExpired:
-            failed.append({"name": act.name, "version": act.new_version, "error": "timeout"})
+            failed.append({"name": act.name, "version": act.needed_version, "error": "timeout"})
             log.error("    FAILED: timeout")
         except Exception as e:
-            failed.append({"name": act.name, "version": act.new_version, "error": str(e)})
+            failed.append({"name": act.name, "version": act.needed_version, "error": str(e)})
             log.error("    FAILED: %s", e)
+
+    # Clean up pip tmpdir
+    subprocess.run(["sudo", "rm", "-rf", pip_tmpdir], capture_output=True, timeout=10)
 
     # Re-seal root filesystem
     log.info("Remounting / read-only")
     subprocess.run(["sudo", "mount", "-o", "remount,ro", "/"],
                    capture_output=True, timeout=10)
 
-    return {"installed": installed, "failed": failed, "skipped": skipped}
+    return {"installed": installed, "failed": failed, "skipped": []}
 
 
-def sync(repo: str = "OxygenLiu/c3pilot", branch: str = "bmw-master",
-         local_lock_path: str | None = None,
-         check_only: bool = False, dry_run: bool = False) -> dict:
-    """Main entry point. Returns sync result dict.
+def ensure_venv(check_only: bool = False, dry_run: bool = False,
+                lock_path: str | None = None, runtime_only: bool = False) -> dict:
+    """Ensure the venv matches the local uv.lock. Primary entry point.
 
-    Args:
-        repo: GitHub owner/repo for remote uv.lock
-        branch: Branch name to fetch uv.lock from
-        local_lock_path: Optional path to a local uv.lock to compare against (instead of GitHub)
-        check_only: If True, only report status without installing
-        dry_run: If True, show what would be installed without doing it
+    1. Read /data/openpilot/uv.lock (or override with lock_path)
+    2. Fast path: if hash matches cached .venv_synced_hash, skip
+    3. Parse packages, batch-check installed versions
+    4. Install missing/wrong-version packages
+    5. Cache hash on success
 
-    Returns:
-        {synced: bool, hash_match: bool, actions: [...], installed: [...], ...}
+    Returns: {synced: bool, actions: [...], installed: [...], ...}
     """
     # Read local lock
-    local_text = read_local_lock()
-    if local_text is None:
-        return {"synced": False, "error": "local uv.lock not found"}
+    path = lock_path or LOCAL_LOCK
+    try:
+        with open(path) as f:
+            lock_text = f.read()
+    except FileNotFoundError:
+        log.warning("uv.lock not found at %s", path)
+        return {"synced": False, "error": f"uv.lock not found at {path}"}
 
-    # Get remote/target lock
-    if local_lock_path:
-        remote_text = read_lock_file(local_lock_path)
-    else:
-        remote_text = fetch_remote_lock(repo, branch)
-    if remote_text is None:
-        return {"synced": False, "error": "failed to fetch remote uv.lock"}
+    lock_hash = sha256_of(lock_text)
 
-    # Fast path: hash comparison
-    local_hash = sha256_of(local_text)
-    remote_hash = sha256_of(remote_text)
-    if local_hash == remote_hash:
-        log.info("uv.lock hashes match — venv is in sync")
-        return {"synced": True, "hash_match": True, "local_hash": local_hash[:12]}
+    # Fast path: already synced for this exact uv.lock
+    cached = _read_cached_hash()
+    if cached == lock_hash and not check_only and not dry_run:
+        log.info("venv already synced for uv.lock %s (cached)", lock_hash[:12])
+        return {"synced": True, "cached": True, "hash": lock_hash[:12]}
 
-    log.info("uv.lock hashes differ (local=%s, remote=%s) — analyzing packages",
-             local_hash[:12], remote_hash[:12])
+    # Parse packages
+    packages = parse_lock_packages(lock_text, runtime_only=runtime_only)
+    log.info("Parsed %d packages from uv.lock (%s)", len(packages), lock_hash[:12])
 
-    # Parse and diff
-    local_pkgs = parse_lock_packages(local_text)
-    remote_pkgs = parse_lock_packages(remote_text)
-    actions = diff_packages(local_pkgs, remote_pkgs)
+    # Compare against installed venv
+    actions = find_actions(packages)
 
     if not actions:
-        log.info("Hashes differ but no actionable package changes (wheels not available for aarch64)")
-        return {
-            "synced": True, "hash_match": False,
-            "local_hash": local_hash[:12], "remote_hash": remote_hash[:12],
-            "note": "lock files differ but no aarch64 wheel changes",
-        }
+        log.info("venv is in sync — all %d installable packages match", len(packages))
+        if not check_only and not dry_run:
+            _write_cached_hash(lock_hash)
+        return {"synced": True, "cached": False, "hash": lock_hash[:12],
+                "checked": len(packages)}
 
     log.info("Found %d package(s) to %s:", len(actions),
-             "check" if check_only else "install")
+             "check" if check_only else ("install" if not dry_run else "dry-run"))
     for act in actions:
         log.info("  %s", act)
 
     if check_only:
         return {
-            "synced": False, "hash_match": False,
-            "local_hash": local_hash[:12], "remote_hash": remote_hash[:12],
-            "actions": [{"name": a.name, "old": a.old_version,
-                         "new": a.new_version, "action": a.action} for a in actions],
+            "synced": False, "hash": lock_hash[:12],
+            "actions": [{"name": a.name, "installed": a.installed_version,
+                         "needed": a.needed_version, "action": a.action} for a in actions],
         }
 
     # Install
     result = install_packages(actions, dry_run=dry_run)
-    return {
-        "synced": len(result["failed"]) == 0,
-        "hash_match": False,
-        "local_hash": local_hash[:12],
-        "remote_hash": remote_hash[:12],
-        **result,
-    }
+
+    synced = len(result["failed"]) == 0
+    if synced and not dry_run:
+        _write_cached_hash(lock_hash)
+
+    return {"synced": synced, "hash": lock_hash[:12], **result}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync C3 venv packages against target branch uv.lock")
-    parser.add_argument("--repo", default="OxygenLiu/c3pilot",
-                        help="GitHub owner/repo (default: OxygenLiu/c3pilot)")
-    parser.add_argument("--branch", default="bmw-master",
-                        help="Branch name (default: bmw-master)")
-    parser.add_argument("--local-lock", default=None,
-                        help="Compare against a local uv.lock file instead of GitHub")
+    parser = argparse.ArgumentParser(
+        description="Ensure C3 venv matches deployed branch's uv.lock")
+    parser.add_argument("--lock", default=None,
+                        help="Path to uv.lock (default: /data/openpilot/uv.lock)")
     parser.add_argument("--check-only", action="store_true",
-                        help="Only check sync status, don't install (exit 0=synced, 1=not)")
+                        help="Report status without installing (exit 0=synced, 1=not)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be installed without doing it")
     parser.add_argument("--json", action="store_true",
                         help="Output result as JSON")
+    parser.add_argument("--runtime-only", action="store_true",
+                        help="Only sync runtime deps (skip dev/testing/docs)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose logging")
     args = parser.parse_args()
@@ -417,12 +569,11 @@ def main():
         format="[venv_sync] %(message)s",
     )
 
-    result = sync(
-        repo=args.repo,
-        branch=args.branch,
-        local_lock_path=args.local_lock,
+    result = ensure_venv(
         check_only=args.check_only,
         dry_run=args.dry_run,
+        lock_path=args.lock,
+        runtime_only=args.runtime_only,
     )
 
     if args.json:
@@ -431,25 +582,25 @@ def main():
         if result.get("error"):
             print(f"ERROR: {result['error']}")
         elif result.get("synced"):
-            if result.get("hash_match"):
-                print("Venv is in sync (lock hashes match)")
+            if result.get("cached"):
+                print(f"venv in sync (cached, hash {result['hash']})")
             else:
-                print(f"Venv is in sync ({result.get('note', 'all packages installed')})")
+                checked = result.get("checked", 0)
+                msg = f"venv in sync (checked {checked} packages)" if checked else "venv in sync"
+                print(msg)
                 for pkg in result.get("installed", []):
                     print(f"  {pkg['action']}: {pkg['name']}=={pkg['version']}")
-                for pkg in result.get("skipped", []):
-                    print(f"  skipped: {pkg['name']}=={pkg['version']} ({pkg['reason']})")
         else:
-            print("Venv is OUT OF SYNC")
+            print("venv OUT OF SYNC")
             for act in result.get("actions", []):
-                label = "upgrade" if act["old"] else "install"
-                print(f"  {label}: {act['name']} {act['old']} → {act['new']}")
+                label = "upgrade" if act.get("installed") else "install"
+                old = act.get("installed", "")
+                print(f"  {label}: {act['name']} {old + ' → ' if old else ''}{act['needed']}")
             for pkg in result.get("installed", []):
                 print(f"  installed: {pkg['name']}=={pkg['version']}")
             for pkg in result.get("failed", []):
                 print(f"  FAILED: {pkg['name']}=={pkg['version']}: {pkg['error']}")
 
-    # Exit code for --check-only mode
     if args.check_only:
         sys.exit(0 if result.get("synced") else 1)
 

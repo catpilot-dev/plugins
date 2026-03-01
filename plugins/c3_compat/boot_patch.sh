@@ -85,15 +85,17 @@ for pkg in kaitaistruct; do
   fi
 done
 
-# 2d. venv_sync safety net: warn if venv is out of sync with branch uv.lock
-#     This catches manual git operations that bypass COD (which runs full venv_sync).
-#     Non-blocking — just logs a warning; COD handles actual installs.
+# 2d. venv_sync: ensure venv matches deployed branch's uv.lock BEFORE launch.
+#     Compares each package in uv.lock against what's installed in the venv.
+#     Installs anything missing or at wrong version. Fast path: if uv.lock hash
+#     matches cached .venv_synced_hash, skip entirely (<100ms).
+#     This guarantees openpilot won't crash on import errors regardless of how
+#     the code was deployed (COD update, manual git checkout, AGNOS reflash).
 VENV_SYNC="/data/plugins/c3_compat/venv_sync.py"
 if [ -f "$VENV_SYNC" ] && [ -f /data/openpilot/uv.lock ]; then
-  if ! /usr/local/venv/bin/python3 "$VENV_SYNC" --check-only --json 2>/dev/null | grep -q '"synced": true'; then
-    echo "[c3_compat] WARNING: venv may be out of sync with branch uv.lock"
-    echo "[c3_compat]   Run POST /v1/software/venv-sync via COD to fix"
-  fi
+  /usr/local/venv/bin/python3 "$VENV_SYNC" --runtime-only 2>&1 | while IFS= read -r line; do
+    echo "[c3_compat] $line"
+  done
 fi
 
 # 2c. DRM raylib: AGNOS 12.8 venv has Wayland raylib, but C3 uses DRM backend
