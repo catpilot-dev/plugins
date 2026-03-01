@@ -49,65 +49,85 @@ PYEOF
   echo "[c3_compat] Patched amplifier.py with tici config"
 fi
 
-# 2. msgfmt stub: AGNOS 12.8 lacks gettext — create valid empty .mo files
-#    /usr is read-only on AGNOS, so put stub in /data/plugins/c3_compat/bin and prepend to PATH
-if ! command -v msgfmt &>/dev/null; then
-  mkdir -p /data/plugins/c3_compat/bin
-  cat > /data/plugins/c3_compat/bin/msgfmt << 'STUB'
+# 2. Venv patching: install missing tools and packages directly into the venv
+#    AGNOS 12.8 root is read-only — remount rw, patch venv, remount ro.
+#    This avoids fragile PYTHONPATH juggling with /data/pip_packages + c3_compat/site-packages.
+#    Everything lives in /usr/local/venv/ — the single source of truth.
+VENV_BIN="/usr/local/venv/bin"
+VENV_SITE="/usr/local/venv/lib/python3.12/site-packages"
+_venv_patched=0
+
+# 2a. msgfmt stub: AGNOS 12.8 lacks gettext — scons needs it for .po → .mo
+if [ ! -f "$VENV_BIN/msgfmt" ]; then
+  sudo mount -o remount,rw / 2>/dev/null
+  sudo tee "$VENV_BIN/msgfmt" > /dev/null << 'STUB'
 #!/bin/sh
 # Stub: c3_compat — produce valid empty .mo files (proper gettext binary format)
-# scons calls: msgfmt -o output.mo input.po
 while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) shift; OUTPUT="$1" ;;
-  esac
+  case "$1" in -o) shift; OUTPUT="$1" ;; esac
   shift
 done
-if [ -n "$OUTPUT" ]; then
-  # Write a valid empty .mo file: magic + revision + 0 strings + offsets
-  printf '\xde\x12\x04\x95\x00\x00\x00\x00\x00\x00\x00\x00\x1c\x00\x00\x00\x1c\x00\x00\x00\x00\x00\x00\x00\x1c\x00\x00\x00' > "$OUTPUT"
-fi
+[ -n "$OUTPUT" ] && printf '\xde\x12\x04\x95\x00\x00\x00\x00\x00\x00\x00\x00\x1c\x00\x00\x00\x1c\x00\x00\x00\x00\x00\x00\x00\x1c\x00\x00\x00' > "$OUTPUT"
 STUB
-  chmod +x /data/plugins/c3_compat/bin/msgfmt
-  echo "[c3_compat] Installed msgfmt stub"
+  sudo chmod +x "$VENV_BIN/msgfmt"
+  _venv_patched=1
+  echo "[c3_compat] Installed msgfmt stub to venv"
 fi
-export PATH="/data/plugins/c3_compat/bin:$PATH"
+
+# 2b. Missing Python packages: install into venv site-packages
+#     jeepney: needed by AGNOS 12.8 dbus stack
+#     kaitaistruct: needed by system services
+for pkg in jeepney kaitaistruct; do
+  if ! /usr/local/venv/bin/python3 -c "import $pkg" 2>/dev/null; then
+    [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
+    /usr/local/venv/bin/pip install --target "$VENV_SITE" "$pkg" -q 2>/dev/null || true
+    _venv_patched=1
+    echo "[c3_compat] Installed $pkg to venv"
+  fi
+done
+
+# 2c. DRM raylib: AGNOS 12.8 venv has Wayland raylib, but C3 uses DRM backend
+#     Copy DRM-built raylib from /data/pip_packages into venv (overwrites Wayland version)
+if [ -d /data/pip_packages/raylib ] && ! /usr/local/venv/bin/python3 -c "import raylib" 2>&1 | grep -q 'DRM\|STATIC'; then
+  [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
+  sudo cp -rf /data/pip_packages/raylib/* "$VENV_SITE/raylib/"
+  sudo cp -rf /data/pip_packages/pyray/* "$VENV_SITE/pyray/" 2>/dev/null || true
+  _venv_patched=1
+  echo "[c3_compat] Installed DRM raylib to venv"
+fi
+
+# Re-seal root filesystem
+if [ $_venv_patched -eq 1 ]; then
+  sudo mount -o remount,ro / 2>/dev/null || true
+fi
 
 # 3. Multilang: patch to handle invalid/empty .mo files gracefully
-#    Even with valid .mo stubs, be resilient to any translation failures
 MULTILANG_FILE="$OPENPILOT_DIR/openpilot/system/ui/lib/multilang.py"
 if [ -f "$MULTILANG_FILE" ] && grep -q 'except FileNotFoundError' "$MULTILANG_FILE"; then
   sed -i 's/except FileNotFoundError:/except Exception:/' "$MULTILANG_FILE"
   echo "[c3_compat] Patched multilang.py to handle invalid .mo files"
 fi
 
-# 4. Python packages: install missing deps to writable location
-#    AGNOS 12.8 /usr/local/venv is read-only — install to /data/plugins/c3_compat/site-packages
-C3_SITE_PACKAGES="/data/plugins/c3_compat/site-packages"
-mkdir -p "$C3_SITE_PACKAGES"
-
-# Missing Python packages: install to writable location if not already present
-# These are in AGNOS 16 system Python but missing from AGNOS 12.8
-C3_MISSING_PKGS="jeepney kaitaistruct"
-for pkg in $C3_MISSING_PKGS; do
-  if ! PYTHONPATH="$C3_SITE_PACKAGES" python3 -c "import $pkg" 2>/dev/null; then
-    /usr/local/venv/bin/pip install --target "$C3_SITE_PACKAGES" "$pkg" -q 2>/dev/null || true
-    echo "[c3_compat] Installed $pkg to $C3_SITE_PACKAGES"
-  fi
-done
+# 5a. UI FPS: set tici (C3) to 20 FPS like tizi (C3X)
+#     v0.10.3 dropped C3 from the FPS dict — defaults to 60 FPS, wasting ~15% CPU.
+#     C3's Snapdragon 845 GPU is fine at 20 FPS for the offroad UI.
+APP_FILE="$OPENPILOT_DIR/system/ui/lib/application.py"
+if [ -f "$APP_FILE" ] && grep -q "{'tizi': 20}" "$APP_FILE"; then
+  sed -i "s/{'tizi': 20}/{'tizi': 20, 'tici': 20}/" "$APP_FILE"
+  echo "[c3_compat] Patched UI FPS: tici → 20 FPS (was defaulting to 60)"
+fi
 
 # 5. Display: DRM backend (no Weston compositor)
-#    DRM raylib at /data/pip_packages shadows venv's Wayland raylib
 #    Must stop Weston so raylib can get DRM master on /dev/dri/card0
 sudo systemctl stop weston 2>/dev/null || true
 
-# 6. PYTHONPATH: patch launch script for c3_compat site-packages + DRM raylib
-#    launch_chffrplus.sh does: export PYTHONPATH="$PWD" which clobbers any prior PYTHONPATH
-#    /data/pip_packages MUST come before venv so DRM raylib shadows Wayland raylib
+# 6. PYTHONPATH: make venv packages visible to scons (system Python)
+#    scons at /usr/bin/scons uses #!/usr/bin/python3 which can't see venv packages.
+#    All packages (raylib, jeepney, etc.) now live directly in the venv — just add it.
 LAUNCH_FILE="$OPENPILOT_DIR/launch_chffrplus.sh"
 if [ -f "$LAUNCH_FILE" ] && ! grep -q 'c3_compat' "$LAUNCH_FILE"; then
-  sed -i "s|export PYTHONPATH=\"\$PWD\"|export PYTHONPATH=\"\$PWD:/data/pip_packages:$C3_SITE_PACKAGES\"|" "$LAUNCH_FILE"
-  echo "[c3_compat] Patched launch_chffrplus.sh PYTHONPATH (DRM raylib + site-packages)"
+  sed -i "s|export PYTHONPATH=\"\$PWD\"|export PYTHONPATH=\"\$PWD:$VENV_SITE\"|" "$LAUNCH_FILE"
+  echo "[c3_compat] Patched launch_chffrplus.sh PYTHONPATH (venv site-packages for scons)"
 fi
 
 # 7. launch_env.sh: remove Wayland env vars (DRM backend uses /dev/dri/card0 directly)
