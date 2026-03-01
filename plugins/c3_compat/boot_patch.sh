@@ -74,17 +74,27 @@ STUB
   echo "[c3_compat] Installed msgfmt stub to venv"
 fi
 
-# 2b. Missing Python packages: install into venv site-packages
-#     jeepney: needed by AGNOS 12.8 dbus stack
-#     kaitaistruct: needed by system services
-for pkg in jeepney kaitaistruct; do
+# 2b. AGNOS-specific packages: not in uv.lock, needed by AGNOS system services
+#     kaitaistruct: used by AGNOS system daemons, not declared in openpilot's pyproject.toml
+for pkg in kaitaistruct; do
   if ! /usr/local/venv/bin/python3 -c "import $pkg" 2>/dev/null; then
     [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
     /usr/local/venv/bin/pip install --target "$VENV_SITE" "$pkg" -q 2>/dev/null || true
     _venv_patched=1
-    echo "[c3_compat] Installed $pkg to venv"
+    echo "[c3_compat] Installed AGNOS shim: $pkg"
   fi
 done
+
+# 2d. venv_sync safety net: warn if venv is out of sync with branch uv.lock
+#     This catches manual git operations that bypass COD (which runs full venv_sync).
+#     Non-blocking — just logs a warning; COD handles actual installs.
+VENV_SYNC="/data/plugins/c3_compat/venv_sync.py"
+if [ -f "$VENV_SYNC" ] && [ -f /data/openpilot/uv.lock ]; then
+  if ! /usr/local/venv/bin/python3 "$VENV_SYNC" --check-only --json 2>/dev/null | grep -q '"synced": true'; then
+    echo "[c3_compat] WARNING: venv may be out of sync with branch uv.lock"
+    echo "[c3_compat]   Run POST /v1/software/venv-sync via COD to fix"
+  fi
+fi
 
 # 2c. DRM raylib: AGNOS 12.8 venv has Wayland raylib, but C3 uses DRM backend
 #     Copy DRM-built raylib from /data/pip_packages into venv (overwrites Wayland version)
