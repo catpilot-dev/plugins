@@ -2,41 +2,81 @@
 
 ## Overview
 
-Plugin system for openpilot-plugins repo (`~/openpilot-plugins`, branch `plugins`).
-Plugins live in `plugins/` and hook into the control loop via the hook system,
-or run as managed processes.
+Plugin system for openpilot-plugins standalone repo (`~/openpilot-plugins-standalone/` → `OxygenLiu/openpilot-plugins` on GitHub).
+Plugins live in `plugins/` and hook into the control loop via the hook system, run as managed processes, or register car interfaces.
+
+### Repository Structure
+
+- **Standalone repo**: `~/openpilot-plugins-standalone/` — all plugin code + framework overlay files
+- **Fork repo**: `~/openpilot-plugins/` (branch `plugins-release`) — minimal upstream v0.10.3 fork with only plugin framework hooks (~20 files diff)
+- **Runtime**: `install.sh` overlays framework + cereal into openpilot tree, copies plugins to `/data/plugins/`
 
 ### Available Hook Points (wired in repo)
-- `controls.curvature_correction` (controlsd.py:123) — curvature adjustment
-- `planner.v_cruise` (longitudinal_planner.py:107) — cruise speed override
-- `planner.accel_limits` (longitudinal_planner.py:128) — accel limit adjustment
-- `desire.post_update` (desire_helper.py:113) — lane change extensions
+- `controls.curvature_correction` (controlsd.py) — curvature adjustment
+- `planner.v_cruise` (longitudinal_planner.py) — cruise speed override
+- `planner.accel_limits` (longitudinal_planner.py) — accel limit adjustment
+- `desire.post_update` (desire_helper.py) — lane change extensions
+- `car.register_interfaces` (car_helpers.py) — register car platforms
+- `car.panda_status` (car_helpers.py) — monitor panda health
 
 ---
 
 ## Repo-Level Prerequisites ✅ COMPLETED
 
-Commit `9c0215a` — cereal schemas, params, planner subscriptions.
-
-- ✅ `cereal/custom.capnp` — SpeedLimitState, MapdOut, MapdIn, MapdExtendedOut structs with full fields
-- ✅ `cereal/log.capnp` — Event field renames (speedLimitState @107, mapdOut @145, mapdIn @144, mapdExtendedOut @143)
+- ✅ `cereal/custom.capnp` — SpeedLimitState, MapdOut, MapdIn, MapdExtendedOut structs
+- ✅ `cereal/log.capnp` — Event field renames (speedLimitState, mapdOut, mapdIn, mapdExtendedOut)
 - ✅ `cereal/services.py` — mapdOut (20Hz), mapdExtendedOut (20Hz), mapdIn (no-log), speedLimitState (1Hz)
 - ✅ `common/params_keys.h` — LaneCenteringCorrection, MapdVersion, SpeedLimitConfirmed, SpeedLimitValue
 - ✅ `selfdrive/controls/plannerd.py` — speedLimitState + mapdOut added to SubMaster
 
 ---
 
-## Plugin: lane_centering ✅ COMPLETED
+## Plugin: bmw_e9x_e8x ✅ COMPLETED
 
-Commit `b1941cb`
+**Type**: car (hook-based registration)
+**Hooks**: `car.register_interfaces`, `car.panda_status`
+
+Full BMW E8x/E9x car interface:
+- VIN-based detection (empty CAN fingerprints, pure VIN model code matching)
+- Car interface (CarState, CarController, CarParams)
+- DCC control (speed-dependent Dynamic Cruise Control via tick-counted commands)
+- Stepper servo steering (Ocelot stepper servo on F-CAN/AUX-CAN)
+- Panda safety model (bmw.h, safety model ID 35)
+
+Based on [dzid26's BMW E8x/E9x openpilot implementation](https://github.com/BMW-E8x-E9x/openpilot).
+
+---
+
+## Plugin: c3_compat ✅ COMPLETED
+
+**Type**: hybrid (process + hook)
+**Device filter**: tici (Comma 3)
+
+Comma 3 hardware compatibility for AGNOS 12.8:
+- **Raylib Python UI** — Full replacement UI (onroad HUD, settings, driver camera)
+- **boot_patch.sh** — AGNOS 12.8 boot patches:
+  - Cache symlinks (pip, tinygrad → /data/cache/) to avoid filling 100MB /home overlay
+  - PATH + PYTHONPATH for scons build (cythonize, opendbc imports)
+  - kaitaistruct install (AGNOS system dependency)
+  - DRM raylib overlay for GPU-accelerated rendering
+  - Wayland/Weston socket permissions
+  - SPI disable for USB-only F4 panda
+  - Crash diagnostics
+- **venv_sync.py** — Python package sync against local uv.lock:
+  - Dependency graph walk with PEP 508 marker filtering
+  - Hash cache for <100ms skip when unchanged
+  - AGNOS 12.8 pip workarounds (sudo -E, TMPDIR, --no-cache-dir)
+  - Runtime-only mode (62 packages) for boot
+- **watchdog.sh** — Process watchdog with crash recovery
+- **Panda health monitoring** — STM32F4/Dos health check hook
+
+---
+
+## Plugin: lane_centering ✅ COMPLETED
 
 **Type**: hook
 **Hook**: `controls.curvature_correction`
 **Param toggle**: `LaneCenteringCorrection` (bool, default off)
-
-Files:
-- `plugins/lane_centering/plugin.json`
-- `plugins/lane_centering/correction.py` — LaneCenteringCorrection class + on_curvature_correction()
 
 Features:
 - Curvature-dependent K gain (sharper turns → stronger correction)
@@ -50,34 +90,20 @@ Features:
 
 ## Plugin: mapd ✅ COMPLETED
 
-Commit `b1941cb`
-
 **Type**: process
 **Condition**: always_run
 **Device filter**: tici, tizi, mici
 
-Files:
-- `plugins/mapd/plugin.json`
-- `plugins/mapd/mapd_manager.py` — Binary lifecycle (ensure, download, backup, update, version check)
-- `plugins/mapd/mapd_runner.py` — Entry point: ensure binary + os.execv()
-
-Binary: pfeiferj/mapd (Go), publishes mapdOut at 20Hz with OSM speed limits, road names, curve speeds, hazards.
+Binary lifecycle manager for pfeiferj/mapd (Go binary). Publishes mapdOut at 20Hz with OSM speed limits, road names, curve speeds, hazards.
 
 ---
 
 ## Plugin: speedlimitd ✅ COMPLETED
 
-Commit `b1941cb`
-
 **Type**: hybrid (process + hook)
 **Dependency**: mapd plugin
 **Process**: speedlimitd at 1Hz (only_onroad)
 **Hook**: `planner.v_cruise` — enforces confirmed speed limits
-
-Files:
-- `plugins/speedlimitd/plugin.json`
-- `plugins/speedlimitd/speedlimitd.py` — SpeedLimitMiddleware (subscribes mapdOut + modelV2, publishes speedLimitState)
-- `plugins/speedlimitd/planner_hook.py` — on_v_cruise() with speed-dependent offset
 
 Three-tier priority:
 1. OSM maxspeed (confidence 0.95)
@@ -88,19 +114,17 @@ Speed-dependent offset (km/h above limit):
 - 20-60 km/h zones: +20 km/h
 - 70-120 km/h zones: +10 km/h
 
-Road type fallback: PRC GB 5768 urban/non-urban tables by highway type + lane count.
-
 ---
 
-## Plugin: bmw_e9x_e8x ✅ (pre-existing)
+## Plugin: model_selector ✅ COMPLETED
 
-Car interface plugin with VIN-based detection, DCC control, stepper servo steering.
+**Type**: process
+**Condition**: always_run
 
----
-
-## Plugin: c3_compat ✅ (pre-existing)
-
-Comma 3 hardware compatibility (STM32F4/AGNOS 12.8, Raylib UI).
+Runtime model swapping:
+- Download alternative driving models from GitHub releases
+- Hot-swap models without rebuild (modeld restart)
+- Model compatibility filtering by device type
 
 ---
 
@@ -133,9 +157,18 @@ rebase. The only breakage risk is if comma changes a hook call site signature
 
 ---
 
+## C3 Deployment Status ✅ VERIFIED
+
+- ✅ scons build working on AGNOS 12.8 (PATH, PYTHONPATH, cache symlinks)
+- ✅ Overnight stability verified (10+ hours, no crashes/OOM/hangs)
+- ✅ venv_sync working (runtime-only mode, hash caching)
+- ✅ Boot patches applied cleanly every reboot
+- ✅ connect_on_device SOFTWARE panel matches stock openpilot update flow
+
+---
+
 ## TODO
 
-- [ ] C3 deployment testing for all three new plugins
 - [ ] YOLO speed sign integration into speedlimitd (currently placeholder)
-- [ ] Map download UI (Phase 2D from mapd_v2 integration)
 - [ ] Interactive speed limit HUD element (tap to confirm/dismiss)
+- [ ] UI render hook for plugin overlays
