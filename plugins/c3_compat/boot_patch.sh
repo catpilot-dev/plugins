@@ -11,15 +11,6 @@ OPENPILOT_DIR="${1:-/data/openpilot}"
 
 echo "[c3_compat] Applying AGNOS 12.8 patches to $OPENPILOT_DIR"
 
-# 0. Prevent overlay swap from wiping our patches
-#    launch_chffrplus.sh checks .overlay_init + finalized/.overlay_consistent
-#    and swaps /data/openpilot with the staging copy (losing all our patches).
-#    Remove the marker so the swap is skipped — updates go through COD instead.
-if [ -f "$OPENPILOT_DIR/.overlay_init" ]; then
-  rm -f "$OPENPILOT_DIR/.overlay_init"
-  echo "[c3_compat] Removed .overlay_init (prevents stale overlay swap)"
-fi
-
 # 1. Amplifier: add tici config (removed in v0.10.3 which dropped C3 support)
 AMP_FILE="$OPENPILOT_DIR/openpilot/system/hardware/tici/amplifier.py"
 if [ -f "$AMP_FILE" ] && ! grep -q '"tici"' "$AMP_FILE"; then
