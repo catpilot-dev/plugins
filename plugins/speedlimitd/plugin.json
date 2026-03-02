@@ -26,6 +26,11 @@
       "function": "on_v_cruise",
       "priority": 50,
       "subscriptions": ["speedLimitState"]
+    },
+    "ui.render_overlay": {
+      "module": "ui_overlay",
+      "function": "on_render_overlay",
+      "priority": 50
     }
   },
   "processes": [

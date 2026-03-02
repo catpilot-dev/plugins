@@ -2,7 +2,7 @@
 
 ## Quick Reference
 
-- **6 hook points** implemented across 4 files
+- **7 hook points** implemented across 5 files
 - **Zero overhead** when no plugins registered (~50ns per call)
 - **Fail-safe**: plugin exceptions return default value, never crash openpilot
 
@@ -58,16 +58,21 @@ Registers car platforms into openpilot's dynamic interface loading system. BMW p
 
 Monitors panda safety model status. BMW plugin detects ELM327 fallback and logs warnings.
 
----
+### 7. `ui.render_overlay`
 
-## Planned Hooks
+**File**: `selfdrive/ui/onroad/augmented_road_view.py`
+**Plugin**: speedlimitd
+**Signature**: `callback(None, content_rect) -> None`
 
-### `ui.render_overlay`
+Plugin overlay rendering hook. Called each frame inside scissor mode, after HUD render and before alert renderer. Plugins draw using stock pyray + UI lib (`gui_app.font()`, `measure_text_cached()`, `ui_state.sm`). Multiple plugins can register — each draws independently. Void hook (default `None`, callbacks return `None`).
 
-**File**: `selfdrive/ui/layouts/main.py`
-**Signature**: `callback(None, screen, ui_state) -> None`
-
-Custom HUD overlays (speed limit sign, DCC mode display, debug info).
+Render pipeline order:
+1. Camera view (base)
+2. model_renderer (path, lane lines, lead)
+3. hud_renderer (MAX box, speed, exp button)
+4. **ui.render_overlay** (plugin overlays)
+5. alert_renderer (critical alerts, always topmost)
+6. driver_state_renderer (driver monitoring)
 
 ---
 

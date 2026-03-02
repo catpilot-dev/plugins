@@ -79,7 +79,8 @@ verify_hooks() {
   for file in \
     "$OPENPILOT_ROOT/selfdrive/controls/controlsd.py" \
     "$OPENPILOT_ROOT/selfdrive/controls/lib/longitudinal_planner.py" \
-    "$OPENPILOT_ROOT/system/manager/manager.py"; do
+    "$OPENPILOT_ROOT/system/manager/manager.py" \
+    "$OPENPILOT_ROOT/selfdrive/ui/onroad/augmented_road_view.py"; do
     if [[ -f "$file" ]]; then
       if ! grep -q "selfdrive.plugins" "$file" 2>/dev/null; then
         warn "Hook call site missing in: ${file#$OPENPILOT_ROOT/}"
@@ -122,6 +123,28 @@ overlay_framework() {
   cp -v "$src"/*.py "$dst/" 2>/dev/null || true
   if [[ -d "$src/tests" ]]; then
     cp -v "$src/tests"/*.py "$dst/tests/" 2>/dev/null || true
+  fi
+}
+
+# --- 1b. Overlay UI modules ---
+overlay_ui() {
+  local src="$SCRIPT_DIR/selfdrive/ui"
+  if [[ ! -d "$src" ]]; then return; fi
+  local dst="$OPENPILOT_ROOT/selfdrive/ui"
+
+  log "Overlaying UI: selfdrive/ui/"
+
+  if $DRY_RUN; then
+    find "$src" -type f -name '*.py' | while read -r f; do
+      echo "  COPY ${f#$SCRIPT_DIR/} → ${dst#$OPENPILOT_ROOT/}/${f##$src/}"
+    done
+    return
+  fi
+
+  # Copy onroad/ overlay files
+  if [[ -d "$src/onroad" ]]; then
+    mkdir -p "$dst/onroad"
+    cp -v "$src/onroad/"*.py "$dst/onroad/" 2>/dev/null || true
   fi
 }
 
@@ -189,6 +212,7 @@ install_plugins() {
 }
 
 overlay_framework
+overlay_ui
 overlay_cereal
 install_plugins
 
