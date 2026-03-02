@@ -134,8 +134,17 @@ if [ -f "$APP_FILE" ] && grep -q "{'tizi': 20}" "$APP_FILE"; then
 fi
 
 # 5. Display: DRM backend (no Weston compositor)
-#    Must stop Weston so raylib can get DRM master on /dev/dri/card0
+#    Must stop Weston so raylib can get DRM master on /dev/dri/card0.
+#    Also mask weston/weston-ready to eliminate the 28s boot timeout in
+#    AGNOS comma.sh which polls `systemctl is-active weston-ready`.
+#    Masking persists across reboots (only needs root rw once).
 sudo systemctl stop weston 2>/dev/null || true
+if ! systemctl is-enabled weston 2>/dev/null | grep -q 'masked'; then
+  sudo mount -o remount,rw / 2>/dev/null
+  sudo systemctl mask weston weston-ready 2>/dev/null || true
+  sudo mount -o remount,ro / 2>/dev/null || true
+  echo "[c3_compat] Masked weston services (eliminates 28s boot delay)"
+fi
 
 # 6. PATH + PYTHONPATH: make venv tools and packages visible to scons
 #    scons at /usr/bin/scons uses #!/usr/bin/python3 which can't see venv packages.
