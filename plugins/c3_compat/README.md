@@ -1,52 +1,44 @@
-# c3_compat — Comma 3 Compatibility Plugin
+# Comma 3 Compatibility
 
-**Type**: hybrid (process + hook)
-**Device filter**: tici (Comma 3)
+Keeps the [comma three](https://github.com/commaai/hardware/tree/master/comma_three) (2021) running on openpilot v0.10.3+. Upstream dropped Comma 3 support in v0.10.3 — this plugin restores it without maintaining a separate branch or codebase.
 
-## What it does
+## For Comma 3 Owners
 
-Provides Comma 3 (TICI) hardware compatibility for AGNOS 12.8:
+Install a pre-patched [catpilot](https://github.com/catpilot-dev/catpilot) v0.10.3+ release for minimal risk — c3_compat is included and applied automatically on every boot. No manual setup required.
 
-- **Raylib Python UI** — Full replacement UI process using raylib instead of Qt
-  - Onroad HUD with speed, alerts, model/path rendering
-  - Settings panels (device, software, developer, toggles, firehose)
-  - Augmented road view with driver camera dialog
-  - Speed limit sign and curvature speed overlays
-- **Panda health monitoring** — STM32F4/Dos health check hook
-- **AGNOS 12.8 support** — Wayland backend, GPU preemption, venv paths
+**Disclaimer**: c3_compat has been fully tested on a comma three device (serial dc8405e6). Please [report any issues](https://github.com/catpilot-dev/plugins/issues). Use at your own risk — we are not liable for any consequences.
 
-## Params
+## Why
 
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| ShowSpeedLimitSign | bool | true | Show speed limit sign on HUD |
-| ShowCurvatureSpeed | bool | true | Show curvature-limited speed on HUD |
+The Comma 3 (code name "tici") uses a Snapdragon 845 SoC and STM32F4 panda MCU. When comma released v0.10.3, they removed C3-specific code paths: the tici amplifier config, STM32F4 panda support, SPI protocol compatibility, and the Wayland/Weston display stack. Without this plugin, a Comma 3 running v0.10.3 can't detect its panda, produce audio, or render a UI.
 
-## Key files
+The other major gap is AGNOS — the comma device OS. Comma 3 is capped at AGNOS 12.8, while openpilot v0.10.3 targets AGNOS 16. c3_compat bridges the differences: missing system packages, read-only root filesystem constraints, Wayland→DRM display backend, and Python venv dependencies that changed between the two AGNOS versions.
+
+## What It Does
+
+**Boot patches** (`boot_patch.sh`) — applied before openpilot launches:
+
+- Restores STM32F4 (Dos board) panda support: MCU type, USB detection, firmware version skip, SPI→USB fallback
+- Restores tici amplifier EQ config (audio)
+- Replaces Weston/Wayland display stack with DRM backend (eliminates 28s boot delay)
+- Installs `venv_sync` — ensures venv matches `uv.lock` on every boot regardless of how code was deployed
+- Patches `launch_chffrplus.sh` with correct PATH/PYTHONPATH for scons builds
+- Symlinks cache directories to `/data/` (prevents 100MB `/home` overlay from filling up)
+- Persistent crash diagnostics: rotated dmesg + system state snapshots in `/data/crash_diag/`
+- Background watchdog for system health monitoring
+
+**Panda health hook** (`compat.py`) — runtime STM32F4/Dos health check
+
+## Plugin Details
+
+**Type**: hybrid (process + hook) | **Device filter**: tici (Comma 3 only)
 
 ```
 c3_compat/
   plugin.json          # Plugin manifest
+  boot_patch.sh        # AGNOS 12.8 boot-time patches (14 sections)
   compat.py            # device.health_check hook
-  ui.py                # UI process entry point
-  ui_state.py          # UIState cereal subscriptions
-  layouts/             # Raylib layout components
-    main.py            # Main onroad layout
-    home.py            # Home/offroad layout
-    sidebar.py         # Sidebar with connectivity/temp
-    settings/          # Settings panels
-  onroad/              # Onroad rendering
-    hud_renderer.py    # Speed, alerts, speed limit sign
-    model_renderer.py  # Path/lane rendering
-    cameraview.py      # Camera frame display
-    alert_renderer.py  # Alert overlay
-  lib/                 # Helpers
-    api_helpers.py     # API/auth helpers
-    prime_state.py     # Prime subscription state
+  venv_sync.py         # uv.lock → venv dependency synchronizer
+  watchdog.sh          # Background system health monitor
+  raylib_drm/          # DRM-backend raylib .so (Git LFS)
 ```
-
-## Notes
-
-- Replaces the default UI process (`"replace": true` in plugin.json)
-- Requires Wayland (Weston compositor) on AGNOS 12.8
-- Font loading uses `.ttf` directly via raylib `load_font_ex()`

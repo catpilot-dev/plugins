@@ -9,7 +9,7 @@ plugins/
 ├── install.sh                     # Overlay installer
 ├── plugins/                       # Plugin packages (→ /data/plugins/)
 │   ├── bmw_e9x_e8x/              # BMW E8x/E9x car interface
-│   ├── c3_compat/                 # Comma 3 compatibility + custom UI
+│   ├── c3_compat/                 # Comma 3 compatibility (AGNOS 12.8)
 │   ├── lane_centering/            # Lane centering correction
 │   ├── mapd/                      # OSM map daemon
 │   ├── model_selector/            # Driving model selector
@@ -26,7 +26,7 @@ plugins/
 | Plugin | Type | Description |
 |--------|------|-------------|
 | `bmw_e9x_e8x` | car | BMW E82/E90 car interface with VIN-based detection |
-| `c3_compat` | hybrid | Comma 3 compatibility layer + Raylib Python UI |
+| `c3_compat` | hybrid | Comma 3 compatibility layer (AGNOS 12.8, STM32F4 panda, DRM display) |
 | `lane_centering` | hook | Single-lane centering curvature correction |
 | `mapd` | process | OSM map daemon for speed limits and curves |
 | `model_selector` | tool | Download and swap driving models |
