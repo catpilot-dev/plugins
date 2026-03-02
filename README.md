@@ -14,18 +14,11 @@ openpilot-plugins/
 │   ├── mapd/                      # OSM map daemon
 │   ├── model_selector/            # Driving model selector
 │   ├── speedlimitd/               # Speed limit enforcement
-│   └── docs/                      # Architecture docs
-├── selfdrive/plugins/             # Framework (overlays into openpilot)
-│   ├── hooks.py                   # Hook registry + fail-safe dispatcher
-│   ├── registry.py                # Plugin discovery + lifecycle
-│   ├── manifest.py                # Manifest validation
-│   ├── builder.py                 # Boot-time JIT schema patcher
-│   ├── plugind.py                 # Plugin daemon
-│   ├── api.py                     # REST API (port 8083)
-│   ├── plugin_base.py             # Base class
-│   └── tests/                     # Framework tests
-└── cereal/
-    └── custom.capnp               # 20 reserved struct slots for plugins
+├── overlays/                       # Files overlaid into openpilot tree
+│   ├── selfdrive/plugins/         #   Plugin framework (hooks, registry, builder)
+│   ├── selfdrive/ui/onroad/       #   UI overlay modules (HUD, model, alerts)
+│   └── cereal/custom.capnp        #   20 reserved struct slots for plugins
+└── docs/                          # Architecture docs
 ```
 
 ## Quick Start

@@ -3,8 +3,8 @@
 # install.sh — Install openpilot-plugins onto a device or local openpilot tree.
 #
 # Three operations:
-#   1. Overlay selfdrive/plugins/ → openpilot tree (framework modules)
-#   2. Overlay cereal/custom.capnp → openpilot tree (schema extensions)
+#   1. Overlay overlays/selfdrive/ → openpilot tree (framework + UI modules)
+#   2. Overlay overlays/cereal/ → openpilot tree (schema extensions)
 #   3. Copy each plugins/*/ → /data/plugins/ (runtime plugin packages)
 #
 # Usage:
@@ -106,7 +106,7 @@ verify_hooks
 
 # --- 1. Overlay framework modules ---
 overlay_framework() {
-  local src="$SCRIPT_DIR/selfdrive/plugins"
+  local src="$SCRIPT_DIR/overlays/selfdrive/plugins"
   local dst="$OPENPILOT_ROOT/selfdrive/plugins"
 
   log "Overlaying framework: selfdrive/plugins/"
@@ -128,7 +128,7 @@ overlay_framework() {
 
 # --- 1b. Overlay UI modules ---
 overlay_ui() {
-  local src="$SCRIPT_DIR/selfdrive/ui"
+  local src="$SCRIPT_DIR/overlays/selfdrive/ui"
   if [[ ! -d "$src" ]]; then return; fi
   local dst="$OPENPILOT_ROOT/selfdrive/ui"
 
@@ -164,7 +164,6 @@ install_plugins() {
     for plugin_dir in "$SCRIPT_DIR"/plugins/*/; do
       local name
       name="$(basename "$plugin_dir")"
-      [[ "$name" == "docs" ]] && continue
       if [[ -f "$plugin_dir/plugin.json" ]]; then
         echo "  COPY plugins/$name/ → $PLUGINS_DEST/$name/"
       fi
