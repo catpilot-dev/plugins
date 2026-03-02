@@ -135,15 +135,31 @@ fi
 
 # 5. Display: DRM backend (no Weston compositor)
 #    Must stop Weston so raylib can get DRM master on /dev/dri/card0.
-#    Also mask weston/weston-ready to eliminate the 28s boot timeout in
-#    AGNOS comma.sh which polls `systemctl is-active weston-ready`.
-#    Masking persists across reboots (only needs root rw once).
+#    Also replace weston-ready with a no-op stub to eliminate the 28s boot
+#    timeout in AGNOS comma.sh which polls `systemctl is-active weston-ready`.
+#    A masked service stays "inactive" (comma.sh loops 200x), but a stub with
+#    RemainAfterExit=yes exits instantly and stays "active" (1s boot).
+#    Persists across reboots — only needs root rw once.
 sudo systemctl stop weston 2>/dev/null || true
-if ! systemctl is-enabled weston 2>/dev/null | grep -q 'masked'; then
+if ! grep -q 'c3_compat' /etc/systemd/system/weston-ready.service 2>/dev/null; then
   sudo mount -o remount,rw / 2>/dev/null
-  sudo systemctl mask weston weston-ready 2>/dev/null || true
+  sudo systemctl mask weston 2>/dev/null || true
+  sudo tee /etc/systemd/system/weston-ready.service > /dev/null << 'WESTONEOF'
+[Unit]
+Description=Weston ready stub (c3_compat: DRM mode, no Weston needed)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target
+WESTONEOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable weston-ready 2>/dev/null || true
   sudo mount -o remount,ro / 2>/dev/null || true
-  echo "[c3_compat] Masked weston services (eliminates 28s boot delay)"
+  echo "[c3_compat] Installed weston-ready stub (eliminates 28s boot delay)"
 fi
 
 # 6. PATH + PYTHONPATH: make venv tools and packages visible to scons
