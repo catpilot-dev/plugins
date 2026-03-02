@@ -28,9 +28,9 @@ plugins/
 | `bmw_e9x_e8x` | car | BMW E82/E90 car interface with VIN-based detection |
 | `c3_compat` | hybrid | Comma 3 compatibility layer (AGNOS 12.8, STM32F4 panda, DRM display) |
 | `lane_centering` | hook | Single-lane centering curvature correction |
-| `mapd` | process | OSM map daemon for speed limits and curves |
+| `mapd` | process | OSM map daemon for speed limits, curves, and road context |
 | `model_selector` | tool | Download and swap driving models |
-| `speedlimitd` | hybrid | Speed limit enforcement (OSM + YOLO + inference) |
+| `speedlimitd` | hybrid | Speed limit fusion and enforcement (requires `mapd`) |
 
 ## Managing Plugins
 
