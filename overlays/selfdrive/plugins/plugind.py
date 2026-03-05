@@ -65,6 +65,21 @@ class PluginProcessManager:
 
     try:
       os.kill(pid, 0)
+      # Check for zombie — os.kill(pid, 0) succeeds for zombies
+      try:
+        with open(f'/proc/{pid}/status') as f:
+          for line in f:
+            if line.startswith('State:'):
+              if 'Z' in line:
+                # Reap the zombie
+                try:
+                  os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                  pass
+                raise OSError("zombie process")
+              break
+      except FileNotFoundError:
+        raise OSError("process gone")
       # Verify this PID belongs to us — check cmdline or start time
       with open(f'/proc/{pid}/cmdline') as f:
         cmdline = f.read()
@@ -83,6 +98,18 @@ class PluginProcessManager:
     self._pids.pop(name, None)
     return None
 
+  @staticmethod
+  def _services_ready(requires) -> bool:
+    """Check if required cereal services are available via shared memory.
+
+    Args:
+      requires: dict with "services" list, or empty dict/list
+    """
+    if not requires:
+      return True
+    services = requires.get('services', [])
+    return all(os.path.exists(f'/dev/shm/msgq_{s}') for s in services)
+
   def sync(self, desired: list[dict]):
     """Start/stop processes to match desired state."""
     desired_names = {p['name'] for p in desired}
@@ -99,11 +126,17 @@ class PluginProcessManager:
           if name not in desired_names:
             self._stop(name)
 
-    # Start processes that aren't running
+    # Start processes that aren't running (respecting required services)
     for proc_def in desired:
       name = proc_def['name']
       if self._is_running(name) is not None:
         continue
+
+      # Probe required cereal services before spawning
+      requires = proc_def.get('requires', [])
+      if not self._services_ready(requires):
+        continue
+
       if name in self._pids:
         cloudlog.warning(f"plugin process '{name}' died, restarting")
       self._start(proc_def)
@@ -114,10 +147,13 @@ class PluginProcessManager:
     module = proc_def['module']
     module_file = os.path.join(plugin_dir, *module.split('.')) + '.py'
 
+    # Inherit parent sys.path so child can import cereal, openpilot, etc.
+    parent_paths = [p for p in sys.path if p and p != plugin_dir]
     launcher_code = (
       f"import sys, os; "
-      f"sys.path.insert(0, {plugin_dir!r}); "
+      f"sys.path[:0] = {[plugin_dir] + parent_paths!r}; "
       f"os.chdir({plugin_dir!r}); "
+      f"os.environ['PWD'] = {plugin_dir!r}; "
       f"from setproctitle import setproctitle; "
       f"setproctitle('plugin_{name}'); "
       f"import importlib.util; "
@@ -128,7 +164,7 @@ class PluginProcessManager:
     )
 
     log_path = self._log_file(name)
-    log_fd = open(log_path, 'a')
+    log_fd = open(log_path, 'w')
     proc = subprocess.Popen(
       [sys.executable, '-c', launcher_code],
       stdin=subprocess.DEVNULL,

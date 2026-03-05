@@ -262,6 +262,7 @@ class PluginRegistry:
             'plugin_id': plugin_id,
             'plugin_dir': info.plugin_dir,
             'condition': proc_def.get('condition', 'always_run'),
+            'requires': proc_def.get('requires', []),
           })
     return processes
 

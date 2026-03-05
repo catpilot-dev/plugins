@@ -42,7 +42,8 @@
     {
       "name": "speedlimitd",
       "module": "speedlimitd",
-      "condition": "only_onroad"
+      "condition": "only_onroad",
+      "requires": {"services": ["mapdOut"], "timeout": 1000}
     }
   ],
   "params": {

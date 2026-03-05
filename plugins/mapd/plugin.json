@@ -38,7 +38,8 @@
     {
       "name": "mapd",
       "module": "mapd_runner",
-      "condition": "always_run"
+      "condition": "always_run",
+      "requires": {"services": ["deviceState"], "timeout": 2000}
     }
   ],
   "params": {
