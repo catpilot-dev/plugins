@@ -148,12 +148,41 @@ overlay_ui() {
   fi
 }
 
-# --- 2. Overlay cereal schema ---
+# --- 2. Overlay cereal schema + inject plugin schemas/services ---
 overlay_cereal() {
-  # NOTE: custom.capnp is patched at boot by the plugin builder (builder.py).
-  # It reads each plugin's cereal slot claims and standalone schemas, then
-  # patches the stock custom.capnp. Overlaying here would conflict.
-  log "Skipping cereal overlay (builder.py handles custom.capnp at boot)"
+  local cereal_dir="$OPENPILOT_ROOT/cereal"
+
+  # Copy base custom.capnp overlay (stock template with reserved slots)
+  local src="$SCRIPT_DIR/overlays/cereal/custom.capnp"
+  if [[ -f "$src" ]] && [[ -d "$cereal_dir" ]]; then
+    if $DRY_RUN; then
+      echo "  COPY overlays/cereal/custom.capnp → cereal/custom.capnp"
+    else
+      cp -v "$src" "$cereal_dir/custom.capnp"
+    fi
+  fi
+
+  $DRY_RUN && return
+
+  # Inject plugin cereal schemas (custom.capnp + log.capnp)
+  local capnp_script="$SCRIPT_DIR/plugins/custom_capnp.py"
+  if [[ -f "$capnp_script" ]] && [[ -d "$cereal_dir" ]]; then
+    python3 "$capnp_script" "$cereal_dir" "$PLUGINS_DEST" 2>&1 | while IFS= read -r line; do
+      log "$line"
+    done
+  fi
+
+  # Inject plugin services into cereal/services.py
+  local svc_script="$SCRIPT_DIR/plugins/services.py"
+  local svc_target="$cereal_dir/services.py"
+  if [[ -f "$svc_script" ]] && [[ -f "$svc_target" ]]; then
+    python3 "$svc_script" "$svc_target" "$PLUGINS_DEST" 2>&1 | while IFS= read -r line; do
+      log "$line"
+    done
+  fi
+
+  # Clear __pycache__ for patched cereal files
+  find "$cereal_dir" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 }
 
 # --- 3. Copy plugin packages ---
@@ -212,8 +241,8 @@ install_plugins() {
 
 overlay_framework
 overlay_ui
-overlay_cereal
 install_plugins
+overlay_cereal
 
 if $DRY_RUN; then
   log "Dry run complete. Re-run without --dry-run to apply."
