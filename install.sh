@@ -224,8 +224,9 @@ install_plugins() {
         mv "$dest/data" "/tmp/_plugin_data_$$"
         had_data=true
       fi
-      local was_disabled=false
+      local was_disabled=false was_enforced=false
       [[ -f "$dest/.disabled" ]] && was_disabled=true
+      [[ -f "$dest/.enforced" ]] && was_enforced=true
       rm -rf "$dest"
       cp -r "$plugin_dir" "$dest"
       if $had_data; then
@@ -233,6 +234,9 @@ install_plugins() {
       fi
       if $was_disabled; then
         touch "$dest/.disabled"
+      fi
+      if $was_enforced; then
+        touch "$dest/.enforced"
       fi
     else
       log "  Installing: $name"
@@ -245,6 +249,11 @@ overlay_framework
 overlay_ui
 install_plugins
 overlay_cereal
+
+# Mark enforced plugins (always-on, hidden from Settings panel)
+if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
+  touch "$PLUGINS_DEST/c3_compat/.enforced"
+fi
 
 if $DRY_RUN; then
   log "Dry run complete. Re-run without --dry-run to apply."

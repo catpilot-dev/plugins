@@ -66,14 +66,13 @@ def _sync_mapd_settings():
 
 class _PluginEntry:
   """Lightweight struct for a discovered plugin."""
-  __slots__ = ('id', 'name', 'description', 'enabled', 'locked', 'params')
+  __slots__ = ('id', 'name', 'description', 'enabled', 'params')
 
-  def __init__(self, id, name, description, enabled, locked, params):
+  def __init__(self, id, name, description, enabled, params):
     self.id = id
     self.name = name
     self.description = description
     self.enabled = enabled
-    self.locked = locked
     self.params = params
 
 
@@ -110,8 +109,11 @@ class PluginsLayout(Widget):
         if device_type not in device_filter:
           continue
 
-      locked = (name == 'c3_compat' and IS_C3)
-      enabled = True if locked else not os.path.exists(os.path.join(plugin_dir, '.disabled'))
+      # Skip disabled and enforced plugins — manage via COD
+      if os.path.exists(os.path.join(plugin_dir, '.disabled')):
+        continue
+      if os.path.exists(os.path.join(plugin_dir, '.enforced')):
+        continue
 
       # Collect visible params (those with 'desc' field)
       params = []
@@ -134,8 +136,7 @@ class PluginsLayout(Widget):
         id=name,
         name=manifest.get('name', name),
         description=manifest.get('description', ''),
-        enabled=enabled,
-        locked=locked,
+        enabled=True,
         params=params,
       ))
 
@@ -154,7 +155,7 @@ class PluginsLayout(Widget):
         entry.description,
         entry.enabled,
         callback=lambda state, e=entry: self._toggle_plugin(state, e),
-        enabled=not entry.locked,
+        enabled=True,
       )
       items.append(header)
 
