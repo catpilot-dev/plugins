@@ -110,6 +110,16 @@ def _handle_tap(content_rect):
     _params.put("SpeedLimitValue", str(_speed_limit))
 
 
+def on_state_subscriptions(services):
+  """Hook callback for ui.state_subscriptions.
+
+  Adds speedLimitState to the UI SubMaster so the overlay can read speed limit data.
+  """
+  if 'speedLimitState' not in services:
+    services.append('speedLimitState')
+  return services
+
+
 def on_render_overlay(default, content_rect):
   """Hook callback for ui.render_overlay. Called each frame inside scissor mode."""
   _ensure_init()

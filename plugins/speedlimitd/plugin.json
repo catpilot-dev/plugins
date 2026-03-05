@@ -31,6 +31,11 @@
       "module": "ui_overlay",
       "function": "on_render_overlay",
       "priority": 50
+    },
+    "ui.state_subscriptions": {
+      "module": "ui_overlay",
+      "function": "on_state_subscriptions",
+      "priority": 50
     }
   },
   "processes": [

@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from collections.abc import Callable
 from cereal import log
+from openpilot.selfdrive.plugins.hooks import hooks
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos, FONT_SCALE
 from openpilot.system.ui.lib.multilang import tr, tr_noop
@@ -130,10 +131,15 @@ class Sidebar(Widget):
 
   def _update_connection_status(self, device_state):
     last_ping = device_state.lastAthenaPingTime
-    if last_ping == 0:
-      self._connect_status.update(tr_noop("CONNECT"), tr_noop("OFFLINE"), Colors.WARNING)
-    elif time.monotonic_ns() - last_ping < 80_000_000_000:  # 80 seconds in nanoseconds
+    athena_ok = last_ping != 0 and time.monotonic_ns() - last_ping < 80_000_000_000
+
+    # Plugin hook: additional connectivity checks (e.g., github.com reachability)
+    plugin_ok = hooks.run('ui.connectivity_check', False)
+
+    if athena_ok or plugin_ok:
       self._connect_status.update(tr_noop("CONNECT"), tr_noop("ONLINE"), Colors.GOOD)
+    elif last_ping == 0 and not plugin_ok:
+      self._connect_status.update(tr_noop("CONNECT"), tr_noop("OFFLINE"), Colors.WARNING)
     else:
       self._connect_status.update(tr_noop("CONNECT"), tr_noop("ERROR"), Colors.DANGER)
 

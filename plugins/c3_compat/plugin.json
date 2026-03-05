@@ -2,9 +2,9 @@
   "id": "c3-compat",
   "name": "Comma 3 Compatibility",
   "version": "1.0.0",
-  "type": "hybrid",
+  "type": "hook",
   "author": "c3pilot",
-  "description": "Comma 3 (TICI) compatibility: Raylib Python UI, AGNOS 12.8 support, panda F4/Dos health monitoring.",
+  "description": "Comma 3 (TICI) compatibility: AGNOS 12.8 support, panda F4/Dos health monitoring.",
   "min_openpilot": "0.10.0",
   "max_openpilot": "0.10.99",
   "device_filter": ["tici"],
@@ -17,13 +17,5 @@
       "priority": 50
     }
   },
-  "processes": [
-    {
-      "name": "ui",
-      "module": "ui.ui",
-      "condition": "always_run",
-      "replace": true
-    }
-  ],
   "params": {}
 }

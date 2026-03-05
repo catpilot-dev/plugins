@@ -32,32 +32,39 @@ class UIState:
 
   def _initialize(self):
     self.params = Params()
-    self.sm = messaging.SubMaster(
-      [
-        "modelV2",
-        "controlsState",
-        "onroadEvents",
-        "liveCalibration",
-        "radarState",
-        "deviceState",
-        "pandaStates",
-        "carParams",
-        "driverMonitoringState",
-        "carState",
-        "driverStateV2",
-        "roadCameraState",
-        "wideRoadCameraState",
-        "managerState",
-        "selfdriveState",
-        "longitudinalPlan",
-        "gpsLocationExternal",
-        "carOutput",
-        "carControl",
-        "liveParameters",
-        "rawAudioData",
-        "speedLimitState",
-      ]
-    )
+
+    services = [
+      "modelV2",
+      "controlsState",
+      "onroadEvents",
+      "liveCalibration",
+      "radarState",
+      "deviceState",
+      "pandaStates",
+      "carParams",
+      "driverMonitoringState",
+      "carState",
+      "driverStateV2",
+      "roadCameraState",
+      "wideRoadCameraState",
+      "managerState",
+      "selfdriveState",
+      "longitudinalPlan",
+      "gpsLocationExternal",
+      "carOutput",
+      "carControl",
+      "liveParameters",
+      "rawAudioData",
+    ]
+
+    # Plugin hook: let plugins add subscriptions (e.g., speedLimitState)
+    try:
+      from openpilot.selfdrive.plugins.hooks import hooks
+      services = hooks.run('ui.state_subscriptions', services)
+    except ImportError:
+      pass
+
+    self.sm = messaging.SubMaster(services)
 
     self.prime_state = PrimeState()
 
