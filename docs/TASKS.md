@@ -5,15 +5,17 @@
 Plugin system for catpilot-dev plugins repo (`~/catpilot-dev/plugins/` → `catpilot-dev/plugins` on GitHub).
 Plugins live in `plugins/` and hook into the control loop via the hook system, run as managed processes, or register car interfaces.
 Overlays live in `overlays/` and replace stock openpilot UI/settings files at install time.
+Development branch: `dev`. Release branch: `main`.
 
 ### Repository Structure
 
-- **Plugins repo**: `~/catpilot-dev/plugins/` (branch `debug` — active development)
+- **Plugins repo**: `~/catpilot-dev/plugins/` (branch `main` — release, `dev` — active development)
 - **Connect repo**: `~/catpilot-dev/connect/` — COD web app for device management
 - **Runtime**: `install.sh` overlays framework + cereal into openpilot tree, copies plugins to `/data/plugins/`
 
 ### Available Hook Points (wired in repo)
 - `controls.curvature_correction` (controlsd.py) — curvature adjustment
+- `planner.subscriptions` (plannerd.py) — inject cereal services into planner SubMaster
 - `planner.v_cruise` (longitudinal_planner.py) — cruise speed override
 - `planner.accel_limits` (longitudinal_planner.py) — accel limit adjustment
 - `desire.post_update` (desire_helper.py) — lane change extensions
@@ -28,7 +30,7 @@ Overlays live in `overlays/` and replace stock openpilot UI/settings files at in
 - ✅ `cereal/log.capnp` — Event field renames (speedLimitState, mapdOut, mapdIn, mapdExtendedOut)
 - ✅ `cereal/services.py` — mapdOut (20Hz), mapdExtendedOut (20Hz), mapdIn (no-log), speedLimitState (1Hz)
 - ✅ `common/params_keys.h` — LaneCenteringCorrection, MapdVersion, SpeedLimitConfirmed, SpeedLimitValue
-- ✅ `selfdrive/controls/plannerd.py` — speedLimitState + mapdOut added to SubMaster
+- ✅ `selfdrive/controls/plannerd.py` — `hooks.run('planner.subscriptions', base_services)` for dynamic subscription injection
 
 ---
 
@@ -103,8 +105,8 @@ Binary lifecycle manager for pfeiferj/mapd (Go binary). Publishes mapdOut at 20H
 
 **Type**: hybrid (process + hook)
 **Dependency**: mapd plugin
-**Process**: speedlimitd at 1Hz (only_onroad)
-**Hook**: `planner.v_cruise` — enforces confirmed speed limits
+**Process**: speedlimitd at 1Hz (only_onroad), requires `mapdOut` service
+**Hooks**: `planner.subscriptions` (inject speedLimitState), `planner.v_cruise` (enforce confirmed limits), `ui.render_overlay` + `ui.state_subscriptions` (HUD sign)
 
 Three-tier priority:
 1. OSM maxspeed (confidence 0.95)
@@ -211,9 +213,12 @@ Shows green when github.com is reachable (via LastGithubPingTime param from gith
   - Complements COD: COD handles offline tasks (repo install, model downloads, route review); Settings panel enables on-road param tuning without pulling out a phone
   - Add `overlays/selfdrive/ui/layouts/settings/plugins.py` (~250 lines)
   - PluginsLayout: scan manifests, render toggle + param controls per plugin
-  - Support bool/pills/string param types, dependsOn/requiresPlugin conditionals
+  - Support bool/pills param types, dependsOn/requiresPlugin conditionals
   - Enable/disable via .disabled marker + reboot dialog
   - MapdSettings JSON sync for mapd params
 - [ ] YOLO speed sign integration into speedlimitd (currently placeholder)
-- [ ] Interactive speed limit HUD element (tap to confirm/dismiss)
-- [ ] UI render hook for plugin overlays
+- [x] Interactive speed limit HUD element (tap to confirm/dismiss) — implemented in `ui_overlay.py`
+- [x] UI render hook for plugin overlays — `ui.render_overlay` + `ui.state_subscriptions` hooks
+- [x] Dynamic subscription injection — `planner.subscriptions` hook replaces static JSON file
+- [x] Declarative process dependencies — `requires.services` in plugin.json, plugind checks shm files
+- [x] COD v0.10.2 — process status badges, author info, dynamic dependency labels
