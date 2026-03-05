@@ -85,6 +85,7 @@ class BmwPlatformConfig(PlatformConfig):
     Bus.pt: os.path.join(PLUGIN_DBC_DIR, 'bmw_e9x_e8x.dbc'),
     Bus.chassis: os.path.join(PLUGIN_DBC_DIR, 'bmw_e9x_e8x.dbc'),
     Bus.body: os.path.join(PLUGIN_DBC_DIR, 'bmw_e9x_e8x.dbc'),
+    Bus.alt: os.path.join(PLUGIN_DBC_DIR, 'ocelot_controls.dbc'),
     })
 
 

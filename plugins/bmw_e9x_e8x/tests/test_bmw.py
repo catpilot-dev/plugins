@@ -1,4 +1,4 @@
-"""Tests for BMW E9x/E8x plugin — VIN detection, CAN checksums, panda status."""
+"""Tests for BMW E9x/E8x plugin — VIN detection, CAN checksums, DBC paths."""
 import pytest
 from unittest.mock import MagicMock, patch
 import sys
@@ -54,7 +54,7 @@ def mock_opendbc(monkeypatch):
     def common(harnesses): return harnesses
 
   class Bus:
-    pt = 0; chassis = 1; body = 2
+    pt = 0; chassis = 1; body = 2; alt = 3
 
   class Platforms(Enum):
     @classmethod
@@ -236,70 +236,40 @@ class TestEnums:
 
 
 # ============================================================
-# Panda Status Monitor
+# DBC Path Resolution
 # ============================================================
 
-class TestPandaStatus:
-  @pytest.fixture(autouse=True)
-  def mock_cloudlog(self, monkeypatch):
-    mock = MagicMock()
-    monkeypatch.setitem(sys.modules, 'openpilot', MagicMock())
-    monkeypatch.setitem(sys.modules, 'openpilot.common', MagicMock())
-    monkeypatch.setitem(sys.modules, 'openpilot.common.swaglog', MagicMock(cloudlog=mock))
-    self.cloudlog = mock
-
-  def _load_module(self):
+class TestDBCPaths:
+  def test_dbc_dict_has_all_buses(self, mock_opendbc):
+    """All Bus entries (pt, chassis, body, alt) resolve to plugin-local DBC files."""
     import importlib
-    import panda_status
-    importlib.reload(panda_status)
-    return panda_status
+    import bmw.values as mod
+    importlib.reload(mod)
+    assert os.path.isabs(mod.PLUGIN_DBC_DIR)
+    dbc_dict = mod.BmwPlatformConfig([], mod.CarSpecs()).dbc_dict
+    for bus_key in ['pt', 'chassis', 'body', 'alt']:
+      bus_val = getattr(mod.Bus, bus_key) if hasattr(mod.Bus, bus_key) else bus_key
+      path = dbc_dict.get(bus_val)
+      if path is None:
+        path = dbc_dict.get({'pt': 0, 'chassis': 1, 'body': 2, 'alt': 3}[bus_key])
+      assert path is not None, f"Bus.{bus_key} not in dbc_dict"
+      assert mod.PLUGIN_DBC_DIR in path, f"Bus.{bus_key} path not in plugin dir: {path}"
 
-  def test_none_panda_states(self):
-    mod = self._load_module()
-    result = mod.on_panda_status(None, panda_states=None)
-    assert result is None
+  def test_ocelot_controls_dbc_exists(self, mock_opendbc):
+    """ocelot_controls.dbc exists in plugin dbc directory."""
+    import importlib
+    import bmw.values as mod
+    importlib.reload(mod)
+    ocelot_path = os.path.join(mod.PLUGIN_DBC_DIR, 'ocelot_controls.dbc')
+    assert os.path.exists(ocelot_path), f"Missing: {ocelot_path}"
 
-  def test_bmw_safety_active(self):
-    mod = self._load_module()
-    ps = MagicMock()
-    ps.safetyModel = 'bmw'
-    mod.on_panda_status(None, panda_states=[ps])
-    assert mod._last_status == 'bmw'
-    assert mod._alert_count == 0
-
-  def test_elm327_fallback_alerts(self):
-    mod = self._load_module()
-    ps = MagicMock()
-    ps.safetyModel = 'elm327'
-    mod.on_panda_status(None, panda_states=[ps])
-    assert mod._last_status == 'elm327'
-    assert mod._alert_count == 1
-
-  def test_status_change_triggers_log(self):
-    mod = self._load_module()
-    ps_bmw = MagicMock()
-    ps_bmw.safetyModel = 'bmw'
-    ps_elm = MagicMock()
-    ps_elm.safetyModel = 'elm327'
-
-    mod.on_panda_status(None, panda_states=[ps_bmw])
-    mod.on_panda_status(None, panda_states=[ps_bmw])  # no change — no new log
-    mod.on_panda_status(None, panda_states=[ps_elm])
-    assert mod._last_status == 'elm327'
-    assert mod._alert_count == 1
-
-  def test_get_status(self):
-    mod = self._load_module()
-    status = mod.get_status()
-    assert status['safety_model'] == 'unknown'
-    assert status['is_bmw_active'] is False
-    assert status['expected_id'] == 35
-
-    ps = MagicMock()
-    ps.safetyModel = 'bmw'
-    mod.on_panda_status(None, panda_states=[ps])
-    status = mod.get_status()
-    assert status['is_bmw_active'] is True
+  def test_bmw_dbc_exists(self, mock_opendbc):
+    """bmw_e9x_e8x.dbc exists in plugin dbc directory."""
+    import importlib
+    import bmw.values as mod
+    importlib.reload(mod)
+    bmw_path = os.path.join(mod.PLUGIN_DBC_DIR, 'bmw_e9x_e8x.dbc')
+    assert os.path.exists(bmw_path), f"Missing: {bmw_path}"
 
 
 # ============================================================

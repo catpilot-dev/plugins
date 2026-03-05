@@ -1,6 +1,7 @@
+import os
 from enum import Enum
 from opendbc.can import CANPacker
-from bmw.values import CanBus
+from bmw.values import CanBus, PLUGIN_DBC_DIR
 
 
 class SteeringModes(Enum):
@@ -23,7 +24,7 @@ class CruiseStalk(Enum):
 # *** StepperServoCAN ***
 def create_steer_command(frame: int, mode: SteeringModes, steer_tq: float = 0, steer_delta: float = 0):
     """Creates a CAN message for the actuator STEERING_COMMAND"""
-    packer = CANPacker('ocelot_controls')
+    packer = CANPacker(os.path.join(PLUGIN_DBC_DIR, 'ocelot_controls.dbc'))
     values = {
         "COUNTER": frame % 16,
         "STEER_MODE": mode.value,

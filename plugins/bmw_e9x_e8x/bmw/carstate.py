@@ -223,5 +223,5 @@ class CarState(CarStateBase):
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, CanBus.PT_CAN),
       Bus.body: CANParser(DBC[CP.carFingerprint][Bus.body], fcan_messages, CanBus.F_CAN),
-      Bus.alt: CANParser('ocelot_controls', servo_can_messages, CanBus.SERVO_CAN),
+      Bus.alt: CANParser(DBC[CP.carFingerprint][Bus.alt], servo_can_messages, CanBus.SERVO_CAN),
     }
