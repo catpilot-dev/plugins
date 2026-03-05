@@ -9,8 +9,6 @@ Registered as a ui.render_overlay hook callback. Uses stock UI lib directly:
 """
 import math
 import pyray as rl
-from openpilot.common.params import Params
-from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 
@@ -23,6 +21,9 @@ SPEED_SIGN_FONT_SIZE = 56
 SOURCE_LABELS = {0: "OSM", 1: "SIGN", 2: "~"}
 
 # Module-level state (initialized lazily on first render frame)
+# ui_state and Params are lazily imported in _ensure_init to avoid circular import
+# when the plugin registry loads this module during ui_state.__init__.
+ui_state = None
 _font_bold = None
 _font_medium = None
 _params = None
@@ -32,9 +33,12 @@ _speed_limit_confirmed = False
 
 
 def _ensure_init():
-  """Lazy init — fonts require a GL context, so defer until first render frame."""
-  global _font_bold, _font_medium, _params
+  """Lazy init — fonts and imports deferred until first render frame."""
+  global _font_bold, _font_medium, _params, ui_state
   if _font_bold is None:
+    from openpilot.common.params import Params
+    from openpilot.selfdrive.ui.ui_state import ui_state as _ui_state
+    ui_state = _ui_state
     _font_bold = gui_app.font(FontWeight.BOLD)
     _font_medium = gui_app.font(FontWeight.MEDIUM)
     _params = Params()

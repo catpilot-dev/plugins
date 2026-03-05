@@ -189,3 +189,31 @@ class TestPlannerHook:
     assert hook.SPEED_LIMIT_OFFSET[60] == 20
     assert hook.SPEED_LIMIT_OFFSET[70] == 10
     assert hook.SPEED_LIMIT_OFFSET[120] == 10
+
+
+# ============================================================
+# plugin.json validation
+# ============================================================
+
+class TestPluginManifest:
+  def test_valid_json(self):
+    import json, os
+    manifest_path = os.path.join(os.path.dirname(__file__), '..', 'plugin.json')
+    with open(manifest_path) as f:
+      manifest = json.load(f)
+
+    assert manifest['id'] == 'speedlimitd'
+    assert manifest['type'] == 'hybrid'
+    assert 'planner.v_cruise' in manifest['hooks']
+    assert 'ui.render_overlay' in manifest['hooks']
+
+  def test_has_state_subscriptions_hook(self):
+    import json, os
+    manifest_path = os.path.join(os.path.dirname(__file__), '..', 'plugin.json')
+    with open(manifest_path) as f:
+      manifest = json.load(f)
+
+    assert 'ui.state_subscriptions' in manifest['hooks']
+    hook = manifest['hooks']['ui.state_subscriptions']
+    assert hook['module'] == 'ui_overlay'
+    assert hook['function'] == 'on_state_subscriptions'

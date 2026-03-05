@@ -121,9 +121,37 @@ class TestLazyInit:
     assert mock_openpilot['gui_app'].font.call_count == 2
 
 
+class TestStateSubscriptionsHook:
+  """Test the ui.state_subscriptions hook callback."""
+
+  def test_adds_speed_limit_state(self, overlay):
+    services = ["modelV2", "controlsState", "deviceState"]
+    result = overlay.on_state_subscriptions(services)
+    assert 'speedLimitState' in result
+
+  def test_does_not_duplicate(self, overlay):
+    services = ["modelV2", "speedLimitState", "deviceState"]
+    result = overlay.on_state_subscriptions(services)
+    assert result.count('speedLimitState') == 1
+
+  def test_preserves_existing_services(self, overlay):
+    services = ["modelV2", "controlsState"]
+    result = overlay.on_state_subscriptions(services)
+    assert "modelV2" in result
+    assert "controlsState" in result
+    assert "speedLimitState" in result
+
+  def test_returns_same_list(self, overlay):
+    """Modifies in-place and returns the same list object."""
+    services = ["modelV2"]
+    result = overlay.on_state_subscriptions(services)
+    assert result is services
+
+
 class TestUpdateState:
   def test_no_speed_limit_state(self, overlay, mock_openpilot):
     """When no speedLimitState received, state stays at defaults."""
+    overlay._ensure_init()
     mock_openpilot['sm'].recv_frame = {}
     overlay._update_state()
     assert overlay._speed_limit == 0.0
@@ -132,6 +160,7 @@ class TestUpdateState:
 
   def test_speed_limit_state_received(self, overlay, mock_openpilot):
     """When speedLimitState has been received, state is updated."""
+    overlay._ensure_init()
     mock_sls = MagicMock()
     mock_sls.speedLimit = 80.0
     mock_sls.source.raw = 0  # OSM
@@ -145,6 +174,7 @@ class TestUpdateState:
     assert overlay._speed_limit_confirmed is True
 
   def test_speed_limit_unconfirmed(self, overlay, mock_openpilot):
+    overlay._ensure_init()
     mock_sls = MagicMock()
     mock_sls.speedLimit = 60.0
     mock_sls.source.raw = 1  # SIGN
@@ -158,6 +188,7 @@ class TestUpdateState:
 
   def test_source_fallback_to_int(self, overlay, mock_openpilot):
     """When source has no .raw attribute, falls back to int()."""
+    overlay._ensure_init()
     mock_sls = MagicMock(spec=[])  # empty spec — no auto-created attributes
     mock_sls.speedLimit = 100.0
     mock_sls.source = 2  # plain int, hasattr(source, 'raw') is False
