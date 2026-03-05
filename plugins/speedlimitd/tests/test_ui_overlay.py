@@ -17,7 +17,7 @@ def mock_openpilot(monkeypatch):
   # Create mock modules for openpilot imports
   mock_modules = {}
   for mod in [
-    'openpilot', 'openpilot.common', 'openpilot.common.params',
+    'openpilot', 'openpilot.common',
     'openpilot.selfdrive', 'openpilot.selfdrive.ui', 'openpilot.selfdrive.ui.ui_state',
     'openpilot.system', 'openpilot.system.ui', 'openpilot.system.ui.lib',
     'openpilot.system.ui.lib.application', 'openpilot.system.ui.lib.text_measure',
@@ -42,9 +42,9 @@ def mock_openpilot(monkeypatch):
   mock_text_size.y = 30.0
   mock_modules['openpilot.system.ui.lib.text_measure'].measure_text_cached = MagicMock(return_value=mock_text_size)
 
-  # Params mock
-  mock_params_instance = MagicMock()
-  mock_modules['openpilot.common.params'].Params = MagicMock(return_value=mock_params_instance)
+  # params_helper mock
+  mock_params_helper = MagicMock()
+  mock_modules['params_helper'] = mock_params_helper
 
   # ui_state mock with SubMaster-like sm
   mock_sm = MagicMock()
@@ -61,7 +61,7 @@ def mock_openpilot(monkeypatch):
     'gui_app': mock_gui_app,
     'font_bold': mock_font_bold,
     'font_medium': mock_font_medium,
-    'params': mock_params_instance,
+    'params_helper': mock_params_helper,
     'ui_state': mock_ui_state,
     'sm': mock_sm,
     'measure_text_cached': mock_modules['openpilot.system.ui.lib.text_measure'].measure_text_cached,
@@ -104,13 +104,11 @@ class TestLazyInit:
   def test_fonts_none_before_init(self, overlay):
     assert overlay._font_bold is None
     assert overlay._font_medium is None
-    assert overlay._params is None
 
   def test_ensure_init_loads_fonts(self, overlay, mock_openpilot):
     overlay._ensure_init()
     assert overlay._font_bold is not None
     assert overlay._font_medium is not None
-    assert overlay._params is not None
     mock_openpilot['gui_app'].font.assert_any_call('BOLD')
     mock_openpilot['gui_app'].font.assert_any_call('MEDIUM')
 
@@ -210,7 +208,7 @@ class TestHandleTap:
       overlay._handle_tap(content_rect)
 
     assert overlay._speed_limit_confirmed is False
-    mock_openpilot['params'].put.assert_not_called()
+    mock_openpilot['params_helper'].put.assert_not_called()
 
   def test_tap_inside_sign_toggles_confirmed(self, overlay, mock_openpilot, content_rect):
     overlay._ensure_init()
@@ -229,8 +227,8 @@ class TestHandleTap:
       overlay._handle_tap(content_rect)
 
     assert overlay._speed_limit_confirmed is True
-    mock_openpilot['params'].put.assert_any_call("SpeedLimitConfirmed", "1")
-    mock_openpilot['params'].put.assert_any_call("SpeedLimitValue", "80.0")
+    mock_openpilot['params_helper'].put.assert_any_call("SpeedLimitConfirmed", "1")
+    mock_openpilot['params_helper'].put.assert_any_call("SpeedLimitValue", "80.0")
 
   def test_tap_outside_sign_no_toggle(self, overlay, mock_openpilot, content_rect):
     overlay._ensure_init()
@@ -247,7 +245,7 @@ class TestHandleTap:
       overlay._handle_tap(content_rect)
 
     assert overlay._speed_limit_confirmed is False
-    mock_openpilot['params'].put.assert_not_called()
+    mock_openpilot['params_helper'].put.assert_not_called()
 
   def test_tap_on_edge_of_sign(self, overlay, mock_openpilot, content_rect):
     """Tap exactly at radius boundary should still register."""
@@ -270,7 +268,7 @@ class TestHandleTap:
 
     # Should toggle: confirmed True → False
     assert overlay._speed_limit_confirmed is False
-    mock_openpilot['params'].put.assert_any_call("SpeedLimitConfirmed", "0")
+    mock_openpilot['params_helper'].put.assert_any_call("SpeedLimitConfirmed", "0")
 
   def test_tap_just_outside_radius(self, overlay, mock_openpilot, content_rect):
     """Tap 1px beyond radius should not register."""

@@ -8,10 +8,15 @@ import importlib
 @pytest.fixture(autouse=True)
 def mock_openpilot(monkeypatch):
   """Mock openpilot + cereal imports."""
-  for mod in ['openpilot', 'openpilot.common', 'openpilot.common.params',
+  for mod in ['openpilot', 'openpilot.common',
               'openpilot.common.realtime', 'cereal', 'cereal.messaging']:
     monkeypatch.setitem(sys.modules, mod, MagicMock())
   sys.modules['openpilot.common.realtime'].Ratekeeper = MagicMock
+
+  # Mock params_helper (file-based params used by speedlimitd)
+  mock_params_helper = MagicMock()
+  mock_params_helper.get = MagicMock(return_value=None)
+  monkeypatch.setitem(sys.modules, 'params_helper', mock_params_helper)
 
 
 @pytest.fixture

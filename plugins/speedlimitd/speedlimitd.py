@@ -10,7 +10,7 @@ Three-tier priority:
 """
 import time
 import cereal.messaging as messaging
-from openpilot.common.params import Params
+import params_helper
 from openpilot.common.realtime import Ratekeeper
 
 # Road type -> speed limit fallback table (km/h)
@@ -86,7 +86,6 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
 
 class SpeedLimitMiddleware:
   def __init__(self):
-    self.params = Params()
     self.sm = messaging.SubMaster(['mapdOut', 'modelV2'])
     self.pm = messaging.PubMaster(['speedLimitState'])
 
@@ -178,11 +177,9 @@ class SpeedLimitMiddleware:
       confidence = 0.5
 
     # --- Confirmation management ---
-    # Read confirmation state from Params (set by HUD touch handler)
-    confirmed_raw = self.params.get("SpeedLimitConfirmed")
-    confirmed_param = confirmed_raw.decode('utf-8') if confirmed_raw else None
-    value_raw = self.params.get("SpeedLimitValue")
-    confirmed_value_param = value_raw.decode('utf-8') if value_raw else None
+    # Read confirmation state from params (set by HUD touch handler)
+    confirmed_param = params_helper.get("SpeedLimitConfirmed")
+    confirmed_value_param = params_helper.get("SpeedLimitValue")
 
     if confirmed_param == '1' and confirmed_value_param:
       try:
@@ -194,7 +191,7 @@ class SpeedLimitMiddleware:
         else:
           # Speed limit changed — reset confirmation
           self.confirmed = False
-          self.params.put("SpeedLimitConfirmed", "0")
+          params_helper.put("SpeedLimitConfirmed", "0")
       except ValueError:
         self.confirmed = False
     else:

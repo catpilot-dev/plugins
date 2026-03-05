@@ -5,7 +5,7 @@ Registered as a ui.render_overlay hook callback. Uses stock UI lib directly:
   - gui_app.font() for font access
   - measure_text_cached() for text measurement
   - ui_state.sm for speedLimitState data
-  - Params for tap-to-confirm persistence
+  - params_helper for tap-to-confirm persistence
 """
 import math
 import pyray as rl
@@ -21,12 +21,11 @@ SPEED_SIGN_FONT_SIZE = 56
 SOURCE_LABELS = {0: "OSM", 1: "SIGN", 2: "~"}
 
 # Module-level state (initialized lazily on first render frame)
-# ui_state and Params are lazily imported in _ensure_init to avoid circular import
+# ui_state is lazily imported in _ensure_init to avoid circular import
 # when the plugin registry loads this module during ui_state.__init__.
 ui_state = None
 _font_bold = None
 _font_medium = None
-_params = None
 _speed_limit = 0.0
 _speed_limit_source = 2  # roadTypeInference default
 _speed_limit_confirmed = False
@@ -34,14 +33,12 @@ _speed_limit_confirmed = False
 
 def _ensure_init():
   """Lazy init — fonts and imports deferred until first render frame."""
-  global _font_bold, _font_medium, _params, ui_state
+  global _font_bold, _font_medium, ui_state
   if _font_bold is None:
-    from openpilot.common.params import Params
     from openpilot.selfdrive.ui.ui_state import ui_state as _ui_state
     ui_state = _ui_state
     _font_bold = gui_app.font(FontWeight.BOLD)
     _font_medium = gui_app.font(FontWeight.MEDIUM)
-    _params = Params()
 
 
 def _update_state():
@@ -109,9 +106,10 @@ def _handle_tap(content_rect):
   dx = pos.x - cx
   dy = pos.y - cy
   if math.sqrt(dx * dx + dy * dy) <= SPEED_SIGN_RADIUS:
+    import params_helper
     _speed_limit_confirmed = not _speed_limit_confirmed
-    _params.put("SpeedLimitConfirmed", "1" if _speed_limit_confirmed else "0")
-    _params.put("SpeedLimitValue", str(_speed_limit))
+    params_helper.put("SpeedLimitConfirmed", "1" if _speed_limit_confirmed else "0")
+    params_helper.put("SpeedLimitValue", str(_speed_limit))
 
 
 def on_state_subscriptions(services):
