@@ -241,6 +241,30 @@ class PluginRegistry:
           }
     return overrides
 
+  def get_standalone_processes(self) -> list[dict]:
+    """Return standalone (non-replacement) processes from loaded plugins.
+
+    Returns list of process definitions for plugind to spawn directly:
+      [{"name": "github_pinger", "module": "github_pinger", "plugin_id": "...", "plugin_dir": "..."}]
+    """
+    processes = []
+    for plugin_id, info in self.plugins.items():
+      if not info.loaded:
+        continue
+      manifest = info.manifest
+      if manifest['type'] not in ('process', 'hybrid'):
+        continue
+      for proc_def in manifest.get('processes', []):
+        if not proc_def.get('replace', False):
+          processes.append({
+            'name': proc_def['name'],
+            'module': proc_def['module'],
+            'plugin_id': plugin_id,
+            'plugin_dir': info.plugin_dir,
+            'condition': proc_def.get('condition', 'always_run'),
+          })
+    return processes
+
   def get_status(self) -> list[dict]:
     """Return status of all discovered plugins."""
     return [

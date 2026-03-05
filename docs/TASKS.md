@@ -2,13 +2,14 @@
 
 ## Overview
 
-Plugin system for openpilot-plugins standalone repo (`~/openpilot-plugins-standalone/` → `OxygenLiu/openpilot-plugins` on GitHub).
+Plugin system for catpilot-dev plugins repo (`~/catpilot-dev/plugins/` → `catpilot-dev/plugins` on GitHub).
 Plugins live in `plugins/` and hook into the control loop via the hook system, run as managed processes, or register car interfaces.
+Overlays live in `overlays/` and replace stock openpilot UI/settings files at install time.
 
 ### Repository Structure
 
-- **Standalone repo**: `~/openpilot-plugins-standalone/` — all plugin code + framework overlay files
-- **Fork repo**: `~/openpilot-plugins/` (branch `plugins-release`) — minimal upstream v0.10.3 fork with only plugin framework hooks (~20 files diff)
+- **Plugins repo**: `~/catpilot-dev/plugins/` (branch `debug` — active development)
+- **Connect repo**: `~/catpilot-dev/connect/` — COD web app for device management
 - **Runtime**: `install.sh` overlays framework + cereal into openpilot tree, copies plugins to `/data/plugins/`
 
 ### Available Hook Points (wired in repo)
@@ -157,6 +158,43 @@ rebase. The only breakage risk is if comma changes a hook call site signature
 
 ---
 
+## Overlay: settings.py ✅ COMPLETED
+
+**Path**: `overlays/selfdrive/ui/layouts/settings/settings.py`
+
+Custom SettingsLayout with `_run_plugin_ui_hooks()` for plugin UI injection.
+Scans `/data/plugins/*/plugin.json` for hook declarations and calls UI hooks at panel init time.
+Currently wires `ui.network_settings_extend` hook to inject proxy/static IP controls into the Network panel.
+
+---
+
+## Plugin: network_settings ✅ COMPLETED
+
+**Type**: hybrid (process + hook)
+**Device filter**: tici
+**Hooks**: `manager.startup` (proxy, no-op), `ui.network_settings_extend` (UI injection)
+**Process**: github_pinger (always_run) — pings github.com every 80s
+
+Network proxy toggle + static IPv4 + github.com connectivity check:
+- `proxy.py` — SOCKS5 env var management (ALL_PROXY, HTTP_PROXY, HTTPS_PROXY)
+- `static_ip.py` — nmcli device modify for runtime static IPv4 (per-SSID)
+- `params_helper.py` — raw file I/O for plugin params (/data/params/d/)
+- `github_pinger.py` — background pinger + per-SSID proxy auto-enable/disable
+- `ui.py` (~155 lines) — ProxyNetworkSettings subclass with lazy imports, no factory functions
+- **No wifi_manager overlay** — stock works correctly (main's 837-line overlay caused reconnect loop)
+- 184 tests passing
+
+---
+
+## Overlay: sidebar.py ✅ COMPLETED
+
+**Path**: `overlays/selfdrive/ui/layouts/sidebar.py`
+
+Custom sidebar with `hooks.run('ui.connectivity_check', False)` for CONNECT indicator.
+Shows green when github.com is reachable (via LastGithubPingTime param from github_pinger).
+
+---
+
 ## C3 Deployment Status ✅ VERIFIED
 
 - ✅ scons build working on AGNOS 12.8 (PATH, PYTHONPATH, cache symlinks)
@@ -169,6 +207,13 @@ rebase. The only breakage risk is if comma changes a hook call site signature
 
 ## TODO
 
+- [ ] **Plugins panel in Settings UI** — on-device plugin management for on-road use (see `docs/plugins-panel-plan.md`)
+  - Complements COD: COD handles offline tasks (repo install, model downloads, route review); Settings panel enables on-road param tuning without pulling out a phone
+  - Add `overlays/selfdrive/ui/layouts/settings/plugins.py` (~250 lines)
+  - PluginsLayout: scan manifests, render toggle + param controls per plugin
+  - Support bool/pills/string param types, dependsOn/requiresPlugin conditionals
+  - Enable/disable via .disabled marker + reboot dialog
+  - MapdSettings JSON sync for mapd params
 - [ ] YOLO speed sign integration into speedlimitd (currently placeholder)
 - [ ] Interactive speed limit HUD element (tap to confirm/dismiss)
 - [ ] UI render hook for plugin overlays
