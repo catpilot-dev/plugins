@@ -79,8 +79,7 @@ verify_hooks() {
   for file in \
     "$OPENPILOT_ROOT/selfdrive/controls/controlsd.py" \
     "$OPENPILOT_ROOT/selfdrive/controls/lib/longitudinal_planner.py" \
-    "$OPENPILOT_ROOT/system/manager/manager.py" \
-    "$OPENPILOT_ROOT/selfdrive/ui/onroad/augmented_road_view.py"; do
+    "$OPENPILOT_ROOT/system/manager/manager.py"; do
     if [[ -f "$file" ]]; then
       if ! grep -q "selfdrive.plugins" "$file" 2>/dev/null; then
         warn "Hook call site missing in: ${file#$OPENPILOT_ROOT/}"
@@ -141,11 +140,13 @@ overlay_ui() {
     return
   fi
 
-  # Copy onroad/ overlay files
-  if [[ -d "$src/onroad" ]]; then
-    mkdir -p "$dst/onroad"
-    cp -v "$src/onroad/"*.py "$dst/onroad/" 2>/dev/null || true
-  fi
+  # Recursively copy all .py files, preserving directory structure
+  find "$src" -type f -name '*.py' | while read -r f; do
+    local rel="${f#$src/}"
+    local target_dir="$dst/$(dirname "$rel")"
+    mkdir -p "$target_dir"
+    cp -v "$f" "$target_dir/" 2>/dev/null || true
+  done
 }
 
 # --- 2. Overlay cereal schema + inject plugin schemas/services ---
@@ -215,19 +216,20 @@ install_plugins() {
     local dest="$PLUGINS_DEST/$name"
     if [[ -d "$dest" ]]; then
       log "  Updating: $name"
-      # Preserve site-packages/ (pip-installed deps from boot_patch.sh)
-      # and .disabled marker (user preference)
-      local had_site_packages=false
-      if [[ -d "$dest/site-packages" ]]; then
-        mv "$dest/site-packages" "/tmp/_plugin_site_packages_$$"
-        had_site_packages=true
+      # Preserve runtime state across reinstalls:
+      #   data/     — persistent plugin params (survive reboot/reinstall)
+      #   .disabled — user preference marker
+      local had_data=false
+      if [[ -d "$dest/data" ]]; then
+        mv "$dest/data" "/tmp/_plugin_data_$$"
+        had_data=true
       fi
       local was_disabled=false
       [[ -f "$dest/.disabled" ]] && was_disabled=true
       rm -rf "$dest"
       cp -r "$plugin_dir" "$dest"
-      if $had_site_packages; then
-        mv "/tmp/_plugin_site_packages_$$" "$dest/site-packages"
+      if $had_data; then
+        mv "/tmp/_plugin_data_$$" "$dest/data"
       fi
       if $was_disabled; then
         touch "$dest/.disabled"

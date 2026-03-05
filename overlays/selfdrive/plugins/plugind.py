@@ -8,12 +8,16 @@ Runs as an always_run process. Responsibilities:
   4. Spawn and monitor standalone plugin processes
   5. Serve REST API on localhost for COD
   6. Poll for enable/disable changes
+
+Plugin processes use subprocess.Popen with os.setpgrp (like DaemonProcess
+for athena) so they survive plugind restarts and are isolated from
+signal propagation. PIDs are tracked on disk for reconnection.
 """
-import importlib
-import importlib.util
-import multiprocessing
 import os
+import signal
+import subprocess
 import sys
+import time
 
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
@@ -21,81 +25,147 @@ from openpilot.selfdrive.plugins.registry import PluginRegistry
 from openpilot.selfdrive.plugins.api import set_registry, start_api_server
 
 POLL_INTERVAL = 5.0  # seconds between checking for config changes
-
-
-def _run_plugin_process(plugin_dir: str, module_name: str, proc_name: str):
-  """Entry point for spawned plugin processes."""
-  if plugin_dir not in sys.path:
-    sys.path.insert(0, plugin_dir)
-
-  cloudlog.info(f"plugin process '{proc_name}' starting from {plugin_dir}/{module_name}")
-
-  module_file = os.path.join(plugin_dir, *module_name.split('.')) + '.py'
-  spec = importlib.util.spec_from_file_location(f"plugin_proc_{proc_name}", module_file)
-  if spec is None or spec.loader is None:
-    cloudlog.error(f"plugin process '{proc_name}': cannot find {module_file}")
-    return
-
-  module = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(module)
-
-  main_fn = getattr(module, 'main', None)
-  if main_fn is None:
-    cloudlog.error(f"plugin process '{proc_name}': no main() function in {module_name}")
-    return
-
-  main_fn()
+PID_DIR = '/data/plugins/.pids'
+LOG_DIR = '/tmp/plugin_logs'
 
 
 class PluginProcessManager:
-  """Spawns and monitors standalone plugin processes."""
+  """Spawns and monitors standalone plugin processes.
+
+  Uses subprocess.Popen with preexec_fn=os.setpgrp (own process group)
+  so plugin processes are isolated from signals sent to plugind's group
+  and survive plugind restarts. PID files enable reconnection.
+  """
 
   def __init__(self):
-    self._procs: dict[str, multiprocessing.Process] = {}
+    self._pids: dict[str, int] = {}
+    os.makedirs(PID_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+  def _pid_file(self, name: str) -> str:
+    return os.path.join(PID_DIR, f'{name}.pid')
+
+  def _log_file(self, name: str) -> str:
+    return os.path.join(LOG_DIR, f'plugin_{name}.log')
+
+  def _is_running(self, name: str) -> int | None:
+    """Check if a plugin process is still alive. Returns PID or None.
+
+    Validates via cmdline containing plugin_{name} OR the plugin module name,
+    to handle processes that execv into a native binary (e.g. mapd_runner
+    exec's into /data/media/0/osm/mapd). Falls back to checking if the PID
+    was started after plugind (guards against stale PIDs from prior boot).
+    """
+    pid = self._pids.get(name)
+    if pid is None:
+      try:
+        pid = int(open(self._pid_file(name)).read().strip())
+      except (FileNotFoundError, ValueError):
+        return None
+
+    try:
+      os.kill(pid, 0)
+      # Verify this PID belongs to us — check cmdline or start time
+      with open(f'/proc/{pid}/cmdline') as f:
+        cmdline = f.read()
+      if f'plugin_{name}' in cmdline or name in cmdline:
+        self._pids[name] = pid
+        return pid
+      # Process may have execv'd — check it started after plugind
+      pid_start = os.stat(f'/proc/{pid}').st_mtime
+      plugind_start = os.stat(f'/proc/{os.getpid()}').st_mtime
+      if pid_start >= plugind_start:
+        self._pids[name] = pid
+        return pid
+    except (OSError, FileNotFoundError):
+      pass
+
+    self._pids.pop(name, None)
+    return None
 
   def sync(self, desired: list[dict]):
     """Start/stop processes to match desired state."""
     desired_names = {p['name'] for p in desired}
 
     # Stop processes no longer needed
-    for name in list(self._procs):
+    for name in list(self._pids):
       if name not in desired_names:
         self._stop(name)
+    # Also stop orphaned PID files
+    if os.path.isdir(PID_DIR):
+      for f in os.listdir(PID_DIR):
+        if f.endswith('.pid'):
+          name = f[:-4]
+          if name not in desired_names:
+            self._stop(name)
 
-    # Start or restart processes
+    # Start processes that aren't running
     for proc_def in desired:
       name = proc_def['name']
-      proc = self._procs.get(name)
-      if proc is not None and proc.is_alive():
+      if self._is_running(name) is not None:
         continue
-      if proc is not None and not proc.is_alive():
-        cloudlog.warning(f"plugin process '{name}' died (exit={proc.exitcode}), restarting")
+      if name in self._pids:
+        cloudlog.warning(f"plugin process '{name}' died, restarting")
       self._start(proc_def)
 
   def _start(self, proc_def: dict):
     name = proc_def['name']
-    p = multiprocessing.Process(
-      target=_run_plugin_process,
-      args=(proc_def['plugin_dir'], proc_def['module'], name),
-      name=f"plugin_{name}",
-      daemon=True,
+    plugin_dir = proc_def['plugin_dir']
+    module = proc_def['module']
+    module_file = os.path.join(plugin_dir, *module.split('.')) + '.py'
+
+    launcher_code = (
+      f"import sys, os; "
+      f"sys.path.insert(0, {plugin_dir!r}); "
+      f"os.chdir({plugin_dir!r}); "
+      f"from setproctitle import setproctitle; "
+      f"setproctitle('plugin_{name}'); "
+      f"import importlib.util; "
+      f"spec = importlib.util.spec_from_file_location('plugin_{name}', {module_file!r}); "
+      f"mod = importlib.util.module_from_spec(spec); "
+      f"spec.loader.exec_module(mod); "
+      f"mod.main()"
     )
-    p.start()
-    self._procs[name] = p
-    cloudlog.info(f"plugin process '{name}' spawned (pid={p.pid})")
+
+    log_path = self._log_file(name)
+    log_fd = open(log_path, 'a')
+    proc = subprocess.Popen(
+      [sys.executable, '-c', launcher_code],
+      stdin=subprocess.DEVNULL,
+      stdout=log_fd,
+      stderr=log_fd,
+      preexec_fn=os.setpgrp,
+    )
+    log_fd.close()
+
+    self._pids[name] = proc.pid
+    with open(self._pid_file(name), 'w') as f:
+      f.write(str(proc.pid))
+
+    cloudlog.info(f"plugin process '{name}' spawned (pid={proc.pid})")
 
   def _stop(self, name: str):
-    proc = self._procs.pop(name, None)
-    if proc is not None and proc.is_alive():
-      proc.terminate()
-      proc.join(timeout=5)
-      if proc.is_alive():
-        proc.kill()
+    pid = self._is_running(name)
+    if pid is not None:
+      try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+          time.sleep(0.1)
+          try:
+            os.kill(pid, 0)
+          except OSError:
+            break
+        else:
+          os.kill(pid, signal.SIGKILL)
+      except OSError:
+        pass
       cloudlog.info(f"plugin process '{name}' stopped")
 
-  def stop_all(self):
-    for name in list(self._procs):
-      self._stop(name)
+    self._pids.pop(name, None)
+    try:
+      os.unlink(self._pid_file(name))
+    except FileNotFoundError:
+      pass
 
 
 def main():
@@ -123,21 +193,20 @@ def main():
   api_server = start_api_server()
 
   # Main loop: poll for config changes, health monitoring
+  # Note: no finally/stop_all — plugin processes are independent (own process
+  # group) and should survive plugind restarts. They die on reboot naturally.
   rk = Ratekeeper(1.0 / POLL_INTERVAL, print_delay_threshold=None)
-  try:
-    while True:
-      try:
-        # Re-check enabled state (user may toggle via COD or Params)
-        registry.load_enabled()
+  while True:
+    try:
+      # Re-check enabled state (user may toggle via COD or Params)
+      registry.load_enabled()
 
-        # Sync standalone processes (restart crashed ones, stop disabled ones)
-        proc_mgr.sync(registry.get_standalone_processes())
-      except Exception:
-        cloudlog.exception("plugind poll error")
+      # Sync standalone processes (restart crashed ones, stop disabled ones)
+      proc_mgr.sync(registry.get_standalone_processes())
+    except Exception:
+      cloudlog.exception("plugind poll error")
 
-      rk.keep_time()
-  finally:
-    proc_mgr.stop_all()
+    rk.keep_time()
 
 
 if __name__ == "__main__":
