@@ -23,7 +23,6 @@ LOG_CAPNP = os.path.join(CEREAL_DIR, 'log.capnp')
 SERVICES_PY = os.path.join(CEREAL_DIR, 'services.py')
 
 BUILD_HASH_FILE = '/tmp/plugin_build_hash'
-SUBSCRIPTIONS_FILE = '/tmp/plugin_subscriptions.json'
 PLUGINS_DIR = '/data/plugins'
 
 # Struct IDs for each reserved custom slot (from upstream custom.capnp)
@@ -57,16 +56,6 @@ SLOT_EVENT_IDS = {
   10: 136, 11: 137, 12: 138, 13: 139, 14: 140,
   15: 141, 16: 142, 17: 143, 18: 144, 19: 145,
 }
-
-# Hook name → process name mapping for subscription injection
-HOOK_PROCESS_MAP = {
-  'planner.v_cruise': 'plannerd',
-  'planner.accel_limits': 'plannerd',
-  'controls.curvature_correction': 'controlsd',
-  'controls.post_actuators': 'controlsd',
-  'desire.post_update': 'plannerd',
-}
-
 
 def _load_manifest(plugin_dir: str) -> dict:
   manifest_path = os.path.join(plugin_dir, 'plugin.json')
@@ -293,29 +282,6 @@ def _patch_services(plugin_dirs: list[str]) -> None:
   cloudlog.info("plugin builder: patched services.py")
 
 
-def _write_subscriptions(plugin_dirs: list[str]) -> None:
-  """Collect hook subscriptions, group by process, write JSON."""
-  process_subs: dict[str, list[str]] = {}
-
-  for plugin_dir in plugin_dirs:
-    manifest = _load_manifest(plugin_dir)
-    for hook_name, hook_def in manifest.get('hooks', {}).items():
-      subs = hook_def.get('subscriptions', [])
-      if not subs:
-        continue
-      process_name = HOOK_PROCESS_MAP.get(hook_name)
-      if process_name:
-        if process_name not in process_subs:
-          process_subs[process_name] = []
-        for sub in subs:
-          if sub not in process_subs[process_name]:
-            process_subs[process_name].append(sub)
-
-  with open(SUBSCRIPTIONS_FILE, 'w') as f:
-    json.dump(process_subs, f, indent=2)
-  cloudlog.info(f"plugin builder: wrote subscriptions {process_subs}")
-
-
 def _write_params(plugin_dirs: list[str]) -> None:
   """Write plugin param defaults to /data/params/d/ directly.
 
@@ -351,10 +317,6 @@ def build() -> None:
 
   if not plugin_dirs:
     cloudlog.info("plugin builder: no enabled plugins found")
-    # Ensure subscription file exists (empty) so plannerd doesn't error
-    if not os.path.exists(SUBSCRIPTIONS_FILE):
-      with open(SUBSCRIPTIONS_FILE, 'w') as f:
-        json.dump({}, f)
     return
 
   plugin_names = [os.path.basename(d) for d in plugin_dirs]
@@ -369,7 +331,6 @@ def build() -> None:
   _patch_custom_capnp(plugin_dirs)
   _patch_log_capnp(plugin_dirs)
   _patch_services(plugin_dirs)
-  _write_subscriptions(plugin_dirs)
   _write_params(plugin_dirs)
 
   # Save build hash
@@ -401,10 +362,9 @@ def restore_stock() -> None:
       cloudlog.warning(f"plugin builder: failed to restore {rel_path}")
 
   # Clean up build artifacts
-  for f in (BUILD_HASH_FILE, SUBSCRIPTIONS_FILE):
-    try:
-      os.remove(f)
-    except FileNotFoundError:
-      pass
+  try:
+    os.remove(BUILD_HASH_FILE)
+  except FileNotFoundError:
+    pass
 
   cloudlog.info("plugin builder: restored stock files")

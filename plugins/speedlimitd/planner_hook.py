@@ -7,6 +7,12 @@ SPEED_LIMIT_OFFSET = {
 }
 
 
+def on_planner_subscriptions(services):
+  if 'speedLimitState' not in services:
+    services.append('speedLimitState')
+  return services
+
+
 def on_v_cruise(v_cruise, v_ego, sm):
   if not sm.valid.get('speedLimitState', False) and sm.recv_frame.get('speedLimitState', 0) == 0:
     return v_cruise

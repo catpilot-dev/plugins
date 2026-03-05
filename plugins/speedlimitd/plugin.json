@@ -21,11 +21,15 @@
     "speedLimitState": [true, 1.0, 1]
   },
   "hooks": {
+    "planner.subscriptions": {
+      "module": "planner_hook",
+      "function": "on_planner_subscriptions",
+      "priority": 50
+    },
     "planner.v_cruise": {
       "module": "planner_hook",
       "function": "on_v_cruise",
-      "priority": 50,
-      "subscriptions": ["speedLimitState"]
+      "priority": 50
     },
     "ui.render_overlay": {
       "module": "ui_overlay",
