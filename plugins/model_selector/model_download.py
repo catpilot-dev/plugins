@@ -16,6 +16,9 @@ from datetime import datetime
 from enum import Enum
 
 
+from plugins.model_selector.model_swapper import MIN_MODEL_DATE
+
+
 class ModelType(Enum):
     """Model type enumeration"""
     DRIVING = "driving"
@@ -290,6 +293,9 @@ def list_available(model_type: ModelType = None):
         print("For lateral/longitudinal control (driving_vision.onnx + driving_policy.onnx)")
         print()
         for model_id, info in driving_models.items():
+            # Skip old models incompatible with current openpilot version
+            if info.get('date', '9999-99-99') < MIN_MODEL_DATE['driving']:
+                continue
             # Check compatibility
             is_compatible, _ = check_model_compatibility(info, ModelType.DRIVING)
             compat_icon = "✅" if is_compatible else "⚠️"
@@ -309,6 +315,9 @@ def list_available(model_type: ModelType = None):
         print("For driver attention detection (dmonitoring_model.onnx)")
         print()
         for model_id, info in dm_models.items():
+            # Skip old DM models incompatible with current openpilot version
+            if info.get('date', '9999-99-99') < MIN_MODEL_DATE['dm']:
+                continue
             print(f"📦 {model_id}")
             print(f"   Name: {info['name']}")
             print(f"   Commit: {info['commit']}")
@@ -324,7 +333,7 @@ def check_updates():
 
     Returns JSON with new models available for download
     Filters:
-    - Only models >= Firehose (2025-09-05) for v0.10.1+ compatibility
+    - Only models compatible with current openpilot version (MIN_MODEL_DATE)
     - Excludes reverted models
     - Excludes already downloaded models
     """
@@ -355,8 +364,8 @@ def check_updates():
         if model_id in installed_driving:
             continue
 
-        # FILTER 1: Exclude models older than Firehose (2025-09-05)
-        if info.get('date', '9999-99-99') < '2025-09-05':
+        # FILTER 1: Exclude models older than minimum date for current openpilot version
+        if info.get('date', '9999-99-99') < MIN_MODEL_DATE['driving']:
             continue
 
         # FILTER 2: Skip reverted models
@@ -375,7 +384,11 @@ def check_updates():
         if model_id in installed_dm:
             continue
 
-        # FILTER 2: Skip reverted models (DM models don't need date filter)
+        # FILTER 1: Exclude old DM models incompatible with current openpilot version
+        if info.get('date', '9999-99-99') < MIN_MODEL_DATE['dm']:
+            continue
+
+        # FILTER 2: Skip reverted models
         if 'revert' in model_id.lower() or 'revert' in info.get('name', '').lower():
             continue
 
@@ -501,7 +514,7 @@ def update_registry_from_github():
     """Fetch latest model commits from GitHub and update registry
 
     Three-Layer Filtering System:
-    1. Date Filter: Exclude models older than Firehose (2025-09-05) for v0.10.1+ compatibility
+    1. Date Filter: Exclude models older than Firehose (2025-09-05) from registry ingestion
     2. Revert Filter: Exclude reverted models and revert commits themselves
        - Detects "Revert" commits and parses which commit was reverted
        - Removes reverted models from registry

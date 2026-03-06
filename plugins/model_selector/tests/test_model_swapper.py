@@ -74,7 +74,7 @@ class TestListModels:
     model_dir.mkdir(parents=True)
 
     # Create model_info.json
-    info = {'id': 'test_model_abc123', 'name': 'Test Model', 'date': '2025-09-15'}
+    info = {'id': 'test_model_abc123', 'name': 'Test Model', 'date': '2025-12-15'}
     (model_dir / 'model_info.json').write_text(json.dumps(info))
     # Create ONNX files
     (model_dir / 'driving_vision.onnx').write_bytes(b'\x00')
@@ -113,7 +113,7 @@ class TestListModels:
   def test_sorted_newest_first(self, ModelSwapper, ModelType, tmp_path):
     models_dir = tmp_path / 'models' / 'driving'
 
-    for name, date in [('old', '2025-01-01'), ('new', '2025-12-01'), ('mid', '2025-06-15')]:
+    for name, date in [('old', '2025-10-15'), ('new', '2025-12-01'), ('mid', '2025-11-15')]:
       d = models_dir / name
       d.mkdir(parents=True)
       (d / 'model_info.json').write_text(json.dumps({'id': name, 'name': name, 'date': date}))
@@ -127,7 +127,7 @@ class TestListModels:
 
     models = swapper.list_models()
     dates = [m['date'] for m in models]
-    assert dates == ['2025-12-01', '2025-06-15', '2025-01-01']
+    assert dates == ['2025-12-01', '2025-11-15', '2025-10-15']
 
 
 class TestResolveModelId:

@@ -12,6 +12,15 @@ from pathlib import Path
 from enum import Enum
 
 
+# Minimum model dates for v0.10.3 compatibility
+# Driving: cool_people (2025-10-20) is the v0.10.3 shipping model
+# DM: models before 2025-11-01 lack output_slices metadata
+MIN_MODEL_DATE = {
+    'driving': '2025-10-01',
+    'dm': '2025-11-01',
+}
+
+
 class ModelType(Enum):
     """Model type enumeration"""
     DRIVING = "driving"
@@ -121,6 +130,11 @@ class ModelSwapper:
 
                         # Check which PKL files exist (cached)
                         cached_pkl = sum(1 for f in self.pkl_files if (model_dir / f).exists())
+
+                        # Filter out models incompatible with current openpilot version
+                        min_date = MIN_MODEL_DATE.get(self.model_type.value, '0000-00-00')
+                        if info.get('date', '0000-00-00') < min_date:
+                            continue
 
                         models.append({
                             'id': model_dir.name,
