@@ -1,7 +1,6 @@
 import numpy as np
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value
-from openpilot.common.params import Params
 
 
 class LaneCenteringCorrection:
@@ -139,13 +138,19 @@ class LaneCenteringCorrection:
 
 
 _lcc = None
-_params = None
+_PARAM_FILE = '/data/plugins/lane_centering/data/LaneCenteringEnabled'
+
+def _is_enabled():
+  try:
+    with open(_PARAM_FILE) as f:
+      return f.read().strip() == '1'
+  except (FileNotFoundError, OSError):
+    return True  # enabled by default when param file doesn't exist
+
 
 def on_curvature_correction(curvature, model_v2, v_ego, lane_changing):
-  global _lcc, _params
-  if _params is None:
-    _params = Params()
-  if not _params.get_bool("LaneCenteringCorrection"):
+  global _lcc
+  if not _is_enabled():
     return curvature
   if _lcc is None:
     _lcc = LaneCenteringCorrection()

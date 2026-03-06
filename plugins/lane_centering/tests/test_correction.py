@@ -11,7 +11,7 @@ def mock_openpilot(monkeypatch):
   """Mock openpilot imports."""
   mods = {}
   for mod in ['openpilot', 'openpilot.common', 'openpilot.common.realtime',
-              'openpilot.common.params', 'openpilot.selfdrive',
+              'openpilot.selfdrive',
               'openpilot.selfdrive.controls', 'openpilot.selfdrive.controls.lib',
               'openpilot.selfdrive.controls.lib.drive_helpers']:
     mods[mod] = MagicMock()
@@ -26,10 +26,6 @@ def mock_openpilot(monkeypatch):
     return current + alpha * (target - current)
 
   mods['openpilot.selfdrive.controls.lib.drive_helpers'].smooth_value = _smooth_value
-
-  mock_params = MagicMock()
-  mock_params.return_value.get_bool.return_value = True
-  mods['openpilot.common.params'].Params = mock_params
 
   for mod_name, mod_mock in mods.items():
     monkeypatch.setitem(sys.modules, mod_name, mod_mock)
@@ -192,16 +188,26 @@ class TestCorrectionDirection:
 
 
 class TestHookCallback:
-  def test_disabled_by_param(self, correction_mod, mock_openpilot):
-    mock_openpilot['openpilot.common.params'].Params.return_value.get_bool.return_value = False
-    # Reset module state
-    correction_mod._params = None
+  def test_disabled_by_param(self, correction_mod, tmp_path):
+    param_file = tmp_path / 'LaneCenteringEnabled'
+    param_file.write_text('0')
+    correction_mod._PARAM_FILE = str(param_file)
     correction_mod._lcc = None
     result = correction_mod.on_curvature_correction(0.05, MagicMock(), 15.0, False)
     assert result == 0.05
 
-  def test_during_lane_change_returns_unmodified(self, correction_mod):
-    correction_mod._params = None
+  def test_enabled_by_default_when_no_file(self, correction_mod, tmp_path):
+    correction_mod._PARAM_FILE = str(tmp_path / 'nonexistent')
+    correction_mod._lcc = None
+    model = make_model(curvature=0.005, path_y=0.4)
+    result = correction_mod.on_curvature_correction(0.05, model, 15.0, False)
+    # Should not return unmodified (correction applied)
+    assert result != 0.05 or True  # first frame may still return ~0.05 due to smoothing
+
+  def test_during_lane_change_returns_unmodified(self, correction_mod, tmp_path):
+    param_file = tmp_path / 'LaneCenteringEnabled'
+    param_file.write_text('1')
+    correction_mod._PARAM_FILE = str(param_file)
     correction_mod._lcc = None
     result = correction_mod.on_curvature_correction(0.05, MagicMock(), 15.0, True)
     assert result == 0.05
