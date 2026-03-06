@@ -182,8 +182,7 @@ overlay_cereal() {
     done
   fi
 
-  # Clear __pycache__ for patched cereal files
-  find "$cereal_dir" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
 }
 
 # --- 3. Copy plugin packages ---
@@ -250,6 +249,58 @@ overlay_ui
 install_plugins
 overlay_cereal
 
+# --- Restore stock files for removed overlays ---
+restore_removed_overlays() {
+  local manifest="$PLUGINS_DEST/.overlay_manifest"
+  local new_manifest="$PLUGINS_DEST/.overlay_manifest.new"
+
+  # Build current overlay file list (relative to openpilot root)
+  : > "$new_manifest"
+  for overlay_dir in "$SCRIPT_DIR/overlays/selfdrive"; do
+    if [[ -d "$overlay_dir" ]]; then
+      find "$overlay_dir" -type f -name '*.py' | while read -r f; do
+        echo "selfdrive/${f#$overlay_dir/}" >> "$new_manifest"
+      done
+    fi
+  done
+  sort -o "$new_manifest" "$new_manifest"
+
+  # Compare with previous manifest and restore removed files
+  if [[ -f "$manifest" ]]; then
+    local restored=0
+    while IFS= read -r old_file; do
+      if ! grep -qxF "$old_file" "$new_manifest"; then
+        if git -C "$OPENPILOT_ROOT" checkout -- "$old_file" 2>/dev/null; then
+          log "  Restored stock: $old_file"
+          restored=$((restored + 1))
+        fi
+      fi
+    done < "$manifest"
+    if [[ $restored -gt 0 ]]; then
+      log "Restored $restored stock file(s) from removed overlays"
+    fi
+  fi
+
+  mv "$new_manifest" "$manifest"
+}
+
+if ! $DRY_RUN; then
+  restore_removed_overlays
+fi
+
+# Clear stale .pyc caches for all overlaid directories
+if ! $DRY_RUN; then
+  for dir in \
+    "$OPENPILOT_ROOT/selfdrive/plugins" \
+    "$OPENPILOT_ROOT/selfdrive/ui" \
+    "$OPENPILOT_ROOT/cereal" \
+    "$PLUGINS_DEST"; do
+    find "$dir" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+  done
+  # Signal plugind to restart plugin processes and UI when offroad
+  touch "$PLUGINS_DEST/.needs_restart"
+fi
+
 # Mark enforced plugins (always-on, hidden from Settings panel)
 if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
   touch "$PLUGINS_DEST/c3_compat/.enforced"
@@ -260,8 +311,7 @@ if $DRY_RUN; then
 else
   log "Installation complete."
   log ""
-  log "Next steps:"
-  log "  1. Reboot device (or restart openpilot) to activate plugins"
-  log "  2. Disable a plugin:  touch $PLUGINS_DEST/<name>/.disabled"
-  log "  3. Re-enable:         rm $PLUGINS_DEST/<name>/.disabled"
+  log "Plugin processes and UI will auto-restart when offroad."
+  log "Disable a plugin:  touch $PLUGINS_DEST/<name>/.disabled"
+  log "Re-enable:         rm $PLUGINS_DEST/<name>/.disabled"
 fi

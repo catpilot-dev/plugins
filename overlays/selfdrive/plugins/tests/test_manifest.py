@@ -1,7 +1,6 @@
 """Tests for plugin manifest parsing and compatibility checking."""
 import json
 import os
-import tempfile
 
 import pytest
 from openpilot.selfdrive.plugins.manifest import load_manifest, check_compatibility, parse_version

@@ -1,7 +1,6 @@
 """Tests for plugin discovery, loading, and lifecycle."""
 import json
 import os
-import tempfile
 
 import pytest
 from unittest.mock import patch, MagicMock
