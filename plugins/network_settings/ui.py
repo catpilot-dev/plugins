@@ -8,6 +8,7 @@ Connectivity check (green CONNECT indicator) is handled by the sidebar's
 ui.connectivity_check hook — not in this module.
 """
 import json
+import math
 import time
 
 import params_helper
@@ -103,13 +104,11 @@ def on_network_settings_extend(default, net_ui):
       self._dns_btn.action_item.set_value(lambda: self._get_current_dns())
       self._dns_btn.set_visible(lambda: self._static_ip_action.get_state())
 
-      # Pad width hints so IP values aren't truncated by gui_label.
-      # ButtonAction.get_width_hint() returns exactly text_width + BUTTON_WIDTH + TEXT_PADDING,
-      # leaving zero margin for font rendering — gui_label truncates with "...".
-      # Add 40px extra so the value rect has breathing room.
+      # ButtonAction.get_width_hint() returns exact float width — float32 precision
+      # loss through rl.Rectangle causes gui_label to truncate. ceil() fixes it.
       for btn in (self._ip_btn, self._gateway_btn, self._dns_btn, self._proxy_setting_btn):
         _orig = btn.action_item.get_width_hint
-        btn.action_item.get_width_hint = lambda _o=_orig: _o() + 40
+        btn.action_item.get_width_hint = lambda _o=_orig: math.ceil(_o())
 
       # Insert items at top (before Enable Tethering)
       for i, item in enumerate([proxy_toggle, self._proxy_setting_btn,
