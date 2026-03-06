@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 
+import cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.plugins.registry import PluginRegistry
@@ -27,6 +28,7 @@ from openpilot.selfdrive.plugins.api import set_registry, start_api_server
 POLL_INTERVAL = 5.0  # seconds between checking for config changes
 PID_DIR = '/data/plugins/.pids'
 LOG_DIR = '/tmp/plugin_logs'
+RESTART_MARKER = '/data/plugins/.needs_restart'
 
 
 class PluginProcessManager:
@@ -203,6 +205,28 @@ class PluginProcessManager:
     except FileNotFoundError:
       pass
 
+  def stop_all(self):
+    """Stop all managed plugin processes."""
+    for name in list(self._pids):
+      self._stop(name)
+    # Also stop any orphaned PID files
+    if os.path.isdir(PID_DIR):
+      for f in os.listdir(PID_DIR):
+        if f.endswith('.pid'):
+          self._stop(f[:-4])
+
+
+def _kill_ui():
+  """Kill the UI process so manager restarts it with fresh code."""
+  try:
+    result = subprocess.run(['pgrep', '-f', 'selfdrive.ui.ui'], capture_output=True, text=True)
+    for pid_str in result.stdout.strip().split('\n'):
+      if pid_str:
+        os.kill(int(pid_str), signal.SIGTERM)
+        cloudlog.info(f"plugind: killed UI process (pid={pid_str}) for restart")
+  except Exception:
+    cloudlog.exception("plugind: failed to kill UI process")
+
 
 def main():
   cloudlog.info("plugind starting")
@@ -228,17 +252,31 @@ def main():
   set_registry(registry)
   api_server = start_api_server()
 
+  # Subscribe to deviceState for onroad/offroad detection
+  sm = messaging.SubMaster(['deviceState'])
+
   # Main loop: poll for config changes, health monitoring
   # Note: no finally/stop_all — plugin processes are independent (own process
   # group) and should survive plugind restarts. They die on reboot naturally.
   rk = Ratekeeper(1.0 / POLL_INTERVAL, print_delay_threshold=None)
   while True:
     try:
+      sm.update(0)
+
       # Re-check enabled state (user may toggle via COD or Params)
       registry.load_enabled()
 
       # Sync standalone processes (restart crashed ones, stop disabled ones)
       proc_mgr.sync(registry.get_standalone_processes())
+
+      # Handle restart marker (written by install.sh after plugin updates)
+      # Only restart when offroad (deviceState.started == False) for safety
+      if os.path.exists(RESTART_MARKER) and not sm['deviceState'].started:
+        cloudlog.warning("plugind: restart marker detected, restarting plugin processes and UI")
+        os.unlink(RESTART_MARKER)
+        proc_mgr.stop_all()
+        # sync() will respawn with fresh code on next poll
+        _kill_ui()
     except Exception:
       cloudlog.exception("plugind poll error")
 
