@@ -39,13 +39,20 @@ def _read_active(model_type):
   swapper = _SWAPPERS[model_type]
   try:
     raw = swapper.active_model_file.read_text().strip()
-    data = json.loads(raw)
-    model_id = data.get('id', raw)
-    name = _strip_emoji(data.get('name', model_id))
+    try:
+      data = json.loads(raw)
+      model_id = data.get('id', raw)
+      name = _strip_emoji(data.get('name', model_id))
+    except (json.JSONDecodeError, AttributeError):
+      # Plain string (e.g. written by echo), not JSON
+      model_id = raw
+      name = model_id
     date = ''
     try:
       with open(swapper.models_dir / model_id / 'model_info.json') as f:
-        date = json.load(f).get('date', '')
+        info = json.load(f)
+        name = _strip_emoji(info.get('name', name))
+        date = info.get('date', '')
     except Exception:
       pass
     display = f"{name} ({date})" if date else name
