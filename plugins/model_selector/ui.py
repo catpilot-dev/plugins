@@ -151,11 +151,8 @@ def on_software_settings_extend(default, layout):
 
       self.items = []
       for model_type, label in MODEL_TYPE_LABELS.items():
-        active_id, active_name = _read_active(model_type)
-        self._model_cache[model_type] = _list_models(model_type)
-
         btn = button_item(label, 'SELECT', callback=lambda mt=model_type: self._on_model_select(mt))
-        btn.action_item.set_value(active_name)
+        btn.action_item.set_value('...')
         self._model_btns[model_type] = btn
         self.items.append(btn)
 
@@ -169,8 +166,7 @@ def on_software_settings_extend(default, layout):
       for model_type in MODEL_TYPE_LABELS:
         self._model_cache[model_type] = _list_models(model_type)
         _, active_name = _read_active(model_type)
-        if model_type in self._model_btns:
-          self._model_btns[model_type].action_item.set_value(active_name)
+        self._model_btns[model_type].action_item.set_value(active_name)
 
     def update(self):
       if self._check_proc is not None and self._check_proc.poll() is not None:

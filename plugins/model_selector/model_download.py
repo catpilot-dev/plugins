@@ -16,7 +16,10 @@ from datetime import datetime
 from enum import Enum
 
 
-from plugins.model_selector.model_swapper import MIN_MODEL_DATE
+try:
+    from plugins.model_selector.model_swapper import MIN_MODEL_DATE
+except ImportError:
+    from model_swapper import MIN_MODEL_DATE
 
 
 class ModelType(Enum):
