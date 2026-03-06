@@ -4,6 +4,7 @@ All UI imports are lazy (inside on_software_settings_extend) to avoid circular
 imports when the hook is loaded during SoftwareLayout.__init__.
 """
 import json
+import math
 import subprocess
 import shutil
 from pathlib import Path
@@ -153,6 +154,8 @@ def on_software_settings_extend(default, layout):
 
       self._new_models_btn = button_item('New Models', 'CHECK', callback=self._on_check_new_models)
       self._new_models_btn.action_item.set_value('check on github')
+      _orig_hint = self._new_models_btn.action_item.get_width_hint
+      self._new_models_btn.action_item.get_width_hint = lambda _o=_orig_hint: math.ceil(_o())
       self.items.append(self._new_models_btn)
 
     def show(self):
