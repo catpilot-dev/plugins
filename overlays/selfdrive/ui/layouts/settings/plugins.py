@@ -115,10 +115,10 @@ class PluginsLayout(Widget):
       if os.path.exists(os.path.join(plugin_dir, '.enforced')):
         continue
 
-      # Collect visible params (those with 'desc' field)
+      # Collect onroad params (marked for touchscreen tuning)
       params = []
       for key, meta in manifest.get('params', {}).items():
-        if 'desc' not in meta:
+        if not meta.get('onroad'):
           continue
         params.append({
           'key': key,

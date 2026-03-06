@@ -4,5 +4,11 @@
   "version": "1.0.0",
   "type": "hook",
   "description": "Download and swap driving and DM models from openpilot GitHub commits",
-  "panel": true
+  "hooks": {
+    "ui.software_settings_extend": {
+      "module": "ui",
+      "function": "on_software_settings_extend",
+      "priority": 50
+    }
+  }
 }

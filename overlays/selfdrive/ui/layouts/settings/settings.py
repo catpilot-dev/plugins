@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from enum import IntEnum
 from collections.abc import Callable
 from openpilot.selfdrive.plugins.hooks import hooks
-from openpilot.selfdrive.ui.layouts.settings.developer import DeveloperLayout
 from openpilot.selfdrive.ui.layouts.settings.device import DeviceLayout
 from openpilot.selfdrive.ui.layouts.settings.plugins import PluginsLayout
 from openpilot.selfdrive.ui.layouts.settings.software import SoftwareLayout
@@ -36,8 +35,7 @@ class PanelType(IntEnum):
   NETWORK = 1
   TOGGLES = 2
   SOFTWARE = 3
-  DEVELOPER = 4
-  PLUGINS = 5
+  PLUGINS = 4
 
 
 @dataclass
@@ -64,7 +62,6 @@ class SettingsLayout(Widget):
       PanelType.NETWORK: PanelInfo(tr_noop("Network"), net_ui),
       PanelType.TOGGLES: PanelInfo(tr_noop("Toggles"), TogglesLayout()),
       PanelType.SOFTWARE: PanelInfo(tr_noop("Software"), SoftwareLayout()),
-      PanelType.DEVELOPER: PanelInfo(tr_noop("Developer"), DeveloperLayout()),
       PanelType.PLUGINS: PanelInfo(tr_noop("Plugins"), PluginsLayout()),
     }
 

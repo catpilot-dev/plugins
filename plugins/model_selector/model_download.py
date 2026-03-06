@@ -9,8 +9,8 @@ Model registry: /data/models/model_registry.json
 """
 import argparse
 import json
+import sys
 import requests
-import subprocess
 from pathlib import Path
 from datetime import datetime
 from enum import Enum
@@ -38,69 +38,77 @@ def load_registry():
     return registry.get('driving_models', {}), registry.get('dm_models', {})
 
 
-def download_file(url: str, dest: Path, desc: str = None):
-    """Download file from URL using Git LFS for ONNX files
+LFS_BATCH_URL = "https://github.com/commaai/openpilot.git/info/lfs/objects/batch"
 
-    Uses git lfs smudge for robust LFS downloads that work with all GitHub models.
-    This method supports all LFS transfer adapters (basic, lfs-standalone-file, ssh),
-    unlike the batch API which only works for some models.
-    """
-    print(f"  📥 Downloading {desc or dest.name}...")
+
+def _resolve_lfs_url(oid: str, size: int) -> str:
+    """Resolve a Git LFS object to its actual download URL via the batch API."""
+    payload = {
+        "operation": "download",
+        "objects": [{"oid": oid, "size": size}],
+    }
+    resp = requests.post(
+        LFS_BATCH_URL,
+        json=payload,
+        headers={
+            "Content-Type": "application/vnd.git-lfs+json",
+            "Accept": "application/vnd.git-lfs+json",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    obj = data["objects"][0]
+    if "error" in obj:
+        raise Exception(f"LFS error: {obj['error'].get('message', obj['error'])}")
+    return obj["actions"]["download"]["href"]
+
+
+def download_file(url: str, dest: Path, desc: str = None):
+    """Download file from URL, resolving Git LFS pointers via the batch API."""
+    print(f"  Downloading {desc or dest.name}...")
 
     # Download the file (may be LFS pointer or regular file)
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
     content = response.content
 
     # Check if this is a Git LFS pointer file
-    if len(content) < 200:
+    if len(content) < 300:
         try:
             lfs_pointer = content.decode('utf-8')
             if lfs_pointer.startswith('version https://git-lfs.github.com'):
-                # Parse LFS metadata for display
+                # Parse LFS pointer for oid and size
+                lfs_oid = None
                 lfs_size = None
                 for line in lfs_pointer.strip().split('\n'):
-                    if line.startswith('size '):
+                    if line.startswith('oid sha256:'):
+                        lfs_oid = line.split(':', 1)[1].strip()
+                    elif line.startswith('size '):
                         lfs_size = int(line.split(' ', 1)[1].strip())
-                        break
 
-                if lfs_size:
-                    print(f"    🔄 Detected Git LFS file (actual size: {lfs_size / 1024 / 1024:.1f}MB)")
-                    print(f"    📦 Using git lfs smudge for download...")
+                if not lfs_oid or not lfs_size:
+                    raise Exception("Failed to parse LFS pointer")
 
-                # Use git lfs smudge to download the actual file
-                # This works for ALL models (uses multiple transfer adapters with fallback)
-                try:
-                    result = subprocess.run(
-                        ['git', 'lfs', 'smudge'],
-                        input=content,
-                        capture_output=True,
-                        check=True,
-                        timeout=300  # 5 minute timeout
-                    )
-                    content = result.stdout
+                print(f"    LFS file detected ({lfs_size / 1024 / 1024:.1f}MB), resolving...")
+                real_url = _resolve_lfs_url(lfs_oid, lfs_size)
 
-                    # Verify we got the actual file, not the pointer
-                    if len(content) < 200 or content.startswith(b'version https://git-lfs.github.com'):
-                        raise Exception("git lfs smudge returned pointer instead of file")
+                # Download the actual file
+                real_resp = requests.get(real_url, timeout=600)
+                real_resp.raise_for_status()
+                content = real_resp.content
 
-                    print(f"    ✅ Downloaded via Git LFS ({len(content) / 1024 / 1024:.1f}MB)")
+                if len(content) < 300 or content.startswith(b'version https://git-lfs.github.com'):
+                    raise Exception("LFS batch API returned pointer instead of file")
 
-                except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
-                    raise Exception(f"git lfs smudge failed: {error_msg}")
-                except FileNotFoundError:
-                    raise Exception("git lfs command not found - please install Git LFS")
         except UnicodeDecodeError:
-            # Not a text file, continue with binary download
             pass
 
-    # Write the file
     with open(dest, 'wb') as f:
         f.write(content)
 
     file_size_mb = dest.stat().st_size / 1024 / 1024
-    print(f"    ✅ {dest.name} ({file_size_mb:.1f}MB)")
+    print(f"    Done: {dest.name} ({file_size_mb:.1f}MB)")
 
 
 def check_model_compatibility(model_info: dict, model_type: ModelType) -> tuple[bool, str]:
@@ -173,12 +181,16 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
     is_compatible, warning = check_model_compatibility(model_info, model_type)
     if not is_compatible:
         print(warning)
-        print("=" * 70)
-        response = input("Download anyway? (yes/no): ")
-        if response.lower() not in ['yes', 'y']:
-            print("❌ Download cancelled")
+        if sys.stdin.isatty():
+            print("=" * 70)
+            response = input("Download anyway? (yes/no): ")
+            if response.lower() not in ['yes', 'y']:
+                print("Download cancelled")
+                return 1
+            print()
+        else:
+            print("Skipping incompatible model (non-interactive)")
             return 1
-        print()
 
     # Determine output directory
     if output_dir is None:

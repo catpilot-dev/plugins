@@ -282,21 +282,6 @@ class ModelSwapper:
             'previous_model_cached': cached_count
         }
 
-    def _remove_symlinks(self):
-        """Remove existing symlinks for this model type only"""
-        all_files = self.onnx_files + self.pkl_files
-
-        for filename in all_files:
-            filepath = self.ACTIVE_DIR / filename
-            if filepath.is_symlink():
-                filepath.unlink()
-            elif filepath.exists() and not filepath.is_symlink():
-                # Real file, not symlink - back it up before removing
-                backup_dir = self.models_dir / '_backup_replaced'
-                backup_dir.mkdir(exist_ok=True)
-                shutil.copy2(filepath, backup_dir / filename)
-                filepath.unlink()
-
     def cache_compiled_pkl(self, model_id: str):
         """
         After openpilot compiles ONNX→PKL, cache the PKL files to model storage
@@ -325,24 +310,6 @@ class ModelSwapper:
                 (source_dir / '.tinygrad_commit').write_text(tg_commit)
 
         return cached_count
-
-    def _backup_current_model(self):
-        """Backup currently active model"""
-        backup_dir = self.models_dir / '_backup_current'
-        backup_dir.mkdir(exist_ok=True)
-
-        all_files = self.onnx_files + self.pkl_files
-
-        for filename in all_files:
-            src = self.ACTIVE_DIR / filename
-            if src.exists():
-                # Follow symlink if necessary
-                if src.is_symlink():
-                    real_src = src.resolve()
-                    if real_src.exists():
-                        shutil.copy2(real_src, backup_dir / filename)
-                else:
-                    shutil.copy2(src, backup_dir / filename)
 
     def get_active_model(self) -> str:
         """Get currently active model ID from file tracker"""
