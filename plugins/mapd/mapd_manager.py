@@ -15,7 +15,7 @@ from pathlib import Path
 MAPD_PATH = Path("/data/media/0/osm/mapd")
 BACKUP_DIR = Path("/data/media/0/osm/mapd_backups")
 VERSION_PATH = Path("/data/media/0/osm/mapd_version")
-PARAMS_DIR = Path("/data/params/d")
+PLUGIN_DATA_DIR = Path("/data/plugins/mapd/data")
 
 GITHUB_API_URL = "https://api.github.com/repos/pfeiferj/mapd/releases/latest"
 
@@ -42,7 +42,7 @@ def ensure_binary():
 def get_current_version():
   """Get currently installed mapd version from params file"""
   try:
-    return (PARAMS_DIR / "MapdVersion").read_text().strip() or "v2.0.2"
+    return (PLUGIN_DATA_DIR / "MapdVersion").read_text().strip() or "v2.0.2"
   except FileNotFoundError:
     return "v2.0.2"
 
@@ -148,8 +148,8 @@ def replace_binary(temp_file_path):
 def update_version_param(version):
   """Update MapdVersion param to new version"""
   try:
-    PARAMS_DIR.mkdir(parents=True, exist_ok=True)
-    param_path = PARAMS_DIR / "MapdVersion"
+    PLUGIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    param_path = PLUGIN_DATA_DIR / "MapdVersion"
     with open(param_path, "w") as f:
       f.write(version)
       os.fsync(f.fileno())

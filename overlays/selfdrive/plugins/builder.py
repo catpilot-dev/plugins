@@ -283,20 +283,17 @@ def _patch_services(plugin_dirs: list[str]) -> None:
 
 
 def _write_params(plugin_dirs: list[str]) -> None:
-  """Write plugin param defaults to /data/params/d/ directly.
+  """Write plugin param defaults to each plugin's data dir.
 
-  Plugin params are NOT in params_keys.h (stock), so we can't use the
-  compiled Params class. Write them as plain files instead — the plugin
-  framework reads them at runtime via its own param helpers.
+  Params are stored under /data/plugins/<id>/data/ to survive reboots
+  (openpilot's Params::clearAll wipes /data/params/d/ on boot).
   """
-  params_dir = '/data/params/d'
-  if not os.path.isdir(params_dir):
-    return
-
   for plugin_dir in plugin_dirs:
     manifest = _load_manifest(plugin_dir)
+    plugin_id = os.path.basename(plugin_dir)
+    data_dir = os.path.join(plugin_dir, 'data')
     for param_name, param_def in manifest.get('params', {}).items():
-      param_path = os.path.join(params_dir, param_name)
+      param_path = os.path.join(data_dir, param_name)
       if not os.path.exists(param_path):
         default = param_def.get('default', '')
         if isinstance(default, bool):
@@ -304,11 +301,12 @@ def _write_params(plugin_dirs: list[str]) -> None:
         else:
           value = str(default)
         try:
+          os.makedirs(data_dir, exist_ok=True)
           with open(param_path, 'w') as f:
             f.write(value)
-          cloudlog.info(f"plugin builder: set default param {param_name}={value}")
+          cloudlog.info(f"plugin builder: set default param {plugin_id}/{param_name}={value}")
         except OSError as e:
-          cloudlog.warning(f"plugin builder: failed to write param {param_name}: {e}")
+          cloudlog.warning(f"plugin builder: failed to write param {plugin_id}/{param_name}: {e}")
 
 
 def build() -> None:

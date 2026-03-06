@@ -17,7 +17,7 @@ class TestConstants:
     assert manager.MAPD_PATH == Path("/data/media/0/osm/mapd")
     assert manager.BACKUP_DIR == Path("/data/media/0/osm/mapd_backups")
     assert manager.VERSION_PATH == Path("/data/media/0/osm/mapd_version")
-    assert manager.PARAMS_DIR == Path("/data/params/d")
+    assert manager.PLUGIN_DATA_DIR == Path("/data/plugins/mapd/data")
 
   def test_github_url(self, manager):
     assert "pfeiferj/mapd" in manager.GITHUB_API_URL
@@ -107,12 +107,12 @@ class TestCheckForUpdates:
 class TestUpdateVersionParam:
   def test_writes_version(self, manager, tmp_path):
     # Override paths to use temp dir
-    manager.PARAMS_DIR = tmp_path / "params"
+    manager.PLUGIN_DATA_DIR = tmp_path / "data"
     manager.VERSION_PATH = tmp_path / "version"
 
     result = manager.update_version_param('v2.1.5')
     assert result is True
-    assert (manager.PARAMS_DIR / "MapdVersion").read_text() == 'v2.1.5'
+    assert (manager.PLUGIN_DATA_DIR / "MapdVersion").read_text() == 'v2.1.5'
     assert manager.VERSION_PATH.read_text() == 'v2.1.5'
 
 
