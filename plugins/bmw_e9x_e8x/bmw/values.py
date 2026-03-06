@@ -34,10 +34,9 @@ class BmwFlags(IntFlag):
   ACTIVE_CRUISE_CONTROL = 2 ** 3          # ACC $541 - LDM and ACC sensor - #! not supported
   ACTIVE_CRUISE_CONTROL_NO_ACC = 2 ** 4   # no ACC module - DSC, DME, KOMBI coded to $541, LDM coded to $544
   ACTIVE_CRUISE_CONTROL_NO_LDM = 2 ** 5   # no LDM/ACC - DSC, DME, KOMBI coded to $541
-  SERVOTRONIC = 2 ** 6                    # ServoTonic $216A - TODO: needs firmware query
 
   # User-Configurable Flags (set via params)
-  DCC_CALIBRATION_MODE = 2 ** 7           # Disable OP engagement, log DCC performance for tuning
+  DCC_CALIBRATION_MODE = 2 ** 6           # Disable OP engagement, log DCC performance for tuning
 
 
 class CruiseSettings:

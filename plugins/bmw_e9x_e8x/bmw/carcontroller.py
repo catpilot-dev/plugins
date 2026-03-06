@@ -96,7 +96,6 @@ class CarController(CarControllerBase):
     if not cruise_stalk_human_pressing and CS.out.cruiseState.enabled:
       if self.cruise_cancel:
         cruise_cmd(CruiseStalk.cancel, CRUISE_STALK_SINGLE_TICK_STOCK)
-        print("cancel")
       elif CC.enabled:
         if CS.out.gasPressed:
           cruise_cmd(CruiseStalk.plus1, CRUISE_STALK_PLUS1_SINGLE_TICK)
@@ -159,10 +158,6 @@ class CarController(CarControllerBase):
         apply_torque = 0
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.Off))
       self.apply_torque_last = apply_torque
-
-    if CC.enabled and (self.frame % 10) == 0:
-      frame_number = self.frame
-      print(f"Steering req: {actuators.torque}, Speed: {CS.out.vEgoCluster}, Frame number: {frame_number}")
 
     self.cruise_enabled_prev = CC.enabled
 

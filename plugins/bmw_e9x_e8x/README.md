@@ -24,7 +24,6 @@ Full BMW E8x/E9x car interface for openpilot:
 | Hook | Module | Description |
 |------|--------|-------------|
 | car.register_interfaces | register.py | Register BMW platforms into openpilot car detection |
-| car.panda_status | panda_status.py | Monitor panda safety model (detect ELM327 fallback) |
 
 ## Key files
 
@@ -32,7 +31,6 @@ Full BMW E8x/E9x car interface for openpilot:
 bmw_e9x_e8x/
   plugin.json           # Plugin manifest
   register.py           # car.register_interfaces hook
-  panda_status.py       # car.panda_status hook
   bmw/                  # Car interface (mirrors opendbc/car/bmw/)
     values.py           # Platform config, VIN detection, DBC mapping
     fingerprints.py     # Empty fingerprints + dummy FW versions

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-import numpy as np
 from opendbc.car import structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car import get_safety_config
-from bmw.values import CanBus, BmwFlags, CarControllerParams
+from bmw.values import CanBus, BmwFlags
 from opendbc.car.interfaces import CarInterfaceBase
 from bmw.carcontroller import CarController
 from bmw.carstate import CarState
@@ -32,26 +31,6 @@ class CarInterface(CarInterfaceBase):
 
   def __init__(self, CP, *args, **kwargs):
     super().__init__(CP, *args, **kwargs)
-
-  @staticmethod
-  def get_steer_feedforward_servotronic(desired_angle, v_ego):
-    angle_bp = [-40.0, -6.0, -4.0, -3.0, -2.0, -1.0, -0.5,  0.5,  1.0,  2.0,  3.0,  4.0,  6.0, 40.0]
-    hold_torque_v  = [-6, -2.85, -2.5, -2.25, -2, -1.65, -1, 1, 1.65, 2, 2.25, 2.5, 2.85, 6]
-    hold_torque = np.interp(desired_angle, angle_bp, hold_torque_v)
-    return hold_torque
-
-  @staticmethod
-  def get_steer_feedforward(desired_angle, v_ego):
-    angle_bp = [-40.0, -6.0, -4.0, -3.0, -2.0, -1.0, -0.5,  0.5,  1.0,  2.0,  3.0,  4.0,  6.0, 40.0]
-    hold_torque_v  = [-6, -2.85, -2.5, -2.25, -2, -1.65, -1, 1, 1.65, 2, 2.25, 2.5, 2.85, 6]
-    hold_torque = np.interp(desired_angle, angle_bp, hold_torque_v)
-    return hold_torque
-
-  def get_steer_feedforward_function(self):
-    if self.CP.flags & BmwFlags.SERVOTRONIC:
-      return self.get_steer_feedforward_servotronic
-    else:
-      return self.get_steer_feedforward
 
   @staticmethod
   def _get_params(ret, candidate, fingerprint, car_fw, alpha_long, is_release, docs):
