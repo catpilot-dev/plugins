@@ -15,6 +15,7 @@ from openpilot.system.ui.widgets.scroller_tici import Scroller
 
 PLUGINS_DIR = '/data/plugins'
 PLUGINS_REPO = '/data/catpilot-plugins'
+OPENPILOT_DIR = '/data/openpilot'
 BUILD_HASH_FILE = '/tmp/plugin_build_hash'
 IS_C3 = os.path.exists('/TICI')
 
@@ -149,15 +150,23 @@ class PluginsLayout(Widget):
 
   def _apply_update(self):
     try:
+      branch = subprocess.check_output(
+        ['git', '-C', PLUGINS_REPO, 'rev-parse', '--abbrev-ref', 'HEAD'],
+        stderr=subprocess.DEVNULL, timeout=5,
+      ).decode().strip()
       subprocess.check_call(
-        ['git', '-C', PLUGINS_REPO, 'pull', '--ff-only'],
+        ['git', '-C', PLUGINS_REPO, 'reset', '--hard', f'origin/{branch}'],
         timeout=60, stderr=subprocess.DEVNULL,
         env={**os.environ, 'GIT_SSL_NO_VERIFY': '1'},
       )
       subprocess.check_call(
-        ['bash', os.path.join(PLUGINS_REPO, 'install.sh')],
+        ['bash', os.path.join(PLUGINS_REPO, 'install.sh'), '--target', OPENPILOT_DIR],
         timeout=120, stderr=subprocess.DEVNULL,
       )
+      try:
+        os.remove(BUILD_HASH_FILE)
+      except FileNotFoundError:
+        pass
       self._update_btn_text = 'CHECK'
       self._update_status = 'updated, reboot to apply'
       self._update_enabled = False
