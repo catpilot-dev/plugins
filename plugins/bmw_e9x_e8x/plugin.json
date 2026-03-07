@@ -25,6 +25,11 @@
       "module": "register",
       "function": "on_cruise_initialized",
       "priority": 50
+    },
+    "ui.vehicle_settings": {
+      "module": "register",
+      "function": "on_vehicle_settings",
+      "priority": 50
     }
   }
 }

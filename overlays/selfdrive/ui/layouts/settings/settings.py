@@ -8,6 +8,8 @@ from openpilot.selfdrive.ui.layouts.settings.driving import DrivingLayout
 from openpilot.selfdrive.ui.layouts.settings.plugins import PluginsLayout
 from openpilot.selfdrive.ui.layouts.settings.software import SoftwareLayout
 from openpilot.selfdrive.ui.layouts.settings.toggles import TogglesLayout
+from openpilot.selfdrive.ui.layouts.settings.vehicle import VehicleLayout
+from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -36,8 +38,9 @@ class PanelType(IntEnum):
   NETWORK = 1
   TOGGLES = 2
   DRIVING = 3
-  SOFTWARE = 4
-  PLUGINS = 5
+  VEHICLE = 4
+  SOFTWARE = 5
+  PLUGINS = 6
 
 
 @dataclass
@@ -64,6 +67,7 @@ class SettingsLayout(Widget):
       PanelType.NETWORK: PanelInfo(tr_noop("Network"), net_ui),
       PanelType.TOGGLES: PanelInfo(tr_noop("Toggles"), TogglesLayout()),
       PanelType.DRIVING: PanelInfo(tr_noop("Driving"), DrivingLayout()),
+      PanelType.VEHICLE: PanelInfo(tr_noop("Vehicle"), VehicleLayout()),
       PanelType.SOFTWARE: PanelInfo(tr_noop("Software"), SoftwareLayout()),
       PanelType.PLUGINS: PanelInfo(tr_noop("Plugins"), PluginsLayout()),
     }
@@ -123,9 +127,12 @@ class SettingsLayout(Widget):
     for panel_type, panel_info in self._panels.items():
       button_rect = rl.Rectangle(rect.x + 50, y, rect.width - 150, NAV_BTN_HEIGHT)
 
+      # Vehicle panel: greyed out when no car fingerprinted
+      vehicle_disabled = panel_type == PanelType.VEHICLE and ui_state.CP is None
+
       # Button styling
-      is_selected = panel_type == self._current_panel
-      text_color = TEXT_SELECTED if is_selected else TEXT_NORMAL
+      is_selected = panel_type == self._current_panel and not vehicle_disabled
+      text_color = TEXT_SELECTED if is_selected else (rl.Color(64, 64, 64, 255) if vehicle_disabled else TEXT_NORMAL)
       # Draw button text (right-aligned)
       panel_name = tr(panel_info.name)
       text_size = measure_text_cached(self._font_medium, panel_name, 65)
@@ -158,6 +165,8 @@ class SettingsLayout(Widget):
     # Check navigation buttons
     for panel_type, panel_info in self._panels.items():
       if rl.check_collision_point_rec(mouse_pos, panel_info.button_rect):
+        if panel_type == PanelType.VEHICLE and ui_state.CP is None:
+          return
         self.set_current_panel(panel_type)
         return
 

@@ -63,3 +63,35 @@ def on_cruise_initialized(result, v_cruise_helper, CS):
     v_cruise_helper.v_cruise_kph = v_cruise_helper.v_cruise_kph_last
     v_cruise_helper.v_cruise_cluster_kph = v_cruise_helper.v_cruise_kph_last
   return result
+
+
+def _read_param(key):
+  try:
+    with open(os.path.join(_PLUGIN_DIR, 'data', key)) as f:
+      return f.read().strip()
+  except (FileNotFoundError, OSError):
+    return ''
+
+
+def _write_param(key, value):
+  data_dir = os.path.join(_PLUGIN_DIR, 'data')
+  os.makedirs(data_dir, exist_ok=True)
+  with open(os.path.join(data_dir, key), 'w') as f:
+    f.write(value)
+
+
+def on_vehicle_settings(items, CP):
+  """Hook callback: populate Vehicle panel with BMW-specific toggles."""
+  if CP.brand != 'bmw':
+    return items
+
+  from openpilot.system.ui.widgets.list_view import toggle_item
+
+  items.append(toggle_item(
+    "Cruise Speed Memory",
+    "Remember cruise speed ceiling across disengage/re-engage within the same drive.",
+    _read_param('CruiseCeilingMemory') != '0',
+    callback=lambda state: _write_param('CruiseCeilingMemory', '1' if state else '0'),
+  ))
+
+  return items
