@@ -166,13 +166,7 @@ class CarState(CarStateBase):
     else:
       self.resume_button_hold_frames = 0
 
-    if self.cruise_stalk_resume and not self.prev_cruise_stalk_resume:
-      resume_button_events.append(structs.CarState.ButtonEvent(
-        pressed=True,
-        type=ButtonType.resumeCruise
-      ))
-
-    elif not self.cruise_stalk_resume and self.prev_cruise_stalk_resume:
+    if not self.cruise_stalk_resume and self.prev_cruise_stalk_resume:
       if self.resume_button_hold_frames >= RESUME_LONG_PRESS_FRAMES:
         resume_button_events.append(structs.CarState.ButtonEvent(
           pressed=True,
@@ -183,6 +177,10 @@ class CarState(CarStateBase):
           type=ButtonType.gapAdjustCruise
         ))
       else:
+        resume_button_events.append(structs.CarState.ButtonEvent(
+          pressed=True,
+          type=ButtonType.resumeCruise
+        ))
         resume_button_events.append(structs.CarState.ButtonEvent(
           pressed=False,
           type=ButtonType.resumeCruise
