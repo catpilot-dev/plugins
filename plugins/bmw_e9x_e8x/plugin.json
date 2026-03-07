@@ -13,6 +13,10 @@
     "CruiseCeilingMemory": {
       "default": true,
       "description": "Remember cruise speed ceiling across disengage/re-engage within same drive"
+    },
+    "ConsecutiveLaneChange": {
+      "default": true,
+      "description": "Press steering button during lane change to chain consecutive lane changes"
     }
   },
   "hooks": {
@@ -29,6 +33,21 @@
     "ui.vehicle_settings": {
       "module": "register",
       "function": "on_vehicle_settings",
+      "priority": 50
+    },
+    "desire.pre_lane_change": {
+      "module": "register",
+      "function": "on_pre_lane_change",
+      "priority": 50
+    },
+    "desire.post_lane_change": {
+      "module": "register",
+      "function": "on_post_lane_change",
+      "priority": 50
+    },
+    "desire.post_update": {
+      "module": "register",
+      "function": "on_desire_post_update",
       "priority": 50
     }
   }

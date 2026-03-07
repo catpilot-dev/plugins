@@ -94,4 +94,81 @@ def on_vehicle_settings(items, CP):
     callback=lambda state: _write_param('CruiseCeilingMemory', '1' if state else '0'),
   ))
 
+  items.append(toggle_item(
+    "Consecutive Lane Changes",
+    "Press steering button during an active lane change to chain the next one immediately for fluid multi-lane merges.",
+    _read_param('ConsecutiveLaneChange') != '0',
+    callback=lambda state: _write_param('ConsecutiveLaneChange', '1' if state else '0'),
+  ))
+
   return items
+
+
+# --- Consecutive lane change state (per-process, used by desire hooks) ---
+
+class _ConsecutiveLCState:
+  prev_steering_button = False
+  consecutive_requested = False
+  desire_gap = 0
+
+_clc = _ConsecutiveLCState()
+
+
+def _is_consecutive_enabled():
+  return _read_param('ConsecutiveLaneChange') != '0'
+
+
+def on_pre_lane_change(result, dh, carstate):
+  """Handle desire gap countdown before state machine runs."""
+  if not _is_consecutive_enabled():
+    return result
+
+  if _clc.desire_gap > 0:
+    _clc.desire_gap -= 1
+    if _clc.desire_gap == 0:
+      from cereal import log
+      dh.lane_change_state = log.LaneChangeState.laneChangeStarting
+      dh.lane_change_ll_prob = 1.0
+      dh.lane_change_timer = 0.0
+      _clc.consecutive_requested = False
+  return result
+
+
+def on_post_lane_change(result, dh, carstate, one_blinker, below_lane_change_speed, lane_change_prob):
+  """Detect consecutive lane change triggers after state machine."""
+  if not _is_consecutive_enabled():
+    _clc.prev_steering_button = False
+    return result
+
+  from cereal import log
+
+  # BMW uses VoiceControl button (steeringPressed) but not gas pedal for consecutive trigger
+  steering_button = carstate.steeringPressed and not carstate.gasPressed
+  rising_edge = steering_button and not _clc.prev_steering_button
+  _clc.prev_steering_button = steering_button
+
+  if dh.lane_change_state in (log.LaneChangeState.off, log.LaneChangeState.preLaneChange):
+    _clc.consecutive_requested = False
+    _clc.desire_gap = 0
+
+  elif dh.lane_change_state == log.LaneChangeState.laneChangeStarting:
+    if rising_edge and one_blinker:
+      _clc.consecutive_requested = True
+    # Re-trigger as soon as car is committed (ll_prob faded ~0.5s) — skip waiting for model
+    if _clc.consecutive_requested and one_blinker and not below_lane_change_speed \
+        and dh.lane_change_ll_prob < 0.01:
+      _clc.desire_gap = 1
+
+  elif dh.lane_change_state == log.LaneChangeState.laneChangeFinishing:
+    if rising_edge and one_blinker and not below_lane_change_speed:
+      _clc.desire_gap = 1
+
+  return result
+
+
+def on_desire_post_update(desire, lane_change_state, lane_change_direction, carstate):
+  """Override desire to none during consecutive gap frame for model rising edge."""
+  if _clc.desire_gap > 0:
+    from cereal import log
+    return log.Desire.none
+  return desire
