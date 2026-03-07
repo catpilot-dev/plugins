@@ -244,8 +244,31 @@ install_plugins() {
   done
 }
 
+overlay_opendbc() {
+  local src="$SCRIPT_DIR/overlays/opendbc"
+  if [[ ! -d "$src" ]]; then return; fi
+  local dst="$OPENPILOT_ROOT/opendbc_repo/opendbc"
+
+  log "Overlaying opendbc: opendbc/"
+
+  if $DRY_RUN; then
+    find "$src" -type f -name '*.py' | while read -r f; do
+      echo "  COPY ${f#$SCRIPT_DIR/} → opendbc_repo/opendbc/${f#$src/}"
+    done
+    return
+  fi
+
+  find "$src" -type f -name '*.py' | while read -r f; do
+    local rel="${f#$src/}"
+    local target_dir="$dst/$(dirname "$rel")"
+    mkdir -p "$target_dir"
+    cp -v "$f" "$target_dir/" 2>/dev/null || true
+  done
+}
+
 overlay_framework
 overlay_ui
+overlay_opendbc
 install_plugins
 overlay_cereal
 
@@ -263,6 +286,11 @@ restore_removed_overlays() {
       done
     fi
   done
+  if [[ -d "$SCRIPT_DIR/overlays/opendbc" ]]; then
+    find "$SCRIPT_DIR/overlays/opendbc" -type f -name '*.py' | while read -r f; do
+      echo "opendbc_repo/opendbc/${f#$SCRIPT_DIR/overlays/opendbc/}" >> "$new_manifest"
+    done
+  fi
   sort -o "$new_manifest" "$new_manifest"
 
   # Compare with previous manifest and restore removed files
@@ -293,6 +321,7 @@ if ! $DRY_RUN; then
   for dir in \
     "$OPENPILOT_ROOT/selfdrive/plugins" \
     "$OPENPILOT_ROOT/selfdrive/ui" \
+    "$OPENPILOT_ROOT/opendbc_repo/opendbc/car" \
     "$OPENPILOT_ROOT/cereal" \
     "$PLUGINS_DEST"; do
     find "$dir" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
