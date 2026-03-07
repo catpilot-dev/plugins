@@ -69,6 +69,35 @@ log "openpilot root: $OPENPILOT_ROOT"
 log "plugins dest:   $PLUGINS_DEST"
 $DRY_RUN && log "DRY RUN — no files will be written"
 
+# --- Align plugins branch with catpilot branch ---
+align_branch() {
+  # Only align if both repos are git repos
+  if [[ ! -d "$OPENPILOT_ROOT/.git" ]] || [[ ! -d "$SCRIPT_DIR/.git" ]]; then
+    return
+  fi
+
+  local catpilot_branch
+  catpilot_branch="$(git -C "$OPENPILOT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" || return
+  local plugins_branch
+  plugins_branch="$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)" || return
+
+  if [[ "$catpilot_branch" != "$plugins_branch" ]]; then
+    # Check if the matching branch exists in plugins repo
+    if git -C "$SCRIPT_DIR" rev-parse --verify "origin/$catpilot_branch" &>/dev/null; then
+      log "Branch alignment: plugins $plugins_branch → $catpilot_branch (matching catpilot)"
+      if ! $DRY_RUN; then
+        git -C "$SCRIPT_DIR" fetch origin "$catpilot_branch" --quiet 2>/dev/null || true
+        git -C "$SCRIPT_DIR" checkout "$catpilot_branch" --quiet 2>/dev/null || true
+        git -C "$SCRIPT_DIR" reset --hard "origin/$catpilot_branch" --quiet 2>/dev/null || true
+      fi
+    else
+      warn "Branch '$catpilot_branch' not found in plugins repo — staying on $plugins_branch"
+    fi
+  fi
+}
+
+align_branch
+
 # --- Hook-site verification ---
 verify_hooks() {
   local missing=0

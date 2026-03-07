@@ -109,6 +109,24 @@ class PluginsLayout(Widget):
     except Exception:
       return ''
 
+  @staticmethod
+  def _get_target_branch():
+    """Get target branch — aligned to catpilot's branch."""
+    try:
+      return subprocess.check_output(
+        ['git', '-C', OPENPILOT_DIR, 'rev-parse', '--abbrev-ref', 'HEAD'],
+        stderr=subprocess.DEVNULL, timeout=5,
+      ).decode().strip()
+    except Exception:
+      pass
+    try:
+      return subprocess.check_output(
+        ['git', '-C', PLUGINS_REPO, 'rev-parse', '--abbrev-ref', 'HEAD'],
+        stderr=subprocess.DEVNULL, timeout=5,
+      ).decode().strip()
+    except Exception:
+      return 'main'
+
   def _on_update_click(self):
     if self._update_btn_text == 'CHECK':
       self._update_enabled = False
@@ -121,15 +139,12 @@ class PluginsLayout(Widget):
 
   def _check_update(self):
     try:
+      branch = self._get_target_branch()
       subprocess.check_call(
-        ['git', '-C', PLUGINS_REPO, 'fetch', '--quiet'],
+        ['git', '-C', PLUGINS_REPO, 'fetch', 'origin', branch, '--quiet'],
         timeout=30, stderr=subprocess.DEVNULL,
         env={**os.environ, 'GIT_SSL_NO_VERIFY': '1'},
       )
-      branch = subprocess.check_output(
-        ['git', '-C', PLUGINS_REPO, 'rev-parse', '--abbrev-ref', 'HEAD'],
-        stderr=subprocess.DEVNULL, timeout=5,
-      ).decode().strip()
       behind = subprocess.check_output(
         ['git', '-C', PLUGINS_REPO, 'rev-list', '--count', f'HEAD..origin/{branch}'],
         stderr=subprocess.DEVNULL, timeout=5,
@@ -150,10 +165,7 @@ class PluginsLayout(Widget):
 
   def _apply_update(self):
     try:
-      branch = subprocess.check_output(
-        ['git', '-C', PLUGINS_REPO, 'rev-parse', '--abbrev-ref', 'HEAD'],
-        stderr=subprocess.DEVNULL, timeout=5,
-      ).decode().strip()
+      branch = self._get_target_branch()
       subprocess.check_call(
         ['git', '-C', PLUGINS_REPO, 'reset', '--hard', f'origin/{branch}'],
         timeout=60, stderr=subprocess.DEVNULL,
