@@ -15,7 +15,7 @@ from pathlib import Path
 MAPD_PATH = Path("/data/media/0/osm/mapd")
 BACKUP_DIR = Path("/data/media/0/osm/mapd_backups")
 VERSION_PATH = Path("/data/media/0/osm/mapd_version")
-PLUGIN_DATA_DIR = Path("/data/plugins/mapd/data")
+PLUGIN_DATA_DIR = Path("/data/plugins-runtime/mapd/data")
 
 GITHUB_API_URL = "https://api.github.com/repos/pfeiferj/mapd/releases/latest"
 

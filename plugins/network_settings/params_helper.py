@@ -11,7 +11,7 @@ files from /data/params/d/ on every manager start. Persistent user config
 import os
 from pathlib import Path
 
-PARAMS_DIR = Path("/data/plugins/network_settings/data")
+PARAMS_DIR = Path("/data/plugins-runtime/network_settings/data")
 # Keep PERSIST_DIR as alias for tests that patch both
 PERSIST_DIR = PARAMS_DIR
 

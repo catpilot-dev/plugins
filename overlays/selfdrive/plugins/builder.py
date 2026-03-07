@@ -23,7 +23,7 @@ LOG_CAPNP = os.path.join(CEREAL_DIR, 'log.capnp')
 SERVICES_PY = os.path.join(CEREAL_DIR, 'services.py')
 
 BUILD_HASH_FILE = '/tmp/plugin_build_hash'
-PLUGINS_DIR = '/data/plugins'
+PLUGINS_DIR = '/data/plugins-runtime'
 
 # Struct IDs for each reserved custom slot (from upstream custom.capnp)
 SLOT_IDS = {
@@ -285,7 +285,7 @@ def _patch_services(plugin_dirs: list[str]) -> None:
 def _write_params(plugin_dirs: list[str]) -> None:
   """Write plugin param defaults to each plugin's data dir.
 
-  Params are stored under /data/plugins/<id>/data/ to survive reboots
+  Params are stored under /data/plugins-runtime/<id>/data/ to survive reboots
   (openpilot's Params::clearAll wipes /data/params/d/ on boot).
   """
   for plugin_dir in plugin_dirs:

@@ -1,12 +1,12 @@
 """Plugin-safe params read/write via raw file I/O.
 
-Uses /data/plugins/speedlimitd/data/ instead of /data/params/d/ to avoid
+Uses /data/plugins-runtime/speedlimitd/data/ instead of /data/params/d/ to avoid
 openpilot's Params::clearAll() which rejects unknown keys.
 """
 import os
 from pathlib import Path
 
-PARAMS_DIR = Path("/data/plugins/speedlimitd/data")
+PARAMS_DIR = Path("/data/plugins-runtime/speedlimitd/data")
 
 
 def get(key: str) -> str | None:

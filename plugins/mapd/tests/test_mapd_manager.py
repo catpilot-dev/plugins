@@ -17,7 +17,7 @@ class TestConstants:
     assert manager.MAPD_PATH == Path("/data/media/0/osm/mapd")
     assert manager.BACKUP_DIR == Path("/data/media/0/osm/mapd_backups")
     assert manager.VERSION_PATH == Path("/data/media/0/osm/mapd_version")
-    assert manager.PLUGIN_DATA_DIR == Path("/data/plugins/mapd/data")
+    assert manager.PLUGIN_DATA_DIR == Path("/data/plugins-runtime/mapd/data")
 
   def test_github_url(self, manager):
     assert "pfeiferj/mapd" in manager.GITHUB_API_URL

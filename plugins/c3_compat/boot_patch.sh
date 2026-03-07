@@ -95,7 +95,7 @@ done
 #     matches cached .venv_synced_hash, skip entirely (<100ms).
 #     This guarantees openpilot won't crash on import errors regardless of how
 #     the code was deployed (COD update, manual git checkout, AGNOS reflash).
-VENV_SYNC="/data/plugins/c3_compat/venv_sync.py"
+VENV_SYNC="/data/plugins-runtime/c3_compat/venv_sync.py"
 if [ -f "$VENV_SYNC" ] && [ -f /data/openpilot/uv.lock ]; then
   /usr/local/venv/bin/python3 "$VENV_SYNC" --runtime-only 2>&1 | while IFS= read -r line; do
     echo "[c3_compat] $line"
@@ -104,7 +104,7 @@ fi
 
 # 2c. DRM raylib: AGNOS 12.8 venv has Wayland raylib, but C3 uses DRM backend
 #     Copy DRM-built raylib from plugin's raylib_drm/ into venv (overwrites Wayland version)
-RAYLIB_DRM="/data/plugins/c3_compat/raylib_drm"
+RAYLIB_DRM="/data/plugins-runtime/c3_compat/raylib_drm"
 if [ -d "$RAYLIB_DRM/raylib" ] && ! /usr/local/venv/bin/python3 -c "import raylib" 2>&1 | grep -q 'DRM\|STATIC'; then
   [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
   sudo cp -rf "$RAYLIB_DRM/raylib/"* "$VENV_SITE/raylib/"
@@ -538,7 +538,7 @@ dmesg -T > "$DIAG_DIR/dmesg_current.log" 2>/dev/null || dmesg > "$DIAG_DIR/dmesg
 
 # Background watchdog: periodically save system vitals to catch state before hang
 # Uses setsid to create a new session — survives the exec in continue.sh
-WATCHDOG="/data/plugins/c3_compat/watchdog.sh"
+WATCHDOG="/data/plugins-runtime/c3_compat/watchdog.sh"
 if [ -f "$WATCHDOG" ]; then
   # Kill any stale watchdog from previous boot
   pkill -f "watchdog.sh" 2>/dev/null || true

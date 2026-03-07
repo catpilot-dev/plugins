@@ -2,7 +2,7 @@
 """Plugin manager daemon — discovers, loads, and monitors plugins.
 
 Runs as an always_run process. Responsibilities:
-  1. Scan /data/plugins/ for installed plugins
+  1. Scan /data/plugins-runtime/ for installed plugins
   2. Validate compatibility (min/max openpilot version)
   3. Load enabled plugins, register hooks + processes
   4. Spawn and monitor standalone plugin processes
@@ -26,9 +26,9 @@ from openpilot.selfdrive.plugins.registry import PluginRegistry
 from openpilot.selfdrive.plugins.api import set_registry, start_api_server
 
 POLL_INTERVAL = 5.0  # seconds between checking for config changes
-PID_DIR = '/data/plugins/.pids'
+PID_DIR = '/data/plugins-runtime/.pids'
 LOG_DIR = '/tmp/plugin_logs'
-RESTART_MARKER = '/data/plugins/.needs_restart'
+RESTART_MARKER = '/data/plugins-runtime/.needs_restart'
 
 
 class PluginProcessManager:

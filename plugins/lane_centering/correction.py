@@ -138,7 +138,7 @@ class LaneCenteringCorrection:
 
 
 _lcc = None
-_PARAM_FILE = '/data/plugins/lane_centering/data/LaneCenteringEnabled'
+_PARAM_FILE = '/data/plugins-runtime/lane_centering/data/LaneCenteringEnabled'
 
 def _is_enabled():
   try:

@@ -1,6 +1,6 @@
 #!/bin/bash
 # c3_compat vitals watchdog — saves system state every 60s
-# Run: setsid /data/plugins/c3_compat/watchdog.sh &
+# Run: setsid /data/plugins-runtime/c3_compat/watchdog.sh &
 DIAG_DIR=/data/crash_diag
 mkdir -p "$DIAG_DIR"
 TICK=0

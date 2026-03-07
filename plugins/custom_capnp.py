@@ -118,7 +118,7 @@ def main():
     sys.exit(1)
 
   cereal_dir = sys.argv[1]
-  plugins_dir = sys.argv[2] if len(sys.argv) > 2 else "/data/plugins"
+  plugins_dir = sys.argv[2] if len(sys.argv) > 2 else "/data/plugins-runtime"
 
   slots, standalone_files = collect_cereal(plugins_dir)
   if not slots and not standalone_files:

@@ -63,7 +63,7 @@ def main():
     sys.exit(1)
 
   services_py = sys.argv[1]
-  plugins_dir = sys.argv[2] if len(sys.argv) > 2 else "/data/plugins"
+  plugins_dir = sys.argv[2] if len(sys.argv) > 2 else "/data/plugins-runtime"
 
   services = collect_services(plugins_dir)
   if not services:

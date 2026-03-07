@@ -15,7 +15,7 @@ from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.selfdrive.ui.ui_state import ui_state
 
-PLUGINS_DIR = '/data/plugins'
+PLUGINS_DIR = '/data/plugins-runtime'
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
 OFFSET_VALUES = [0, 5, 10, 15]            # % — indexed by pill selection

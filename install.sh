@@ -5,7 +5,7 @@
 # Three operations:
 #   1. Overlay overlays/selfdrive/ → openpilot tree (framework + UI modules)
 #   2. Overlay overlays/cereal/ → openpilot tree (schema extensions)
-#   3. Copy each plugins/*/ → /data/plugins/ (runtime plugin packages)
+#   3. Copy each plugins/*/ → /data/plugins-runtime/ (runtime plugin packages)
 #
 # Usage:
 #   bash install.sh                  # Auto-detect openpilot location
@@ -18,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY_RUN=false
 OPENPILOT_ROOT=""
-PLUGINS_DEST="/data/plugins"
+PLUGINS_DEST="/data/plugins-runtime"
 
 usage() {
   echo "Usage: install.sh [OPTIONS]"
@@ -28,7 +28,7 @@ usage() {
   echo "Options:"
   echo "  --dry-run        Preview actions without writing files"
   echo "  --target PATH    Specify openpilot root directory"
-  echo "  --plugins-dir P  Specify plugins destination (default: /data/plugins)"
+  echo "  --plugins-dir P  Specify plugins destination (default: /data/plugins-runtime)"
   echo "  --help           Show this help"
   exit 0
 }

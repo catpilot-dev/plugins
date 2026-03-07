@@ -44,7 +44,7 @@ LOCAL_LOCK = "/data/openpilot/uv.lock"
 VENV_SITE = "/usr/local/venv/lib/python3.12/site-packages"
 VENV_PIP = "/usr/local/venv/bin/pip"
 VENV_PYTHON = "/usr/local/venv/bin/python3"
-HASH_CACHE = "/data/plugins/c3_compat/.venv_synced_hash"
+HASH_CACHE = "/data/plugins-runtime/c3_compat/.venv_synced_hash"
 
 # --- C3 target platform ---
 TARGET_PYTHON = "cp312"

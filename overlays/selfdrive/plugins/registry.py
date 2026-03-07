@@ -1,6 +1,6 @@
 """Plugin discovery, loading, and lifecycle management.
 
-Scans /data/plugins/ for installed plugins, validates manifests,
+Scans /data/plugins-runtime/ for installed plugins, validates manifests,
 loads enabled plugins, and manages their lifecycle.
 
 Supports plugin types: hook, process, hybrid, car, firmware
@@ -17,7 +17,7 @@ from openpilot.selfdrive.plugins import hooks as hooks_module
 from openpilot.selfdrive.plugins.manifest import load_manifest, check_compatibility, \
   check_dependencies, check_conflicts
 
-PLUGINS_DIR = '/data/plugins'
+PLUGINS_DIR = '/data/plugins-runtime'
 
 
 class PluginInfo:

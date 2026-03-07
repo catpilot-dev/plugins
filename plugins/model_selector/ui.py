@@ -11,7 +11,7 @@ from pathlib import Path
 
 from model_swapper import ModelSwapper, ModelType
 
-PLUGINS_DIR = '/data/plugins'
+PLUGINS_DIR = '/data/plugins-runtime'
 PYTHON_BIN = '/usr/local/venv/bin/python'
 
 _SWAPPERS = {

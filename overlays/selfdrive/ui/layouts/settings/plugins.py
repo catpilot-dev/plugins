@@ -13,8 +13,8 @@ from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.widgets.list_view import button_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
-PLUGINS_DIR = '/data/plugins'
-PLUGINS_REPO = '/data/catpilot-plugins'
+PLUGINS_DIR = '/data/plugins-runtime'
+PLUGINS_REPO = '/data/plugins'
 OPENPILOT_DIR = '/data/openpilot'
 BUILD_HASH_FILE = '/tmp/plugin_build_hash'
 IS_C3 = os.path.exists('/TICI')
@@ -59,7 +59,7 @@ class PluginsLayout(Widget):
     )
 
   def _scan_plugins(self):
-    """Scan /data/plugins/ for plugin manifests, return sorted list of _PluginEntry."""
+    """Scan /data/plugins-runtime/ for plugin manifests, return sorted list of _PluginEntry."""
     if not os.path.isdir(PLUGINS_DIR):
       return []
 
