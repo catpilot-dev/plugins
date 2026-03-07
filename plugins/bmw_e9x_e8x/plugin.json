@@ -9,10 +9,21 @@
   "max_openpilot": "0.10.99",
   "conflicts": [],
   "dependencies": [],
+  "params": {
+    "CruiseCeilingMemory": {
+      "default": true,
+      "description": "Remember cruise speed ceiling across disengage/re-engage within same drive"
+    }
+  },
   "hooks": {
     "car.register_interfaces": {
       "module": "register",
       "function": "on_register_interfaces",
+      "priority": 50
+    },
+    "car.cruise_initialized": {
+      "module": "register",
+      "function": "on_cruise_initialized",
       "priority": 50
     }
   }

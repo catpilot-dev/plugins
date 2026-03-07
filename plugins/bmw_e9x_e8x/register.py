@@ -43,3 +43,23 @@ def on_register_interfaces(interfaces):
     pass
 
   return interfaces
+
+
+def on_cruise_initialized(result, v_cruise_helper, CS):
+  """Hook callback: restore last cruise ceiling on re-engagement.
+
+  Stock openpilot resets cruise speed to V_CRUISE_INITIAL on every engagement
+  for BMW because engagement is a state transition (not a resume button press).
+  This restores the user's last-adjusted ceiling within the same onroad session.
+  """
+  try:
+    with open(os.path.join(_PLUGIN_DIR, 'data', 'CruiseCeilingMemory')) as f:
+      if f.read().strip() == '0':
+        return result
+  except (FileNotFoundError, OSError):
+    pass  # default: enabled
+
+  if v_cruise_helper.v_cruise_kph_last > 0:
+    v_cruise_helper.v_cruise_kph = v_cruise_helper.v_cruise_kph_last
+    v_cruise_helper.v_cruise_cluster_kph = v_cruise_helper.v_cruise_kph_last
+  return result

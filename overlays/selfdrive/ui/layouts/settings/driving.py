@@ -109,6 +109,17 @@ class DrivingLayout(Widget):
       )
       items.append(self._lane_centering)
 
+    # --- BMW Cruise Ceiling Memory (if plugin enabled) ---
+    if _plugin_enabled('bmw-e9x-e8x'):
+      cruise_mem = _read_plugin_param('bmw-e9x-e8x', 'CruiseCeilingMemory') != '0'
+      self._cruise_ceiling = toggle_item(
+        "Cruise Speed Memory",
+        "Remember cruise speed ceiling across disengage/re-engage within the same drive.",
+        cruise_mem,
+        callback=self._on_cruise_ceiling,
+      )
+      items.append(self._cruise_ceiling)
+
     # --- Speedlimitd items (if plugin enabled) ---
     if _plugin_enabled('speedlimitd'):
       # Map Speed Control
@@ -160,6 +171,9 @@ class DrivingLayout(Widget):
 
   def _set_personality(self, button_index):
     self._params.put("LongitudinalPersonality", button_index)
+
+  def _on_cruise_ceiling(self, state):
+    _write_plugin_param('bmw-e9x-e8x', 'CruiseCeilingMemory', '1' if state else '0')
 
   def _on_lane_centering(self, state):
     _write_plugin_param('lane_centering', 'LaneCenteringEnabled', '1' if state else '0')
