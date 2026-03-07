@@ -208,16 +208,8 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP):
-    pt_messages = [
-      ("TurnSignals", float('nan')),
-      ("Status_contact_handbrake", float('nan')),
-      ("EngineData", float('nan')),
-    ]
-
+    pt_messages = []
     fcan_messages = []
-    if CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
-      fcan_messages.append(("CruiseControlStalk", float('nan')))
-
     servo_can_messages = []
 
     return {
