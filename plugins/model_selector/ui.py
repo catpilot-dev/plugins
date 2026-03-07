@@ -7,6 +7,7 @@ import json
 import math
 import subprocess
 import shutil
+import time
 from pathlib import Path
 
 from model_swapper import ModelSwapper, ModelType
@@ -156,17 +157,36 @@ def on_software_settings_extend(default, layout):
         self._model_btns[model_type] = btn
         self.items.append(btn)
 
+      self._last_check_time = None
+
       self._new_models_btn = button_item('New Models', 'CHECK', callback=self._on_check_new_models)
-      self._new_models_btn.action_item.set_value('check on github')
+      self._new_models_btn.action_item.set_value('up to date, last checked never')
       _orig_hint = self._new_models_btn.action_item.get_width_hint
       self._new_models_btn.action_item.get_width_hint = lambda _o=_orig_hint: math.ceil(_o())
       self.items.append(self._new_models_btn)
+
+    def _time_ago(self):
+      if self._last_check_time is None:
+        return 'never'
+      diff = int(time.monotonic() - self._last_check_time)
+      if diff < 60:
+        return 'now'
+      if diff < 3600:
+        m = diff // 60
+        return f'{m} minute{"s" if m != 1 else ""} ago'
+      if diff < 86400:
+        h = diff // 3600
+        return f'{h} hour{"s" if h != 1 else ""} ago'
+      d = diff // 86400
+      return f'{d} day{"s" if d != 1 else ""} ago'
 
     def show(self):
       for model_type in MODEL_TYPE_LABELS:
         self._model_cache[model_type] = _list_models(model_type)
         _, active_name = _read_active(model_type)
         self._model_btns[model_type].action_item.set_value(active_name)
+      # Refresh "last checked" relative time
+      self._set_status(f'up to date, last checked {self._time_ago()}')
 
     def update(self):
       if self._check_proc is not None and self._check_proc.poll() is not None:
@@ -249,7 +269,7 @@ def on_software_settings_extend(default, layout):
       if self._check_proc is not None and self._check_proc.poll() is None:
         return
 
-      self._set_status('checking')
+      self._set_status('checking...')
       self._new_models_btn.action_item.set_enabled(False)
 
       self._check_proc = subprocess.Popen(
@@ -273,8 +293,9 @@ def on_software_settings_extend(default, layout):
         return
 
       total = updates.get('total', 0)
+      self._last_check_time = time.monotonic()
       if total == 0:
-        self._set_status('up to date')
+        self._set_status('up to date, last checked now')
         return
 
       TYPE_PREFIX = {'driving': 'Driving', 'dm': 'DM'}

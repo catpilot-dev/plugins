@@ -3,9 +3,11 @@
 Runtime driving feature tuning is in the Driving panel.
 """
 import json
+import math
 import os
 import subprocess
 import threading
+import time
 
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget, DialogResult
@@ -40,23 +42,27 @@ class _PluginEntry:
 class PluginsLayout(Widget):
   def __init__(self):
     super().__init__()
-    self._scroller = None
     self._entries = []
-    self._needs_rebuild = True
 
     # Update state
-    self._update_status = ''  # status text shown next to button
-    self._update_btn_text = 'CHECK'
-    self._update_enabled = True
     self._update_commits_behind = 0
     self._show_reboot = False
+    self._last_check_time = None  # monotonic timestamp of last successful check
+    self._check_state = 'idle'  # idle, checking, checked, failed, updating, updated, update_failed
+    self._cached_hash = None  # cached git hash, computed once
+
     self._update_btn = button_item(
       'Plugin Updates',
-      lambda: self._update_btn_text,
-      description=lambda: self._update_status or self._get_current_hash(),
+      'CHECK',
       callback=self._on_update_click,
-      enabled=lambda: self._update_enabled,
     )
+
+    # Fix float32 truncation: ceil + extra padding for rl.Rectangle precision loss
+    _orig_hint = self._update_btn.action_item.get_width_hint
+    self._update_btn.action_item.get_width_hint = lambda: math.ceil(_orig_hint()) + 10
+
+    # Build scroller once (like Software panel)
+    self._scroller = self._build_scroller()
 
   def _scan_plugins(self):
     """Scan /data/plugins-runtime/ for plugin manifests, return sorted list of _PluginEntry."""
@@ -100,14 +106,16 @@ class PluginsLayout(Widget):
     return entries
 
   def _get_current_hash(self):
-    """Return short hash of currently installed plugins commit."""
-    try:
-      return subprocess.check_output(
-        ['git', '-C', PLUGINS_REPO, 'rev-parse', '--short', 'HEAD'],
-        stderr=subprocess.DEVNULL, timeout=5,
-      ).decode().strip()
-    except Exception:
-      return ''
+    """Return short hash of currently installed plugins commit (cached)."""
+    if self._cached_hash is None:
+      try:
+        self._cached_hash = subprocess.check_output(
+          ['git', '-C', PLUGINS_REPO, 'rev-parse', '--short', 'HEAD'],
+          stderr=subprocess.DEVNULL, timeout=5,
+        ).decode().strip()
+      except Exception:
+        self._cached_hash = ''
+    return self._cached_hash
 
   @staticmethod
   def _get_target_branch():
@@ -128,14 +136,27 @@ class PluginsLayout(Widget):
       return 'main'
 
   def _on_update_click(self):
-    if self._update_btn_text == 'CHECK':
-      self._update_enabled = False
-      self._update_status = 'checking...'
+    if self._check_state in ('idle', 'checked', 'failed', 'update_failed'):
+      self._check_state = 'checking'
       threading.Thread(target=self._check_update, daemon=True).start()
-    elif self._update_btn_text == 'UPDATE':
-      self._update_enabled = False
-      self._update_status = 'updating...'
+    elif self._check_state == 'available':
+      self._check_state = 'updating'
       threading.Thread(target=self._apply_update, daemon=True).start()
+
+  def _time_ago(self):
+    if self._last_check_time is None:
+      return 'never'
+    diff = int(time.monotonic() - self._last_check_time)
+    if diff < 60:
+      return 'now'
+    if diff < 3600:
+      m = diff // 60
+      return f'{m} minute{"s" if m != 1 else ""} ago'
+    if diff < 86400:
+      h = diff // 3600
+      return f'{h} hour{"s" if h != 1 else ""} ago'
+    d = diff // 86400
+    return f'{d} day{"s" if d != 1 else ""} ago'
 
   def _check_update(self):
     try:
@@ -151,17 +172,10 @@ class PluginsLayout(Widget):
       ).decode().strip()
       n = int(behind)
       self._update_commits_behind = n
-      if n > 0:
-        self._update_btn_text = 'UPDATE'
-        self._update_status = f'{n} new commit{"s" if n != 1 else ""} available'
-      else:
-        self._update_btn_text = 'CHECK'
-        self._update_status = 'up to date'
-      self._update_enabled = True
+      self._last_check_time = time.monotonic()
+      self._check_state = 'available' if n > 0 else 'checked'
     except Exception:
-      self._update_btn_text = 'CHECK'
-      self._update_status = 'check failed'
-      self._update_enabled = True
+      self._check_state = 'failed'
 
   def _apply_update(self):
     try:
@@ -179,18 +193,14 @@ class PluginsLayout(Widget):
         os.remove(BUILD_HASH_FILE)
       except FileNotFoundError:
         pass
-      self._update_btn_text = 'CHECK'
-      self._update_status = 'updated, reboot to apply'
-      self._update_enabled = False
-      self._needs_rebuild = True
+      self._cached_hash = None  # invalidate cached hash
+      self._check_state = 'updated'
       self._show_reboot = True
     except Exception:
-      self._update_btn_text = 'CHECK'
-      self._update_status = 'update failed'
-      self._update_enabled = True
+      self._check_state = 'update_failed'
 
   def _build_scroller(self):
-    """Build widget list from plugin entries."""
+    """Build widget list from plugin entries and return Scroller."""
     self._entries = self._scan_plugins()
     items = []
 
@@ -208,7 +218,7 @@ class PluginsLayout(Widget):
       )
       items.append(header)
 
-    self._scroller = Scroller(items, line_separator=True, spacing=0)
+    return Scroller(items, line_separator=True, spacing=0)
 
   def _toggle_plugin(self, state, entry):
     """Enable/disable a plugin via .disabled marker."""
@@ -237,23 +247,52 @@ class PluginsLayout(Widget):
     dlg = ConfirmDialog('Reboot required to apply changes.', 'OK', cancel_text='')
     gui_app.set_modal_overlay(dlg, callback=lambda _: None)
 
-    self._needs_rebuild = True
-
   def show_event(self):
     super().show_event()
-    self._needs_rebuild = True
+    self._scroller.show_event()
+
+  def _update_state(self):
+    btn = self._update_btn
+    if self._check_state == 'checking':
+      btn.action_item.set_value('checking...')
+      btn.action_item.set_text('CHECK')
+      btn.action_item.set_enabled(False)
+    elif self._check_state == 'updating':
+      btn.action_item.set_value('updating...')
+      btn.action_item.set_text('UPDATE')
+      btn.action_item.set_enabled(False)
+    elif self._check_state == 'available':
+      n = self._update_commits_behind
+      btn.action_item.set_value(f'{n} new commit{"s" if n != 1 else ""} available')
+      btn.action_item.set_text('UPDATE')
+      btn.action_item.set_enabled(True)
+    elif self._check_state == 'checked':
+      btn.action_item.set_value(f'up to date, last checked {self._time_ago()}')
+      btn.action_item.set_text('CHECK')
+      btn.action_item.set_enabled(True)
+    elif self._check_state == 'failed':
+      btn.action_item.set_value('check failed')
+      btn.action_item.set_text('CHECK')
+      btn.action_item.set_enabled(True)
+    elif self._check_state == 'updated':
+      btn.action_item.set_value('updated, reboot to apply')
+      btn.action_item.set_text('CHECK')
+      btn.action_item.set_enabled(False)
+    elif self._check_state == 'update_failed':
+      btn.action_item.set_value('update failed')
+      btn.action_item.set_text('CHECK')
+      btn.action_item.set_enabled(True)
+    else:
+      btn.action_item.set_value('up to date, last checked never')
+      btn.action_item.set_text('CHECK')
+      btn.action_item.set_enabled(True)
 
   def _render(self, rect):
     if self._show_reboot:
       self._show_reboot = False
       self._prompt_reboot()
 
-    if self._needs_rebuild:
-      self._build_scroller()
-      self._needs_rebuild = False
-
-    if self._scroller:
-      self._scroller.render(rect)
+    self._scroller.render(rect)
 
   def _prompt_reboot(self):
     def _on_reboot(result):

@@ -19,8 +19,8 @@ from openpilot.system.ui.widgets.network import NetworkUI
 
 # Constants
 SIDEBAR_WIDTH = 500
-CLOSE_BTN_SIZE = 200
-CLOSE_ICON_SIZE = 70
+CLOSE_BTN_SIZE = 150
+CLOSE_ICON_SIZE = 55
 NAV_BTN_HEIGHT = 110
 PANEL_MARGIN = 50
 
@@ -93,9 +93,9 @@ class SettingsLayout(Widget):
   def _draw_sidebar(self, rect: rl.Rectangle):
     rl.draw_rectangle_rec(rect, SIDEBAR_COLOR)
 
-    # Close button
+    # Close button (compact)
     close_btn_rect = rl.Rectangle(
-      rect.x + (rect.width - CLOSE_BTN_SIZE) / 2, rect.y + 60, CLOSE_BTN_SIZE, CLOSE_BTN_SIZE
+      rect.x + (rect.width - CLOSE_BTN_SIZE) / 2, rect.y + 45, CLOSE_BTN_SIZE, CLOSE_BTN_SIZE
     )
 
     pressed = (rl.is_mouse_button_down(rl.MouseButton.MOUSE_BUTTON_LEFT) and
@@ -123,7 +123,7 @@ class SettingsLayout(Widget):
     self._close_btn_rect = close_btn_rect
 
     # Navigation buttons
-    y = rect.y + 300
+    y = rect.y + 220
     for panel_type, panel_info in self._panels.items():
       button_rect = rl.Rectangle(rect.x + 50, y, rect.width - 150, NAV_BTN_HEIGHT)
 
