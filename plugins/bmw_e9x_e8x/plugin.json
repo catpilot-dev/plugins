@@ -1,0 +1,78 @@
+{
+  "id": "bmw-e9x-e8x",
+  "name": "BMW E9x/E8x Car Interface",
+  "version": "1.0.0",
+  "type": "car",
+  "author": "c3pilot",
+  "description": "BMW E9x/E8x car interface with VIN-based detection, DCC control, and stepper servo steering. Safety model (bmw.h) is compiled C on STM32.",
+  "min_openpilot": "0.10.0",
+  "max_openpilot": "0.10.99",
+  "conflicts": [],
+  "dependencies": [],
+  "params": {
+    "CruiseCeilingMemory": {
+      "default": true,
+      "description": "Remember cruise speed ceiling across disengage/re-engage within same drive"
+    },
+    "ConsecutiveLaneChange": {
+      "default": true,
+      "description": "Press steering button during lane change to chain consecutive lane changes"
+    },
+    "TemperatureOverlay": {
+      "default": true,
+      "description": "Show coolant and oil temperature on the onroad HUD"
+    }
+  },
+  "cereal": {
+    "safety_models": {
+      "bmw": 35
+    }
+  },
+  "hooks": {
+    "torqued.allowed_cars": {
+      "module": "register",
+      "function": "on_torqued_allowed_cars",
+      "priority": 50
+    },
+    "controls.post_actuators": {
+      "module": "register",
+      "function": "on_post_actuators",
+      "priority": 50
+    },
+    "car.cruise_initialized": {
+      "module": "register",
+      "function": "on_cruise_initialized",
+      "priority": 50
+    },
+    "ui.vehicle_settings": {
+      "module": "register",
+      "function": "on_vehicle_settings",
+      "priority": 50
+    },
+    "desire.pre_lane_change": {
+      "module": "register",
+      "function": "on_pre_lane_change",
+      "priority": 50
+    },
+    "desire.post_lane_change": {
+      "module": "register",
+      "function": "on_post_lane_change",
+      "priority": 50
+    },
+    "desire.post_update": {
+      "module": "register",
+      "function": "on_desire_post_update",
+      "priority": 50
+    },
+    "ui.state_subscriptions": {
+      "module": "register",
+      "function": "on_state_subscriptions",
+      "priority": 50
+    },
+    "ui.render_overlay": {
+      "module": "ui_overlay",
+      "function": "on_render_overlay",
+      "priority": 50
+    }
+  }
+}
