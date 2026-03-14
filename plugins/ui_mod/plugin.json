@@ -1,0 +1,30 @@
+{
+  "id": "ui_mod",
+  "name": "UI Customizations",
+  "version": "1.0.0",
+  "type": "hook",
+  "author": "c3pilot",
+  "description": "Drive stats, branded exp button, driving/vehicle/plugins panels",
+  "hooks": {
+    "ui.settings_extend": {
+      "module": "hooks",
+      "function": "on_settings_extend"
+    },
+    "ui.home_extend": {
+      "module": "hooks",
+      "function": "on_home_extend"
+    },
+    "ui.main_extend": {
+      "module": "hooks",
+      "function": "on_main_extend"
+    },
+    "ui.state_tick": {
+      "module": "hooks",
+      "function": "on_state_tick"
+    },
+    "ui.onroad_exp_button": {
+      "module": "hooks",
+      "function": "on_exp_button"
+    }
+  }
+}
