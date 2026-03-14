@@ -1,0 +1,29 @@
+{
+  "id": "bus_logger",
+  "name": "Plugin Bus Logger",
+  "version": "1.0.0",
+  "type": "daemon",
+  "author": "c3pilot",
+  "description": "Logs all plugin bus messages to cereal for rlog capture and debugging.",
+  "min_openpilot": "0.10.0",
+  "max_openpilot": "0.10.99",
+  "cereal": {
+    "slots": {
+      "1": {
+        "struct_name": "PluginBusLog",
+        "event_field": "pluginBusLog",
+        "schema_file": "cereal/slot1.capnp"
+      }
+    }
+  },
+  "services": {
+    "pluginBusLog": [true, 5.0, 1]
+  },
+  "processes": [
+    {
+      "name": "bus_logger",
+      "module": "bus_logger",
+      "condition": "only_onroad"
+    }
+  ]
+}
