@@ -1,0 +1,32 @@
+{
+  "id": "network-settings",
+  "name": "Network Settings",
+  "version": "1.0.0",
+  "type": "hybrid",
+  "author": "c3pilot",
+  "description": "Network proxy toggle with github.com connectivity check",
+  "min_openpilot": "0.10.0",
+  "max_openpilot": "0.10.99",
+  "device_filter": ["tici"],
+  "dependencies": [],
+  "conflicts": [],
+  "hooks": {
+    "manager.startup": {
+      "module": "proxy",
+      "function": "on_startup",
+      "priority": 10
+    },
+    "ui.network_settings_extend": {
+      "module": "ui",
+      "function": "on_network_settings_extend",
+      "priority": 50
+    }
+  },
+  "processes": [
+    {
+      "name": "github_pinger",
+      "module": "github_pinger",
+      "condition": "always_run"
+    }
+  ]
+}
