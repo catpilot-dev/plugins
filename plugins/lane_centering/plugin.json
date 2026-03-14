@@ -1,0 +1,18 @@
+{
+  "id": "lane-centering",
+  "name": "Lane Centering in Turns",
+  "version": "1.0.0",
+  "type": "hook",
+  "author": "c3pilot",
+  "description": "Adjusts steering curvature in turns to keep the car centered between lane lines using vision-based detection.",
+  "min_openpilot": "0.10.0",
+  "max_openpilot": "0.10.99",
+  "hooks": {
+    "controls.curvature_correction": {
+      "module": "correction",
+      "function": "on_curvature_correction",
+      "priority": 50
+    }
+  },
+  "params": {}
+}
