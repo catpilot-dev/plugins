@@ -1,0 +1,16 @@
+{
+  "id": "screen_capture",
+  "name": "Screen Capture",
+  "version": "1.0.0",
+  "type": "hook",
+  "hooks": {
+    "ui.pre_end_drawing": {
+      "module": "capture",
+      "function": "on_pre_end_drawing"
+    },
+    "ui.render_overlay": {
+      "module": "capture",
+      "function": "on_render_overlay"
+    }
+  }
+}
