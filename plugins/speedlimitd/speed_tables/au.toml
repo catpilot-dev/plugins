@@ -1,0 +1,30 @@
+# Australia — Australian Road Rules
+# Urban default 50, rural 100, motorway 110
+
+bbox = [-44, -10, 113, 154]  # [min_lat, max_lat, min_lon, max_lon]
+default_fallback = 50
+
+[urban]
+motorway      = { multi = 110, single = 110 }
+motorway_link = { multi = 60,  single = 60 }
+trunk         = { multi = 80,  single = 60 }
+trunk_link    = { multi = 40,  single = 40 }
+primary       = { multi = 60,  single = 60 }
+primary_link  = { multi = 40,  single = 40 }
+secondary     = { multi = 60,  single = 50 }
+tertiary      = { multi = 50,  single = 50 }
+residential   = { multi = 50,  single = 50 }
+unclassified  = { multi = 50,  single = 50 }
+living_street = { multi = 10,  single = 10 }
+service       = { multi = 20,  single = 20 }
+
+[nonurban]
+motorway      = { multi = 110, single = 110 }
+motorway_link = { multi = 80,  single = 60 }
+trunk         = { multi = 100, single = 100 }
+trunk_link    = { multi = 60,  single = 60 }
+primary       = { multi = 100, single = 100 }
+primary_link  = { multi = 60,  single = 60 }
+secondary     = { multi = 100, single = 80 }
+tertiary      = { multi = 80,  single = 80 }
+unclassified  = { multi = 100, single = 80 }

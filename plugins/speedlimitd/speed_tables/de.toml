@@ -1,0 +1,30 @@
+# Germany — StVO (Straßenverkehrs-Ordnung)
+# Urban default 50, rural 100, motorway advisory 130 (no limit)
+
+bbox = [47, 55, 6, 15]  # [min_lat, max_lat, min_lon, max_lon]
+default_fallback = 50
+
+[urban]
+motorway      = { multi = 130, single = 130 }
+motorway_link = { multi = 60,  single = 60 }
+trunk         = { multi = 70,  single = 50 }
+trunk_link    = { multi = 50,  single = 50 }
+primary       = { multi = 50,  single = 50 }
+primary_link  = { multi = 30,  single = 30 }
+secondary     = { multi = 50,  single = 50 }
+tertiary      = { multi = 50,  single = 50 }
+residential   = { multi = 30,  single = 30 }
+unclassified  = { multi = 50,  single = 50 }
+living_street = { multi = 20,  single = 20 }
+service       = { multi = 20,  single = 20 }
+
+[nonurban]
+motorway      = { multi = 130, single = 130 }
+motorway_link = { multi = 60,  single = 60 }
+trunk         = { multi = 100, single = 100 }
+trunk_link    = { multi = 60,  single = 60 }
+primary       = { multi = 100, single = 100 }
+primary_link  = { multi = 60,  single = 60 }
+secondary     = { multi = 100, single = 100 }
+tertiary      = { multi = 100, single = 100 }
+unclassified  = { multi = 100, single = 100 }
