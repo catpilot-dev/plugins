@@ -63,6 +63,12 @@ def on_state_tick(default, sm):
     _drive_tracker.tick(sm)
 
 
+def on_state_subscriptions(services):
+  if 'pluginBusLog' not in services:
+    services.append('pluginBusLog')
+  return services
+
+
 def on_exp_button(default, size, icon_size):
   from exp_button import ExpButton
   return ExpButton(size, icon_size)
