@@ -240,27 +240,21 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP):
+    # Always subscribe to both DCC and NCC cruise messages (with nan = no timeout).
+    # Fingerprinting may misclassify cruise type if the ECU is slow to wake;
+    # subscribing to both prevents canValid failures from unsubscribed messages
+    # being lazily accessed via vl[] in update().
     pt_messages = [
       ("TurnSignals", float('nan')),
+      ("DynamicCruiseControlStatus", float('nan')),
+      ("CruiseControlStatus", float('nan')),
+      ("CruiseControlStalk", float('nan')),
     ]
-    # $540 vehicle option could use just PT_CAN, but $544 requires sending
-    # and receiving cruise commands on F-CAN. Use F-CAN. Works for both options
-    fcan_messages = []
+    fcan_messages = [
+      ("CruiseControlStalk", float('nan')),
+      ("SteeringWheelAngle_DSC", float('nan')),
+    ]
     servo_can_messages = []
-
-    if CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
-      pt_messages += [
-        ("DynamicCruiseControlStatus", 5),
-      ]
-      fcan_messages += [
-        ("CruiseControlStalk", 5),
-        ("SteeringWheelAngle_DSC", 100),
-      ]
-    if CP.flags & BmwFlags.NORMAL_CRUISE_CONTROL:
-      pt_messages += [
-        ("CruiseControlStatus", 5),
-        ("CruiseControlStalk", float('nan')),
-      ]
 
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, CanBus.PT_CAN),

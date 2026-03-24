@@ -36,8 +36,14 @@ class CarInterface(CarInterfaceBase):
   def _get_params(ret, candidate, fingerprint, car_fw, alpha_long, is_release, docs):
     ret.brand = "bmw"
 
-    has_normal_cruise = 0x200 in fingerprint.get(CanBus.PT_CAN, {})
-    has_dynamic_cruise = 0x193 in fingerprint.get(CanBus.PT_CAN, {})
+    # Detect cruise type by ECU status messages first (authoritative),
+    # then fall back to stalk bus location if ECU is slow to wake.
+    #   NCC ($540): CruiseControlStatus 0x200 on PT_CAN
+    #   DCC ($544): CruiseControlStatus 0x193 on PT_CAN
+    # Stalk (0x194) can appear on both buses, so it's only used as fallback.
+    has_ncc_ecu = 0x200 in fingerprint.get(CanBus.PT_CAN, {})
+    has_dcc_ecu = 0x193 in fingerprint.get(CanBus.PT_CAN, {})
+    stalk_on_fcan = 0x194 in fingerprint.get(CanBus.F_CAN, {})
     has_ldm = 0x0D5 in fingerprint.get(CanBus.PT_CAN, {})
 
     if (0x22F in fingerprint.get(CanBus.SERVO_CAN, {}) or
@@ -49,9 +55,9 @@ class CarInterface(CarInterfaceBase):
     ret.pcmCruise = False
 
     ret.autoResumeSng = False
-    if has_normal_cruise:
+    if has_ncc_ecu:
       ret.flags |= BmwFlags.NORMAL_CRUISE_CONTROL.value
-    elif has_dynamic_cruise:
+    elif has_dcc_ecu or stalk_on_fcan:
       if not has_ldm:
         ret.flags |= BmwFlags.DYNAMIC_CRUISE_CONTROL.value
       else:
