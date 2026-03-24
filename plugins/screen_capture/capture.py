@@ -1,9 +1,19 @@
-"""Screen capture plugin — dim camera icon tap zone at bottom center."""
+"""Screen capture plugin — dim camera icon tap zone at bottom center.
+
+Offroad: saves PNG screenshot to /data/media/screenshots/ (GUI documentation).
+Onroad:  saves HUD PNG + sends bookmarkButton (→ userBookmark in rlog).
+         The PNG captures the full HUD overlay from the render texture.
+         COD shows it on the bookmark row for instant HUD frame export.
+"""
 import os
+import sys
+import threading
 import time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import MEDIA_DIR
 import pyray as rl
 
-SCREENSHOT_DIR = '/data/media/screenshots'
+SCREENSHOT_DIR = os.path.join(MEDIA_DIR, 'screenshots')
 TAP_W = 200
 TAP_H = 80
 FLASH_FRAMES = 2
@@ -20,6 +30,8 @@ _icon_x = 0
 _icon_y = 0
 _flash_remaining = 0
 _last_capture = 0.0
+_capture_pending = False   # set by pre_end_drawing, consumed by post_end_drawing
+_pm = None  # cereal PubMaster for bookmarkButton
 
 
 def _ensure_init():
@@ -60,38 +72,79 @@ def _draw_camera_icon(cx, cy, alpha):
     rl.draw_ring(rl.Vector2(cx, cy + 3), lens_r, lens_r + 3, 0, 360, 36, color)
 
 
-def _capture_from_texture():
-    """Capture screenshot from the render texture (complete frame, no UI overlay)."""
+def _is_onroad():
+    """Check if device is onroad via ui_state."""
+    try:
+        from openpilot.selfdrive.ui.ui_state import UIState
+        return UIState().started
+    except Exception:
+        return False
+
+
+def _write_png_bg(image, path):
+    """Background thread: encode and write PNG, then unload image."""
+    try:
+        rl.export_image(image, path)
+    finally:
+        rl.unload_image(image)
+
+
+def _save_png():
+    """Save PNG screenshot from the render texture. Returns filename or None.
+
+    Called from on_post_end_drawing (after end_drawing()), so GPU readback
+    does not block the current frame's completion.  PNG encoding and disk
+    write are handed off to a background thread.
+    """
     from openpilot.system.ui.lib.application import gui_app
     rt = gui_app._render_texture
     if rt is None:
-        return
+        return None
     ts = time.strftime('%Y%m%d_%H%M%S')
-    path = os.path.join(SCREENSHOT_DIR, f'capture_{ts}.png')
+    filename = f'capture_{ts}.png'
+    path = os.path.join(SCREENSHOT_DIR, filename)
+    # GPU readback — safe here because end_drawing() has already returned
     image = rl.load_image_from_texture(rt.texture)
     rl.image_flip_vertical(image)
-    rl.export_image(image, path)
-    rl.unload_image(image)
+    rl.image_format(image, rl.PIXELFORMAT_UNCOMPRESSED_R8G8B8)
+    # Encode + write off the render thread
+    threading.Thread(target=_write_png_bg, args=(image, path), daemon=True).start()
+    return filename
+
+
+def _send_bookmark():
+    """Send bookmarkButton event → feedbackd → userBookmark in rlog."""
+    global _pm
+    try:
+        if _pm is None:
+            from cereal import messaging
+            _pm = messaging.PubMaster(['bookmarkButton'])
+        from cereal import messaging
+        msg = messaging.new_message('bookmarkButton')
+        msg.valid = True
+        _pm.send('bookmarkButton', msg)
+    except Exception:
+        pass
 
 
 def on_pre_end_drawing(default):
-    """Draw camera icon, detect taps, capture from render texture."""
-    global _flash_remaining, _last_capture
+    """Draw camera icon + flash overlay; record tap intent for post_end_drawing."""
+    global _flash_remaining, _last_capture, _capture_pending
     _ensure_init()
 
     from openpilot.system.ui.lib.application import gui_app
 
-    # Draw dim camera icon (on screen buffer, won't appear in captures)
+    # Draw dim camera icon (screen buffer only — won't appear in render texture)
     _draw_camera_icon(_icon_x, _icon_y, ICON_ALPHA)
 
-    # Check for tap in zone
+    # Detect tap — set flag for post_end_drawing to act on
     now = time.monotonic()
     if now - _last_capture > COOLDOWN:
         for ev in gui_app.mouse_events:
             if ev.left_released and rl.check_collision_point_rec(
                 rl.Vector2(ev.pos.x, ev.pos.y), _tap_rect
             ):
-                _capture_from_texture()
+                _capture_pending = True
                 _flash_remaining = FLASH_FRAMES
                 _last_capture = now
                 break
@@ -101,6 +154,19 @@ def on_pre_end_drawing(default):
         rl.draw_rectangle(0, 0, gui_app.width, gui_app.height,
                           rl.Color(255, 255, 255, 60))
         _flash_remaining -= 1
+
+
+def on_post_end_drawing(default):
+    """GPU readback + bookmark — runs after end_drawing() to avoid blocking the frame."""
+    global _capture_pending
+    if not _capture_pending:
+        return
+    _capture_pending = False
+
+    _save_png()
+
+    if _is_onroad():
+        _send_bookmark()
 
 
 def on_render_overlay(default, content_rect):

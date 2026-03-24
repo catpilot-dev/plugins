@@ -8,6 +8,10 @@
       "module": "capture",
       "function": "on_pre_end_drawing"
     },
+    "ui.post_end_drawing": {
+      "module": "capture",
+      "function": "on_post_end_drawing"
+    },
     "ui.render_overlay": {
       "module": "capture",
       "function": "on_render_overlay"
