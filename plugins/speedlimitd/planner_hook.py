@@ -8,16 +8,9 @@ LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
 
 
 def _effective_offset_percent(speed_limit_kph):
-  """Tiered offset: generous at low limits (comfort), strict at high limits (tickets).
-
-  Low speed limits (≤50 kph) are often turns, residential streets, or construction
-  zones where real traffic flows well above the posted limit. Enforcement is rare.
-  High speed limits are highways where speed cameras and enforcement are strict.
-  """
-  if speed_limit_kph <= 50:
-    return 40
-  elif speed_limit_kph <= 60:
-    return 30
+  """Tiered offset: +15% for limits < 80 km/h, +10% for limits >= 80 km/h."""
+  if speed_limit_kph < 80:
+    return 15
   else:
     return 10
 

@@ -17,7 +17,6 @@ SPEED_SIGN_RADIUS_IMPERIAL = 86   # diameter 172 = imperial MAX width
 SPEED_SIGN_BORDER_RATIO = 0.1     # red ring = 1/10 diameter (Vienna Convention)
 SPEED_SIGN_GAP = 30               # vertical gap between MAX block bottom and sign top
 SPEED_SIGN_FONT_SIZE = 84
-SOURCE_LABELS = {0: "OSM", 1: "SIGN", 2: "~"}
 
 # MAX block layout (mirrors hud_renderer.py UIConfig)
 _MAX_X_OFFSET = 60
@@ -129,17 +128,6 @@ def _draw_speed_limit_sign(content_rect):
     text_color,
   )
 
-  # Source indicator below the sign
-  source_label = SOURCE_LABELS.get(_speed_limit_source, "?")
-  source_size = measure_text_cached(_font_medium, source_label, 36)
-  rl.draw_text_ex(
-    _font_medium,
-    source_label,
-    rl.Vector2(cx - source_size.x / 2, cy + r + 10),
-    36,
-    0,
-    rl.Color(200, 200, 200, alpha),
-  )
 
 
 _tap_pub = None

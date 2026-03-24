@@ -11,9 +11,11 @@
   highwayType @7 :Text;           # motorway/trunk/primary/...
   roadName @8 :Text;
   laneCount @9 :UInt8;
+  mapdSuggested @10 :UInt16;      # mapd suggestedSpeed in km/h (0 = unavailable)
 
   enum Source {
     osmMaxspeed @0;
     yoloDetection @1;
     roadTypeInference @2;
+    mapdSuggested @3;
   }

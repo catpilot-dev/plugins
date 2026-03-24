@@ -6,7 +6,10 @@ lifecycle — that's managed in the Plugins panel.
 """
 import json
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from config import PLUGINS_RUNTIME_DIR, read_plugin_param, write_plugin_param, write_param
 from cereal import log
 from openpilot.common.params import Params
 from openpilot.system.ui.widgets import Widget
@@ -15,7 +18,7 @@ from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.selfdrive.ui.ui_state import ui_state
 
-PLUGINS_DIR = '/data/plugins-runtime'
+PLUGINS_DIR = PLUGINS_RUNTIME_DIR
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
 LAT_ACCEL_VALUES = [1.5, 2.0, 2.5, 3.0]   # m/s² — indexed by pill selection
@@ -26,47 +29,27 @@ def _plugin_enabled(plugin_id):
           not os.path.exists(os.path.join(PLUGINS_DIR, plugin_id, '.disabled')))
 
 
-def _plugin_param_path(plugin_id, key):
-  return os.path.join(PLUGINS_DIR, plugin_id, 'data', key)
-
-
-def _read_plugin_param(plugin_id, key):
-  try:
-    with open(_plugin_param_path(plugin_id, key)) as f:
-      return f.read().strip()
-  except (FileNotFoundError, OSError):
-    return ''
-
-
-def _write_plugin_param(plugin_id, key, value):
-  data_dir = os.path.join(PLUGINS_DIR, plugin_id, 'data')
-  os.makedirs(data_dir, exist_ok=True)
-  with open(os.path.join(data_dir, key), 'w') as f:
-    f.write(value)
 
 
 def _sync_mapd_settings():
   """Regenerate MapdSettings JSON for mapd Go binary (/data/params/d/)."""
-  enabled = _read_plugin_param('speedlimitd', 'MapdSpeedLimitControlEnabled') == '1'
+  enabled = read_plugin_param('speedlimitd', 'MapdSpeedLimitControlEnabled') == '1'
 
   try:
-    lat_idx = int(_read_plugin_param('speedlimitd', 'MapdCurveTargetLatAccel') or '0')
+    lat_idx = int(read_plugin_param('speedlimitd', 'MapdCurveTargetLatAccel') or '0')
   except ValueError:
     lat_idx = 0
   lat_accel = LAT_ACCEL_VALUES[lat_idx] if 0 <= lat_idx < len(LAT_ACCEL_VALUES) else 1.5
 
   settings = {
     'speed_limit_control_enabled': enabled,
-    'map_curve_speed_control_enabled': enabled,
-    'vision_curve_speed_control_enabled': enabled,
-    'speed_limit_offset': 0.10,  # not used — tiered offset in planner_hook
+    'map_curve_speed_control_enabled': True,   # always on — placeholder for future OSM curve data
+    'vision_curve_speed_control_enabled': True, # always on — toggle removed by design
+    'speed_limit_offset': 0.0,   # no offset — planner_hook applies tiered offset
     'map_curve_target_lat_a': lat_accel,
     'vision_curve_target_lat_a': lat_accel,
   }
-  # MapdSettings goes to /data/params/d/ — mapd Go binary reads it there
-  os.makedirs('/data/params/d', exist_ok=True)
-  with open('/data/params/d/MapdSettings', 'w') as f:
-    f.write(json.dumps(settings))
+  write_param('MapdSettings', json.dumps(settings))
 
 
 class DrivingLayout(Widget):
@@ -94,7 +77,7 @@ class DrivingLayout(Widget):
 
     # --- Lane Centering in Turns (if plugin enabled) ---
     if _plugin_enabled('lane_centering'):
-      current = _read_plugin_param('lane_centering', 'LaneCenteringEnabled') != '0'
+      current = read_plugin_param('lane_centering', 'LaneCenteringEnabled') != '0'
       self._lane_centering = toggle_item(
         "Lane Centering in Turns",
         "Adjusts steering curvature in turns to keep the car centered between lane lines.",
@@ -106,7 +89,7 @@ class DrivingLayout(Widget):
     # --- Speedlimitd items (if plugin enabled) ---
     if _plugin_enabled('speedlimitd'):
       # Conditional Speed Control
-      map_speed_enabled = _read_plugin_param('speedlimitd', 'MapdSpeedLimitControlEnabled') == '1'
+      map_speed_enabled = read_plugin_param('speedlimitd', 'MapdSpeedLimitControlEnabled') == '1'
       self._map_speed = toggle_item(
         "Conditional Speed Control",
         "Limit cruise speed to detected speed limit when confirmed.",
@@ -117,7 +100,7 @@ class DrivingLayout(Widget):
       items.append(self._map_speed)
 
       # Curve Comfort (depends on Conditional Speed Control)
-      current_curve = _read_plugin_param('speedlimitd', 'MapdCurveTargetLatAccel')
+      current_curve = read_plugin_param('speedlimitd', 'MapdCurveTargetLatAccel')
       try:
         curve_idx = int(current_curve) if current_curve else 0
       except ValueError:
@@ -130,7 +113,7 @@ class DrivingLayout(Widget):
         button_width=150,
         callback=self._on_curve_comfort,
       )
-      self._curve_comfort.set_visible(lambda: _read_plugin_param('speedlimitd', 'MapdSpeedLimitControlEnabled') == '1')
+      self._curve_comfort.set_visible(lambda: read_plugin_param('speedlimitd', 'MapdSpeedLimitControlEnabled') == '1')
       items.append(self._curve_comfort)
 
     self._scroller = Scroller(items, line_separator=True, spacing=0)
@@ -139,14 +122,14 @@ class DrivingLayout(Widget):
     self._params.put("LongitudinalPersonality", button_index)
 
   def _on_lane_centering(self, state):
-    _write_plugin_param('lane_centering', 'LaneCenteringEnabled', '1' if state else '0')
+    write_plugin_param('lane_centering', 'LaneCenteringEnabled', '1' if state else '0')
 
   def _on_map_speed(self, state):
-    _write_plugin_param('speedlimitd', 'MapdSpeedLimitControlEnabled', '1' if state else '0')
+    write_plugin_param('speedlimitd', 'MapdSpeedLimitControlEnabled', '1' if state else '0')
     _sync_mapd_settings()
 
   def _on_curve_comfort(self, idx):
-    _write_plugin_param('speedlimitd', 'MapdCurveTargetLatAccel', str(idx))
+    write_plugin_param('speedlimitd', 'MapdCurveTargetLatAccel', str(idx))
     _sync_mapd_settings()
 
   def _update_state(self):

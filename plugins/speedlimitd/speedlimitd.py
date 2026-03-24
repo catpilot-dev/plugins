@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Speed Limit Middleware — merges OSM, YOLO, and road-type inference
+Speed Limit Middleware — merges mapd, YOLO, and road-type inference
 into a single SpeedLimitState message at 5 Hz.
 
 Three-tier priority:
-  1. OSM maxspeed tag (highest confidence)
-  2. YOLO speed sign detection (event-driven)
-  3. Road type + lane count inference (always available)
+  1. YOLO speed sign detection (direct sign reading, highest confidence)
+  2. mapd suggestedSpeed (comprehensive: visionCurveSpeed + speed limit + road type)
+  3. Vision-inferred speed (lane count + road type, own fallback when mapd has no data)
 """
 import os
 import time
@@ -61,6 +61,19 @@ def country_from_gps(lat: float, lon: float, bboxes: list) -> str | None:
 # Default to China; overridden by GPS auto-detection at runtime
 SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED = load_speed_table('cn')
 
+# Standard speed limit values used in China (GB 5768)
+_STANDARD_SPEEDS = [30, 40, 60, 80, 100, 120]
+
+
+def snap_to_standard_speed(speed: int) -> int:
+  """Snap a computed speed to the nearest standard speed limit value.
+
+  mapd visionCurveSpeed produces raw values like 47, 75, 83 km/h.
+  Speed limit signs always display standard values, so we snap for
+  clean display and consistent planner behaviour.
+  """
+  return min(_STANDARD_SPEEDS, key=lambda s: abs(s - speed))
+
 
 def infer_lane_count(model_msg) -> int:
   """Infer lane count from modelV2 laneLineProbs and roadEdges.
@@ -112,8 +125,11 @@ def vision_speed_cap(model_msg) -> int:
   if inner_confident == 0:
     return 0  # not confident enough
 
-  # Count all visible lines at normal threshold
-  visible_lines = sum(1 for p in probs if p > 0.3)
+  # Count visible lines: inner pair at 0.3, outer pair (indices 0, 3) at 0.5.
+  # The higher outer threshold prevents faint echoes of an adjacent main road
+  # from counting as a visible lane when entering a link/ramp.
+  visible_lines = sum(1 for i, p in enumerate(probs)
+                      if p > (0.5 if i in (0, 3) else 0.3))
 
   if inner_confident >= 2 and visible_lines <= 2:
     return 40  # 2 lanes — link/ramp
@@ -125,10 +141,18 @@ def vision_speed_cap(model_msg) -> int:
 def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context: str) -> int:
   """Look up fallback speed from road context + highway type + lane count.
 
-  Lane count can promote highway type: a 4-lane "secondary" road is
-  effectively trunk-grade. Wider roads → higher class.
+  For narrow roads (≤2 lanes), vision cannot distinguish a through road from
+  a link/ramp, so road-type tables are not used — speed is derived directly
+  from lane count: 2 lanes → 40 km/h, 1 lane → 30 km/h.
+
+  For wider roads (≥3 lanes), lane count infers road class and the
+  appropriate speed table is consulted.
   """
-  lane_key = 'multi' if lane_count >= 2 else 'single'
+  # Narrow roads: use lane count directly, skip table lookup
+  if lane_count <= 1:
+    return 30
+  if lane_count == 2:
+    return 40
 
   # Secondary and below are almost never nonurban high-speed roads (especially
   # in China). Override mapd's roadContext to urban when highway type is low.
@@ -141,25 +165,31 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
   else:
     table = SPEED_TABLE_URBAN
 
-  # Infer road class from lane count
-  if lane_count >= 6:
-    lane_class = 'motorway'
+  # Infer road class from lane count.
+  # Motorway requires freeway context — a 4-lane urban arterial (e.g. 中环路) is trunk, not motorway.
+  # Only freeways (expressways with controlled access) can be motorway-grade.
+  if lane_count >= 4:
+    lane_class = 'motorway' if road_context == 'freeway' else 'trunk'
   elif lane_count >= 3:
-    lane_class = 'trunk'
-  elif lane_count >= 2:
-    lane_class = 'primary'
+    lane_class = 'trunk' if road_context == 'freeway' else 'primary'
   else:
     lane_class = ''
 
-  # Use the higher class between highway type and lane-count inference
-  rank = {'motorway': 4, 'trunk': 3, 'primary': 2, 'secondary': 1, 'tertiary': 0}
-  hw_rank = rank.get(highway_type, -1)
-  lane_rank = rank.get(lane_class, -1)
-  effective_type = lane_class if lane_rank > hw_rank else highway_type
+  # When highway type comes from a known G/S expressway ref, trust it directly —
+  # don't let lane count promote beyond the ref classification.
+  # For inferred/lower types (secondary, primary, etc.), lane-count promotion still applies.
+  EXPRESSWAY_REFS = {'motorway', 'trunk'}
+  if highway_type in EXPRESSWAY_REFS:
+    effective_type = highway_type
+  else:
+    rank = {'motorway': 4, 'trunk': 3, 'primary': 2, 'secondary': 1, 'tertiary': 0}
+    hw_rank = rank.get(highway_type, -1)
+    lane_rank = rank.get(lane_class, -1)
+    effective_type = lane_class if lane_rank > hw_rank else highway_type
 
   entry = table.get(effective_type)
   if entry:
-    return entry[lane_key]
+    return entry['multi']  # lane_count >= 3, always multi-lane
 
   return DEFAULT_FALLBACK_SPEED
 
@@ -174,14 +204,19 @@ class SpeedLimitMiddleware:
 
     # State
     self.last_osm_speed: float = 0.0
+    self.last_mapd_suggested: float = 0.0   # mapd suggestedSpeed (comprehensive)
     self.last_yolo_speed: float = 0.0
     self.last_highway_type: str = ''
     self.last_road_name: str = ''
+    self.last_road_id: str = ''        # roadName or wayRef — stable road identity
     self.last_road_context: str = 'unknown'
+    self.last_way_ref: str = ''
     self.osm_lanes: int = 0
     self.lane_count: int = 1
     self.lane_count_stable: int = 1
     self.lane_count_stable_since: float = 0.0
+    self.lane_count_locked: bool = False  # True once vision has a 2 s stable reading
+    self.lane_conf: float = 0.0           # smoothed lane line confidence (0.0–1.0)
     self.vision_cap: int = 0
     self.vision_cap_stable: int = 0
     self.vision_cap_stable_since: float = 0.0
@@ -220,11 +255,12 @@ class SpeedLimitMiddleware:
             pass
         self.country_detected = True
 
-    # --- Read OSM data from mapdOut ---
+    # --- Read mapd data ---
     if self.sm.updated['mapdOut']:
       mapd = self.sm['mapdOut']
-      # mapd publishes speedLimit in m/s, convert to km/h
+      # mapd publishes speeds in m/s, convert to km/h
       self.last_osm_speed = mapd.speedLimit * 3.6 if mapd.speedLimit > 0 else 0.0
+      self.last_mapd_suggested = mapd.suggestedSpeed * 3.6 if mapd.suggestedSpeed > 0 else 0.0
       self.last_road_name = mapd.roadName
 
       # Road context from mapd (0=freeway, 1=city)
@@ -237,36 +273,63 @@ class SpeedLimitMiddleware:
         self.last_road_context = 'unknown'
 
       self.osm_lanes = mapd.lanes
+      self.last_way_ref = mapd.wayRef
 
-      # Infer highway type from wayRef (China: G=national, S=provincial, X=county)
-      self.last_highway_type = ''
+      # Highway type from wayRef — only expressway-grade refs are reliable.
+      # G (national expressway) → motorway (120 km/h), S (provincial expressway) → trunk (100 km/h).
+      # Lower-grade refs (X=county, etc.) are ignored: GPS cannot distinguish
+      # an elevated expressway from the ground-level road beneath it when they
+      # share the same name, so county-road classification is left to vision
+      # lane count which reads the actual road geometry.
       way_ref = mapd.wayRef
-      if way_ref:
-        if way_ref.startswith('G'):
-          self.last_highway_type = 'trunk'
-        elif way_ref.startswith('S'):
-          self.last_highway_type = 'primary'
-        elif way_ref.startswith('X'):
-          self.last_highway_type = 'secondary'
+      road_id = mapd.roadName or way_ref
+      if road_id:
+        hw = ''
+        if way_ref:
+          if way_ref.startswith('G'):
+            hw = 'motorway'   # national expressway — 120 km/h
+          elif way_ref.startswith('S'):
+            hw = 'trunk'      # provincial expressway — 100 km/h
+        hw_rank = {'motorway': 4, 'trunk': 3}
+        if road_id != self.last_road_id:
+          self.last_road_id = road_id
+          self.last_highway_type = hw
+        elif hw_rank.get(hw, -1) > hw_rank.get(self.last_highway_type, -1):
+          # Same road, higher-rank ref seen — promote (never demote)
+          self.last_highway_type = hw
 
     # --- Read lane data from vision model ---
     if self.sm.updated['modelV2']:
       model = self.sm['modelV2']
       raw_lane_count = infer_lane_count(model)
 
-      # Require stable lane detection for 2+ seconds
+      # Directional hysteresis: fast to promote (2 s), slow to demote (5 s).
+      # Once vision confirms a wide road, a brief occlusion won't drop the count.
       if raw_lane_count != self.lane_count:
         self.lane_count = raw_lane_count
         self.lane_count_stable_since = now
-      elif now - self.lane_count_stable_since > 2.0:
-        self.lane_count_stable = self.lane_count
+      else:
+        going_down = raw_lane_count < self.lane_count_stable
+        stability_window = 5.0 if going_down else 2.0
+        if now - self.lane_count_stable_since > stability_window:
+          self.lane_count_stable = self.lane_count
+          self.lane_count_locked = True
+
+      # Lane line confidence: sum of all probs divided by line count.
+      # Scales with both the number of visible lines and their individual strength.
+      probs = list(model.laneLineProbs) if hasattr(model, 'laneLineProbs') else []
+      if probs:
+        raw_conf = sum(min(p, 1.0) for p in probs) / len(probs)
+        # Exponential smoothing (α=0.2) — fast enough to track real changes,
+        # slow enough to suppress single-frame noise.
+        self.lane_conf = 0.8 * self.lane_conf + 0.2 * raw_conf
 
       # Vision speed cap for narrow roads (links/ramps)
       raw_cap = vision_speed_cap(model)
       if raw_cap != self.vision_cap:
         self.vision_cap = raw_cap
         self.vision_cap_stable_since = now
-      elif now - self.vision_cap_stable_since > 2.0:
+      elif now - self.vision_cap_stable_since > 1.0:
         self.vision_cap_stable = self.vision_cap
 
     # --- YOLO timeout ---
@@ -276,30 +339,50 @@ class SpeedLimitMiddleware:
     # --- Priority cascade ---
     osm_speed = round(self.last_osm_speed) if self.last_osm_speed > 0 else 0
     yolo_speed = self.yolo_speed
+
+    # Urban expressways without a G/S highway ref (like 中环路, 北翟高架路) are classified
+    # as 'freeway' by mapd but their actual speed limit is trunk-class (80 km/h), not
+    # motorway-class (120 km/h). Treat them as 'city' for inference.
+    road_ctx_for_infer = self.last_road_context
+    if not self.last_way_ref and road_ctx_for_infer == 'freeway':
+      road_ctx_for_infer = 'city'
+
     inferred_speed = infer_speed_from_road_type(
-      self.last_highway_type, self.lane_count_stable, self.last_road_context
+      self.last_highway_type, self.lane_count_stable, road_ctx_for_infer
     )
 
     # Vision cap: when vision confidently sees ≤2 lanes, cap inferred speed.
-    # Only apply on secondary and below — highways/trunks trust mapd lane data.
-    VISION_CAP_TYPES = {'secondary', 'tertiary', 'residential', 'unclassified', 'living_street', 'service', ''}
-    if self.vision_cap_stable > 0 and self.last_highway_type in VISION_CAP_TYPES:
+    # Only apply when lane_count_stable < 3 — on confirmed multi-lane roads the
+    # outermost lane line probability naturally fluctuates below the cap threshold
+    # without implying a narrow road, so the cap would fire spuriously.
+    if self.vision_cap_stable > 0 and self.lane_count_stable < 3:
       inferred_speed = min(inferred_speed, self.vision_cap_stable)
 
-    MIN_SPEED_LIMIT = 30  # km/h — no real road is below this
+    MIN_SPEED_LIMIT = 30   # km/h — no real road is below this
+    MAPD_UNCONSTRAINED = 130  # km/h — mapd's default ceiling when no OSM/curve data
 
-    if osm_speed >= MIN_SPEED_LIMIT:
-      speed_limit = float(osm_speed)
-      source = 0  # osmMaxspeed
-      confidence = 0.95
-    elif yolo_speed >= MIN_SPEED_LIMIT:
-      speed_limit = float(yolo_speed)
-      source = 1  # yoloDetection
-      confidence = 0.8
-    else:
-      speed_limit = float(max(inferred_speed, MIN_SPEED_LIMIT))
-      source = 2  # roadTypeInference
-      confidence = 0.5
+    raw_suggested = round(self.last_mapd_suggested) if self.last_mapd_suggested > 0 else 0
+    # Treat mapd's unconstrained ceiling as "no data" — fall through to own inference.
+    # Also ignore suggestedSpeed when mapd has no road data (no wayRef, no OSM lane count):
+    # in that case mapd is just outputting its default ceiling, not a meaningful constraint.
+    # Only trust mapd's suggestedSpeed when we have a real OSM way reference.
+    # mapd reports osm_lanes > 0 even on roads it detects visually (no OSM data),
+    # so osm_lanes alone is not a reliable indicator. Without wayRef, mapd has no
+    # speed limit data and its visionCurveSpeed can oscillate wildly on curves.
+    mapd_has_road_data = bool(self.last_way_ref)
+    mapd_suggested = raw_suggested if raw_suggested < MAPD_UNCONSTRAINED and mapd_has_road_data else 0
+
+    # Take minimum across all available sources — most conservative valid reading wins.
+    # mapd contributes curve constraints, inference contributes road-type knowledge,
+    # YOLO contributes sign readings. No single source is trusted exclusively.
+    candidates = []
+    if yolo_speed >= MIN_SPEED_LIMIT:
+      candidates.append((float(yolo_speed), 1, 0.8))    # yoloDetection
+    if mapd_suggested >= MIN_SPEED_LIMIT:
+      candidates.append((float(mapd_suggested), 3, 0.6)) # mapdSuggested
+    candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # roadTypeInference
+
+    speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
 
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus
@@ -319,13 +402,14 @@ class SpeedLimitMiddleware:
     # --- Publish ---
     msg = messaging.new_message('speedLimitState')
     sls = msg.speedLimitState
-    sls.speedLimit = speed_limit
+    sls.speedLimit = snap_to_standard_speed(int(speed_limit))
     sls.source = source
     sls.confirmed = self.confirmed
     sls.confidence = confidence
     sls.osmMaxspeed = osm_speed
     sls.yoloSpeed = yolo_speed
     sls.inferredSpeed = inferred_speed
+    sls.mapdSuggested = mapd_suggested  # 0 if unconstrained (>=130) or no road data
     sls.highwayType = self.last_highway_type
     sls.roadName = self.last_road_name
     sls.laneCount = self.lane_count_stable

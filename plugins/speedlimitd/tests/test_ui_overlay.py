@@ -98,9 +98,6 @@ class TestConstants:
     assert overlay.SPEED_SIGN_BORDER_RATIO == 0.1  # Vienna Convention: 1/10 diameter
     assert overlay.SPEED_SIGN_FONT_SIZE == 84
 
-  def test_source_labels(self, overlay):
-    assert overlay.SOURCE_LABELS == {0: "OSM", 1: "SIGN", 2: "~"}
-
 
 class TestLazyInit:
   def test_fonts_none_before_init(self, overlay):
@@ -368,8 +365,8 @@ class TestOnRenderOverlay:
 
     # Should draw outer ring + inner fill = 2 draw_circle calls
     assert mock_draw_circle.call_count == 2
-    # Should draw speed text + source label = 2 draw_text_ex calls
-    assert mock_draw_text.call_count == 2
+    # Should draw speed text
+    assert mock_draw_text.call_count == 1
 
   def test_alpha_confirmed_vs_unconfirmed(self, overlay, mock_openpilot, content_rect):
     """Confirmed = alpha 255, unconfirmed = alpha 128.
