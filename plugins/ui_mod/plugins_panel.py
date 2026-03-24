@@ -6,18 +6,20 @@ import json
 import math
 import os
 import subprocess
+import sys
 import threading
 import time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from config import PLUGINS_RUNTIME_DIR, PLUGINS_REPO_DIR, OPENPILOT_DIR
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget, DialogResult
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.widgets.list_view import button_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
-PLUGINS_DIR = '/data/plugins-runtime'
-PLUGINS_REPO = '/data/plugins'
-OPENPILOT_DIR = '/data/openpilot'
+PLUGINS_DIR = PLUGINS_RUNTIME_DIR
+PLUGINS_REPO = PLUGINS_REPO_DIR
 BUILD_HASH_FILE = '/tmp/plugin_build_hash'
 IS_C3 = os.path.exists('/TICI')
 

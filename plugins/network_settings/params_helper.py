@@ -9,9 +9,12 @@ files from /data/params/d/ on every manager start. Persistent user config
 (ProxySSID, ProxyAddress, StaticIPNetworks) must be stored outside of it.
 """
 import os
+import sys
 from pathlib import Path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import plugin_data_dir
 
-PARAMS_DIR = Path("/data/plugins-runtime/network_settings/data")
+PARAMS_DIR = plugin_data_dir("network_settings")
 # Keep PERSIST_DIR as alias for tests that patch both
 PERSIST_DIR = PARAMS_DIR
 

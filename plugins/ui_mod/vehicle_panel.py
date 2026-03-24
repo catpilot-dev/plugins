@@ -8,6 +8,9 @@ Hook signature:
   Plugins append toggle_item/multiple_button_item widgets to the list.
 """
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import PLUGINS_REPO_DIR
 
 import pyray as rl
 from openpilot.selfdrive.plugins.hooks import hooks
@@ -19,7 +22,7 @@ from openpilot.system.ui.widgets.scroller_tici import Scroller
 
 HEADING_HEIGHT = 80
 ICON_SIZE = 64
-LOGOS_DIR = '/data/plugins/logos/icons'
+LOGOS_DIR = os.path.join(PLUGINS_REPO_DIR, 'logos', 'icons')
 
 
 class VehicleLayout(Widget):

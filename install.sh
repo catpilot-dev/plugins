@@ -269,6 +269,12 @@ overlay_opendbc
 install_plugins
 overlay_cereal
 
+# Copy shared config module to plugins-runtime root so all plugins can import it
+if [[ -f "$SCRIPT_DIR/plugins/config.py" ]] && ! $DRY_RUN; then
+  cp "$SCRIPT_DIR/plugins/config.py" "$PLUGINS_DEST/config.py"
+  log "Installed shared config.py to $PLUGINS_DEST/"
+fi
+
 # --- Restore stock files for removed overlays ---
 restore_removed_overlays() {
   local manifest="$PLUGINS_DEST/.overlay_manifest"

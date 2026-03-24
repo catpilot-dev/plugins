@@ -39,12 +39,15 @@ except ImportError:
 
 log = logging.getLogger("venv_sync")
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import OPENPILOT_DIR, plugin_data_dir
+
 # --- Paths ---
-LOCAL_LOCK = "/data/openpilot/uv.lock"
+LOCAL_LOCK = os.path.join(OPENPILOT_DIR, "uv.lock")
 VENV_SITE = "/usr/local/venv/lib/python3.12/site-packages"
 VENV_PIP = "/usr/local/venv/bin/pip"
 VENV_PYTHON = "/usr/local/venv/bin/python3"
-HASH_CACHE = "/data/plugins-runtime/c3_compat/.venv_synced_hash"
+HASH_CACHE = str(plugin_data_dir("c3_compat").parent / ".venv_synced_hash")
 
 # --- C3 target platform ---
 TARGET_PYTHON = "cp312"

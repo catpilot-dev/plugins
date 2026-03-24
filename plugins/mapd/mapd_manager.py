@@ -12,10 +12,13 @@ import sys
 import urllib.request
 from pathlib import Path
 
-MAPD_PATH = Path("/data/media/0/osm/mapd")
-BACKUP_DIR = Path("/data/media/0/osm/mapd_backups")
-VERSION_PATH = Path("/data/media/0/osm/mapd_version")
-PLUGIN_DATA_DIR = Path("/data/plugins-runtime/mapd/data")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import MEDIA_DIR, plugin_data_dir
+
+MAPD_PATH    = Path(MEDIA_DIR) / "0/osm/mapd"
+BACKUP_DIR   = Path(MEDIA_DIR) / "0/osm/mapd_backups"
+VERSION_PATH = Path(MEDIA_DIR) / "0/osm/mapd_version"
+PLUGIN_DATA_DIR = plugin_data_dir("mapd")
 
 GITHUB_API_URL = "https://api.github.com/repos/pfeiferj/mapd/releases/latest"
 

@@ -2,8 +2,11 @@
 
 import json
 import os
+import sys
 import threading
 import urllib.request
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import PLUGINS_REPO_DIR
 
 import pyray as rl
 
@@ -14,7 +17,7 @@ from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.widgets import Widget
 
 COD_BASE = "http://localhost:8082"
-EMBLEMS_DIR = '/data/plugins/logos/emblems'
+EMBLEMS_DIR = os.path.join(PLUGINS_REPO_DIR, 'logos', 'emblems')
 EMBLEM_SIZE = 180
 
 BG_COLOR = rl.Color(51, 51, 51, 255)

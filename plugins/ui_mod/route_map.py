@@ -9,17 +9,20 @@ rect completely — no black borders.
 import math
 import os
 import random
+import sys
 import threading
 import urllib.request
-
 import socket
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import PLUGINS_RUNTIME_DIR
 
 import pyray as rl
 
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 
-TILE_CACHE_DIR = '/data/plugins-runtime/map_tiles'
+TILE_CACHE_DIR = os.path.join(PLUGINS_RUNTIME_DIR, 'map_tiles')
 TILE_SIZE = 256
 CARTODB_URL = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png'
 CARTODB_SUBDOMAINS = 'abcd'
