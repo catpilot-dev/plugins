@@ -10,8 +10,7 @@ import time
 
 import cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
-
-BUS_DIR = "/tmp/plugin_bus"
+from openpilot.selfdrive.plugins.plugin_bus import BUS_DIR
 
 
 def _discover_topics() -> list[str]:
@@ -27,7 +26,6 @@ def main():
   pm = messaging.PubMaster(['pluginBusLog'])
   rk = Ratekeeper(5, print_delay_threshold=None)
 
-  # Lazy import to avoid circular deps at module level
   from openpilot.selfdrive.plugins.plugin_bus import PluginSub
 
   sub = None

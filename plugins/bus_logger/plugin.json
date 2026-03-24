@@ -2,7 +2,7 @@
   "id": "bus_logger",
   "name": "Plugin Bus Logger",
   "version": "1.0.0",
-  "type": "daemon",
+  "type": "process",
   "author": "c3pilot",
   "description": "Logs all plugin bus messages to cereal for rlog capture and debugging.",
   "min_openpilot": "0.10.0",
