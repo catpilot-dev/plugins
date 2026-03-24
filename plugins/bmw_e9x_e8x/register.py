@@ -298,7 +298,10 @@ def on_post_lane_change(result, dh, carstate, one_blinker, below_lane_change_spe
     _clc.desire_gap = 0
 
   elif dh.lane_change_state == log.LaneChangeState.laneChangeStarting:
-    if rising_edge and one_blinker:
+    # Only count a press as consecutive when the lane change is already committed (ll_prob < 0.5,
+    # i.e. >0.25s in). The initiating press fires at ll_prob=1.0 and must NOT be counted —
+    # otherwise it immediately schedules a second lane change the user never requested.
+    if rising_edge and one_blinker and dh.lane_change_ll_prob < 0.5:
       _clc.consecutive_requested = True
     # Re-trigger as soon as car is committed (ll_prob faded ~0.5s) — skip waiting for model
     if _clc.consecutive_requested and one_blinker and not below_lane_change_speed \
