@@ -199,7 +199,8 @@ class TestPostLaneChange:
     (param_dir / 'ConsecutiveLaneChange').write_text('1')
 
     cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.5)
+    # ll_prob=0.4 < 0.5 threshold: press counts as consecutive (not the initiating press)
+    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.4)
 
     register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.5)
     assert register._clc.consecutive_requested is True
