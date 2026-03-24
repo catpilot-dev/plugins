@@ -6,15 +6,18 @@ Replaces stock steering wheel / atomic icons with the vehicle brand emblem.
   - Lane centering active: green ring around the button
 """
 import os
+import sys
 import time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import PLUGINS_REPO_DIR
 import pyray as rl
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget
 
-ICONS_DIR = '/data/plugins/logos/icons'
-EMBLEMS_DIR = '/data/plugins/logos/emblems'
+ICONS_DIR = os.path.join(PLUGINS_REPO_DIR, 'logos', 'icons')
+EMBLEMS_DIR = os.path.join(PLUGINS_REPO_DIR, 'logos', 'emblems')
 
 # Colors
 BG_COLOR = rl.Color(0, 0, 0, 77)               # 30% opacity black
@@ -47,7 +50,7 @@ class ExpButton(Widget):
     self._rect.x, self._rect.y = rect.x, rect.y
 
   def _load_textures(self):
-    """Load white icon and color emblem for the vehicle brand."""
+    """Load white icon and color emblem for the vehicle brand, resized to icon_size."""
     self._textures_loaded = True
     CP = ui_state.CP
     if CP is None:
@@ -55,20 +58,33 @@ class ExpButton(Widget):
     brand = getattr(CP, 'brand', '')
     if not brand:
       return
-    # White icon (normal mode) — pre-rendered at 168px longest edge
+    # White icon (normal mode)
     icon_path = os.path.join(ICONS_DIR, f'{brand}.png')
     if os.path.isfile(icon_path):
       try:
-        self._txt_icon = rl.load_texture(icon_path)
+        self._txt_icon = self._load_and_resize(icon_path)
       except Exception:
         pass
-    # Color emblem (experimental mode) — pre-rendered at 168px longest edge
+    # Color emblem (experimental mode)
     emblem_path = os.path.join(EMBLEMS_DIR, f'{brand}.png')
     if os.path.isfile(emblem_path):
       try:
-        self._txt_emblem = rl.load_texture(emblem_path)
+        self._txt_emblem = self._load_and_resize(emblem_path)
       except Exception:
         pass
+
+  def _load_and_resize(self, path: str) -> rl.Texture:
+    """Load image, resize to fit button with 12px padding (maintaining aspect ratio), return texture."""
+    img = rl.load_image(path)
+    # 12px gap between emblem edge and circle boundary
+    target = int(self._rect.width) - 24
+    scale = target / max(img.width, img.height)
+    new_w = int(img.width * scale)
+    new_h = int(img.height * scale)
+    rl.image_resize(img, new_w, new_h)
+    tex = rl.load_texture_from_image(img)
+    rl.unload_image(img)
+    return tex
 
   def _update_state(self) -> None:
     selfdrive_state = ui_state.sm["selfdriveState"]
@@ -79,7 +95,7 @@ class ExpButton(Widget):
     if not self._textures_loaded:
       self._load_textures()
 
-    # Check lane centering state via plugin bus
+    # Check lane centering state via plugin bus (live) or pluginBusLog cereal (replay)
     try:
       if self._lcc_sub is None:
         from openpilot.selfdrive.plugins.plugin_bus import PluginSub
@@ -90,6 +106,19 @@ class ExpButton(Widget):
         self._lane_centering_active = data.get('active', False)
     except Exception:
       pass
+
+    # Fallback: read from pluginBusLog (replayed from rlog)
+    if not self._lane_centering_active:
+      try:
+        sm = ui_state.sm
+        if sm.updated.get('pluginBusLog', False):
+          for entry in sm['pluginBusLog'].entries:
+            if entry.topic == 'lane_centering_state':
+              import json
+              data = json.loads(entry.json)
+              self._lane_centering_active = data.get('active', False)
+      except Exception:
+        pass
 
   def _handle_mouse_release(self, _):
     super()._handle_mouse_release(_)

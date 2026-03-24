@@ -22,6 +22,10 @@
       "module": "hooks",
       "function": "on_state_tick"
     },
+    "ui.state_subscriptions": {
+      "module": "hooks",
+      "function": "on_state_subscriptions"
+    },
     "ui.onroad_exp_button": {
       "module": "hooks",
       "function": "on_exp_button"
