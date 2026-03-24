@@ -1,0 +1,17 @@
+{
+  "id": "phone_gps",
+  "name": "Phone GPS",
+  "version": "1.0.0",
+  "type": "hook",
+  "author": "c3pilot",
+  "description": "Receives GPS from phone browser via /ws/gps WebSocket and publishes as gpsLocationExternal cereal message. Enables phone GPS comparison with on-device GPS chip.",
+  "min_openpilot": "0.10.0",
+  "max_openpilot": "0.10.99",
+  "hooks": {
+    "webrtc.app_routes": {
+      "module": "hook",
+      "function": "on_webrtc_app_routes",
+      "priority": 50
+    }
+  }
+}
