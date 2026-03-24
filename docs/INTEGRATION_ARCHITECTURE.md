@@ -3,186 +3,126 @@
 ## Overview
 
 **Status**: IMPLEMENTED AND VALIDATED
-**Target Openpilot**: v0.10.3 with msgq memory optimization
-**Device**: Comma 3 (TICI) on AGNOS 12.8
+**Base**: catpilot (openpilot fork with plugin hook points)
+**Devices**: Comma 3 (TICI/AGNOS), RK3588 (Orange Pi 5 Plus)
 
 ---
 
 ## Repository Layout
 
-### Standalone Repo (`~/openpilot-plugins-standalone/` → `OxygenLiu/openpilot-plugins`)
+### catpilot (`~/catpilot-dev/catpilot/` → `catpilot-dev/catpilot`)
+
+Fork of openpilot with the plugin framework built-in. Contains:
+
+- `selfdrive/plugins/hooks.py` — HookRegistry: register, run, fail-safe
+- `selfdrive/plugins/loader.py` — Plugin discovery + lazy-load per-process
+- `selfdrive/plugins/registry.py` — PluginRegistry: manifest scanning, enable/disable
+- `selfdrive/plugins/plugind.py` — Boot-time plugin manager process
+- `selfdrive/plugins/builder.py` — Boot-time capnp/services/events injection
+- `selfdrive/plugins/bus.py` — ZMQ IPC pub/sub (PluginPub/PluginSub)
+- Hook call sites in: controlsd, plannerd, card, longitudinal_planner, desire_helper, car_helpers, selfdrived, torqued, webrtcd, ui layouts, ui_state, application
+
+No `plugins/` directory — all plugin code lives in the plugins repo.
+
+### plugins (`~/catpilot-dev/plugins/` → `catpilot-dev/plugins`, branches `dev`/`main`)
+
+Hooks-only plugins. No framework code, no overlays. Works on both C3 and RK3588 via `device_filter`.
 
 ```
-openpilot-plugins-standalone/
-  install.sh              # Overlay framework + cereal into openpilot, copy plugins
-  selfdrive/              # Framework overlay files
-    plugins/
-      hooks.py            # HookRegistry (register, run, fail-safe)
-      loader.py           # Plugin discovery + lazy-load
-      plugin_base.py      # Plugin base class
-      plugind.py           # Boot-time plugin builder process
-  cereal/                 # Custom capnp schemas + service registrations
-  common/                 # params_keys.h additions
-  plugins/                # All plugins
-    bmw_e9x_e8x/          # BMW car interface
-    c3_compat/            # Comma 3 AGNOS 12.8 compatibility
+plugins/
+  install.sh              # Deploy plugins to /data/plugins-runtime/; install cereal slots
+  plugins/
+    config.py             # Shared path config; deployed to /data/plugins-runtime/config.py
+    bmw_e9x_e8x/          # BMW E8x/E9x car interface (hook-based registration)
+    c3_compat/            # Comma 3 AGNOS compatibility (boot patches, venv_sync)
     lane_centering/       # Curvature correction hook
     mapd/                 # OSM map data process
-    model_selector/       # Runtime model swapping
+    model_selector/       # Runtime driving model swapping
+    network_settings/     # Proxy + static IP + github connectivity
+    phone_display/        # Phone-as-display: WebRTC video + HUD, watchdog
     speedlimitd/          # Speed limit fusion (process + hook)
-    docs/                 # This documentation
+    trafficd/             # YOLO traffic sign detection (NPU)
+    ui_mod/               # Custom UI panels: Driving, Vehicle, Plugins, drive stats
+  docs/                   # This documentation
 ```
 
-### Fork Repo (`~/openpilot-plugins/` → `OxygenLiu/c3pilot` branch `plugins-release`)
+### connect-on-device (`~/catpilot-dev/connect-on-device/` → `catpilot-dev/connect-on-device`)
 
-Minimal diff against upstream v0.10.3 (~20 files). Contains only:
-- `selfdrive/plugins/` — hook system + plugind
-- Hook call sites in controlsd, planner, desire_helper, car_helpers
+Web app for device management. Served on port 8082 (redirected from port 80 via iptables in `setup_service.sh`). Works on both C3 and RK3588.
 
-No `plugins/` directory — all plugin code lives in the standalone repo.
+---
 
-### Runtime Layout on C3
+## Runtime Layout on Device
 
 ```
-/data/openpilot/          # Openpilot with framework overlay applied
-  selfdrive/plugins/      # Hook system (from install.sh overlay)
-  cereal/custom.capnp     # Custom schemas (from install.sh overlay)
-/data/plugins/            # All plugins (copied by install.sh)
+/data/openpilot/            # catpilot (git clone, branch rk3588 or dev)
+  selfdrive/plugins/        # Hook system + plugind (built-in to catpilot)
+
+/data/plugins/              # Plugins source repo (git clone, branch dev)
+  plugins/
+    config.py               # Source; copied to /data/plugins-runtime/config.py
+
+/data/plugins-runtime/      # Deployed plugin runtime (written by install.sh)
+  config.py                 # Shared path config — importable by all plugins
   bmw_e9x_e8x/
   c3_compat/
   lane_centering/
   mapd/
   model_selector/
+  network_settings/
+  phone_display/
   speedlimitd/
+  trafficd/
+  ui_mod/
+    data/                   # Plugin-specific param storage (plugin_data_dir())
+
+/data/connect-on-device/    # COD repo (git clone)
 ```
 
 ---
 
-## Car Interface Registration
+## Shared Config (`plugins/config.py`)
 
-BMW uses a hook-based registration system that injects platforms into openpilot's
-existing dynamic interface loading:
-
-```
-Boot → plugind → car.register_interfaces hook
-  → bmw_e9x_e8x/register.py injects BMW platforms into opendbc car registry
-  → Fingerprinting finds BMW via VIN-based detection (empty CAN fingerprints)
-  → CarInterface loaded from plugin's bmw/ directory
-```
-
-Key files:
-- `plugins/bmw_e9x_e8x/register.py` — `car.register_interfaces` hook
-- `plugins/bmw_e9x_e8x/bmw/values.py` — Platform config, VIN detection
-- `plugins/bmw_e9x_e8x/bmw/interface.py` — CarInterface implementation
-- `plugins/bmw_e9x_e8x/bmw/carstate.py` — CAN parsing (empty parser pattern)
-- `plugins/bmw_e9x_e8x/bmw/carcontroller.py` — DCC commands, servo, turn signals
-
-### VIN-Based Detection
+All plugins import path constants from `config.py` via sys.path trick:
 
 ```python
-# Empty fingerprints — accept all CAN messages, detect by VIN
-FINGERPRINTS = {CAR.BMW_E82: [{}], CAR.BMW_E90: [{}]}
-
-# VIN positions 4-6 contain model code
-def match_fw_to_car_fuzzy(live_fw_versions, vin, offline_fw_versions):
-    model_code = vin[3:6]
-    vin_to_model = {'PH1': 'BMW_E90', 'UF1': 'BMW_E82', ...}
-    return {vin_to_model[model_code]} if model_code in vin_to_model else set()
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import PLUGINS_RUNTIME_DIR, PLUGINS_REPO_DIR, plugin_data_dir, read_plugin_param
 ```
 
-### Panda Safety
+This import works in both:
+- Source repo: `__file__` = `plugins/plugins/<id>/something.py` → parent of parent = `plugins/plugins/`
+- On device: `__file__` = `/data/plugins-runtime/<id>/something.py` → parent of parent = `/data/plugins-runtime/`
 
-Panda safety model (bmw.h, ID 35) is compiled into the panda firmware and
-activated automatically via `CarParams.safetyConfigs`. The safety model binary
-is included in the plugin's `safety/` directory and flashed at boot if needed.
+**Path constants** (all overridable via env var for testing):
+
+| Constant | Default |
+|----------|---------|
+| `OPENPILOT_DIR` | `/data/openpilot` |
+| `PLUGINS_RUNTIME_DIR` | `/data/plugins-runtime` |
+| `PLUGINS_REPO_DIR` | `/data/plugins` |
+| `PARAMS_DIR` | `/data/params/d` |
+
+**Helpers**: `plugin_data_dir(plugin_id)` → `Path(PLUGINS_RUNTIME_DIR) / plugin_id / "data"`
 
 ---
 
-## Hook System
+## Plugin Params
 
-### Architecture
+Plugin params are **NOT** in `params_keys.h`. Using `Params().get()` for unknown keys throws `UnknownKeyName`. All plugin params use raw file I/O via `config.py` helpers:
 
 ```python
-class HookRegistry:
-    def run(self, hook_name, default, *args, **kwargs):
-        callbacks = self._hooks.get(hook_name)
-        if not callbacks:
-            return default  # ~50ns, zero overhead
-        for priority, plugin_name, callback in callbacks:
-            try:
-                result = callback(result, *args, **kwargs)
-            except Exception:
-                return default  # Fail-safe
-        return result
+from config import read_plugin_param, write_plugin_param
+
+# Read: returns '' if not set
+value = read_plugin_param("phone_display", "CatEyePhoneRequired")
+
+# Write
+write_plugin_param("phone_display", "CatEyePhoneRequired", "1")
 ```
 
-### Implemented Hook Points
-
-| Hook | File | Plugin | Description |
-|------|------|--------|-------------|
-| `controls.curvature_correction` | controlsd.py | lane_centering | Curvature adjustment for lane centering |
-| `planner.v_cruise` | longitudinal_planner.py | speedlimitd | Speed limit enforcement |
-| `planner.accel_limits` | longitudinal_planner.py | (available) | Acceleration limit adjustment |
-| `desire.post_update` | desire_helper.py | (available) | Lane change extensions |
-| `car.register_interfaces` | car_helpers.py | bmw_e9x_e8x | Register car platforms |
-| `car.panda_status` | car_helpers.py | bmw_e9x_e8x | Monitor panda health |
-
----
-
-## Process Management
-
-Plugins can declare managed processes in their `plugin.json`:
-
-```json
-{
-  "processes": [
-    {"name": "mapd", "module": "mapd_runner", "condition": "always_run"},
-    {"name": "speedlimitd", "module": "speedlimitd", "condition": "only_onroad"}
-  ]
-}
-```
-
-`plugind` discovers these declarations and registers them with the manager.
-
----
-
-## AGNOS 12.8 Compatibility (c3_compat)
-
-### boot_patch.sh
-
-Runs before openpilot build/launch. Key sections:
-
-1. **Overlay init removal** — prevents stale overlay swap
-1b. **Cache symlinks** — `~/.cache/pip` and `~/.cache/tinygrad` → `/data/cache/` (100MB /home overlay protection)
-2. **venv_sync** — sync Python packages against local uv.lock (dependency graph walk, PEP 508 markers)
-2b. **kaitaistruct** — AGNOS system dependency (not in uv.lock)
-3. **DRM raylib** — GPU-accelerated rendering overlay
-4. **Wayland socket permissions** — Weston compositor access
-5. **SPI disable** — USB-only F4 panda mode
-6. **PATH + PYTHONPATH** — scons build support (cythonize, opendbc imports)
-7. **Crash diagnostics** — dmesg + process state capture on crash
-
-### venv_sync.py
-
-Ensures C3 venv has all packages required by the current openpilot branch:
-
-```
-local uv.lock → SHA256 hash → cached? → skip (<100ms)
-                             → changed? → parse TOML → walk dependency graph
-                               → filter PEP 508 markers (platform, arch)
-                               → diff against installed packages
-                               → sudo -E pip install (read-only rootfs)
-```
-
-- `--runtime-only`: 62 packages (boot default, excludes dev/test/docs groups)
-- Full mode: 135 packages
-- AGNOS quirks: `TMPDIR=/data/tmp/pip`, `--no-cache-dir` for large wheels
-
-### connect_on_device Integration
-
-- `POST /v1/software/prepare-plugins` — copies staged plugins + runs venv_sync
-- `POST /v1/software/venv-sync` — manual venv sync trigger
-- SOFTWARE panel matches stock openpilot update flow (CHECK → DOWNLOAD → INSTALL)
+Files are stored at `/data/plugins-runtime/<id>/data/<key>`.
 
 ---
 
@@ -194,6 +134,7 @@ local uv.lock → SHA256 hash → cached? → skip (<100ms)
   "name": "Speed Limit Middleware",
   "version": "1.0.0",
   "type": "hybrid",
+  "device_filter": ["tici", "tizi", "mici", "rk3588"],
   "hooks": {
     "planner.v_cruise": {
       "module": "planner_hook",
@@ -204,55 +145,121 @@ local uv.lock → SHA256 hash → cached? → skip (<100ms)
   "processes": [
     {"name": "speedlimitd", "module": "speedlimitd", "condition": "only_onroad"}
   ],
-  "params": {
-    "SpeedLimitConfirmed": {"type": "string", "default": "0"},
-    "SpeedLimitValue": {"type": "string", "default": "0"}
+  "cereal": {
+    "slots": [0],
+    "services": {
+      "speedLimitState": [true, 1.0, 1]
+    },
+    "event_names": ["speedLimitActive", "speedLimitConfirmRequired"]
   },
-  "services": {
-    "speedLimitState": [true, 1.0, 1]
+  "params": {
+    "SpeedLimitConfirmed": {"type": "string", "default": "0", "desc": null}
   }
 }
 ```
 
+Key fields:
+- **device_filter**: `["tici"]` for C3-only, `["rk3588"]` for RK3588-only, omit for all devices
+- **cereal.slots**: Custom capnp struct slots 0-19 (must be unique per plugin)
+- **cereal.event_names**: Injected into `log.capnp` EventName enum at boot by `builder.py`
+- **params**: `desc` non-null = shown in Settings UI; `desc` null = internal only
+
 ---
 
-## Testing
+## Boot Flow
 
-### Pre-deployment validation
+```
+continue.sh
+  └─ /data/connect-on-device/setup_service.sh
+       └─ iptables: 80 → 8082 (PREROUTING + OUTPUT, idempotent)
+       └─ python server.py &   (COD web app)
 
-```bash
-# Test BMW imports
-source ~/openpilot/.venv/bin/activate
-python -c "from opendbc.car.bmw.carstate import CarState; print('OK')"
-
-# Test VIN detection
-python -c "
-from opendbc.car.bmw.values import match_fw_to_car_fuzzy
-print(match_fw_to_car_fuzzy({}, 'LBVPH18059SC20723', {}))  # {'BMW_E90'}
-"
-
-# Test safety model
-python -m pytest opendbc_repo/opendbc/safety/tests/test_bmw.py -v
-
-# Test hook system
-python -c "
-from openpilot.selfdrive.plugins.hooks import HookRegistry
-h = HookRegistry()
-h.register('test', 'p1', lambda x: x * 2, 50)
-assert h.run('test', 5) == 10
-print('Hook system OK')
-"
+openpilot manager
+  └─ plugind (first process)
+       └─ builder.py
+            └─ patch custom.capnp with plugin cereal slots
+            └─ inject EventName entries into log.capnp
+            └─ register services in services.py
+            └─ write param defaults to /data/params/d/
+       └─ start plugin processes (mapd, speedlimitd, phone_watchdog, ...)
+  └─ selfdrived, controlsd, plannerd, card, webrtcd, ...
+       └─ hooks._ensure_loaded() on first hooks.run() call
+            └─ PluginRegistry.discover() + load_enabled()
+            └─ plugin hook callbacks registered in this process
 ```
 
-### On-device validation
+---
+
+## Plugin: phone_display
+
+Enables phone-as-display for headless devices (RK3588, future C3 headless).
+
+**Hooks registered**:
+- `selfdrived.events` — publishes `EventName.catEyePhoneRequired` when phone not connected and required
+- `webrtc.app_routes` — registers WebRTC signaling + HUD data endpoints in webrtcd
+- `webrtc.session_started` / `webrtc.session_ended` — watchdog lifecycle management
+
+**Param**: `CatEyePhoneRequired` (in plugin data dir, not params_keys.h)
+- `0` = phone optional (no blocking alert)
+- `1` = phone required (blocks engagement when disconnected)
+
+**COD routing**: `_PLUGIN_TOGGLE_PARAMS` in `handlers/params.py` routes `CatEyePhoneRequired` reads/writes through `read_plugin_param`/`write_plugin_param` instead of openpilot Params.
+
+---
+
+## Plugin: c3_compat
+
+Comma 3 hardware compatibility for AGNOS 12.8. Device filter: `tici`.
+
+**boot_patch.sh** (runs before openpilot launch):
+1. Cache symlinks: `~/.cache/pip` + `~/.cache/tinygrad` → `/data/cache/` (100MB /home overlay)
+2. **venv_sync.py**: sync Python packages against local `uv.lock` (hash-cached, <100ms when unchanged)
+3. kaitaistruct install (AGNOS system dep)
+4. DRM raylib overlay (GPU-accelerated rendering)
+5. Wayland/Weston socket permissions
+6. SPI disable (USB-only F4 panda)
+7. PATH + PYTHONPATH for scons build
+8. Crash diagnostics
+
+**venv_sync.py**:
+- Parses `uv.lock` TOML, walks dependency graph, filters PEP 508 markers
+- `--runtime-only` mode: 62 packages (boot default)
+- Hash cache at `plugin_data_dir("c3_compat") / ".venv_synced_hash"`
+
+---
+
+## COD Integration
+
+- **Port 80**: iptables PREROUTING + OUTPUT redirect from 80 → 8082, applied by `setup_service.sh` on every boot. Uses `iptables-legacy` on C3/AGNOS, falls back to `iptables` on other platforms.
+- **Plugin API**: plugind serves REST on `:8083` — plugin list, enable/disable, install, status
+- **Software panel**: CHECK → DOWNLOAD → INSTALL flow matching stock openpilot
+
+---
+
+## On-Device Validation
 
 ```bash
-# Verify boot patches
-ssh c3 "cat /tmp/c3_compat.log"
+# Verify COD running
+ssh comma@c3 "curl -s http://localhost:8082/api/health"
 
-# Verify venv sync
-ssh c3 "cat /data/plugins/c3_compat/.venv_synced_hash"
+# Verify iptables redirect
+ssh comma@c3 "sudo iptables-legacy -t nat -L PREROUTING | grep 8082"
 
-# Verify scons build
-ssh c3 "cd /data/openpilot && scons -j8"
+# Verify plugins deployed
+ssh comma@c3 "ls /data/plugins-runtime/"
+
+# Verify config.py deployed
+ssh comma@c3 "python3 -c 'import sys; sys.path.insert(0, \"/data/plugins-runtime\"); from config import PLUGINS_RUNTIME_DIR; print(PLUGINS_RUNTIME_DIR)'"
+
+# Verify hook system
+ssh comma@c3 "cd /data/openpilot && python3 -c \"
+from openpilot.selfdrive.plugins.hooks import hooks
+hooks._loaded = True  # skip plugin load
+hooks.register('test', 'p1', lambda x: x * 2, 50)
+assert hooks.run('test', 5) == 10
+print('Hook system OK')
+\""
+
+# Check plugin logs
+ssh comma@c3 "cat /tmp/plugin_logs/phone_display.log"
 ```
