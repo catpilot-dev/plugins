@@ -17,10 +17,19 @@ CRUISE_STALK_SINGLE_TICK_STOCK = 0.05 # 20Hz
 CRUISE_STALK_HOLD_TICK_STOCK = 0.025  # 40Hz
 
 # Openpilot DCC Emulation - Frequency-based command rates
-CRUISE_STALK_PLUS1_SINGLE_TICK = 0.2    # 5Hz
-CRUISE_STALK_PLUS1_HOLD_TICK = 0.025    # 40Hz
-CRUISE_STALK_MINUS1_HOLD_TICK = 0.025   # 40Hz
+SINGLE_TICK = 0.05    # 20Hz — 5 × DT_CTRL, matches model update rate
+HOLD_TICK = 0.02     # 50Hz — 2 × DT_CTRL, faster than stock 40Hz so DCC recognizes as hold
 
+# DCC command selection thresholds
+V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — deadzone for entry and burst cancellation
+ACCEL_HOLD_THRESHOLD = 0.2     # m/s² — use HOLD_TICK above this, SINGLE_TICK below
+ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — use ±5 step above this, ±1 below
+
+# DCC Calibration  
+# PLUS1 + HOLD_TICK = 0.4 m/s2 
+# PLUS5 + HOLD_TICK = 1.2 m/s2
+# MINUS1 + HOLD_TICK = -0.6 m/s2
+# MINUS5 + HOLD_TICK = -1.2 m/s2
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
@@ -44,10 +53,7 @@ class CarController(CarControllerBase):
 
     self.packer = CANPacker(dbc_name[Bus.pt])
 
-    self.dcc_ticks_remaining = 0
     self.dcc_last_tick_time = 0
-
-    self.last_accel_time = 0
 
   def update(self, CC, CS, now_nanos):
 
@@ -95,54 +101,30 @@ class CarController(CarControllerBase):
 
     if not cruise_stalk_human_pressing and CS.out.cruiseState.enabled:
       if self.cruise_cancel:
-        cruise_cmd(CruiseStalk.cancel, CRUISE_STALK_SINGLE_TICK_STOCK)
+        cruise_cmd(CruiseStalk.cancel, SINGLE_TICK)
       elif CC.enabled:
         if CS.out.gasPressed:
-          cruise_cmd(CruiseStalk.plus1, CRUISE_STALK_PLUS1_SINGLE_TICK)
-          self.dcc_ticks_remaining = 0
+          cruise_cmd(CruiseStalk.plus1, SINGLE_TICK)
         else:
           current_time = now_nanos / 1e9
 
-          if v_error > 0 and self.dcc_ticks_remaining > 0:
-            self.dcc_ticks_remaining = 0
+          setpoint_error = v_target - CS.out.cruiseState.speed
 
-          v_error_setpoint = v_target - CS.out.cruiseState.speed
-
-          v_ego_kph = CS.out.vEgo * 3.6
-          if v_ego_kph <= 120.0:
-            buffer_kph = (1.0 - v_ego_kph / 120.0) * 6.0
-          else:
-            buffer_kph = 0.0
-
-          if v_error > 1.0/3.6 and accel > 0 and v_error_setpoint > -buffer_kph/3.6:
-            v_error_kmh = v_error * 3.6
-            setpoint_increase_needed = int(round(v_error_kmh))
-
-            time_since_last_accel = current_time - self.last_accel_time
-
-            if time_since_last_accel >= CRUISE_STALK_PLUS1_SINGLE_TICK and setpoint_increase_needed > 0:
-              if setpoint_increase_needed >= 3:
-                cruise_cmd(CruiseStalk.plus1, CRUISE_STALK_PLUS1_HOLD_TICK)
-              else:
-                cruise_cmd(CruiseStalk.plus1, CRUISE_STALK_PLUS1_SINGLE_TICK)
-              self.last_accel_time = current_time
-              self.dcc_ticks_remaining = 0
-
-          elif v_error < -1.0/3.6 and accel < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
-            if self.dcc_ticks_remaining == 0:
-              v_error_ticks = int(round(-v_error * 3.6))
-              max_ticks = max(0, int((CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6))
-              self.dcc_ticks_remaining = min(v_error_ticks, max_ticks)
+          if v_error > V_ERROR_DEADZONE and accel > 0 and setpoint_error > 0:
+            cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
+            interval = HOLD_TICK if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_TICK
+            if current_time - self.dcc_last_tick_time >= interval:
+              cruise_cmd(cmd, interval)
               self.dcc_last_tick_time = current_time
 
-            if self.dcc_ticks_remaining > 0:
-              if current_time - self.dcc_last_tick_time >= CRUISE_STALK_MINUS1_HOLD_TICK:
-                cruise_cmd(CruiseStalk.minus1, CRUISE_STALK_MINUS1_HOLD_TICK)
-                self.dcc_ticks_remaining -= 1
-                self.dcc_last_tick_time = current_time
-
-          else:
-            self.dcc_ticks_remaining = 0
+          elif v_error < -V_ERROR_DEADZONE and accel < 0 and setpoint_error < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
+            headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
+            cmd = CruiseStalk.minus5 if -accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.minus1
+            interval = HOLD_TICK if -accel >= ACCEL_HOLD_THRESHOLD else SINGLE_TICK
+            step = 5 if cmd == CruiseStalk.minus5 else 1
+            if headroom_kmh >= step and current_time - self.dcc_last_tick_time >= interval:
+              cruise_cmd(cmd, interval)
+              self.dcc_last_tick_time = current_time
 
     if self.flags & BmwFlags.STEPPER_SERVO_CAN:
       if CC.enabled and CC.latActive:
