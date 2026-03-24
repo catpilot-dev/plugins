@@ -1,0 +1,14 @@
+{
+  "id": "webrtc_stack",
+  "name": "WebRTC Stack",
+  "version": "1.0.0",
+  "type": "hook",
+  "description": "Minimal WebRTC session implementation built directly on aiortc. Replaces the teleoprtc dependency. Installs via webrtc.session_factory hook — works on any openpilot fork that exposes that hook point.",
+  "hooks": {
+    "webrtc.session_factory": {
+      "module": "factory",
+      "function": "provide_session_class",
+      "priority": 10
+    }
+  }
+}
