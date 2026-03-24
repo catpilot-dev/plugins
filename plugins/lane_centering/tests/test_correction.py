@@ -155,6 +155,17 @@ class TestLaneWidthEstimation:
     assert lcc.estimated_lane_width is not None
     assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)
 
+  def test_width_fallback_when_too_wide(self, LCC):
+    lcc = LCC()
+    # Learn valid width first
+    model = make_model(left_y=-2.0, right_y=2.0, left_prob=0.8, right_prob=0.8)
+    lcc.update(model, 15.0)
+    assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)
+    # Turn distorts apparent width > MAX — lane_width should fall back to default, estimate unchanged
+    wide = make_model(curvature=0.01, left_y=-2.5, right_y=2.5, left_prob=0.8, right_prob=0.8)
+    result = lcc.update(wide, 15.0)
+    assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)  # estimate unchanged
+
   def test_width_rejected_if_too_narrow(self, LCC):
     lcc = LCC()
     model = make_model(left_y=-1.0, right_y=1.0)  # 2.0m < MIN (2.5m)
@@ -263,26 +274,34 @@ class TestDerivativeDamping:
 
 
 class TestHookCallback:
-  def test_disabled_by_param(self, correction_mod, tmp_path):
-    param_file = tmp_path / 'LaneCenteringEnabled'
-    param_file.write_text('0')
-    correction_mod._PARAM_FILE = str(param_file)
+  def _reset(self, correction_mod):
     correction_mod._lcc = None
-    result = correction_mod.on_curvature_correction(0.05, MagicMock(), 15.0, False)
+    correction_mod._lcc_pub = None
+    correction_mod._enabled = None
+
+  def test_disabled_by_param(self, correction_mod):
+    self._reset(correction_mod)
+    with patch('plugins.lane_centering.correction.read_plugin_param', return_value='0'):
+      result = correction_mod.on_curvature_correction(0.05, MagicMock(), 15.0, False)
     assert result == 0.05
+    assert correction_mod._enabled is False
 
-  def test_enabled_by_default_when_no_file(self, correction_mod, tmp_path):
-    correction_mod._PARAM_FILE = str(tmp_path / 'nonexistent')
-    correction_mod._lcc = None
-    model = make_model(curvature=0.005, path_y=0.4)
-    result = correction_mod.on_curvature_correction(0.05, model, 15.0, False)
-    # Should not return unmodified (correction applied)
-    assert result != 0.05 or True  # first frame may still return ~0.05 due to smoothing
+  def test_enabled_by_default_when_no_file(self, correction_mod):
+    self._reset(correction_mod)
+    with patch('plugins.lane_centering.correction.read_plugin_param', return_value=''):
+      model = make_model(curvature=0.005, path_y=0.4)
+      correction_mod.on_curvature_correction(0.05, model, 15.0, False)
+    assert correction_mod._enabled is True
 
-  def test_during_lane_change_returns_unmodified(self, correction_mod, tmp_path):
-    param_file = tmp_path / 'LaneCenteringEnabled'
-    param_file.write_text('1')
-    correction_mod._PARAM_FILE = str(param_file)
-    correction_mod._lcc = None
+  def test_enabled_explicitly(self, correction_mod):
+    self._reset(correction_mod)
+    with patch('plugins.lane_centering.correction.read_plugin_param', return_value='1'):
+      model = make_model(curvature=0.005, path_y=0.4)
+      correction_mod.on_curvature_correction(0.05, model, 15.0, False)
+    assert correction_mod._enabled is True
+
+  def test_during_lane_change_returns_unmodified(self, correction_mod):
+    self._reset(correction_mod)
+    correction_mod._enabled = True
     result = correction_mod.on_curvature_correction(0.05, MagicMock(), 15.0, True)
     assert result == 0.05

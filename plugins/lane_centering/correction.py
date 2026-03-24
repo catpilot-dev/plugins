@@ -1,5 +1,14 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
+from config import read_plugin_param
 from openpilot.common.realtime import DT_MDL
+try:
+  from openpilot.common.swaglog import cloudlog
+except ImportError:
+  import logging
+  cloudlog = logging.getLogger(__name__)
 from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value
 
 
@@ -99,7 +108,10 @@ class LaneCenteringCorrection:
     right_y = model_v2.laneLines[2].y[0]
     left_y = model_v2.laneLines[1].y[0]
 
-    # Dynamic lane width estimation when both lanes are confident
+    # Dynamic lane width estimation when both lanes are confident.
+    # When measured width is out of valid range (e.g. > 4.5m due to turn
+    # projection distortion), fall back to standard width immediately rather
+    # than using a stale smoothed estimate.
     if right_prob >= self.MIN_PROB and left_prob >= self.MIN_PROB:
       measured_width = right_y - left_y
       if self.LANE_WIDTH_MIN <= measured_width <= self.LANE_WIDTH_MAX:
@@ -107,8 +119,11 @@ class LaneCenteringCorrection:
           self.estimated_lane_width = measured_width
         else:
           self.estimated_lane_width = smooth_value(measured_width, self.estimated_lane_width, self.LANE_WIDTH_SMOOTH_TAU)
-
-    lane_width = self.estimated_lane_width if self.estimated_lane_width is not None else self.LANE_WIDTH_DEFAULT
+        lane_width = self.estimated_lane_width
+      else:
+        lane_width = self.LANE_WIDTH_DEFAULT
+    else:
+      lane_width = self.estimated_lane_width if self.estimated_lane_width is not None else self.LANE_WIDTH_DEFAULT
     half_width = lane_width / 2
 
     # Use higher confidence lane to estimate center
@@ -183,20 +198,19 @@ class LaneCenteringCorrection:
 
 
 _lcc = None
-_PARAM_FILE = '/data/plugins-runtime/lane_centering/data/LaneCenteringEnabled'
-_enabled = None  # read once at first call, only changeable offroad
-_prev_active = False  # track state changes for UI notification
-_lcc_pub = None  # plugin bus publisher for lane centering state + diagnostics
+_enabled = None   # None = unread; read once from LaneCenteringEnabled param
+_prev_active = False
+_lcc_pub = None   # publishes lane_centering_state (active + diagnostics)
 
 
 def on_curvature_correction(curvature, model_v2, v_ego, lane_changing):
-  global _lcc, _enabled, _prev_active
+  global _lcc, _enabled, _prev_active, _lcc_pub
+
+  # Feature toggle (Driving panel) — independent of plugin lifecycle
   if _enabled is None:
-    try:
-      with open(_PARAM_FILE) as f:
-        _enabled = f.read().strip() == '1'
-    except (FileNotFoundError, OSError):
-      _enabled = True
+    val = read_plugin_param('lane_centering', 'LaneCenteringEnabled')
+    _enabled = val != '0'  # enabled by default; only explicit '0' disables
+
   if not _enabled:
     return curvature
   if _lcc is None:
@@ -205,22 +219,17 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing):
     return curvature
   correction = _lcc.update(model_v2, v_ego)
 
-  # Publish state transitions and diagnostics to plugin bus
+  # Publish active state and diagnostics to plugin bus
   try:
-    global _lcc_pub
+    from openpilot.selfdrive.plugins.plugin_bus import PluginPub
     if _lcc_pub is None:
-      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
       _lcc_pub = PluginPub('lane_centering_state')
-
-    if _lcc.active != _prev_active:
-      _prev_active = _lcc.active
-
     msg = {'active': _lcc.active}
     if _lcc.diag:
       msg.update(_lcc.diag)
     _lcc_pub.send(msg)
-  except Exception:
-    pass
+  except Exception as e:
+    cloudlog.warning(f"lane_centering: publish error: {e}")
 
   return curvature + correction
 
