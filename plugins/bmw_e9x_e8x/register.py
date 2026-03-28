@@ -321,3 +321,16 @@ def on_desire_post_update(desire, lane_change_state, lane_change_direction, cars
     from cereal import log
     return log.Desire.none
   return desire
+
+
+def on_health_check(acc, **kwargs):
+  try:
+    from opendbc.car.car_helpers import interfaces
+    from bmw.values import CAR
+    registered = CAR.BMW_E90 in interfaces or str(CAR.BMW_E90) in interfaces
+  except Exception:
+    registered = False
+  result = {"status": "ok" if registered else "warning", "interfaces_registered": registered}
+  if not registered:
+    result["warnings"] = ["BMW interfaces not registered in opendbc"]
+  return {**acc, "bmw-e9x-e8x": result}

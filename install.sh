@@ -337,9 +337,11 @@ fi
 if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
   touch "$PLUGINS_DEST/c3_compat/.enforced"
 fi
-if [[ -d "$PLUGINS_DEST/mapd" ]]; then
-  touch "$PLUGINS_DEST/mapd/.enforced"
-fi
+# mapd v2.0.6 uses slotless carState subscription (gomsgq) which causes
+# msgq ring buffer corruption on C3's USB panda. Not enforced until fixed.
+# if [[ -d "$PLUGINS_DEST/mapd" ]]; then
+#   touch "$PLUGINS_DEST/mapd/.enforced"
+# fi
 
 if $DRY_RUN; then
   log "Dry run complete. Re-run without --dry-run to apply."

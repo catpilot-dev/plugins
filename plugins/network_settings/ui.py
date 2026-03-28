@@ -145,10 +145,7 @@ def on_network_settings_extend(default, net_ui):
         self._last_connected_ssid = ssid
 
     def _get_connected_ssid(self) -> str:
-      for n in self._wifi_manager._networks:
-        if n.is_connected:
-          return n.ssid
-      return ""
+      return self._wifi_manager.connected_ssid or ""
 
     def _get_proxy_address(self) -> str:
       return (params_helper.get("ProxyAddress") or "").strip() or DEFAULT_PROXY
@@ -181,7 +178,8 @@ def on_network_settings_extend(default, net_ui):
       self._proxy_keyboard.reset(min_text_size=1)
       self._proxy_keyboard.set_title(tr("Proxy Address"), tr("e.g. socks5://host:port"))
       self._proxy_keyboard.set_text(self._get_proxy_address())
-      gui_app.set_modal_overlay(self._proxy_keyboard, on_done)
+      self._proxy_keyboard.set_callback(on_done)
+      gui_app.push_widget(self._proxy_keyboard)
 
     # --- Static IP helpers ---
 
@@ -269,7 +267,8 @@ def on_network_settings_extend(default, net_ui):
       self._proxy_keyboard.reset(min_text_size=1)
       self._proxy_keyboard.set_title(tr(title), tr(hint))
       self._proxy_keyboard.set_text(current_val)
-      gui_app.set_modal_overlay(self._proxy_keyboard, on_done)
+      self._proxy_keyboard.set_callback(on_done)
+      gui_app.push_widget(self._proxy_keyboard)
 
   # --- Inject into NetworkUI ---
   try:

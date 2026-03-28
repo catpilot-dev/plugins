@@ -3,13 +3,13 @@
   "name": "Phone Display",
   "version": "1.0.0",
   "type": "hybrid",
-  "author": "c3pilot",
+  "author": "catpilot",
   "description": "Monitors WebRTC phone display session. On RK3588 (headless), phone display is mandatory and blocks engagement when disconnected. On Comma devices, opt-in via CatEyePhoneRequired toggle.",
   "min_openpilot": "0.10.0",
-  "max_openpilot": "0.10.99",
+  "max_openpilot": "0.11.99",
   "cereal": {
     "event_names": {
-      "phoneDisplayUnavailable": 98
+      "phoneDisplayUnavailable": 99
     }
   },
   "hooks": {
@@ -36,6 +36,11 @@
     "selfdrived.events": {
       "module": "hook",
       "function": "on_selfdrived_events",
+      "priority": 50
+    },
+    "device.health_check": {
+      "module": "hook",
+      "function": "on_health_check",
       "priority": 50
     }
   },
