@@ -154,7 +154,7 @@ class ExpButton(Widget):
       tex = None
 
     if tex:
-      rl.draw_texture(tex, center_x - tex.width // 2, center_y - tex.height // 2, tint)
+      rl.draw_texture_ex(tex, rl.Vector2(center_x - tex.width // 2, center_y - tex.height // 2), 0.0, 1.0, tint)
 
   def _held_or_actual_mode(self):
     now = time.monotonic()

@@ -16,7 +16,7 @@ from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.widgets import Widget
 
-COD_BASE = "http://localhost:8082"
+COD_BASE = "http://localhost"
 EMBLEMS_DIR = os.path.join(PLUGINS_REPO_DIR, 'logos', 'emblems')
 EMBLEM_SIZE = 180
 
@@ -65,6 +65,9 @@ class DriveStatsWidget(Widget):
   def refresh(self):
     self._is_metric = Params().get_bool("IsMetric")
     self._maybe_reload()
+    # Retry stats fetch if it hasn't succeeded yet (e.g. COD not ready at startup)
+    if self._stats is None and not self._fetching:
+      self._fetch_stats()
 
   def _maybe_reload(self):
     """Reload last drive and stats only when the data file changes (offroad transition)."""
@@ -205,9 +208,9 @@ class DriveStatsWidget(Widget):
 
     hours = minutes / 60
     stats_row = [
-      (str(routes), tr("Drives")),
       (f"{distance:.0f}", dist_unit),
       (f"{hours:.0f}", tr("Hours")),
+      (str(routes), tr("Drives")),
     ]
 
     self._draw_stat_cols(x, y, w, stats_row, font_bold, font_normal)

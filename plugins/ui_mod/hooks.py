@@ -9,6 +9,10 @@ _drive_tracker = None
 _driving_key = None
 _plugins_key = None
 
+OFFROAD_FPS = 20
+ONROAD_FPS = 60
+_last_started = None  # track transitions to avoid calling set_target_fps every frame
+
 
 def on_settings_extend(default, settings):
   from driving_panel import DrivingLayout
@@ -52,7 +56,7 @@ def on_main_extend(default, main):
 
 
 def on_state_tick(default, sm):
-  global _drive_tracker
+  global _drive_tracker, _last_started
   if _drive_tracker is None:
     try:
       from drive_tracker import DriveTracker
@@ -61,6 +65,17 @@ def on_state_tick(default, sm):
       _drive_tracker = False
   if _drive_tracker:
     _drive_tracker.tick(sm)
+
+  # Throttle FPS: 20 offroad (home screen is static), 60 onroad (smooth HUD)
+  try:
+    from openpilot.selfdrive.ui.ui_state import ui_state
+    started = ui_state.started
+    if started != _last_started:
+      _last_started = started
+      from openpilot.system.ui.lib.application import gui_app
+      gui_app.set_target_fps(ONROAD_FPS if started else OFFROAD_FPS)
+  except Exception:
+    pass
 
 
 def on_state_subscriptions(services):
@@ -72,3 +87,7 @@ def on_state_subscriptions(services):
 def on_exp_button(default, size, icon_size):
   from exp_button import ExpButton
   return ExpButton(size, icon_size)
+
+
+def on_health_check(acc, **kwargs):
+  return {**acc, "ui_mod": {"status": "ok"}}
