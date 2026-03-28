@@ -67,11 +67,11 @@ class ModelSwapper:
                 'driving_vision.onnx',
                 'driving_policy.onnx',
             ],
-            'pkl_files': [
+            'pkl_patterns': ['*pkl*'],
+            # Required tinygrad stems — any match means that compilation exists
+            'required_pkl_stems': [
                 'driving_vision_tinygrad.pkl',
                 'driving_policy_tinygrad.pkl',
-                'driving_vision_metadata.pkl',
-                'driving_policy_metadata.pkl',
             ],
             'active_file': 'active_driving_model',
             'display_name': 'Driving Model'
@@ -81,7 +81,8 @@ class ModelSwapper:
             'onnx_files': [
                 'dmonitoring_model.onnx',
             ],
-            'pkl_files': [
+            'pkl_patterns': ['*pkl*'],
+            'required_pkl_stems': [
                 'dmonitoring_model_tinygrad.pkl',
             ],
             'active_file': 'active_dm_model',
@@ -107,8 +108,16 @@ class ModelSwapper:
         self.active_model_file = self.models_dir.parent / self.config['active_file']
 
         self.onnx_files = self.config['onnx_files']
-        self.pkl_files = self.config['pkl_files']
+        self.pkl_patterns = self.config['pkl_patterns']
+        self.required_pkl_stems = self.config['required_pkl_stems']
         self.display_name = self.config['display_name']
+
+    def _glob_compiled_files(self, directory: Path) -> list:
+        """Return names of all compiled cache files in directory matching pkl_patterns."""
+        found = []
+        for pattern in self.pkl_patterns:
+            found.extend(p.name for p in directory.glob(pattern))
+        return found
 
     def list_models(self):
         """List all available models for this type"""
@@ -129,7 +138,7 @@ class ModelSwapper:
                         has_onnx = all((model_dir / f).exists() for f in self.onnx_files)
 
                         # Check which PKL files exist (cached)
-                        cached_pkl = sum(1 for f in self.pkl_files if (model_dir / f).exists())
+                        cached_pkl = len(self._glob_compiled_files(model_dir))
 
                         # Filter out models incompatible with current openpilot version
                         min_date = MIN_MODEL_DATE.get(self.model_type.value, '0000-00-00')
@@ -140,7 +149,7 @@ class ModelSwapper:
                             'id': model_dir.name,
                             'has_onnx': has_onnx,
                             'cached_pkl_count': cached_pkl,
-                            'total_pkl_count': len(self.pkl_files),
+                            'total_pkl_count': len(self.required_pkl_stems),
                             **info
                         })
                     except Exception as e:
@@ -228,7 +237,7 @@ class ModelSwapper:
         # Only use cached PKL if tinygrad version matches
         available_pkl = []
         if pkl_compatible:
-            available_pkl = [f for f in self.pkl_files if (source_dir / f).exists()]
+            available_pkl = self._glob_compiled_files(source_dir)
 
         # STEP 3: Copy ONNX and PKL files to selfdrive/modeld/models/
         copied_files = []
@@ -242,10 +251,9 @@ class ModelSwapper:
             shutil.copy2(src, dst)
             copied_files.append(filename)
 
-        # Remove stale PKL files from runtime dir (force recompile if incompatible)
-        for filename in self.pkl_files:
-            dst = self.ACTIVE_DIR / filename
-            if dst.exists() or dst.is_symlink():
+        # Remove stale compiled files from runtime dir (force recompile if incompatible)
+        for pattern in self.pkl_patterns:
+            for dst in self.ACTIVE_DIR.glob(pattern):
                 dst.unlink()
 
         # Copy compatible PKL files if available
@@ -272,7 +280,10 @@ class ModelSwapper:
         with open(self.active_model_file, 'w') as f:
             json.dump(active_data, f)
 
-        needs_compilation = len(available_pkl) < len(self.pkl_files)
+        needs_compilation = not all(
+            list(source_dir.glob(stem + '*'))
+            for stem in self.required_pkl_stems
+        ) if pkl_compatible else True
 
         return {
             'model_id': model_id,
@@ -280,7 +291,7 @@ class ModelSwapper:
             'copied_files': copied_files,
             'onnx_files': len(self.onnx_files),
             'cached_pkl_files': len(available_pkl),
-            'total_pkl_files': len(self.pkl_files),
+            'total_pkl_files': len(self.required_pkl_stems),
             'needs_compilation': needs_compilation,
             'compilation_note': (
                 f'PKL cache built by tinygrad {cached_tg}, current is {current_tg} — will recompile'
@@ -308,14 +319,13 @@ class ModelSwapper:
             raise ValueError(f"Model directory not found: {source_dir}")
 
         cached_count = 0
-        for filename in self.pkl_files:
-            active_file = self.ACTIVE_DIR / filename
-            cached_file = source_dir / filename
-
-            # If PKL exists in active dir but not in cache, copy it
-            if active_file.exists() and not active_file.is_symlink() and not cached_file.exists():
-                shutil.copy2(active_file, cached_file)
-                cached_count += 1
+        for pattern in self.pkl_patterns:
+            for active_file in self.ACTIVE_DIR.glob(pattern):
+                cached_file = source_dir / active_file.name
+                # Copy to cache if real file (not symlink) and not already cached
+                if not active_file.is_symlink() and not cached_file.exists():
+                    shutil.copy2(active_file, cached_file)
+                    cached_count += 1
 
         # Record which tinygrad built these PKL files
         if cached_count > 0:
@@ -397,9 +407,9 @@ class ModelSwapper:
                 'onnx_files': onnx_sizes
             }
 
-        # Check PKL files (optional, for caching info)
+        # Check compiled cache files (optional, for caching info)
         pkl_sizes = {}
-        for filename in self.pkl_files:
+        for filename in self._glob_compiled_files(source_dir):
             filepath = source_dir / filename
             if filepath.exists():
                 pkl_sizes[filename] = filepath.stat().st_size
@@ -408,7 +418,10 @@ class ModelSwapper:
             'valid': True,
             'onnx_files': onnx_sizes,
             'cached_pkl_files': pkl_sizes,
-            'compilation_needed': len(pkl_sizes) < len(self.pkl_files)
+            'compilation_needed': not all(
+                list(source_dir.glob(stem + '*'))
+                for stem in self.required_pkl_stems
+            )
         }
 
 

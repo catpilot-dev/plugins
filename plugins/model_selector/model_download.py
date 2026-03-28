@@ -44,30 +44,36 @@ def load_registry():
     return registry.get('driving_models', {}), registry.get('dm_models', {})
 
 
-LFS_BATCH_URL = "https://github.com/commaai/openpilot.git/info/lfs/objects/batch"
+# openpilot LFS servers — try GitHub first (older models), fall back to GitLab
+_LFS_BATCH_URLS = [
+    "https://github.com/commaai/openpilot.git/info/lfs/objects/batch",
+    "https://gitlab.com/commaai/openpilot-lfs.git/info/lfs/objects/batch",
+]
 
 
 def _resolve_lfs_url(oid: str, size: int) -> str:
-    """Resolve a Git LFS object to its actual download URL via the batch API."""
+    """Resolve a Git LFS object to its actual download URL, trying each known LFS server."""
     payload = {
         "operation": "download",
         "objects": [{"oid": oid, "size": size}],
     }
-    resp = requests.post(
-        LFS_BATCH_URL,
-        json=payload,
-        headers={
-            "Content-Type": "application/vnd.git-lfs+json",
-            "Accept": "application/vnd.git-lfs+json",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    obj = data["objects"][0]
-    if "error" in obj:
-        raise Exception(f"LFS error: {obj['error'].get('message', obj['error'])}")
-    return obj["actions"]["download"]["href"]
+    headers = {
+        "Content-Type": "application/vnd.git-lfs+json",
+        "Accept": "application/vnd.git-lfs+json",
+    }
+    last_error = None
+    for url in _LFS_BATCH_URLS:
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            obj = resp.json()["objects"][0]
+            if "error" in obj:
+                last_error = f"LFS error: {obj['error'].get('message', obj['error'])}"
+                continue
+            return obj["actions"]["download"]["href"]
+        except Exception as e:
+            last_error = str(e)
+    raise Exception(last_error or "LFS object not found on any server")
 
 
 def download_file(url: str, dest: Path, desc: str = None):
@@ -484,6 +490,8 @@ def add_model_from_pr(pr_number: int, model_type: str = 'driving'):
     title = pr['title']
     merge_commit = pr.get('merge_commit_sha')
     merged_at = pr.get('merged_at')
+    # LFS objects are stored against the PR head commit, not the merge commit
+    head_commit = pr.get('head', {}).get('sha') or merge_commit
 
     if not merge_commit:
         print(f"❌ PR #{pr_number} has not been merged yet")
@@ -491,22 +499,23 @@ def add_model_from_pr(pr_number: int, model_type: str = 'driving'):
 
     merged_date = merged_at[:10] if merged_at else datetime.now().strftime('%Y-%m-%d')
 
-    # Generate model_id
+    # Generate model_id from head commit (LFS objects live there, not on merge commit)
     clean_name = title.lower().replace(' ', '_').replace('-', '_')
     clean_name = re.sub(r'[^a-z0-9_]', '', clean_name)
-    model_id = f"{clean_name}_{merge_commit[:7]}"
+    model_id = f"{clean_name}_{head_commit[:7]}"
 
     print(f"✅ Found: {title}")
-    print(f"   Commit: {merge_commit[:12]}")
+    print(f"   Head commit: {head_commit[:12]}")
+    print(f"   Merge commit: {merge_commit[:12]}")
     print(f"   Merged: {merged_date}")
     print()
 
-    # Add to registry
+    # Add to registry using head commit (where LFS objects are stored)
     return add_model_to_registry(
         model_type=model_type,
         model_id=model_id,
         name=title,
-        commit=merge_commit,
+        commit=head_commit,
         date=merged_date,
         description=f"Driving model from PR #{pr_number}",
         pr=f"#{pr_number}"
@@ -613,17 +622,29 @@ def update_registry_from_github():
 
         # Parse commit message for model info
         # Expected format: "Model Name 🎯 (#12345)"
+        # Fallback: look up associated PR via GitHub API for non-standard messages
         if '(#' not in commit_message:
-            continue
-
-        # Extract PR number
-        pr_match = commit_message.find('(#')
-        if pr_match == -1:
-            continue
-
-        pr_end = commit_message.find(')', pr_match)
-        pr_number = commit_message[pr_match:pr_end+1]
-        model_name = commit_message[:pr_match].strip()
+            try:
+                pr_resp = requests.get(
+                    f"https://api.github.com/repos/commaai/openpilot/commits/{commit_hash}/pulls",
+                    headers={"Accept": "application/vnd.github.v3+json"},
+                    timeout=10,
+                )
+                pr_resp.raise_for_status()
+                prs = pr_resp.json()
+                if not prs:
+                    continue
+                pr_data = prs[0]
+                pr_number = f"#{pr_data['number']}"
+                model_name = pr_data['title'].strip()
+            except Exception:
+                continue
+        else:
+            # Extract PR number
+            pr_match = commit_message.find('(#')
+            pr_end = commit_message.find(')', pr_match)
+            pr_number = commit_message[pr_match:pr_end+1]
+            model_name = commit_message[:pr_match].strip()
 
         # Determine model type
         if 'DM:' in model_name or 'dmonitoring' in commit_message.lower():
