@@ -499,10 +499,18 @@ def add_model_from_pr(pr_number: int, model_type: str = 'driving'):
 
     merged_date = merged_at[:10] if merged_at else datetime.now().strftime('%Y-%m-%d')
 
-    # Generate model_id from head commit (LFS objects live there, not on merge commit)
+    # Generate model_id: use PR number for dedup (same PR = same model, different commits)
     clean_name = title.lower().replace(' ', '_').replace('-', '_')
     clean_name = re.sub(r'[^a-z0-9_]', '', clean_name)
-    model_id = f"{clean_name}_{head_commit[:7]}"
+
+    # Use PR number as model_id for dedup (same PR = same model)
+    # Check if registry already has an entry from this PR
+    existing_id = None
+    for mid, minfo in registry.items():
+        if minfo.get('pr', '').strip('#()') == str(pr_number):
+            existing_id = mid
+            break
+    model_id = existing_id or f"{clean_name}_{pr_number}"
 
     print(f"✅ Found: {title}")
     print(f"   Head commit: {head_commit[:12]}")
@@ -657,13 +665,23 @@ def update_registry_from_github():
             registry_key = 'driving_models'
             files = ['driving_vision.onnx', 'driving_policy.onnx']
 
-        # Generate model ID - clean up name and append commit hash
+        # Generate model ID - deduplicate by PR number
         import re
         clean_name = model_name.lower().replace(' ', '_')
         clean_name = re.sub(r'[^a-z0-9_]', '', clean_name)
-        model_id = f"{clean_name}_{commit_hash_short}"
 
-        # Create model entry
+        # Check if registry already has a model from this PR
+        existing_id = None
+        if pr_number:
+            pr_str = pr_number.strip('#()')
+            for mid, minfo in registry[registry_key].items():
+                if minfo.get('pr', '').strip('#()') == pr_str:
+                    existing_id = mid
+                    break
+        pr_id = pr_number.strip('#()') if pr_number else commit_hash_short
+        model_id = existing_id or f"{clean_name}_{pr_id}"
+
+        # Create model entry (updates existing if same PR)
         model_entry = {
             'name': model_name,
             'commit': commit_hash,
@@ -673,7 +691,7 @@ def update_registry_from_github():
             'files': files
         }
 
-        # Add to registry
+        # Add/update registry
         registry[registry_key][model_id] = model_entry
         new_models_added += 1
 
