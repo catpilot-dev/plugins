@@ -294,11 +294,27 @@ init = init.replace(
     'INTERNAL_DEVICES = (HW_TYPE_TRES, HW_TYPE_CUATRO, HW_TYPE_DOS)'
 )
 
-# Patch get_mcu_type to handle F4
-init = init.replace(
-    '  def get_mcu_type(self) -> McuType:\n    hw_type = self.get_type()\n    if hw_type in Panda.H7_DEVICES:\n      return McuType.H7\n    raise ValueError(f"unknown HW type: {hw_type}")',
-    '  def get_mcu_type(self) -> McuType:\n    hw_type = self.get_type()\n    if hw_type in Panda.H7_DEVICES:\n      return McuType.H7\n    if hw_type in Panda.F4_DEVICES:\n      return McuType.F4\n    raise ValueError(f"unknown HW type: {hw_type}")'
-)
+# Patch or add get_mcu_type to handle F4
+# Upstream v0.11.0 removed get_mcu_type (dropped F4) — add it back if missing
+if 'def get_mcu_type' in init:
+    init = init.replace(
+        '  def get_mcu_type(self) -> McuType:\n    hw_type = self.get_type()\n    if hw_type in Panda.H7_DEVICES:\n      return McuType.H7\n    raise ValueError(f"unknown HW type: {hw_type}")',
+        '  def get_mcu_type(self) -> McuType:\n    hw_type = self.get_type()\n    if hw_type in Panda.H7_DEVICES:\n      return McuType.H7\n    if hw_type in Panda.F4_DEVICES:\n      return McuType.F4\n    raise ValueError(f"unknown HW type: {hw_type}")'
+    )
+else:
+    # Method doesn't exist — inject after SUPPORTED_DEVICES
+    init = init.replace(
+        '  SUPPORTED_DEVICES = H7_DEVICES + F4_DEVICES',
+        '  SUPPORTED_DEVICES = H7_DEVICES + F4_DEVICES\n\n'
+        '  def get_mcu_type(self):\n'
+        '    from panda.python.constants import McuType\n'
+        '    hw_type = self.get_type()\n'
+        '    if hw_type in Panda.H7_DEVICES:\n'
+        '      return McuType.H7\n'
+        '    if hw_type in Panda.F4_DEVICES:\n'
+        '      return McuType.F4\n'
+        '    raise ValueError(f"unknown HW type: {hw_type}")'
+    )
 
 with open(init_path, 'w') as f:
     f.write(init)
