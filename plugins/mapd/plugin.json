@@ -2,11 +2,11 @@
   "id": "mapd",
   "name": "Mapd OSM Integration",
   "version": "1.0.0",
-  "type": "process",
-  "author": "c3pilot",
+  "type": "hybrid",
+  "author": "catpilot",
   "description": "Manages the mapd binary (pfeiferj/mapd) that provides OpenStreetMap data including speed limits, road names, curve speeds, and hazards.",
   "min_openpilot": "0.10.0",
-  "max_openpilot": "0.10.99",
+  "max_openpilot": "0.11.99",
   "device_filter": ["tici", "tizi", "mici"],
   "cereal": {
     "slots": {
@@ -34,6 +34,13 @@
     "mapdIn": [false, 0.0]
   },
   "panel": true,
+  "hooks": {
+    "device.health_check": {
+      "module": "hook",
+      "function": "on_health_check",
+      "priority": 50
+    }
+  },
   "processes": [
     {
       "name": "mapd",
