@@ -50,21 +50,48 @@ def _ensure_init():
     _font_medium = gui_app.font(FontWeight.MEDIUM)
 
 
+_sl_sub = None
+_sl_data = None
+
+
 def _update_state():
-  """Read speedLimitState from SubMaster (updated each frame by ui_state)."""
+  """Read speedLimitState from plugin bus."""
   global _speed_limit, _speed_limit_source, _speed_limit_confirmed, speed_limit_capping, speed_limit_ceiling
+  global _sl_sub, _sl_data
   import time
-  sm = ui_state.sm
-  if sm.recv_frame.get("speedLimitState", 0) > 0:
-    sls = sm['speedLimitState']
-    _speed_limit = sls.speedLimit
-    _speed_limit_source = sls.source.raw if hasattr(sls.source, 'raw') else int(sls.source)
-    # Don't overwrite local confirmed state during tap hold period
+
+  # Recreate sub if socket was recycled (speedlimitd restart deletes + rebinds)
+  import os
+  _sl_socket_path = '/tmp/plugin_bus/speedLimitState'
+  if _sl_sub is not None and not os.path.exists(_sl_socket_path):
+    try:
+      _sl_sub.close()
+    except Exception:
+      pass
+    _sl_sub = None
+
+  if _sl_sub is None and os.path.exists(_sl_socket_path):
+    try:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+      _sl_sub = PluginSub(['speedLimitState'])
+    except Exception:
+      pass
+
+  if _sl_sub is not None:
+    try:
+      msg = _sl_sub.drain('speedLimitState')
+      if msg is not None and isinstance(msg, tuple) and len(msg) == 2:
+        _, _sl_data = msg
+    except Exception:
+      pass
+
+  if _sl_data is not None:
+    _speed_limit = _sl_data.get('speedLimit', 0)
+    _speed_limit_source = _sl_data.get('source', 2)
     if time.monotonic() >= _tap_hold_until:
-      _speed_limit_confirmed = sls.confirmed
+      _speed_limit_confirmed = _sl_data.get('confirmed', False)
     speed_limit_capping = _speed_limit_confirmed and _speed_limit > 0
     if speed_limit_capping:
-      # Tiered offset matching planner_hook logic
       if _speed_limit <= 50:
         offset_pct = 40
       elif _speed_limit <= 60:
@@ -157,12 +184,7 @@ def _handle_tap(content_rect):
 
 
 def on_state_subscriptions(services):
-  """Hook callback for ui.state_subscriptions.
-
-  Adds speedLimitState to the UI SubMaster so the overlay can read speed limit data.
-  """
-  if 'speedLimitState' not in services:
-    services.append('speedLimitState')
+  """Hook callback for ui.state_subscriptions (no-op, speedLimitState moved to plugin_bus)."""
   return services
 
 
@@ -185,12 +207,31 @@ def on_hud_set_speed_override(default, max_color, set_speed_color, set_speed, is
   }
 
 
+def _show_sign_enabled():
+  """Check ShowSpeedLimitSign param (cached, refreshed lazily)."""
+  global _show_sign_cache, _show_sign_check_time
+  import time
+  now = time.monotonic()
+  if not hasattr(_show_sign_enabled, '_cache_until') or now > _show_sign_enabled._cache_until:
+    import os
+    val = None
+    try:
+      param_path = '/data/plugins/speedlimitd/data/ShowSpeedLimitSign'
+      if os.path.isfile(param_path):
+        val = open(param_path).read().strip()
+    except Exception:
+      pass
+    _show_sign_enabled._value = val != '0'
+    _show_sign_enabled._cache_until = now + 2.0  # re-check every 2s
+  return _show_sign_enabled._value
+
+
 def on_render_overlay(default, content_rect):
   """Hook callback for ui.render_overlay. Called each frame inside scissor mode."""
   _ensure_init()
   _update_state()
 
-  if _speed_limit > 0:
+  if _speed_limit > 0 and _show_sign_enabled():
     _draw_speed_limit_sign(content_rect)
     _handle_tap(content_rect)
 

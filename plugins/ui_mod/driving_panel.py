@@ -84,6 +84,17 @@ class DrivingLayout(Widget):
       )
       items.append(self._lane_centering)
 
+    # --- Speed Limit Sign (if speedlimitd plugin present) ---
+    if os.path.isdir(os.path.join(PLUGINS_DIR, 'speedlimitd')):
+      current = read_plugin_param('speedlimitd', 'ShowSpeedLimitSign') != '0'
+      self._speed_limit_sign = toggle_item(
+        "Speed Limit Sign",
+        "Show inferred speed limit sign on the driving HUD.",
+        current,
+        callback=self._on_speed_limit_sign,
+      )
+      items.append(self._speed_limit_sign)
+
     # --- Vehicle-specific settings (populated by car plugins) ---
     CP = ui_state.CP
     if CP is not None:
@@ -100,6 +111,9 @@ class DrivingLayout(Widget):
 
   def _on_lane_centering(self, state):
     write_plugin_param('lane_centering', 'LaneCenteringEnabled', '1' if state else '0')
+
+  def _on_speed_limit_sign(self, state):
+    write_plugin_param('speedlimitd', 'ShowSpeedLimitSign', '1' if state else '0')
 
   def _update_state(self):
     if not hasattr(self, '_personality'):

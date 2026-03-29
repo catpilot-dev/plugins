@@ -196,8 +196,14 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
 
 class SpeedLimitMiddleware:
   def __init__(self):
-    self.sm = messaging.SubMaster(['mapdOut', 'modelV2', 'gpsLocationExternal'])
-    self.pm = messaging.PubMaster(['speedLimitState'])
+    from cereal.services import SERVICE_LIST
+    subs = ['modelV2', 'gpsLocationExternal']
+    if 'mapdOut' in SERVICE_LIST:
+      subs.append('mapdOut')
+    self._has_mapd = 'mapdOut' in subs
+    self.sm = messaging.SubMaster(subs)
+    from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+    self._sl_pub = PluginPub('speedLimitState')
 
     self.country_bboxes = load_country_bboxes()
     self.country_detected = False
@@ -222,7 +228,7 @@ class SpeedLimitMiddleware:
     self.vision_cap_stable_since: float = 0.0
 
     # Confirmation state — confirmed by default on engage; user can toggle off
-    self.confirmed: bool = True
+    self.confirmed: bool = False
     self.confirmed_value: float = 0.0
 
     # Plugin bus: receive toggle commands from carstate/UI
@@ -255,8 +261,8 @@ class SpeedLimitMiddleware:
             pass
         self.country_detected = True
 
-    # --- Read mapd data ---
-    if self.sm.updated['mapdOut']:
+    # --- Read mapd data (if available) ---
+    if self._has_mapd and self.sm.updated['mapdOut']:
       mapd = self.sm['mapdOut']
       # mapd publishes speeds in m/s, convert to km/h
       self.last_osm_speed = mapd.speedLimit * 3.6 if mapd.speedLimit > 0 else 0.0
@@ -400,21 +406,19 @@ class SpeedLimitMiddleware:
       self.confirmed_value = 0.0
 
     # --- Publish ---
-    msg = messaging.new_message('speedLimitState')
-    sls = msg.speedLimitState
-    sls.speedLimit = snap_to_standard_speed(int(speed_limit))
-    sls.source = source
-    sls.confirmed = self.confirmed
-    sls.confidence = confidence
-    sls.osmMaxspeed = osm_speed
-    sls.yoloSpeed = yolo_speed
-    sls.inferredSpeed = inferred_speed
-    sls.mapdSuggested = mapd_suggested  # 0 if unconstrained (>=130) or no road data
-    sls.highwayType = self.last_highway_type
-    sls.roadName = self.last_road_name
-    sls.laneCount = self.lane_count_stable
-
-    self.pm.send('speedLimitState', msg)
+    self._sl_pub.send({
+      'speedLimit': snap_to_standard_speed(int(speed_limit)),
+      'source': source,
+      'confirmed': self.confirmed,
+      'confidence': confidence,
+      'osmMaxspeed': osm_speed,
+      'yoloSpeed': yolo_speed,
+      'inferredSpeed': inferred_speed,
+      'mapdSuggested': mapd_suggested,
+      'highwayType': self.last_highway_type,
+      'roadName': self.last_road_name,
+      'laneCount': self.lane_count_stable,
+    })
 
 
 def main():

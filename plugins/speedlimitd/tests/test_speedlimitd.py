@@ -8,9 +8,15 @@ import importlib
 @pytest.fixture(autouse=True)
 def mock_openpilot(monkeypatch):
   """Mock openpilot + cereal imports."""
+  mock_services = MagicMock()
+  mock_services.SERVICE_LIST = {'modelV2': MagicMock(), 'gpsLocationExternal': MagicMock()}
   for mod in ['openpilot', 'openpilot.common',
-              'openpilot.common.realtime', 'cereal', 'cereal.messaging']:
+              'openpilot.common.realtime', 'cereal', 'cereal.messaging',
+              'cereal.services',
+              'openpilot.selfdrive', 'openpilot.selfdrive.plugins',
+              'openpilot.selfdrive.plugins.plugin_bus']:
     monkeypatch.setitem(sys.modules, mod, MagicMock())
+  sys.modules['cereal.services'] = mock_services
   sys.modules['openpilot.common.realtime'].Ratekeeper = MagicMock
 
 
@@ -259,10 +265,9 @@ class TestPriorityCascade:
   def _make_middleware(self, sld):
     """Create a SpeedLimitMiddleware with messaging mocked out."""
     import plugins.speedlimitd.speedlimitd as mod
-    with patch.object(mod.messaging, 'SubMaster'), \
-         patch.object(mod.messaging, 'PubMaster'):
+    with patch.object(mod.messaging, 'SubMaster'):
       mw = mod.SpeedLimitMiddleware()
-    mw.pm = MagicMock()
+    mw._sl_pub = MagicMock()
     return mw
 
   def test_min_of_all_sources(self, sld):
@@ -370,35 +375,30 @@ class TestPlannerHook:
 
     import plugins.speedlimitd.planner_hook as mod
     importlib.reload(mod)
+    mod._sl_sub = None
+    mod._sl_data = None
     return mod
+
+  def _set_sl_data(self, hook, data):
+    """Set the speed limit state dict directly on the module."""
+    hook._sl_data = data
 
   def test_no_speed_limit_state(self, hook):
     sm = MagicMock()
-    sm.valid = {}
-    sm.recv_frame = {}
+    hook._sl_data = None
     result = hook.on_v_cruise(30.0, 20.0, sm)
     assert result == 30.0
 
   def test_unconfirmed_returns_original(self, hook):
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = False
-    sls.speedLimit = 60
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': False, 'speedLimit': 60}
     result = hook.on_v_cruise(30.0, 20.0, sm)
     assert result == 30.0
 
   def test_confirmed_limits_v_cruise_highway(self, hook):
     """Limit >= 80 kph uses 10% offset."""
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = True
-    sls.speedLimit = 80  # kph — >= 80, 10% offset
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': True, 'speedLimit': 80}
 
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result < 100.0
@@ -407,12 +407,7 @@ class TestPlannerHook:
   def test_confirmed_limits_v_cruise_low_speed(self, hook):
     """Limit < 80 kph uses 15% offset."""
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = True
-    sls.speedLimit = 40  # kph — < 80, 15% offset
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': True, 'speedLimit': 40}
 
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
@@ -420,39 +415,24 @@ class TestPlannerHook:
   def test_confirmed_limits_v_cruise_mid_speed(self, hook):
     """Limit 60 kph (< 80) uses 15% offset."""
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = True
-    sls.speedLimit = 60  # kph — < 80, 15% offset
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': True, 'speedLimit': 60}
 
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(60 * 1.15 / 3.6, abs=0.1)
 
   def test_confirmed_no_limit_if_already_below(self, hook):
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = True
-    sls.speedLimit = 120  # kph
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': True, 'speedLimit': 120}
 
     # v_cruise = 10 m/s (already well below 120 * 1.10 kph limit)
     result = hook.on_v_cruise(10.0, 8.0, sm)
     assert result == 10.0
 
-  def _make_sm(self, speed_limit, confirmed=True, lead_status=False, lead_vLead=0.0):
-    """Helper: build SubMaster mock with speedLimitState and radarState."""
+  def _make_sm(self, hook, speed_limit, confirmed=True, lead_status=False, lead_vLead=0.0):
+    """Helper: set _sl_data and build SubMaster mock with radarState."""
+    hook._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit}
+
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-
-    sls = MagicMock()
-    sls.confirmed = confirmed
-    sls.speedLimit = speed_limit
-
     lead = MagicMock()
     lead.status = lead_status
     lead.vLead = lead_vLead
@@ -461,8 +441,6 @@ class TestPlannerHook:
     radar.leadOne = lead
 
     def getitem(key):
-      if key == 'speedLimitState':
-        return sls
       if key == 'radarState':
         return radar
       return MagicMock()
@@ -472,28 +450,25 @@ class TestPlannerHook:
 
   def test_lead_override_fast_lead_skips_limit(self, hook):
     """Lead >10% above speed limit → skip capping."""
-    # Speed limit 80 kph (highway, 10% offset), lead at 95 kph (19% above → override)
-    sm = self._make_sm(80, confirmed=True, lead_status=True, lead_vLead=95 / 3.6)
+    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=95 / 3.6)
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == 100.0  # original v_cruise, not capped
 
   def test_lead_override_slow_lead_keeps_limit(self, hook):
     """Lead only 5% above speed limit → still cap."""
-    # Speed limit 80 kph, lead at 84 kph (5% above → no override)
-    sm = self._make_sm(80, confirmed=True, lead_status=True, lead_vLead=84 / 3.6)
+    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=84 / 3.6)
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
 
   def test_lead_override_no_lead_keeps_limit(self, hook):
     """No tracked lead → normal capping."""
-    sm = self._make_sm(80, confirmed=True, lead_status=False, lead_vLead=0)
+    sm = self._make_sm(hook, 80, confirmed=True, lead_status=False, lead_vLead=0)
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
 
   def test_lead_override_exactly_at_threshold(self, hook):
     """Lead exactly at 10% threshold → no override (must be strictly above)."""
-    # Speed limit 80 kph, lead at exactly 88 kph (10% above → boundary)
-    sm = self._make_sm(80, confirmed=True, lead_status=True, lead_vLead=88 / 3.6)
+    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=88 / 3.6)
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
 
@@ -514,13 +489,12 @@ class TestPluginManifest:
     assert 'planner.v_cruise' in manifest['hooks']
     assert 'ui.render_overlay' in manifest['hooks']
 
-  def test_has_state_subscriptions_hook(self):
+  def test_no_cereal_slot(self):
+    """speedLimitState moved to plugin_bus — no cereal slot needed."""
     import json, os
     manifest_path = os.path.join(os.path.dirname(__file__), '..', 'plugin.json')
     with open(manifest_path) as f:
       manifest = json.load(f)
 
-    assert 'ui.state_subscriptions' in manifest['hooks']
-    hook = manifest['hooks']['ui.state_subscriptions']
-    assert hook['module'] == 'ui_overlay'
-    assert hook['function'] == 'on_state_subscriptions'
+    assert 'cereal' not in manifest or not manifest.get('cereal', {}).get('slots')
+    assert 'services' not in manifest or not manifest.get('services')
