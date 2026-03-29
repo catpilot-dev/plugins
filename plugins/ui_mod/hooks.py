@@ -16,17 +16,10 @@ _last_started = None  # track transitions to avoid calling set_target_fps every 
 
 def on_settings_extend(default, settings):
   from driving_panel import DrivingLayout
-  from vehicle_panel import VehicleLayout
   from plugins_panel import PluginsLayout
 
   global _driving_key, _plugins_key
   _driving_key = settings.add_panel("Driving", DrivingLayout())
-  settings.add_panel(
-    "Vehicle", VehicleLayout(),
-    enabled_fn=lambda: __import__(
-      'openpilot.selfdrive.ui.ui_state', fromlist=['ui_state']
-    ).ui_state.CP is not None,
-  )
   _plugins_key = settings.add_panel("Plugins", PluginsLayout())
 
 
