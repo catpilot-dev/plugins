@@ -151,7 +151,7 @@ class TestPreLaneChange:
 
     assert register._clc.desire_gap == 0
     assert dh.lane_change_state == log.LaneChangeState.laneChangeStarting
-    assert dh.lane_change_ll_prob == 1.0
+    assert dh.lane_change_ll_prob == 0.0
     assert dh.lane_change_timer == 0.0
     assert register._clc.consecutive_requested is False
 
@@ -214,10 +214,14 @@ class TestPostLaneChange:
     register._clc.prev_steering_button = True  # button already held
 
     cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.005)
+    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.005, lane_change_timer=3.0)
 
     register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.01)
-    assert register._clc.desire_gap == 1
+    # Directly transitions to next lane change — no desire_gap, state set inline
+    assert dh.lane_change_state == log.LaneChangeState.laneChangeStarting
+    assert dh.lane_change_ll_prob == 0.0
+    assert dh.lane_change_timer == 0.0
+    assert register._clc.consecutive_requested is False
 
   def test_no_trigger_when_ll_prob_not_faded(self, param_dir, reset_clc):
     from cereal import log
@@ -318,7 +322,7 @@ class TestDesirePostUpdate:
 
 class TestConsecutiveSequence:
   def test_full_double_lane_change(self, param_dir, reset_clc):
-    """Simulate: first LC active → button press → ll_prob fades → gap → re-trigger."""
+    """Simulate: first LC active → button press → ll_prob fades → immediate re-trigger."""
     from cereal import log
     import register
     (param_dir / 'ConsecutiveLaneChange').write_text('1')
@@ -333,24 +337,17 @@ class TestConsecutiveSequence:
     cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
     register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.5)
     assert register._clc.consecutive_requested is True
-    assert register._clc.desire_gap == 0  # ll_prob still > 0.01
 
-    # Step 2: ll_prob fades below threshold
+    # Step 2: ll_prob fades below threshold — immediate inline re-trigger
     dh.lane_change_ll_prob = 0.005
+    dh.lane_change_timer = 3.0
     register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.01)
-    assert register._clc.desire_gap == 1
-
-    # Step 3: Desire override during gap frame
-    desire = register.on_desire_post_update(log.Desire.laneChangeLeft, None, None, None)
-    assert desire == log.Desire.none
-
-    # Step 4: Pre-hook on next frame — gap countdown resets state
-    register.on_pre_lane_change(None, dh, cs)
+    # Directly transitions — no desire_gap, no finishing state
     assert dh.lane_change_state == log.LaneChangeState.laneChangeStarting
-    assert dh.lane_change_ll_prob == 1.0
+    assert dh.lane_change_ll_prob == 0.0
     assert dh.lane_change_timer == 0.0
-    assert register._clc.desire_gap == 0
+    assert register._clc.consecutive_requested is False
 
-    # Step 5: Desire no longer overridden
+    # Step 3: Desire not overridden (no gap frame needed)
     desire = register.on_desire_post_update(log.Desire.laneChangeLeft, None, None, None)
     assert desire == log.Desire.laneChangeLeft

@@ -274,7 +274,7 @@ def on_pre_lane_change(result, dh, carstate):
     if _clc.desire_gap == 0:
       from cereal import log
       dh.lane_change_state = log.LaneChangeState.laneChangeStarting
-      dh.lane_change_ll_prob = 1.0
+      dh.lane_change_ll_prob = 0.0  # skip fade-out, model already knows we're changing
       dh.lane_change_timer = 0.0
       _clc.consecutive_requested = False
   return result
@@ -303,10 +303,14 @@ def on_post_lane_change(result, dh, carstate, one_blinker, below_lane_change_spe
     # otherwise it immediately schedules a second lane change the user never requested.
     if rising_edge and one_blinker and dh.lane_change_ll_prob < 0.5:
       _clc.consecutive_requested = True
-    # Re-trigger as soon as car is committed (ll_prob faded ~0.5s) — skip waiting for model
+    # Re-trigger immediately when committed — skip finishing state entirely
     if _clc.consecutive_requested and one_blinker and not below_lane_change_speed \
         and dh.lane_change_ll_prob < 0.01:
-      _clc.desire_gap = 1
+      # Jump straight to next lane change — no finishing/fade-in gap
+      dh.lane_change_state = log.LaneChangeState.laneChangeStarting
+      dh.lane_change_ll_prob = 0.0
+      dh.lane_change_timer = 0.0
+      _clc.consecutive_requested = False
 
   elif dh.lane_change_state == log.LaneChangeState.laneChangeFinishing:
     if rising_edge and one_blinker and not below_lane_change_speed:
