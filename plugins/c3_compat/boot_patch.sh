@@ -332,7 +332,7 @@ fi
 
 # 8b. Panda: skip packet version checks for F4 panda
 #     F4 firmware is v16 but the v0.11.0 library expects v18 for health.
-#     The version check skips when _mcu_type is set to McuType.F4.
+#     Directly inject the final version with get_mcu_type() call + try/except.
 if [ -f "$PANDA_INIT" ] && ! grep -q 'c3_compat.*version' "$PANDA_INIT"; then
   python3 - "$PANDA_INIT" << 'PYEOF'
 import sys
@@ -340,7 +340,6 @@ path = sys.argv[1]
 with open(path) as f:
     content = f.read()
 
-# Patch ensure_version to skip check for F4 devices
 old_ensure = '''def ensure_version(desc, lib_field, panda_field, fn):
   @wraps(fn)
   def wrapper(self, *args, **kwargs):
@@ -354,10 +353,13 @@ old_ensure = '''def ensure_version(desc, lib_field, panda_field, fn):
 new_ensure = '''def ensure_version(desc, lib_field, panda_field, fn):
   @wraps(fn)
   def wrapper(self, *args, **kwargs):
-    # c3_compat: skip version check for F4 panda (firmware v16, library v17)
+    # c3_compat: skip version check for F4 panda (firmware v16, library v18)
     from panda.python.constants import McuType
-    if getattr(self, '_mcu_type', None) == McuType.F4:
-      return fn(self, *args, **kwargs)
+    try:
+      if self.get_mcu_type() == McuType.F4:
+        return fn(self, *args, **kwargs)
+    except Exception:
+      pass
     lib_version = getattr(self, lib_field)
     panda_version = getattr(self, panda_field)
     if lib_version != panda_version:
@@ -371,40 +373,6 @@ if old_ensure in content:
         f.write(content)
 PYEOF
   echo "[c3_compat] Patched panda version check to skip for F4"
-fi
-
-# 8c. Panda: update ensure_version to call get_mcu_type() directly
-#     Step 8b used _mcu_type cache, but Panda() constructed outside flash_panda()
-#     never has _mcu_type set. Calling get_mcu_type() reads the HW type from USB.
-if [ -f "$PANDA_INIT" ] && ! grep -q 'self.get_mcu_type() == McuType.F4' "$PANDA_INIT"; then
-  python3 - "$PANDA_INIT" << 'PYEOF'
-import sys
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-
-old = '''    # c3_compat: skip version check for F4 panda (firmware v16, library v17)
-    from panda.python.constants import McuType
-    if getattr(self, '_mcu_type', None) == McuType.F4:
-      return fn(self, *args, **kwargs)'''
-
-new = '''    # c3_compat: skip version check for F4 panda (firmware v16, library v17)
-    from panda.python.constants import McuType
-    try:
-      if self.get_mcu_type() == McuType.F4:
-        return fn(self, *args, **kwargs)
-    except Exception:
-      pass'''
-
-if old in content:
-    content = content.replace(old, new, 1)
-    with open(path, 'w') as f:
-        f.write(content)
-    print("OK")
-else:
-    print("SKIP: pattern not found")
-PYEOF
-  echo "[c3_compat] Updated ensure_version to call get_mcu_type() directly"
 fi
 
 # 9. Pandad: skip firmware flashing for F4 panda (BMW plugin handles firmware)
