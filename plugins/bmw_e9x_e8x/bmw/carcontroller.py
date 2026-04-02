@@ -70,7 +70,12 @@ class CarController(CarControllerBase):
     accel = actuators.accel
 
     if CS.cruise_stalk_counter != self.rx_cruise_stalk_counter_last:
-      self.tx_cruise_stalk_counter_last = CS.cruise_stalk_counter
+      # Resync to stock counter, but never go backwards — if we already
+      # sent past the stock counter, keep ours to avoid duplicate counters.
+      stock = CS.cruise_stalk_counter
+      fwd = (stock - self.tx_cruise_stalk_counter_last) % 15
+      if fwd <= 7:  # stock is ahead or same (within half-ring)
+        self.tx_cruise_stalk_counter_last = stock
       self.last_cruise_rx_timestamp = now_nanos
     self.rx_cruise_stalk_counter_last = CS.cruise_stalk_counter
 
@@ -81,10 +86,7 @@ class CarController(CarControllerBase):
         and time_since_cruise_received > CRUISE_STALK_HOLD_TICK_STOCK/2 - DT_CTRL \
         and time_since_cruise_received < CRUISE_STALK_IDLE_TICK_STOCK/2 + DT_CTRL
       if send:
-        tx_cruise_stalk_counter = self.tx_cruise_stalk_counter_last + 1
-        if tx_cruise_stalk_counter == CS.cruise_stalk_counter + 1:
-          tx_cruise_stalk_counter = tx_cruise_stalk_counter + 2
-        tx_cruise_stalk_counter = tx_cruise_stalk_counter % 0xF
+        tx_cruise_stalk_counter = (self.tx_cruise_stalk_counter_last + 1) % 15
         can_sends.append(bmwcan.create_accel_command(self.packer, cmd, self.cruise_bus, tx_cruise_stalk_counter))
         self.tx_cruise_stalk_counter_last = tx_cruise_stalk_counter
         self.last_cruise_tx_timestamp = now_nanos
