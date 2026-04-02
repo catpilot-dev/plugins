@@ -144,58 +144,68 @@ def _write_param(key, value):
     f.write(value)
 
 
-_torque_cache = {"btn": "INACTIVE", "desc": "Online torque learning from driving data.", "t": 0.0}
+_torque_cache = {"val": "Not calibrated", "t": 0.0}
 
-def _torque_update():
+def _torque_value():
   import time
   now = time.monotonic()
   if now - _torque_cache["t"] < 10.0:
-    return
+    return _torque_cache["val"]
   _torque_cache["t"] = now
   try:
+    lt = None
     from openpilot.selfdrive.ui.ui_state import ui_state
     sm = ui_state.sm
     if sm.recv_frame.get('liveTorqueParameters', 0) > 0:
       lt = sm['liveTorqueParameters']
-      _torque_cache["btn"] = "ACTIVE" if lt.useParams and lt.liveValid else "INACTIVE"
-      _torque_cache["desc"] = f"{lt.calPerc}% | F={lt.latAccelFactorFiltered:.2f} f={lt.frictionCoefficientFiltered:.3f}"
+    else:
+      from openpilot.common.params import Params
+      from cereal import log
+      data = Params().get('LiveTorqueParameters')
+      if data:
+        with log.Event.from_bytes(data) as evt:
+          lt = evt.liveTorqueParameters
+    if lt:
+      status = "Estimated" if lt.useParams and lt.liveValid else f"Estimating {lt.calPerc}%"
+      _torque_cache["val"] = f"{status} | F={lt.latAccelFactorFiltered:.2f} f={lt.frictionCoefficientFiltered:.3f}"
   except Exception:
     pass
-
-def _torque_button_text():
-  _torque_update()
-  return _torque_cache["btn"]
-
-def _torque_desc():
-  _torque_update()
-  return _torque_cache["desc"]
+  return _torque_cache["val"]
 
 
-_delay_cache = {"btn": "INACTIVE", "desc": "Online lateral delay estimation from steering response.", "t": 0.0}
+_delay_cache = {"val": "Not calibrated", "t": 0.0}
 
-def _delay_update():
+def _delay_value():
   import time
   now = time.monotonic()
   if now - _delay_cache["t"] < 10.0:
-    return
+    return _delay_cache["val"]
   _delay_cache["t"] = now
   try:
+    ld = None
     from openpilot.selfdrive.ui.ui_state import ui_state
     sm = ui_state.sm
     if sm.recv_frame.get('liveDelay', 0) > 0:
       ld = sm['liveDelay']
-      _delay_cache["btn"] = "ACTIVE" if str(ld.status).split('.')[-1] == 'applied' else "INACTIVE"
-      _delay_cache["desc"] = f"{ld.calPerc}% | {ld.lateralDelay:.2f}s"
+    else:
+      from openpilot.common.params import Params
+      from cereal import log
+      data = Params().get('LiveDelay')
+      if data:
+        with log.Event.from_bytes(data) as evt:
+          ld = evt.liveDelay
+    if ld:
+      s = str(ld.status).split('.')[-1]
+      if s == 'estimated':
+        status = "Estimated"
+      elif s == 'invalid':
+        status = "Invalid"
+      else:
+        status = f"Estimating {ld.calPerc}%"
+      _delay_cache["val"] = f"{status} | {ld.lateralDelay:.2f}s"
   except Exception:
     pass
-
-def _delay_button_text():
-  _delay_update()
-  return _delay_cache["btn"]
-
-def _delay_desc():
-  _delay_update()
-  return _delay_cache["desc"]
+  return _delay_cache["val"]
 
 
 def on_vehicle_settings(items, CP):
@@ -203,21 +213,7 @@ def on_vehicle_settings(items, CP):
   if CP.brand != 'bmw':
     return items
 
-  from openpilot.system.ui.widgets.list_view import toggle_item, button_item
-
-  items.append(toggle_item(
-    "Cruise Speed Memory",
-    "Remember cruise speed ceiling across disengage/re-engage within the same drive.",
-    _read_param('CruiseCeilingMemory') != '0',
-    callback=lambda state: _write_param('CruiseCeilingMemory', '1' if state else '0'),
-  ))
-
-  items.append(toggle_item(
-    "Consecutive Lane Changes",
-    "Press steering button during an active lane change to chain the next one immediately for fluid multi-lane merges.",
-    _read_param('ConsecutiveLaneChange') != '0',
-    callback=lambda state: _write_param('ConsecutiveLaneChange', '1' if state else '0'),
-  ))
+  from openpilot.system.ui.widgets.list_view import toggle_item
 
   items.append(toggle_item(
     "Temperature Overlay",
@@ -230,20 +226,6 @@ def on_vehicle_settings(items, CP):
     "Resume Button Repurposed",
     "Short press: resume (disengaged) or toggle speed limit confirm (engaged). Long press: cycle follow distance.",
     initial_state=True,
-    enabled=False,
-  ))
-
-  items.append(button_item(
-    "Live Torque",
-    _torque_button_text,
-    _torque_desc,
-    enabled=False,
-  ))
-
-  items.append(button_item(
-    "Lateral Delay",
-    _delay_button_text,
-    _delay_desc,
     enabled=False,
   ))
 
@@ -265,18 +247,42 @@ def _is_consecutive_enabled():
 
 
 def on_pre_lane_change(result, dh, carstate):
-  """Handle desire gap countdown before state machine runs."""
+  """Handle consecutive lane change before state machine runs.
+
+  Two jobs:
+  1. When desire_gap counts down to 0, reset state to laneChangeStarting
+     with ll_prob=1.0 so the state machine fades normally.
+  2. When consecutive_requested and ll_prob faded, set desire_gap BEFORE
+     the state machine can transition to laneChangeFinishing.
+  """
   if not _is_consecutive_enabled():
     return result
 
+  from cereal import log
+
+  # Job 1: after gap frame, reset to fresh laneChangeStarting
   if _clc.desire_gap > 0:
     _clc.desire_gap -= 1
     if _clc.desire_gap == 0:
-      from cereal import log
       dh.lane_change_state = log.LaneChangeState.laneChangeStarting
       dh.lane_change_ll_prob = 1.0
       dh.lane_change_timer = 0.0
+    return result
+
+  # Job 2: intercept before state machine transitions starting→finishing
+  # The state machine fades ll_prob by 2*DT_MDL per frame, then checks < 0.01.
+  # We must intercept BEFORE the fade crosses 0.01, so check < 0.11 (0.01 + 2*0.05).
+  # This gives us one frame of margin to set ll_prob=1.0 before the state machine
+  # can transition to finishing.
+  if _clc.consecutive_requested \
+      and dh.lane_change_state == log.LaneChangeState.laneChangeStarting \
+      and dh.lane_change_ll_prob < 0.11:
+    one_blinker = carstate.leftBlinker != carstate.rightBlinker
+    if one_blinker:
+      _clc.desire_gap = 1
       _clc.consecutive_requested = False
+      dh.lane_change_ll_prob = 1.0  # block state machine's starting→finishing transition
+
   return result
 
 
@@ -303,14 +309,17 @@ def on_post_lane_change(result, dh, carstate, one_blinker, below_lane_change_spe
     # otherwise it immediately schedules a second lane change the user never requested.
     if rising_edge and one_blinker and dh.lane_change_ll_prob < 0.5:
       _clc.consecutive_requested = True
-    # Re-trigger as soon as car is committed (ll_prob faded ~0.5s) — skip waiting for model
-    if _clc.consecutive_requested and one_blinker and not below_lane_change_speed \
-        and dh.lane_change_ll_prob < 0.01:
-      _clc.desire_gap = 1
+    # Note: the actual desire_gap trigger for ll_prob < 0.01 is in on_pre_lane_change
+    # (runs BEFORE state machine) to prevent the starting→finishing race condition.
 
   elif dh.lane_change_state == log.LaneChangeState.laneChangeFinishing:
-    if rising_edge and one_blinker and not below_lane_change_speed:
+    # consecutive_requested may have been set during laneChangeStarting but the
+    # state machine transitioned to finishing in the same frame (race condition).
+    # Honor it here — no need for a fresh rising_edge.
+    if (_clc.consecutive_requested or (rising_edge and not carstate.gasPressed)) \
+        and one_blinker and not below_lane_change_speed:
       _clc.desire_gap = 1
+      _clc.consecutive_requested = False
 
   return result
 
@@ -321,3 +330,21 @@ def on_desire_post_update(desire, lane_change_state, lane_change_direction, cars
     from cereal import log
     return log.Desire.none
   return desire
+
+
+def on_lat_controller_init(result, lac, CP):
+  """No-op — adaptive gains in latcontrol_torque.py now compute KP/KI from LiveDelay."""
+  return result
+
+
+def on_health_check(acc, **kwargs):
+  try:
+    from opendbc.car.car_helpers import interfaces
+    from bmw.values import CAR
+    registered = CAR.BMW_E90 in interfaces or str(CAR.BMW_E90) in interfaces
+  except Exception:
+    registered = False
+  result = {"status": "ok" if registered else "warning", "interfaces_registered": registered}
+  if not registered:
+    result["warnings"] = ["BMW interfaces not registered in opendbc"]
+  return {**acc, "bmw-e9x-e8x": result}
