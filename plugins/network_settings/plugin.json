@@ -3,10 +3,10 @@
   "name": "Network Settings",
   "version": "1.0.0",
   "type": "hybrid",
-  "author": "c3pilot",
+  "author": "catpilot",
   "description": "Network proxy toggle with github.com connectivity check",
   "min_openpilot": "0.10.0",
-  "max_openpilot": "0.10.99",
+  "max_openpilot": "0.11.99",
   "device_filter": ["tici"],
   "dependencies": [],
   "conflicts": [],
@@ -19,6 +19,11 @@
     "ui.network_settings_extend": {
       "module": "ui",
       "function": "on_network_settings_extend",
+      "priority": 50
+    },
+    "device.health_check": {
+      "module": "proxy",
+      "function": "on_health_check",
       "priority": 50
     }
   },

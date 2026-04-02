@@ -143,3 +143,11 @@ def on_selfdrived_events(events, CS, sm):
                      "cannot inject engagement block event")
 
   return events
+
+
+def on_health_check(acc, **kwargs):
+  status = "warning" if _required and not _phone_active else "ok"
+  result = {"status": status, "required": _required, "phone_active": _phone_active}
+  if status == "warning":
+    result["warnings"] = ["phone required but not connected"]
+  return {**acc, "phone_display": result}

@@ -33,3 +33,7 @@ def provide_session_class(default_class):
   except Exception:
     pass
   return WebRTCSession
+
+
+def on_health_check(acc, **kwargs):
+  return {**acc, "webrtc_stack": {"status": "ok"}}

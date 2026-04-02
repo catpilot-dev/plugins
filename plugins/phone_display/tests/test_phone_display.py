@@ -135,9 +135,9 @@ class TestHook:
     self.hook._phone_active = False
     self.hook._sub.recv.return_value = None
 
-    # Stub EventName.phoneDisplayUnavailable = 98
+    # Stub EventName.phoneDisplayUnavailable = 99
     log_mock = MagicMock()
-    log_mock.OnroadEvent.EventName.phoneDisplayUnavailable = 98
+    log_mock.OnroadEvent.EventName.phoneDisplayUnavailable = 99
     sys.modules["cereal"].log = log_mock
     sys.modules["cereal.log"] = log_mock
 
@@ -145,7 +145,7 @@ class TestHook:
     cereal.log = log_mock
 
     result = self.hook.on_selfdrived_events([], MagicMock(), MagicMock())
-    assert 98 in result
+    assert 99 in result
 
   def test_bus_message_updates_state(self):
     self.hook._required = False
@@ -157,7 +157,7 @@ class TestHook:
     ]
 
     log_mock = MagicMock()
-    log_mock.OnroadEvent.EventName.phoneDisplayUnavailable = 98
+    log_mock.OnroadEvent.EventName.phoneDisplayUnavailable = 99
     sys.modules["cereal"].log = log_mock
 
     import cereal
@@ -166,7 +166,7 @@ class TestHook:
     result = self.hook.on_selfdrived_events([], MagicMock(), MagicMock())
     assert self.hook._required is True
     assert self.hook._phone_active is False
-    assert 98 in result
+    assert 99 in result
 
   def test_preserves_existing_events(self):
     self.hook._required = False
@@ -249,7 +249,7 @@ class TestAlertRegistry:
 
   def test_returns_dict_with_event(self):
     log_mock = MagicMock()
-    log_mock.OnroadEvent.EventName.phoneDisplayUnavailable = 98
+    log_mock.OnroadEvent.EventName.phoneDisplayUnavailable = 99
     sys.modules["cereal"].log = log_mock
 
     events_mock = MagicMock()
@@ -259,12 +259,12 @@ class TestAlertRegistry:
     sys.modules["openpilot.selfdrive.selfdrived.events"] = events_mock
 
     result = self.hook.on_alert_registry({})
-    assert 98 in result
-    assert "no_entry" in str(result[98]).lower() or result[98] is not None
+    assert 99 in result
+    assert "no_entry" in str(result[99]).lower() or result[99] is not None
 
   def test_preserves_existing_registrations(self):
     log_mock = MagicMock()
-    log_mock.OnroadEvent.EventName.phoneDisplayUnavailable = 98
+    log_mock.OnroadEvent.EventName.phoneDisplayUnavailable = 99
     sys.modules["cereal"].log = log_mock
 
     events_mock = MagicMock()
@@ -273,7 +273,7 @@ class TestAlertRegistry:
     existing = {42: {"warning": "some_alert"}}
     result = self.hook.on_alert_registry(existing)
     assert 42 in result
-    assert 98 in result
+    assert 99 in result
 
 
 class TestPluginJson:
@@ -312,7 +312,7 @@ class TestPluginJson:
 
   def test_event_name_declared(self):
     assert "event_names" in self.cfg["cereal"]
-    assert self.cfg["cereal"]["event_names"]["phoneDisplayUnavailable"] == 98
+    assert self.cfg["cereal"]["event_names"]["phoneDisplayUnavailable"] == 99
 
   def test_process_only_onroad(self):
     proc = self.cfg["processes"][0]

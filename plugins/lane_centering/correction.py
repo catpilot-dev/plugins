@@ -234,3 +234,7 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing):
   return curvature + correction
 
 
+def on_health_check(acc, **kwargs):
+  return {**acc, "lane-centering": {"status": "ok"}}
+
+

@@ -79,3 +79,7 @@ def on_webrtc_app_routes(routes, app):
   app.router.add_get("/ws/gps", _gps_ws_handler)
   cloudlog.info("phone_gps: registered GET /ws/gps on webrtcd")
   return routes + ["/ws/gps"]
+
+
+def on_health_check(acc, **kwargs):
+  return {**acc, "phone_gps": {"status": "ok"}}
