@@ -88,6 +88,7 @@ class CarController(CarControllerBase):
         can_sends.append(bmwcan.create_accel_command(self.packer, cmd, self.cruise_bus, tx_cruise_stalk_counter))
         self.tx_cruise_stalk_counter_last = tx_cruise_stalk_counter
         self.last_cruise_tx_timestamp = now_nanos
+      return send
 
     if not CC.enabled and self.cruise_enabled_prev:
       self.cruise_cancel = True
@@ -114,8 +115,8 @@ class CarController(CarControllerBase):
             cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
             interval = HOLD_TICK if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_TICK
             if current_time - self.dcc_last_tick_time >= interval:
-              cruise_cmd(cmd, interval)
-              self.dcc_last_tick_time = current_time
+              if cruise_cmd(cmd, interval):
+                self.dcc_last_tick_time = current_time
 
           elif v_error < -V_ERROR_DEADZONE and accel < 0 and setpoint_error < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
@@ -123,8 +124,8 @@ class CarController(CarControllerBase):
             interval = HOLD_TICK if -accel >= ACCEL_HOLD_THRESHOLD else SINGLE_TICK
             step = 5 if cmd == CruiseStalk.minus5 else 1
             if headroom_kmh >= step and current_time - self.dcc_last_tick_time >= interval:
-              cruise_cmd(cmd, interval)
-              self.dcc_last_tick_time = current_time
+              if cruise_cmd(cmd, interval):
+                self.dcc_last_tick_time = current_time
 
     if self.flags & BmwFlags.STEPPER_SERVO_CAN:
       if CC.enabled and CC.latActive:
