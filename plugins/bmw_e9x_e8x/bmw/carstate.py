@@ -61,8 +61,11 @@ class CarState(CarStateBase):
     self.cruise_state_enabled = False
     self.dtc_mode = False
 
-    # Subscribe to radarState, liveDelay, speedLimitState
-    self.sm = messaging.SubMaster(['radarState', 'liveDelay', 'speedLimitState'])
+    # Subscribe to radarState, liveDelay
+    self.sm = messaging.SubMaster(['radarState', 'liveDelay'])
+    from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+    self._sl_sub = PluginSub(['speedLimitState'])
+    self._sl_data = None
 
   def update(self, can_parsers) -> structs.CarState:
     cp_PT = can_parsers[Bus.pt]
@@ -207,8 +210,9 @@ class CarState(CarStateBase):
         ))
       elif self.cruise_state_enabled:
         # Short press while engaged: toggle speed limit confirm
-        self.sm.update(0)
-        sl = self.sm['speedLimitState'].speedLimit if self.sm.recv_frame.get('speedLimitState', 0) > 0 else 0.0
+        msg = self._sl_sub.drain('speedLimitState')
+        if msg is not None:
+          _, self._sl_data = msg
         toggle_speed_limit_confirm()
       else:
         resume_button_events.append(structs.CarState.ButtonEvent(
