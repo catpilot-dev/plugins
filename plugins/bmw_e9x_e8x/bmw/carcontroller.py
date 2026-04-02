@@ -23,10 +23,11 @@ HOLD_TICK = 0.02     # 50Hz — 2 × DT_CTRL, faster than stock 40Hz so DCC reco
 # DCC command selection thresholds
 V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — deadzone for entry and burst cancellation
 ACCEL_HOLD_THRESHOLD = 0.2     # m/s² — use HOLD_TICK above this, SINGLE_TICK below
-ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — use ±5 step above this, ±1 below
+ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — use +5 above this, +1 below (midpoint of 0.4–1.2)
+DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint of 0.6–1.2)
 
-# DCC Calibration  
-# PLUS1 + HOLD_TICK = 0.4 m/s2 
+# DCC Calibration
+# PLUS1 + HOLD_TICK = 0.4 m/s2
 # PLUS5 + HOLD_TICK = 1.2 m/s2
 # MINUS1 + HOLD_TICK = -0.6 m/s2
 # MINUS5 + HOLD_TICK = -1.2 m/s2
@@ -122,7 +123,7 @@ class CarController(CarControllerBase):
 
           elif v_error < -V_ERROR_DEADZONE and accel < 0 and setpoint_error < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
-            cmd = CruiseStalk.minus5 if -accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.minus1
+            cmd = CruiseStalk.minus5 if -accel >= DECEL_STEP5_THRESHOLD else CruiseStalk.minus1
             interval = HOLD_TICK if -accel >= ACCEL_HOLD_THRESHOLD else SINGLE_TICK
             step = 5 if cmd == CruiseStalk.minus5 else 1
             if headroom_kmh >= step and current_time - self.dcc_last_tick_time >= interval:
