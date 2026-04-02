@@ -108,13 +108,13 @@ class OsmTileReader:
     best_way = None
 
     for way in offline.ways:
-      # Quick bounding box check
+      # Quick bounding box check — skip ways whose bbox doesn't overlap
       if lat < way.minLat - 0.001 or lat > way.maxLat + 0.001:
         continue
       if lon < way.minLon - 0.001 or lon > way.maxLon + 0.001:
         continue
 
-      # Fine distance check against way segments
+      # Skip ways with no geometry
       nodes = way.nodes
       if len(nodes) < 2:
         continue
