@@ -10,7 +10,7 @@ import pyray as rl
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
-FONT_SIZE = 46
+FONT_SIZE = 56
 BOTTOM_MARGIN = 30
 
 COLOR_REF = rl.Color(100, 200, 255, 220)    # light blue for wayRef
@@ -93,7 +93,7 @@ def on_render_overlay(default, content_rect):
 
   # Semi-transparent background
   bg_rect = rl.Rectangle(x - pad, y - pad / 2, text_size.x + pad * 2, text_size.y + pad)
-  rl.draw_rectangle_rounded(bg_rect, 0.3, 10, rl.Color(0, 0, 0, 100))
+  rl.draw_rectangle_rounded(bg_rect, 0.3, 10, rl.Color(0, 0, 0, 128))
 
   # Draw text — use ref color if wayRef present, otherwise name color
   color = COLOR_REF if way_ref else COLOR_NAME
