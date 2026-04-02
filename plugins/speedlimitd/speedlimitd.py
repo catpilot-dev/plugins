@@ -336,12 +336,11 @@ class SpeedLimitMiddleware:
     self.confirmed_value: float = 0.0
 
     # Plugin bus: receive toggle commands from carstate/UI
+    # Messages buffered before _cmd_init_t are stale (from a previous session)
     try:
       from openpilot.selfdrive.plugins.plugin_bus import PluginSub
       self._cmd_sub = PluginSub(['speedlimit_cmd_car', 'speedlimit_cmd_ui'])
-      # Flush stale messages from previous drive
-      while self._cmd_sub.drain() is not None:
-        pass
+      self._cmd_init_t = time.monotonic()
     except ImportError:
       self._cmd_sub = None
 
@@ -496,7 +495,7 @@ class SpeedLimitMiddleware:
     # Never auto-reset on speed limit change, disengage, or process restart.
     if self._cmd_sub is not None:
       cmd = self._cmd_sub.drain()
-      if cmd is not None:
+      if cmd is not None and time.monotonic() - self._cmd_init_t > 2.0:
         _, data = cmd
         if isinstance(data, dict) and data.get('action') == 'toggle_confirm':
           self.confirmed = not self.confirmed
