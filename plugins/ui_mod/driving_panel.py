@@ -153,6 +153,15 @@ class DrivingLayout(Widget):
       )
       items.append(self._speed_limit_sign)
 
+      current_road = read_plugin_param('ui_mod', 'RoadInfoOverlay') != '0'
+      self._road_info = toggle_item(
+        "Road Info",
+        "Show current road name and highway ref (from OSM) at bottom of HUD.",
+        current_road,
+        callback=self._on_road_info,
+      )
+      items.append(self._road_info)
+
     # --- Cruise Speed Memory ---
     items.append(toggle_item(
       "Cruise Speed Memory",
@@ -192,6 +201,9 @@ class DrivingLayout(Widget):
 
   def _on_speed_limit_sign(self, state):
     write_plugin_param('speedlimitd', 'ShowSpeedLimitSign', '1' if state else '0')
+
+  def _on_road_info(self, state):
+    write_plugin_param('ui_mod', 'RoadInfoOverlay', '1' if state else '0')
 
   def _update_state(self):
     if not hasattr(self, '_personality'):

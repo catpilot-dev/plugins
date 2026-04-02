@@ -30,6 +30,11 @@
       "module": "hooks",
       "function": "on_exp_button"
     },
+    "ui.render_overlay": {
+      "module": "road_info_overlay",
+      "function": "on_render_overlay",
+      "priority": 40
+    },
     "device.health_check": {
       "module": "hooks",
       "function": "on_health_check",
