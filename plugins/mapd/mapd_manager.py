@@ -22,6 +22,10 @@ PLUGIN_DATA_DIR = plugin_data_dir("mapd")
 
 GITHUB_API_URL = "https://api.github.com/repos/pfeiferj/mapd/releases/latest"
 
+# v2.0.6 uses gomsgq shadow subscription for carState which crashes on AGNOS.
+# Pin to v2.0.5 (last compatible release with regular subscriptions).
+MAX_ALLOWED_VERSION = "v2.0.5"
+
 def ensure_binary():
   """Ensure mapd binary exists at MAPD_PATH, downloading if needed"""
   if MAPD_PATH.exists():
@@ -29,15 +33,13 @@ def ensure_binary():
 
   MAPD_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-  # No binary — download latest
-  print("No mapd binary found, downloading latest...")
-  latest_version, _ = get_latest_version()
-  if latest_version:
-    temp = download_binary(latest_version)
-    if temp:
-      os.rename(temp, MAPD_PATH)
-      update_version_param(latest_version)
-      return True
+  # No binary — download pinned version
+  print(f"No mapd binary found, downloading {MAX_ALLOWED_VERSION}...")
+  temp = download_binary(MAX_ALLOWED_VERSION)
+  if temp:
+    os.rename(temp, MAPD_PATH)
+    update_version_param(MAX_ALLOWED_VERSION)
+    return True
 
   print("ERROR: Could not obtain mapd binary", file=sys.stderr)
   return False
@@ -192,6 +194,11 @@ def perform_update():
   if not latest_version:
     print("ERROR: Could not fetch latest version")
     return False
+
+  # Pin to MAX_ALLOWED_VERSION — v2.0.6+ has shadow subscription crash
+  if latest_version > MAX_ALLOWED_VERSION:
+    print(f"Skipping {latest_version} (pinned to {MAX_ALLOWED_VERSION} — shadow mode crash)")
+    latest_version = MAX_ALLOWED_VERSION
 
   if current_version == latest_version:
     print(f"Already up to date: {current_version}")
