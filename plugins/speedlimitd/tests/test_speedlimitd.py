@@ -10,6 +10,9 @@ def mock_openpilot(monkeypatch):
   """Mock openpilot + cereal imports."""
   mock_services = MagicMock()
   mock_services.SERVICE_LIST = {'modelV2': MagicMock(), 'gpsLocationExternal': MagicMock()}
+  mock_plugin_bus = MagicMock()
+  # PluginSub().drain() must return None to avoid infinite loop in __init__
+  mock_plugin_bus.PluginSub.return_value.drain.return_value = None
   for mod in ['openpilot', 'openpilot.common',
               'openpilot.common.realtime', 'cereal', 'cereal.messaging',
               'cereal.services',
@@ -17,6 +20,7 @@ def mock_openpilot(monkeypatch):
               'openpilot.selfdrive.plugins.plugin_bus']:
     monkeypatch.setitem(sys.modules, mod, MagicMock())
   sys.modules['cereal.services'] = mock_services
+  sys.modules['openpilot.selfdrive.plugins.plugin_bus'] = mock_plugin_bus
   sys.modules['openpilot.common.realtime'].Ratekeeper = MagicMock
 
 
