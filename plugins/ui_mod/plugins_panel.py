@@ -24,7 +24,7 @@ BUILD_HASH_FILE = '/tmp/plugin_build_hash'
 IS_C3 = os.path.exists('/TICI')
 
 # Essential plugins — always enforced (non-toggleable)
-ESSENTIAL_PLUGINS = {'mapd', 'speedlimitd', 'bus_logger'}
+ESSENTIAL_PLUGINS = {'bus_logger'}
 
 # Sort order: user-facing plugins first, essential + c3_compat at the bottom
 SORT_ORDER = {
@@ -88,6 +88,10 @@ class PluginsLayout(Widget):
         with open(manifest_path) as f:
           manifest = json.load(f)
       except (json.JSONDecodeError, OSError):
+        continue
+
+      # Hidden plugins (panel: false)
+      if manifest.get('panel') is False:
         continue
 
       # Device filter
@@ -257,8 +261,7 @@ class PluginsLayout(Widget):
       pass
 
     # Show reboot dialog
-    dlg = ConfirmDialog('Reboot required to apply changes.', 'OK', cancel_text='')
-    gui_app.set_modal_overlay(dlg, callback=lambda _: None)
+    gui_app.push_widget(ConfirmDialog('Reboot required to apply changes.', 'OK', cancel_text=''))
 
   def show_event(self):
     super().show_event()
@@ -315,5 +318,4 @@ class PluginsLayout(Widget):
             f.write('1')
         except OSError:
           pass
-    dlg = ConfirmDialog('Plugin update installed. Reboot now?', 'Reboot', cancel_text='Later')
-    gui_app.set_modal_overlay(dlg, callback=_on_reboot)
+    gui_app.push_widget(ConfirmDialog('Plugin update installed. Reboot now?', 'Reboot', cancel_text='Later', callback=_on_reboot))

@@ -3,7 +3,7 @@
   "name": "UI Customizations",
   "version": "1.0.0",
   "type": "hook",
-  "author": "c3pilot",
+  "author": "catpilot",
   "description": "Drive stats, branded exp button, driving/vehicle/plugins panels",
   "hooks": {
     "ui.settings_extend": {
@@ -29,6 +29,11 @@
     "ui.onroad_exp_button": {
       "module": "hooks",
       "function": "on_exp_button"
+    },
+    "device.health_check": {
+      "module": "hooks",
+      "function": "on_health_check",
+      "priority": 50
     }
   }
 }
