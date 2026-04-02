@@ -331,7 +331,7 @@ class SpeedLimitMiddleware:
     self._gps_lon: float = 0.0
     self._gps_valid: bool = False
 
-    # Confirmation state — confirmed by default on engage; user can toggle off
+    # Confirmation state — starts unconfirmed until user explicitly confirms
     self.confirmed: bool = False
     self.confirmed_value: float = 0.0
 
@@ -339,6 +339,9 @@ class SpeedLimitMiddleware:
     try:
       from openpilot.selfdrive.plugins.plugin_bus import PluginSub
       self._cmd_sub = PluginSub(['speedlimit_cmd_car', 'speedlimit_cmd_ui'])
+      # Flush stale messages from previous drive
+      while self._cmd_sub.drain() is not None:
+        pass
     except ImportError:
       self._cmd_sub = None
 
@@ -488,13 +491,20 @@ class SpeedLimitMiddleware:
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
 
     # --- Confirmation management ---
-    # Process toggle commands from carstate resume button / UI tap via plugin bus
+    # Process toggle commands from carstate resume button / UI tap via plugin bus.
+    # Confirmed state is sticky — only changes on explicit user toggle.
+    # Never auto-reset on speed limit change, disengage, or process restart.
     if self._cmd_sub is not None:
       cmd = self._cmd_sub.drain()
       if cmd is not None:
         _, data = cmd
-        if data.get('action') == 'toggle_confirm':
+        if isinstance(data, dict) and data.get('action') == 'toggle_confirm':
           self.confirmed = not self.confirmed
+          try:
+            from openpilot.common.swaglog import cloudlog
+            cloudlog.info(f"speedlimitd: confirmed toggled to {self.confirmed}")
+          except Exception:
+            pass
 
     # Track current limit for the planner (always follows detected limit)
     if self.confirmed:
