@@ -8,10 +8,8 @@ import math
 import os
 import subprocess
 import shutil
-import sys
 import time
 from pathlib import Path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import PLUGINS_RUNTIME_DIR
 from model_swapper import ModelSwapper, ModelType

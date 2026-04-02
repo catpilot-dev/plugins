@@ -39,7 +39,6 @@ except ImportError:
 
 log = logging.getLogger("venv_sync")
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import OPENPILOT_DIR, plugin_data_dir
 
 # --- Paths ---

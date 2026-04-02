@@ -12,7 +12,6 @@ import sys
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import MEDIA_DIR, plugin_data_dir
 
 MAPD_PATH    = Path(MEDIA_DIR) / "0/osm/mapd"

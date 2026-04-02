@@ -9,8 +9,6 @@ Combines:
 Vehicle heading (brand icon + fingerprint) shown when a car is detected.
 """
 import os
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import PLUGINS_RUNTIME_DIR, PLUGINS_REPO_DIR, read_plugin_param, write_plugin_param
 from cereal import log

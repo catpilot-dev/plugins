@@ -10,9 +10,7 @@ Samples on deviceState updates (~2Hz) — matching qlog resolution exactly.
 import json
 import math
 import os
-import sys
 import time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import PLUGINS_RUNTIME_DIR
 
 LAST_DRIVE_FILE = os.path.join(PLUGINS_RUNTIME_DIR, '.last_drive.json')

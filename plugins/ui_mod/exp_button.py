@@ -6,9 +6,7 @@ Replaces stock steering wheel / atomic icons with the vehicle brand emblem.
   - Lane centering active: green ring around the button
 """
 import os
-import sys
 import time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import PLUGINS_REPO_DIR
 import pyray as rl
 from openpilot.common.params import Params

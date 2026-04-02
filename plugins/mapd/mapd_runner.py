@@ -6,7 +6,6 @@ Ensures the mapd binary exists and execs it.
 import json
 import os
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import PARAMS_DIR, plugin_data_dir
 
 LAT_ACCEL_VALUES = [1.5, 2.0, 2.5, 3.0]  # indexed by MapdCurveTargetLatAccel param

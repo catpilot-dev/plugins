@@ -12,8 +12,6 @@ import math
 import time
 import logging
 
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import MEDIA_DIR
 
 log = logging.getLogger("osm_query")
