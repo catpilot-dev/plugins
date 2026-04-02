@@ -75,13 +75,55 @@ def snap_to_standard_speed(speed: int) -> int:
   return min(_STANDARD_SPEEDS, key=lambda s: abs(s - speed))
 
 
+def _near_road_edge(model_msg) -> tuple[bool, bool]:
+  """Check if the car is near the left or right road edge.
+
+  When the outermost visible lane line is close to the road edge (within
+  one lane width ~3.5m) and the road edge is detected with high confidence
+  (low std), the car is in an edge lane and vision likely undercounts by 1.
+
+  Returns (near_left_edge, near_right_edge).
+  """
+  if not hasattr(model_msg, 'roadEdges') or len(model_msg.roadEdges) < 2:
+    return False, False
+  if not hasattr(model_msg, 'roadEdgeStds') or len(model_msg.roadEdgeStds) < 2:
+    return False, False
+
+  probs = model_msg.laneLineProbs
+  re_stds = model_msg.roadEdgeStds
+  EDGE_STD_THRESH = 0.5  # confident road edge detection
+  LANE_WIDTH = 3.5  # meters — gap between outermost line and edge must be < 1 lane
+
+  # y positions at ~10m ahead (index 2)
+  try:
+    ll_y = [model_msg.laneLines[i].y[2] for i in range(4)]
+    re_y = [model_msg.roadEdges[i].y[2] for i in range(2)]
+  except (IndexError, AttributeError):
+    return False, False
+
+  # Left edge: use leftmost visible lane line (index 0 if visible, else 1)
+  left_line_idx = 0 if probs[0] > 0.3 else 1
+  near_left = (re_stds[0] < EDGE_STD_THRESH and probs[left_line_idx] > 0.3 and
+               abs(ll_y[left_line_idx] - re_y[0]) < LANE_WIDTH)
+
+  # Right edge: use rightmost visible lane line (index 3 if visible, else 2)
+  right_line_idx = 3 if probs[3] > 0.3 else 2
+  near_right = (re_stds[1] < EDGE_STD_THRESH and probs[right_line_idx] > 0.3 and
+                abs(re_y[1] - ll_y[right_line_idx]) < LANE_WIDTH)
+
+  return near_left, near_right
+
+
 def infer_lane_count(model_msg) -> int:
   """Infer lane count from modelV2 laneLineProbs and roadEdges.
 
   The model outputs 4 lane lines (indices 0-3) and 2 road edges.
   Lane lines form lane boundaries; N visible lines = up to N-1 lanes
-  on the visible side of the road. Road edges beyond the outermost
-  lane lines suggest additional lanes.
+  on the visible side of the road.
+
+  When the car is in an edge lane (close to a road edge), the far side
+  of the road is harder to see, so we boost the count by 1 to compensate
+  for the likely unseen lane(s) on the opposite side.
 
   Returns estimated total lane count (1-6+).
   """
@@ -98,12 +140,65 @@ def infer_lane_count(model_msg) -> int:
   #   2 lines (inner pair) = our lane + neighbors, at least 2 lanes
   #   1 or 0 = single lane
   if visible_lines >= 4:
-    return 4
+    base_count = 4
   elif visible_lines >= 3:
-    return 3
+    base_count = 3
   elif visible_lines >= 2:
-    return 2
-  return 1
+    base_count = 2
+  else:
+    base_count = 1
+
+  # Edge lane boost: if the car is next to a road edge, vision likely
+  # misses a lane on the far side. Boost by 1, capped at 4.
+  if base_count >= 2:
+    near_left, near_right = _near_road_edge(model_msg)
+    if near_left or near_right:
+      base_count = min(base_count + 1, 4)
+
+  return base_count
+
+
+def curvature_speed_cap(model_msg) -> int:
+  """Cap speed based on predicted path curvature lookahead.
+
+  Uses the model's predicted orientation rate (yaw rate) and velocity
+  over the next ~5 seconds to estimate upcoming curvature. Maps maximum
+  curvature to a safe speed using lateral acceleration limit of 2.0 m/s².
+
+  Returns speed cap in km/h, or 0 if no constraint.
+  """
+  if not hasattr(model_msg, 'orientationRate') or not hasattr(model_msg, 'velocity'):
+    return 0
+
+  try:
+    yaw_rates = list(model_msg.orientationRate.z)
+    velocities = list(model_msg.velocity.x)
+  except Exception:
+    return 0
+
+  if len(yaw_rates) < 10 or len(velocities) < 10:
+    return 0
+
+  # Look 1-5 seconds ahead (indices ~5-22 in T_IDXS, which spans 0-10s quadratically)
+  # T_IDXS[i] = 10 * (i/32)^2, so T~1s is i≈10, T~5s is i≈22
+  max_curvature = 0.0
+  for i in range(5, min(23, len(yaw_rates))):
+    v = max(velocities[i], 5.0)  # floor at 5 m/s to avoid division issues
+    curvature = abs(yaw_rates[i]) / v
+    max_curvature = max(max_curvature, curvature)
+
+  if max_curvature < 0.003:  # negligible curvature (~330m radius)
+    return 0
+
+  # v = sqrt(a_lat_max / curvature), with a_lat_max = 2.0 m/s²
+  MAX_LAT_ACCEL = 2.0
+  safe_speed_ms = (MAX_LAT_ACCEL / max_curvature) ** 0.5
+  safe_speed_kph = safe_speed_ms * 3.6
+
+  if safe_speed_kph >= 100:
+    return 0  # no meaningful constraint
+
+  return snap_to_standard_speed(int(safe_speed_kph))
 
 
 def vision_speed_cap(model_msg) -> int:
@@ -196,15 +291,24 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
 
 class SpeedLimitMiddleware:
   def __init__(self):
-    self.sm = messaging.SubMaster(['mapdOut', 'modelV2', 'gpsLocationExternal'])
-    self.pm = messaging.PubMaster(['speedLimitState'])
+    self.sm = messaging.SubMaster(['modelV2', 'gpsLocationExternal'])
+    from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+    self._sl_pub = PluginPub('speedLimitState')
+
+    # OSM tile reader — reads offline tiles directly, no mapd binary needed
+    _pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    if _pkg_dir not in __import__('sys').path:
+      __import__('sys').path.insert(0, _pkg_dir)
+    from osm_query import OsmTileReader
+    self._osm = OsmTileReader()
+    self._osm_query_interval = 5.0  # seconds between tile queries (0.2 Hz)
+    self._osm_last_query_t = 0.0
 
     self.country_bboxes = load_country_bboxes()
     self.country_detected = False
 
     # State
     self.last_osm_speed: float = 0.0
-    self.last_mapd_suggested: float = 0.0   # mapd suggestedSpeed (comprehensive)
     self.last_yolo_speed: float = 0.0
     self.last_highway_type: str = ''
     self.last_road_name: str = ''
@@ -220,9 +324,15 @@ class SpeedLimitMiddleware:
     self.vision_cap: int = 0
     self.vision_cap_stable: int = 0
     self.vision_cap_stable_since: float = 0.0
+    self.curvature_cap: int = 0
+
+    # GPS state
+    self._gps_lat: float = 0.0
+    self._gps_lon: float = 0.0
+    self._gps_valid: bool = False
 
     # Confirmation state — confirmed by default on engage; user can toggle off
-    self.confirmed: bool = True
+    self.confirmed: bool = False
     self.confirmed_value: float = 0.0
 
     # Plugin bus: receive toggle commands from carstate/UI
@@ -243,74 +353,73 @@ class SpeedLimitMiddleware:
 
     now = time.monotonic()
 
-    # --- Auto-detect country from GPS (once) ---
-    if not self.country_detected and self.sm.updated.get('gpsLocationExternal', False):
+    # --- Auto-detect country from GPS ---
+    if self.sm.updated.get('gpsLocationExternal', False):
       gps = self.sm['gpsLocationExternal']
       if gps.flags % 2 == 1:  # valid fix
-        country = country_from_gps(gps.latitude, gps.longitude, self.country_bboxes)
-        if country:
-          try:
-            SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED = load_speed_table(country)
-          except FileNotFoundError:
-            pass
-        self.country_detected = True
+        self._gps_lat = gps.latitude
+        self._gps_lon = gps.longitude
+        self._gps_valid = True
+        if not self.country_detected:
+          country = country_from_gps(gps.latitude, gps.longitude, self.country_bboxes)
+          if country:
+            try:
+              SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED = load_speed_table(country)
+            except FileNotFoundError:
+              pass
+          self.country_detected = True
 
-    # --- Read mapd data ---
-    if self.sm.updated['mapdOut']:
-      mapd = self.sm['mapdOut']
-      # mapd publishes speeds in m/s, convert to km/h
-      self.last_osm_speed = mapd.speedLimit * 3.6 if mapd.speedLimit > 0 else 0.0
-      self.last_mapd_suggested = mapd.suggestedSpeed * 3.6 if mapd.suggestedSpeed > 0 else 0.0
-      self.last_road_name = mapd.roadName
+    # --- Query OSM tiles at 0.2 Hz ---
+    if self._gps_valid and now - self._osm_last_query_t >= self._osm_query_interval:
+      self._osm_last_query_t = now
+      result = self._osm.query(self._gps_lat, self._gps_lon)
 
-      # Road context from mapd (0=freeway, 1=city)
-      road_ctx = mapd.roadContext
-      if road_ctx == 0:
-        self.last_road_context = 'freeway'
-      elif road_ctx == 1:
-        self.last_road_context = 'city'
-      else:
-        self.last_road_context = 'unknown'
+      if result and result['wayRef']:
+        way_ref = result['wayRef']
+        self.last_way_ref = way_ref
+        self.last_osm_speed = result['speedLimit'] * 3.6 if result['speedLimit'] > 0 else 0.0
+        self.last_road_name = result['roadName']
+        if result['lanes'] > 0:
+          self.osm_lanes = result['lanes']
 
-      self.osm_lanes = mapd.lanes
-      self.last_way_ref = mapd.wayRef
+        # Road context
+        if result['roadContext'] == 0:
+          self.last_road_context = 'freeway'
+        elif result['roadContext'] == 1:
+          self.last_road_context = 'city'
 
-      # Highway type from wayRef — only expressway-grade refs are reliable.
-      # G (national expressway) → motorway (120 km/h), S (provincial expressway) → trunk (100 km/h).
-      # Lower-grade refs (X=county, etc.) are ignored: GPS cannot distinguish
-      # an elevated expressway from the ground-level road beneath it when they
-      # share the same name, so county-road classification is left to vision
-      # lane count which reads the actual road geometry.
-      way_ref = mapd.wayRef
-      road_id = mapd.roadName or way_ref
-      if road_id:
+        # Highway type from wayRef — only G/S expressway refs are reliable.
+        road_id = result['roadName'] or way_ref
         hw = ''
-        if way_ref:
-          if way_ref.startswith('G'):
-            hw = 'motorway'   # national expressway — 120 km/h
-          elif way_ref.startswith('S'):
-            hw = 'trunk'      # provincial expressway — 100 km/h
+        if way_ref.startswith('G'):
+          hw = 'motorway'   # national expressway — 120 km/h
+        elif way_ref.startswith('S'):
+          hw = 'trunk'      # provincial expressway — 100 km/h
         hw_rank = {'motorway': 4, 'trunk': 3}
         if road_id != self.last_road_id:
           self.last_road_id = road_id
           self.last_highway_type = hw
         elif hw_rank.get(hw, -1) > hw_rank.get(self.last_highway_type, -1):
-          # Same road, higher-rank ref seen — promote (never demote)
           self.last_highway_type = hw
+      else:
+        self.last_way_ref = ''
 
     # --- Read lane data from vision model ---
     if self.sm.updated['modelV2']:
       model = self.sm['modelV2']
       raw_lane_count = infer_lane_count(model)
 
-      # Directional hysteresis: fast to promote (2 s), slow to demote (5 s).
-      # Once vision confirms a wide road, a brief occlusion won't drop the count.
+      # Adaptive demotion hysteresis based on predicted curvature.
+      # Straight road: drops are likely lane-change occlusion → 5s to filter.
+      # Curved road: road is genuinely narrowing → 2s for quick response.
+      curving = self.curvature_cap > 0  # curvature_speed_cap detected upcoming curve
       if raw_lane_count != self.lane_count:
         self.lane_count = raw_lane_count
         self.lane_count_stable_since = now
       else:
         going_down = raw_lane_count < self.lane_count_stable
-        stability_window = 5.0 if going_down else 2.0
+        demotion_window = 2.0 if curving else 5.0
+        stability_window = demotion_window if going_down else 1.5
         if now - self.lane_count_stable_since > stability_window:
           self.lane_count_stable = self.lane_count
           self.lane_count_locked = True
@@ -331,6 +440,9 @@ class SpeedLimitMiddleware:
         self.vision_cap_stable_since = now
       elif now - self.vision_cap_stable_since > 1.0:
         self.vision_cap_stable = self.vision_cap
+
+      # Curvature lookahead cap from model predicted path
+      self.curvature_cap = curvature_speed_cap(model)
 
     # --- YOLO timeout ---
     if self.yolo_speed > 0 and (now - self.yolo_last_seen) > self.yolo_timeout:
@@ -359,27 +471,18 @@ class SpeedLimitMiddleware:
       inferred_speed = min(inferred_speed, self.vision_cap_stable)
 
     MIN_SPEED_LIMIT = 30   # km/h — no real road is below this
-    MAPD_UNCONSTRAINED = 130  # km/h — mapd's default ceiling when no OSM/curve data
 
-    raw_suggested = round(self.last_mapd_suggested) if self.last_mapd_suggested > 0 else 0
-    # Treat mapd's unconstrained ceiling as "no data" — fall through to own inference.
-    # Also ignore suggestedSpeed when mapd has no road data (no wayRef, no OSM lane count):
-    # in that case mapd is just outputting its default ceiling, not a meaningful constraint.
-    # Only trust mapd's suggestedSpeed when we have a real OSM way reference.
-    # mapd reports osm_lanes > 0 even on roads it detects visually (no OSM data),
-    # so osm_lanes alone is not a reliable indicator. Without wayRef, mapd has no
-    # speed limit data and its visionCurveSpeed can oscillate wildly on curves.
-    mapd_has_road_data = bool(self.last_way_ref)
-    mapd_suggested = raw_suggested if raw_suggested < MAPD_UNCONSTRAINED and mapd_has_road_data else 0
+    # OSM speed limit from offline tile (if available and has wayRef)
+    osm_speed = round(self.last_osm_speed) if self.last_osm_speed > 0 and self.last_way_ref else 0
 
     # Take minimum across all available sources — most conservative valid reading wins.
-    # mapd contributes curve constraints, inference contributes road-type knowledge,
-    # YOLO contributes sign readings. No single source is trusted exclusively.
     candidates = []
     if yolo_speed >= MIN_SPEED_LIMIT:
       candidates.append((float(yolo_speed), 1, 0.8))    # yoloDetection
-    if mapd_suggested >= MIN_SPEED_LIMIT:
-      candidates.append((float(mapd_suggested), 3, 0.6)) # mapdSuggested
+    if osm_speed >= MIN_SPEED_LIMIT:
+      candidates.append((float(osm_speed), 3, 0.7))     # osmSpeedLimit
+    if self.curvature_cap >= MIN_SPEED_LIMIT:
+      candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # roadTypeInference
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
@@ -400,21 +503,20 @@ class SpeedLimitMiddleware:
       self.confirmed_value = 0.0
 
     # --- Publish ---
-    msg = messaging.new_message('speedLimitState')
-    sls = msg.speedLimitState
-    sls.speedLimit = snap_to_standard_speed(int(speed_limit))
-    sls.source = source
-    sls.confirmed = self.confirmed
-    sls.confidence = confidence
-    sls.osmMaxspeed = osm_speed
-    sls.yoloSpeed = yolo_speed
-    sls.inferredSpeed = inferred_speed
-    sls.mapdSuggested = mapd_suggested  # 0 if unconstrained (>=130) or no road data
-    sls.highwayType = self.last_highway_type
-    sls.roadName = self.last_road_name
-    sls.laneCount = self.lane_count_stable
-
-    self.pm.send('speedLimitState', msg)
+    self._sl_pub.send({
+      'speedLimit': snap_to_standard_speed(int(speed_limit)),
+      'source': source,
+      'confirmed': self.confirmed,
+      'confidence': confidence,
+      'osmMaxspeed': osm_speed,
+      'yoloSpeed': yolo_speed,
+      'inferredSpeed': inferred_speed,
+      'highwayType': self.last_highway_type,
+      'wayRef': self.last_way_ref,
+      'roadName': self.last_road_name,
+      'laneCount': self.lane_count_stable,
+      'curvatureCap': self.curvature_cap,
+    })
 
 
 def main():
