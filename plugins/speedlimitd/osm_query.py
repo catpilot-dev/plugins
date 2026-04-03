@@ -62,7 +62,13 @@ class OsmTileReader:
     self._cache_ttl = 300  # seconds
 
   def _load_tile(self, path: str):
-    """Load and cache a tile file."""
+    """Load tile, convert capnp ways to plain Python, and cache.
+
+    Capnp reader objects have a traversal limit that accumulates across reads.
+    Repeated iteration of a cached capnp message eventually hits the limit and
+    throws KjException. Converting to plain Python on load avoids this entirely
+    and makes subsequent queries faster (no capnp overhead).
+    """
     now = time.monotonic()
     if path in self._tile_cache:
       cached, ts = self._tile_cache[path]
@@ -75,15 +81,33 @@ class OsmTileReader:
     try:
       with open(path, 'rb') as f:
         data = f.read()
-      offline = self.schema.Offline.from_bytes_packed(data)
-      self._tile_cache[path] = (offline, now)
+      import capnp
+      offline = self.schema.Offline.from_bytes_packed(
+        data, traversal_limit_in_words=len(data) * 8,
+      )
+
+      # Extract ways into plain Python tuples — no more capnp reads after this
+      ways = []
+      for way in offline.ways:
+        nodes = [(n.longitude, n.latitude) for n in way.nodes]
+        if len(nodes) < 2:
+          continue
+        ways.append((
+          way.minLat, way.maxLat, way.minLon, way.maxLon,
+          nodes,
+          way.ref or '', way.name or '',
+          way.maxSpeed, way.maxSpeedForward, way.lanes,
+        ))
+      del offline  # release capnp object
+
+      self._tile_cache[path] = (ways, now)
 
       # Evict old tiles
       if len(self._tile_cache) > 10:
         oldest = min(self._tile_cache, key=lambda k: self._tile_cache[k][1])
         del self._tile_cache[oldest]
 
-      return offline
+      return ways
     except Exception as e:
       log.warning("Failed to load tile %s: %s", path, e)
       return None
@@ -98,31 +122,28 @@ class OsmTileReader:
       return None
 
     path = _tile_path(lat, lon)
-    offline = self._load_tile(path)
-    if offline is None:
+    ways = self._load_tile(path)
+    if ways is None:
       return None
 
     best_dist = MAX_WAY_DISTANCE
     best_way = None
 
-    for way in offline.ways:
-      # Quick bounding box check — skip ways whose bbox doesn't overlap
-      if lat < way.minLat - 0.001 or lat > way.maxLat + 0.001:
-        continue
-      if lon < way.minLon - 0.001 or lon > way.maxLon + 0.001:
-        continue
+    for way in ways:
+      min_lat, max_lat, min_lon, max_lon, nodes, ref, name, max_speed, max_speed_fwd, lanes = way
 
-      # Skip ways with no geometry
-      nodes = way.nodes
-      if len(nodes) < 2:
+      # Quick bounding box check
+      if lat < min_lat - 0.001 or lat > max_lat + 0.001:
+        continue
+      if lon < min_lon - 0.001 or lon > max_lon + 0.001:
         continue
 
       min_seg_dist = float('inf')
       for i in range(len(nodes) - 1):
         d = _point_to_segment_distance(
           lon, lat,
-          nodes[i].longitude, nodes[i].latitude,
-          nodes[i + 1].longitude, nodes[i + 1].latitude)
+          nodes[i][0], nodes[i][1],
+          nodes[i + 1][0], nodes[i + 1][1])
         if d < min_seg_dist:
           min_seg_dist = d
 
@@ -133,24 +154,19 @@ class OsmTileReader:
     if best_way is None:
       return None
 
-    ref = best_way.ref
-    name = best_way.name
-    speed = best_way.maxSpeed  # m/s
+    _, _, _, _, _, ref, name, speed, speed_fwd, lanes = best_way
     if speed <= 0:
-      speed = best_way.maxSpeedForward
-    lanes = best_way.lanes
+      speed = speed_fwd
 
     # Road context: only G/S wayRef = freeway (expressway with controlled access).
-    # Urban elevated roads (高架路) and fast roads (快速路) are NOT freeways —
-    # they have intersections, on/off ramps at grade, and 80 km/h limits.
     is_freeway = bool(ref and (ref.startswith('G') or ref.startswith('S')))
 
     return {
-      'wayRef': ref or '',
-      'wayName': name or '',
+      'wayRef': ref,
+      'wayName': name,
       'speedLimit': speed,  # m/s
       'lanes': lanes,
       'roadContext': 0 if is_freeway else 1,  # 0=freeway, 1=city
-      'roadName': name or '',
+      'roadName': name,
       'distance': best_dist,
     }
