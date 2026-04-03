@@ -323,6 +323,8 @@ class SpeedLimitMiddleware:
     self.lane_count_stable: int = 1
     self.lane_count_stable_since: float = 0.0
     self.lane_count_locked: bool = False  # True once vision has a 2 s stable reading
+    self._lane_count_history: list = []   # (time, count) for demotion majority vote
+    self._lane_count_prev_raw: int = 1
     self.lane_conf: float = 0.0           # smoothed lane line confidence (0.0–1.0)
     self.vision_cap: int = 0
     self.vision_cap_stable: int = 0
@@ -417,21 +419,36 @@ class SpeedLimitMiddleware:
     if self.sm.updated['modelV2']:
       model = self.sm['modelV2']
       raw_lane_count = infer_lane_count(model)
+      self.lane_count = raw_lane_count
 
-      # Adaptive demotion hysteresis based on predicted curvature.
+      # Adaptive stability window based on predicted curvature.
       # Straight road: drops are likely lane-change occlusion → 5s to filter.
       # Curved road: road is genuinely narrowing → 2s for quick response.
-      curving = self.curvature_cap > 0  # curvature_speed_cap detected upcoming curve
-      if raw_lane_count != self.lane_count:
-        self.lane_count = raw_lane_count
-        self.lane_count_stable_since = now
+      curving = self.curvature_cap > 0
+      going_down = raw_lane_count < self.lane_count_stable
+      if going_down:
+        # Demotion: use majority vote over the window instead of requiring
+        # continuous stability. Raw counts flicker at forks/merges, so a
+        # strict "N consecutive seconds" timer never fires.
+        demotion_window = 2.0 if curving else 4.0
+        self._lane_count_history.append((now, raw_lane_count))
+        # Trim old entries
+        self._lane_count_history = [(t, c) for t, c in self._lane_count_history if now - t <= demotion_window]
+        if len(self._lane_count_history) >= 3:
+          counts = [c for _, c in self._lane_count_history]
+          median = sorted(counts)[len(counts) // 2]
+          if median < self.lane_count_stable:
+            self.lane_count_stable = median
+            self.lane_count_locked = True
       else:
-        going_down = raw_lane_count < self.lane_count_stable
-        demotion_window = 2.0 if curving else 5.0
-        stability_window = demotion_window if going_down else 1.5
-        if now - self.lane_count_stable_since > stability_window:
-          self.lane_count_stable = self.lane_count
+        self._lane_count_history.clear()
+        # Promotion: require stable reading
+        if raw_lane_count != self._lane_count_prev_raw:
+          self.lane_count_stable_since = now
+        elif now - self.lane_count_stable_since > 1.5:
+          self.lane_count_stable = raw_lane_count
           self.lane_count_locked = True
+      self._lane_count_prev_raw = raw_lane_count
 
       # Lane line confidence: sum of all probs divided by line count.
       # Scales with both the number of visible lines and their individual strength.
