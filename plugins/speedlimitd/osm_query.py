@@ -5,12 +5,14 @@ Reads pre-downloaded Cap'n Proto tile files, finds the nearest way to the
 current GPS position, and returns road context (wayRef, roadName, speedLimit,
 lanes, roadContext).
 
-No msgq subscription, no Go binary, no crashes.
+Tile loading (capnp parse + Python conversion) runs in a background thread
+so the caller's main loop is never blocked.
 """
 import os
 import math
 import time
 import logging
+import threading
 
 from config import MEDIA_DIR
 
@@ -50,6 +52,32 @@ def _point_to_segment_distance(px, py, ax, ay, bx, by):
   return math.sqrt(((px - cx) * LON_DEG_TO_M) ** 2 + ((py - cy) * LAT_DEG_TO_M) ** 2)
 
 
+def _parse_tile(schema, path):
+  """Parse a capnp tile file into plain Python tuples (runs in background thread).
+
+  Capnp reader objects have a cumulative traversal limit — repeated iteration
+  of a cached message eventually throws KjException. Converting to plain Python
+  on load avoids this and makes warm queries ~5x faster.
+  """
+  with open(path, 'rb') as f:
+    data = f.read()
+  offline = schema.Offline.from_bytes_packed(
+    data, traversal_limit_in_words=len(data) * 8,
+  )
+  ways = []
+  for way in offline.ways:
+    nodes = [(n.longitude, n.latitude) for n in way.nodes]
+    if len(nodes) < 2:
+      continue
+    ways.append((
+      way.minLat, way.maxLat, way.minLon, way.maxLon,
+      nodes,
+      way.ref or '', way.name or '',
+      way.maxSpeed, way.maxSpeedForward, way.lanes,
+    ))
+  return ways
+
+
 class OsmTileReader:
   def __init__(self):
     try:
@@ -58,71 +86,57 @@ class OsmTileReader:
     except (ImportError, OSError):
       self.schema = None
       log.warning("capnp not available — OSM tile queries disabled")
-    self._tile_cache = {}  # path -> (offline_msg, timestamp)
-    self._cache_ttl = 300  # seconds
+    self._tile_cache = {}   # path -> (ways, timestamp)
+    self._cache_ttl = 300   # seconds
+    self._loading = set()   # paths currently being loaded in background
 
-  def _load_tile(self, path: str):
-    """Load tile, convert capnp ways to plain Python, and cache.
-
-    Capnp reader objects have a traversal limit that accumulates across reads.
-    Repeated iteration of a cached capnp message eventually hits the limit and
-    throws KjException. Converting to plain Python on load avoids this entirely
-    and makes subsequent queries faster (no capnp overhead).
-    """
-    now = time.monotonic()
-    if path in self._tile_cache:
-      cached, ts = self._tile_cache[path]
-      if now - ts < self._cache_ttl:
-        return cached
-
-    if not os.path.exists(path):
-      return None
-
+  def _load_tile_bg(self, path: str):
+    """Background thread: parse tile and store in cache."""
     try:
-      with open(path, 'rb') as f:
-        data = f.read()
-      import capnp
-      offline = self.schema.Offline.from_bytes_packed(
-        data, traversal_limit_in_words=len(data) * 8,
-      )
-
-      # Extract ways into plain Python tuples — no more capnp reads after this
-      ways = []
-      for way in offline.ways:
-        nodes = [(n.longitude, n.latitude) for n in way.nodes]
-        if len(nodes) < 2:
-          continue
-        ways.append((
-          way.minLat, way.maxLat, way.minLon, way.maxLon,
-          nodes,
-          way.ref or '', way.name or '',
-          way.maxSpeed, way.maxSpeedForward, way.lanes,
-        ))
-      del offline  # release capnp object
-
-      self._tile_cache[path] = (ways, now)
+      ways = _parse_tile(self.schema, path)
+      self._tile_cache[path] = (ways, time.monotonic())
 
       # Evict old tiles
       if len(self._tile_cache) > 10:
         oldest = min(self._tile_cache, key=lambda k: self._tile_cache[k][1])
         del self._tile_cache[oldest]
-
-      return ways
     except Exception as e:
       log.warning("Failed to load tile %s: %s", path, e)
+    finally:
+      self._loading.discard(path)
+
+  def _get_tile(self, path: str):
+    """Return cached ways or kick off background load. Never blocks."""
+    if path in self._tile_cache:
+      cached, ts = self._tile_cache[path]
+      if time.monotonic() - ts < self._cache_ttl:
+        return cached
+      # Cache expired — reload in background, return stale data meanwhile
+      if path not in self._loading:
+        self._loading.add(path)
+        threading.Thread(target=self._load_tile_bg, args=(path,), daemon=True).start()
+      return cached
+
+    if not os.path.exists(path):
       return None
+
+    # First load — start background thread, return None this cycle
+    if path not in self._loading:
+      self._loading.add(path)
+      threading.Thread(target=self._load_tile_bg, args=(path,), daemon=True).start()
+    return None
 
   def query(self, lat: float, lon: float) -> dict | None:
     """Find the nearest way to the given GPS position.
 
     Returns dict with wayRef, wayName, speedLimit, lanes, roadContext, distance,
-    or None if no tile or no nearby way.
+    or None if no tile loaded yet or no nearby way. Never blocks on I/O.
     """
     if self.schema is None:
       return None
 
     path = _tile_path(lat, lon)
-    ways = self._load_tile(path)
+    ways = self._get_tile(path)
     if ways is None:
       return None
 

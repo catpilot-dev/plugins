@@ -374,7 +374,10 @@ class SpeedLimitMiddleware:
     # --- Query OSM tiles at 0.2 Hz ---
     if self._gps_valid and now - self._osm_last_query_t >= self._osm_query_interval:
       self._osm_last_query_t = now
-      result = self._osm.query(self._gps_lat, self._gps_lon)
+      try:
+        result = self._osm.query(self._gps_lat, self._gps_lon)
+      except Exception:
+        result = None
 
       if result and result['wayRef']:
         way_ref = result['wayRef']
