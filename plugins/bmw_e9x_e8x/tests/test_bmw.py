@@ -241,19 +241,28 @@ class TestResumeButton:
 
   def _classify_release(self, cruise_state_enabled, hold_frames):
     """Classify what a resume button release should do given state."""
-    from bmw.carstate import RESUME_LONG_PRESS_FRAMES
+    from bmw.carstate import RESUME_LONG_PRESS_FRAMES, RESUME_SHORT_PRESS_MIN_FRAMES
     if hold_frames >= RESUME_LONG_PRESS_FRAMES:
       return 'gapAdjust'
+    elif hold_frames < RESUME_SHORT_PRESS_MIN_FRAMES:
+      return 'rejected'
     elif cruise_state_enabled:
       return 'speed_limit_toggle'
     else:
       return 'resume'
 
   def test_short_press_disengaged_emits_resume(self):
-    assert self._classify_release(cruise_state_enabled=False, hold_frames=5) == 'resume'
+    from bmw.carstate import RESUME_SHORT_PRESS_MIN_FRAMES
+    assert self._classify_release(cruise_state_enabled=False, hold_frames=RESUME_SHORT_PRESS_MIN_FRAMES) == 'resume'
 
   def test_short_press_engaged_toggles_speed_limit(self):
-    assert self._classify_release(cruise_state_enabled=True, hold_frames=5) == 'speed_limit_toggle'
+    from bmw.carstate import RESUME_SHORT_PRESS_MIN_FRAMES
+    assert self._classify_release(cruise_state_enabled=True, hold_frames=RESUME_SHORT_PRESS_MIN_FRAMES) == 'speed_limit_toggle'
+
+  def test_ultra_short_press_rejected(self):
+    """Presses under 250ms are rejected as accidental stalk touches."""
+    assert self._classify_release(cruise_state_enabled=True, hold_frames=5) == 'rejected'
+    assert self._classify_release(cruise_state_enabled=False, hold_frames=10) == 'rejected'
 
   def test_long_press_emits_gap_adjust(self):
     from bmw.carstate import RESUME_LONG_PRESS_FRAMES
