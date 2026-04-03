@@ -190,8 +190,11 @@ def curvature_speed_cap(model_msg) -> int:
   if max_curvature < 0.003:  # negligible curvature (~330m radius)
     return 0
 
-  # v = sqrt(a_lat_max / curvature), with a_lat_max = 2.0 m/s²
-  MAX_LAT_ACCEL = 2.0
+  # v = sqrt(a_lat_max / curvature)
+  # Use 1.5 m/s² (not the physical limit of ~3-4 m/s²) because the model
+  # underestimates apex curvature when looking ahead from the approach.
+  # 1.5 compensates for this, producing 60 km/h caps ~3s earlier.
+  MAX_LAT_ACCEL = 1.5
   safe_speed_ms = (MAX_LAT_ACCEL / max_curvature) ** 0.5
   safe_speed_kph = safe_speed_ms * 3.6
 
