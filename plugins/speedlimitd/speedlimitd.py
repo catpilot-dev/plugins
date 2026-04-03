@@ -325,6 +325,7 @@ class SpeedLimitMiddleware:
     self.vision_cap_stable: int = 0
     self.vision_cap_stable_since: float = 0.0
     self.curvature_cap: int = 0
+    self._curvature_cap_hold_until: float = 0.0  # monotonic time to hold current cap
 
     # GPS state
     self._gps_lat: float = 0.0
@@ -446,8 +447,20 @@ class SpeedLimitMiddleware:
       elif now - self.vision_cap_stable_since > 1.0:
         self.vision_cap_stable = self.vision_cap
 
-      # Curvature lookahead cap from model predicted path
-      self.curvature_cap = curvature_speed_cap(model)
+      # Curvature lookahead cap from model predicted path.
+      # The model's curvature prediction is noisy — the cap can flicker between
+      # 0 and a valid value frame-to-frame. Smooth by holding the lowest recent
+      # cap for 3 seconds, and only releasing when the raw cap exceeds it.
+      raw_curv_cap = curvature_speed_cap(model)
+      if raw_curv_cap > 0 and (raw_curv_cap < self.curvature_cap or self.curvature_cap == 0):
+        # Tighter cap detected — apply immediately
+        self.curvature_cap = raw_curv_cap
+        self._curvature_cap_hold_until = now + 3.0
+      elif now < self._curvature_cap_hold_until:
+        pass  # Hold current cap during hold period
+      else:
+        # Hold expired — allow cap to relax
+        self.curvature_cap = raw_curv_cap
 
     # --- YOLO timeout ---
     if self.yolo_speed > 0 and (now - self.yolo_last_seen) > self.yolo_timeout:
