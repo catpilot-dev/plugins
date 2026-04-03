@@ -399,13 +399,15 @@ class SpeedLimitMiddleware:
         elif result['roadContext'] == 1:
           self.last_road_context = 'city'
 
-        # Highway type from wayRef — only G/S expressway refs are reliable.
+        # Highway type from wayRef.
+        # G = national expressway (120 km/h), S1-S99 = provincial expressway (100 km/h).
+        # S100+ are provincial general roads, not expressways.
         road_id = result['roadName'] or way_ref
         hw = ''
         if way_ref.startswith('G'):
-          hw = 'motorway'   # national expressway — 120 km/h
-        elif way_ref.startswith('S'):
-          hw = 'trunk'      # provincial expressway — 100 km/h
+          hw = 'motorway'
+        elif way_ref.startswith('S') and len(way_ref[1:]) <= 2 and way_ref[1:].isdigit():
+          hw = 'trunk'
         hw_rank = {'motorway': 4, 'trunk': 3}
         if road_id != self.last_road_id:
           self.last_road_id = road_id

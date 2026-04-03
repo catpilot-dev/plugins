@@ -28,6 +28,21 @@ LAT_DEG_TO_M = 111_320.0
 LON_DEG_TO_M = 111_320.0 * 0.85  # cos(31°) ≈ 0.85 for Shanghai
 
 
+def _is_expressway_ref(ref: str) -> bool:
+  """Check if a wayRef indicates a controlled-access expressway.
+
+  G-prefixed refs are national expressways (国家高速).
+  S-prefixed refs are provincial, but only S1-S99 are expressways (省级高速).
+  S100+ are provincial general roads (普通省道) — urban arterials, not freeways.
+  """
+  if ref.startswith('G'):
+    return True
+  if ref.startswith('S'):
+    num = ref[1:]
+    return len(num) <= 2 and num.isdigit()
+  return False
+
+
 def _tile_path(lat: float, lon: float) -> str:
   """Get tile file path for a GPS coordinate."""
   min_lat = math.floor(lat / TILE_SIZE) * TILE_SIZE
@@ -172,8 +187,9 @@ class OsmTileReader:
     if speed <= 0:
       speed = speed_fwd
 
-    # Road context: only G/S wayRef = freeway (expressway with controlled access).
-    is_freeway = bool(ref and (ref.startswith('G') or ref.startswith('S')))
+    # Road context: G = national expressway, S1-S99 = provincial expressway.
+    # S100+ are provincial general roads (普通省道), not controlled-access.
+    is_freeway = bool(ref and _is_expressway_ref(ref))
 
     return {
       'wayRef': ref,
