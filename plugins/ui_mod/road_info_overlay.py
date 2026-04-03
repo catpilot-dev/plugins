@@ -17,7 +17,7 @@ COLOR_REF = rl.Color(100, 200, 255, 220)    # light blue for wayRef
 COLOR_NAME = rl.Color(200, 200, 200, 200)   # light gray for road name
 
 _font = None
-_unifont = None
+_cjk_font = None
 _measure = None
 _sl_sub = None
 _cached_way_ref = ''
@@ -29,13 +29,26 @@ def _has_cjk(text):
 
 
 def _ensure_init():
-  global _font, _unifont, _measure
+  global _font, _cjk_font, _measure
   if _font is None:
     from openpilot.system.ui.lib.application import gui_app, FontWeight
     from openpilot.system.ui.lib.text_measure import measure_text_cached
     _font = gui_app.font(FontWeight.SEMI_BOLD)
-    _unifont = gui_app.font(FontWeight.UNIFONT)
     _measure = measure_text_cached
+
+    # Load unifont.otf directly with full CJK range + ASCII.
+    # The pre-built unifont.fnt atlas only has glyphs from translation PO files,
+    # which misses many characters used in OSM road names.
+    import ctypes
+    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             '..', '..', 'selfdrive', 'assets', 'fonts', 'unifont.otf')
+    font_path = os.path.normpath(font_path)
+    if not os.path.exists(font_path):
+      font_path = '/data/openpilot/selfdrive/assets/fonts/unifont.otf'
+    # ASCII (32-126) + CJK Unified Ideographs (0x4E00-0x9FFF)
+    codepoints = list(range(32, 127)) + list(range(0x4E00, 0xA000))
+    cp_array = (ctypes.c_int * len(codepoints))(*codepoints)
+    _cjk_font = rl.load_font_ex(font_path, FONT_SIZE, cp_array, len(codepoints))
 
 
 def _is_enabled():
@@ -89,8 +102,8 @@ def on_render_overlay(default, content_rect):
   else:
     text = road_name
 
-  # Use unifont for CJK characters (road names are always Chinese regardless of UI language)
-  font = _unifont if _has_cjk(text) else _font
+  # Use CJK font for Chinese characters (road names are always Chinese regardless of UI language)
+  font = _cjk_font if _has_cjk(text) else _font
   text_size = _measure(font, text, FONT_SIZE)
   pad = 10
 
