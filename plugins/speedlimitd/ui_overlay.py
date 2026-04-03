@@ -2,14 +2,13 @@
 
 Registered as a ui.render_overlay hook callback. Uses stock UI lib directly:
   - pyray for drawing primitives (circles, text)
-  - gui_app.font() for font access
-  - measure_text_cached() for text measurement
+  - fonts.py shared helper for font access
   - ui_state.sm for speedLimitState data
   - plugin bus for tap-to-confirm toggle
 """
 import pyray as rl
 from openpilot.system.ui.lib.application import gui_app, FontWeight
-from openpilot.system.ui.lib.text_measure import measure_text_cached
+from fonts import get_font, measure
 
 # Layout constants — sign diameter matches MAX block width, centered below it
 SPEED_SIGN_RADIUS_METRIC = 100    # diameter 200 = metric MAX width
@@ -41,13 +40,16 @@ _tap_hold_until = 0.0  # Hold local confirmed state until this time (monotonic)
 
 
 def _ensure_init():
-  """Lazy init — fonts and imports deferred until first render frame."""
+  """Lazy init — imports deferred until first render frame."""
   global _font_bold, _font_medium, ui_state
   if _font_bold is None:
+    font_bold = get_font(FontWeight.BOLD)
+    if font_bold is None:
+      return  # fonts not ready yet — retry next frame
     from openpilot.selfdrive.ui.ui_state import ui_state as _ui_state
     ui_state = _ui_state
-    _font_bold = gui_app.font(FontWeight.BOLD)
-    _font_medium = gui_app.font(FontWeight.MEDIUM)
+    _font_bold = font_bold
+    _font_medium = get_font(FontWeight.MEDIUM)
 
 
 _sl_sub = None
@@ -145,7 +147,7 @@ def _draw_speed_limit_sign(content_rect):
   # Speed number (black)
   speed_text = str(round(_speed_limit))
   text_color = rl.Color(0, 0, 0, alpha)
-  text_size = measure_text_cached(_font_bold, speed_text, SPEED_SIGN_FONT_SIZE)
+  text_size = measure(_font_bold, speed_text, SPEED_SIGN_FONT_SIZE)
   rl.draw_text_ex(
     _font_bold,
     speed_text,

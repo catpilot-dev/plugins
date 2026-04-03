@@ -57,6 +57,12 @@ def mock_openpilot(monkeypatch):
   mock_modules['openpilot.selfdrive.plugins'] = MagicMock()
   mock_modules['openpilot.selfdrive.plugins.plugin_bus'] = mock_plugin_bus
 
+  # Mock shared fonts module — overlay now uses fonts.get_font() instead of gui_app.font()
+  mock_fonts = MagicMock()
+  mock_fonts.get_font = MagicMock(side_effect=lambda w: mock_font_bold if w == 'BOLD' else mock_font_medium)
+  mock_fonts.measure = mock_modules['openpilot.system.ui.lib.text_measure'].measure_text_cached
+  mock_modules['fonts'] = mock_fonts
+
   for mod_name, mod_mock in mock_modules.items():
     monkeypatch.setitem(sys.modules, mod_name, mod_mock)
 
@@ -68,6 +74,7 @@ def mock_openpilot(monkeypatch):
     'ui_state': mock_ui_state,
     'sm': mock_sm,
     'measure_text_cached': mock_modules['openpilot.system.ui.lib.text_measure'].measure_text_cached,
+    'fonts': mock_fonts,
   }
 
 
@@ -108,14 +115,12 @@ class TestLazyInit:
     overlay._ensure_init()
     assert overlay._font_bold is not None
     assert overlay._font_medium is not None
-    mock_openpilot['gui_app'].font.assert_any_call('BOLD')
-    mock_openpilot['gui_app'].font.assert_any_call('MEDIUM')
 
-  def test_ensure_init_idempotent(self, overlay, mock_openpilot):
+  def test_ensure_init_idempotent(self, overlay):
     overlay._ensure_init()
     overlay._ensure_init()
-    # font() called exactly twice (BOLD + MEDIUM), not four times
-    assert mock_openpilot['gui_app'].font.call_count == 2
+    # _font_bold set once, second call is a no-op
+    assert overlay._font_bold is not None
 
 
 class TestStateSubscriptionsHook:

@@ -7,6 +7,8 @@ Format: "S20 外环高速" or just "外环高速" when no wayRef is available.
 """
 import os
 import pyray as rl
+from openpilot.system.ui.lib.application import FontWeight
+from fonts import get_font, get_cjk_font, measure
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -16,9 +18,6 @@ BOTTOM_MARGIN = 30
 COLOR_REF = rl.Color(100, 200, 255, 220)    # light blue for wayRef
 COLOR_NAME = rl.Color(200, 200, 200, 200)   # light gray for road name
 
-_font = None
-_cjk_font = None
-_measure = None
 _sl_sub = None
 _cached_way_ref = ''
 _cached_road_name = ''
@@ -26,29 +25,6 @@ _cached_road_name = ''
 
 def _has_cjk(text):
   return any('\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf' for c in text)
-
-
-def _ensure_init():
-  global _font, _cjk_font, _measure
-  if _font is None:
-    from openpilot.system.ui.lib.application import gui_app, FontWeight
-    from openpilot.system.ui.lib.text_measure import measure_text_cached
-    _font = gui_app.font(FontWeight.SEMI_BOLD)
-    _measure = measure_text_cached
-
-    # Load unifont.otf directly with full CJK range + ASCII.
-    # The pre-built unifont.fnt atlas only has glyphs from translation PO files,
-    # which misses many characters used in OSM road names.
-    import ctypes
-    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             '..', '..', 'selfdrive', 'assets', 'fonts', 'unifont.otf')
-    font_path = os.path.normpath(font_path)
-    if not os.path.exists(font_path):
-      font_path = '/data/openpilot/selfdrive/assets/fonts/unifont.otf'
-    # ASCII (32-126) + CJK Unified Ideographs (0x4E00-0x9FFF)
-    codepoints = list(range(32, 127)) + list(range(0x4E00, 0xA000))
-    cp_array = (ctypes.c_int * len(codepoints))(*codepoints)
-    _cjk_font = rl.load_font_ex(font_path, FONT_SIZE, cp_array, len(codepoints))
 
 
 def _is_enabled():
@@ -84,8 +60,6 @@ def _read_road_info():
 
 
 def on_render_overlay(default, content_rect):
-  _ensure_init()
-
   if not _is_enabled():
     return None
 
@@ -102,9 +76,11 @@ def on_render_overlay(default, content_rect):
   else:
     text = road_name
 
-  # Use CJK font for Chinese characters (road names are always Chinese regardless of UI language)
-  font = _cjk_font if _has_cjk(text) else _font
-  text_size = _measure(font, text, FONT_SIZE)
+  # Use CJK font for Chinese characters
+  font = get_cjk_font(FONT_SIZE) if _has_cjk(text) else get_font(FontWeight.SEMI_BOLD)
+  if font is None:
+    return None
+  text_size = measure(font, text, FONT_SIZE)
   pad = 10
 
   # Center horizontally, bottom of content rect
