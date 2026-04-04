@@ -75,6 +75,30 @@ def snap_to_standard_speed(speed: int) -> int:
   return min(_STANDARD_SPEEDS, key=lambda s: abs(s - speed))
 
 
+# Gradual transition timing (seconds per step)
+_STEP_DOWN_INTERVAL = 3.0  # downgrade: 80 → 60 → 50 → 40 (3s per step)
+_STEP_UP_INTERVAL = 2.0    # upgrade:   40 → 50 → 60 → 80 (2s per step)
+
+
+def _step_speed_limit(current: int, target: int) -> int:
+  """Move current one step toward target in _STANDARD_SPEEDS.
+
+  Returns the next standard speed in the direction of target,
+  or target itself if already adjacent or equal.
+  """
+  if current == target or current == 0:
+    return target
+
+  if target < current:
+    # Step down: find the next lower standard speed
+    lower = [s for s in _STANDARD_SPEEDS if s < current]
+    return max(lower) if lower else target
+  else:
+    # Step up: find the next higher standard speed
+    higher = [s for s in _STANDARD_SPEEDS if s > current]
+    return min(higher) if higher else target
+
+
 def _near_road_edge(model_msg) -> tuple[bool, bool]:
   """Check if the car is near the left or right road edge.
 
@@ -328,6 +352,11 @@ class SpeedLimitMiddleware:
     self.curvature_cap: int = 0
     self._curvature_cap_hold_until: float = 0.0  # monotonic time to hold current cap
 
+    # Gradual speed limit transition — step through standard speeds one level
+    # at a time instead of jumping directly (e.g. 80 → 60 → 50 → 40).
+    self._displayed_speed_limit: int = 0
+    self._last_step_time: float = 0.0
+
     # GPS state
     self._gps_lat: float = 0.0
     self._gps_lon: float = 0.0
@@ -502,6 +531,18 @@ class SpeedLimitMiddleware:
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
 
+    # --- Gradual speed limit transition ---
+    target = snap_to_standard_speed(int(speed_limit))
+    if self._displayed_speed_limit == 0:
+      # First reading — set immediately
+      self._displayed_speed_limit = target
+      self._last_step_time = now
+    elif target != self._displayed_speed_limit:
+      interval = _STEP_DOWN_INTERVAL if target < self._displayed_speed_limit else _STEP_UP_INTERVAL
+      if now - self._last_step_time >= interval:
+        self._displayed_speed_limit = _step_speed_limit(self._displayed_speed_limit, target)
+        self._last_step_time = now
+
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
     # Confirmed state is sticky — only changes on explicit user toggle.
@@ -518,15 +559,15 @@ class SpeedLimitMiddleware:
           except Exception:
             pass
 
-    # Track current limit for the planner (always follows detected limit)
+    # Track current limit for the planner (uses displayed limit after gradual transition)
     if self.confirmed:
-      self.confirmed_value = speed_limit
+      self.confirmed_value = self._displayed_speed_limit
     else:
       self.confirmed_value = 0.0
 
     # --- Publish ---
     self._sl_pub.send({
-      'speedLimit': snap_to_standard_speed(int(speed_limit)),
+      'speedLimit': self._displayed_speed_limit,
       'source': source,
       'confirmed': self.confirmed,
       'confidence': confidence,
