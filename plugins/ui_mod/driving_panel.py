@@ -160,6 +160,17 @@ class DrivingLayout(Widget):
       )
       items.append(self._road_info)
 
+    # --- Look Ahead Lateral Control (if plugin enabled) ---
+    if _plugin_enabled('look_ahead'):
+      current_la = read_plugin_param('look_ahead', 'LookAheadEnabled') != '0'
+      self._look_ahead = toggle_item(
+        "Look Ahead Steering",
+        "Use 80m preview distance for smoother steering in straight lanes. Reduces oscillation by looking further ahead like a human driver.",
+        current_la,
+        callback=self._on_look_ahead,
+      )
+      items.append(self._look_ahead)
+
     # --- Cruise Speed Memory ---
     items.append(toggle_item(
       "Cruise Speed Memory",
@@ -202,6 +213,9 @@ class DrivingLayout(Widget):
 
   def _on_road_info(self, state):
     write_plugin_param('ui_mod', 'RoadInfoOverlay', '1' if state else '0')
+
+  def _on_look_ahead(self, state):
+    write_plugin_param('look_ahead', 'LookAheadEnabled', '1' if state else '0')
 
   def _update_state(self):
     if not hasattr(self, '_personality'):
