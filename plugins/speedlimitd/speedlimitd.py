@@ -318,7 +318,6 @@ class SpeedLimitMiddleware:
     self.last_road_id: str = ''        # roadName or wayRef — stable road identity
     self.last_road_context: str = 'unknown'
     self.last_way_ref: str = ''
-    self.osm_lanes: int = 0
     self.lane_count: int = 1
     self.lane_count_stable: int = 1
     self.lane_count_stable_since: float = 0.0
@@ -388,8 +387,6 @@ class SpeedLimitMiddleware:
         self.last_way_ref = way_ref
         self.last_osm_speed = result['speedLimit'] * 3.6 if result['speedLimit'] > 0 else 0.0
         self.last_road_name = result['roadName']
-        if result['lanes'] > 0:
-          self.osm_lanes = result['lanes']
 
         # Road context
         if result['roadContext'] == 0:
