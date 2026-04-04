@@ -6,11 +6,14 @@ ahead, naturally smoothing out near-field noise.
 
 This module recomputes desired curvature from the model's orientation
 prediction at a longer lookahead time:
-  lookahead_t = clamp(LOOKAHEAD_DISTANCE / v_ego, MIN_T, MAX_T)
+  lookahead_t = clamp(lookahead_dist / v_ego, MIN_T, MAX_T)
 
 At 80 km/h with 80m lookahead: 3.6s ahead (vs stock 0.5s).
 The model's far-field predictions are geometrically smoother because
 road curves are large-radius at distance.
+
+With a lead vehicle, lookahead distance is capped to the lead's distance —
+like a human driver focusing on the car ahead rather than the horizon.
 """
 import numpy as np
 
@@ -32,15 +35,40 @@ def _curv_from_plan(yaws, yaw_rates, v_ego, action_t):
   return 2 * curv_from_psi - psi_rate / v
 
 
+_radar_sm = None
+
+
+def _get_lead_distance():
+  """Get lead vehicle distance from radarState, or None if no lead."""
+  global _radar_sm
+  try:
+    if _radar_sm is None:
+      import cereal.messaging as messaging
+      _radar_sm = messaging.SubMaster(['radarState'])
+    _radar_sm.update(0)
+    lead = _radar_sm['radarState'].leadOne
+    if lead.status and lead.dRel > 5.0:
+      return lead.dRel
+  except Exception:
+    pass
+  return None
+
+
 def compute_lookahead_curvature(model_v2, v_ego):
   """Compute curvature from model orientation at lookahead distance.
 
+  Lookahead distance is 80m, or lead vehicle distance if closer.
   Returns (curvature, lookahead_t) or (None, 0) if data unavailable.
   """
   if v_ego < MIN_SPEED:
     return None, 0
 
-  lookahead_t = LOOKAHEAD_DISTANCE / v_ego
+  lookahead_dist = LOOKAHEAD_DISTANCE
+  lead_dist = _get_lead_distance()
+  if lead_dist is not None and lead_dist < lookahead_dist:
+    lookahead_dist = lead_dist
+
+  lookahead_t = lookahead_dist / v_ego
   lookahead_t = max(MIN_LOOKAHEAD_T, min(MAX_LOOKAHEAD_T, lookahead_t))
 
   try:
