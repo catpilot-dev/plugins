@@ -4,19 +4,16 @@ Shows the road identifier from speedlimitd's OSM tile query, useful for
 verifying that the speed limit daemon is reading the correct road.
 
 Format: "S20 外环高速" or just "外环高速" when no wayRef is available.
+
+ALL imports MUST be lazy (inside functions, not module level) — hooks load
+during __init__ mid-import, and module-level UI imports will crash.
 """
 import os
-import pyray as rl
-from openpilot.system.ui.lib.application import FontWeight
-from fonts import get_font, get_cjk_font, measure
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
 FONT_SIZE = 56
 BOTTOM_MARGIN = 30
-
-COLOR_REF = rl.Color(100, 200, 255, 220)    # light blue for wayRef
-COLOR_NAME = rl.Color(200, 200, 200, 200)   # light gray for road name
 
 _sl_sub = None
 _cached_way_ref = ''
@@ -68,6 +65,11 @@ def on_render_overlay(default, content_rect):
   if not way_ref and not road_name:
     return None
 
+  # Lazy imports — must not be at module level
+  import pyray as rl
+  from openpilot.system.ui.lib.application import FontWeight
+  from fonts import get_font, get_cjk_font, measure
+
   # Build display text: "S20 外环高速" or just road name
   if way_ref and road_name and way_ref != road_name:
     text = f"{way_ref}  {road_name}"
@@ -93,7 +95,7 @@ def on_render_overlay(default, content_rect):
   rl.draw_rectangle_rounded(bg_rect, 0.3, 10, rl.Color(0, 0, 0, 128))
 
   # Draw text — use ref color if wayRef present, otherwise name color
-  color = COLOR_REF if way_ref else COLOR_NAME
+  color = rl.Color(100, 200, 255, 220) if way_ref else rl.Color(200, 200, 200, 200)
   rl.draw_text_ex(font, text, rl.Vector2(x, y), FONT_SIZE, 0, color)
 
   return None
