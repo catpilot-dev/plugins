@@ -206,7 +206,7 @@ class TestPlatformConfig:
     assert p.STEER_MAX == 12
     assert p.STEER_STEP == 1
     assert p.STEER_DELTA_UP == 0.1
-    assert p.STEER_DELTA_DOWN == 1.0
+    assert p.STEER_DELTA_DOWN == 0.2
 
   def test_bmw_flags(self, mock_opendbc):
     from bmw.values import BmwFlags
