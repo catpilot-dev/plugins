@@ -260,9 +260,10 @@ class TestResumeButton:
     assert self._classify_release(cruise_state_enabled=True, hold_frames=RESUME_SHORT_PRESS_MIN_FRAMES) == 'speed_limit_toggle'
 
   def test_ultra_short_press_rejected(self):
-    """Presses under 250ms are rejected as accidental stalk touches."""
-    assert self._classify_release(cruise_state_enabled=True, hold_frames=5) == 'rejected'
-    assert self._classify_release(cruise_state_enabled=False, hold_frames=10) == 'rejected'
+    """Presses under the minimum frame threshold are rejected as accidental stalk touches."""
+    from bmw.carstate import RESUME_SHORT_PRESS_MIN_FRAMES
+    assert self._classify_release(cruise_state_enabled=True, hold_frames=RESUME_SHORT_PRESS_MIN_FRAMES - 1) == 'rejected'
+    assert self._classify_release(cruise_state_enabled=False, hold_frames=RESUME_SHORT_PRESS_MIN_FRAMES - 1) == 'rejected'
 
   def test_long_press_emits_gap_adjust(self):
     from bmw.carstate import RESUME_LONG_PRESS_FRAMES
