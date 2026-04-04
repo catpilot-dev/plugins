@@ -495,15 +495,15 @@ class SpeedLimitMiddleware:
 
     MIN_SPEED_LIMIT = 30   # km/h — no real road is below this
 
-    # OSM speed limit from offline tile (if available and has wayRef)
+    # OSM maxSpeed is unreliable in China (inconsistent tagging across way segments).
+    # Use OSM only for road context (freeway/city, G/S ref, lane count, road name).
+    # osm_speed is kept for logging/debugging but excluded from the priority cascade.
     osm_speed = round(self.last_osm_speed) if self.last_osm_speed > 0 and self.last_way_ref else 0
 
     # Take minimum across all available sources — most conservative valid reading wins.
     candidates = []
     if yolo_speed >= MIN_SPEED_LIMIT:
       candidates.append((float(yolo_speed), 1, 0.8))    # yoloDetection
-    if osm_speed >= MIN_SPEED_LIMIT:
-      candidates.append((float(osm_speed), 3, 0.7))     # osmSpeedLimit
     if self.curvature_cap >= MIN_SPEED_LIMIT:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # roadTypeInference
