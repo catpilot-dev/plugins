@@ -311,7 +311,6 @@ class SpeedLimitMiddleware:
     self.country_detected = False
 
     # State
-    self.last_osm_speed: float = 0.0
     self.last_yolo_speed: float = 0.0
     self.last_highway_type: str = ''
     self.last_road_name: str = ''
@@ -385,7 +384,6 @@ class SpeedLimitMiddleware:
       if result and result['wayRef']:
         way_ref = result['wayRef']
         self.last_way_ref = way_ref
-        self.last_osm_speed = result['speedLimit'] * 3.6 if result['speedLimit'] > 0 else 0.0
         self.last_road_name = result['roadName']
 
         # Road context
@@ -469,7 +467,6 @@ class SpeedLimitMiddleware:
       self.yolo_speed = 0
 
     # --- Priority cascade ---
-    osm_speed = round(self.last_osm_speed) if self.last_osm_speed > 0 else 0
     yolo_speed = self.yolo_speed
 
     # Urban expressways without a G/S highway ref (like 中环路, 北翟高架路) are classified
@@ -492,10 +489,8 @@ class SpeedLimitMiddleware:
 
     MIN_SPEED_LIMIT = 30   # km/h — no real road is below this
 
-    # OSM maxSpeed is unreliable in China (inconsistent tagging across way segments).
-    # Use OSM only for road context (freeway/city, G/S ref, lane count, road name).
-    # osm_speed is kept for logging/debugging but excluded from the priority cascade.
-    osm_speed = round(self.last_osm_speed) if self.last_osm_speed > 0 and self.last_way_ref else 0
+    # OSM maxSpeed is unreliable in China — use OSM only for road context,
+    # highway classification (G/S ref), and road name.
 
     # Take minimum across all available sources — most conservative valid reading wins.
     candidates = []
@@ -535,7 +530,6 @@ class SpeedLimitMiddleware:
       'source': source,
       'confirmed': self.confirmed,
       'confidence': confidence,
-      'osmMaxspeed': osm_speed,
       'yoloSpeed': yolo_speed,
       'inferredSpeed': inferred_speed,
       'highwayType': self.last_highway_type,
