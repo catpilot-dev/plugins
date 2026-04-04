@@ -9,10 +9,10 @@ import cereal.messaging as messaging
 ButtonType = structs.CarState.ButtonEvent.Type
 
 # Resume button hold duration thresholds (in frames at 100Hz = 10ms per frame)
-# Short press minimum: 250ms (25 frames) — rejects accidental stalk touches
-# Long press threshold: 1000ms (99 frames) — triggers gap adjust / personality cycle
-RESUME_SHORT_PRESS_MIN_FRAMES = 25
-RESUME_LONG_PRESS_FRAMES = 99
+# Short press minimum: 20ms (2 frames)
+# Long press threshold: 500ms (49 frames) — triggers gap adjust / personality cycle
+RESUME_SHORT_PRESS_MIN_FRAMES = 2
+RESUME_LONG_PRESS_FRAMES = 49
 
 
 _sl_pub = None
