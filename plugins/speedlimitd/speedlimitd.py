@@ -62,7 +62,7 @@ def country_from_gps(lat: float, lon: float, bboxes: list) -> str | None:
 SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED = load_speed_table('cn')
 
 # Standard speed limit values used in China (GB 5768)
-_STANDARD_SPEEDS = [30, 40, 60, 80, 100, 120]
+_STANDARD_SPEEDS = [30, 40, 50, 60, 80, 100, 120]
 
 
 def snap_to_standard_speed(speed: int) -> int:

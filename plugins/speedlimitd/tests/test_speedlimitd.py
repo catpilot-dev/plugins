@@ -124,13 +124,15 @@ class TestVisionSpeedCap:
 
 class TestSnapToStandardSpeed:
   def test_exact_standard_values(self, sld):
-    for v in [30, 40, 60, 80, 100, 120]:
+    for v in [30, 40, 50, 60, 80, 100, 120]:
       assert sld.snap_to_standard_speed(v) == v
 
   def test_rounds_to_nearest(self, sld):
     assert sld.snap_to_standard_speed(31) == 30
-    assert sld.snap_to_standard_speed(45) == 40
-    assert sld.snap_to_standard_speed(55) == 60
+    assert sld.snap_to_standard_speed(44) == 40
+    assert sld.snap_to_standard_speed(47) == 50
+    assert sld.snap_to_standard_speed(55) == 50
+    assert sld.snap_to_standard_speed(56) == 60
     assert sld.snap_to_standard_speed(75) == 80
     assert sld.snap_to_standard_speed(83) == 80
 
@@ -138,7 +140,7 @@ class TestSnapToStandardSpeed:
     # Values seen from mapd visionCurveSpeed on Shanghai expressways
     assert sld.snap_to_standard_speed(99) == 100
     assert sld.snap_to_standard_speed(105) == 100
-    assert sld.snap_to_standard_speed(47) == 40
+    assert sld.snap_to_standard_speed(46) == 50
 
 
 # ============================================================
