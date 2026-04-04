@@ -66,12 +66,12 @@ def get_cjk_font(size=None):
   if font_path is None:
     return None
 
-  import ctypes
   import pyray as rl
   # ASCII (32-126) + CJK Unified Ideographs (0x4E00-0x9FFF)
   codepoints = list(range(32, 127)) + list(range(0x4E00, 0xA000))
-  cp_array = (ctypes.c_int * len(codepoints))(*codepoints)
-  _cjk_font = rl.load_font_ex(font_path, font_size, cp_array, len(codepoints))
+  cp_buffer = rl.ffi.new("int[]", codepoints)
+  cp_ptr = rl.ffi.cast("int *", cp_buffer)
+  _cjk_font = rl.load_font_ex(font_path, font_size, cp_ptr, len(codepoints))
   return _cjk_font
 
 
