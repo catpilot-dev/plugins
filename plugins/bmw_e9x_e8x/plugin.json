@@ -55,6 +55,11 @@
       "function": "on_render_overlay",
       "priority": 50
     },
+    "controls.curvature_correction": {
+      "module": "look_ahead_lateral",
+      "function": "on_curvature_correction",
+      "priority": 40
+    },
     "controls.lat_controller_init": {
       "module": "register",
       "function": "on_lat_controller_init",
