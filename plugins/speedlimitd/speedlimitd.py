@@ -532,6 +532,8 @@ class SpeedLimitMiddleware:
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
 
     # --- Gradual speed limit transition ---
+    # Curvature cap bypasses gradual transition — it's safety-critical and must
+    # apply immediately. The gradual ramp only applies to road-type / YOLO changes.
     target = snap_to_standard_speed(int(speed_limit))
     if self._displayed_speed_limit == 0:
       # First reading — set immediately
@@ -542,6 +544,12 @@ class SpeedLimitMiddleware:
       if now - self._last_step_time >= interval:
         self._displayed_speed_limit = _step_speed_limit(self._displayed_speed_limit, target)
         self._last_step_time = now
+
+    # Curvature cap override — clamp displayed limit immediately
+    if self.curvature_cap >= MIN_SPEED_LIMIT:
+      curv_snapped = snap_to_standard_speed(self.curvature_cap)
+      if curv_snapped < self._displayed_speed_limit:
+        self._displayed_speed_limit = curv_snapped
 
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
