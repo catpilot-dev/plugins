@@ -1,0 +1,15 @@
+{
+  "id": "look_ahead",
+  "name": "Look Ahead Lateral Control",
+  "version": "1.0.0",
+  "type": "hook",
+  "author": "catpilot",
+  "description": "Compute steering curvature from 80m preview distance instead of actuator delay, reducing straight-line oscillation",
+  "hooks": {
+    "controls.curvature_correction": {
+      "module": "look_ahead_lateral",
+      "function": "on_curvature_correction",
+      "priority": 40
+    }
+  }
+}
