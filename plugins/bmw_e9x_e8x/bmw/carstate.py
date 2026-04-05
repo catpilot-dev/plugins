@@ -52,6 +52,7 @@ class CarState(CarStateBase):
     self.prev_cruise_enabled = False  # Track previous openpilot cruise state for resume button logic
     self.resume_button_hold_frames = 0  # Track how many frames resume button has been held (v4 duration-based logic)
     self.steer_fault_counter = 0  # Debounce: consecutive frames with raw fault bits set
+    self.steer_angle_offset = 0.8  # deg — SZL sensor zero offset (positive = sensor reads left of true center)
 
     self.right_blinker_pressed = False
     self.left_blinker_pressed = False
@@ -124,12 +125,12 @@ class CarState(CarStateBase):
 
     cruise_control_stal_msg = cp_PT.vl["CruiseControlStalk"]
     if self.CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
-      ret.steeringAngleDeg = cp_F.vl['SteeringWheelAngle_DSC']['SteeringPosition']
+      ret.steeringAngleDeg = cp_F.vl['SteeringWheelAngle_DSC']['SteeringPosition'] - self.steer_angle_offset
       ret.cruiseState.speed = cp_PT.vl["DynamicCruiseControlStatus"]['CruiseControlSetpointSpeed'] * (CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS)
       ret.cruiseState.enabled = cp_PT.vl["DynamicCruiseControlStatus"]['CruiseActive'] != 0
       cruise_control_stal_msg = cp_F.vl["CruiseControlStalk"]
     elif self.CP.flags & BmwFlags.NORMAL_CRUISE_CONTROL:
-      ret.steeringAngleDeg = cp_PT.vl['SteeringWheelAngle']['SteeringPosition']
+      ret.steeringAngleDeg = cp_PT.vl['SteeringWheelAngle']['SteeringPosition'] - self.steer_angle_offset
       ret.cruiseState.speed = cp_PT.vl["CruiseControlStatus"]['CruiseControlSetpointSpeed'] * (CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS)
       ret.cruiseState.enabled = cp_PT.vl["CruiseControlStatus"]['CruiseControlActiveFlag'] != 0
     ret.cruiseState.speedCluster = ret.cruiseState.speed + CruiseSettings.CLUSTER_OFFSET * CV.KPH_TO_MS
