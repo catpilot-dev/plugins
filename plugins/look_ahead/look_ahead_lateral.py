@@ -8,7 +8,7 @@ This module recomputes desired curvature from the model's orientation
 prediction at a longer lookahead time:
   lookahead_t = clamp(lookahead_dist / v_ego, MIN_T, MAX_T)
 
-At 80 km/h with 80m lookahead: 3.6s ahead (vs stock 0.5s).
+At 80 km/h with 50m lookahead: 2.25s ahead (vs stock 0.5s).
 The model's far-field predictions are geometrically smoother because
 road curves are large-radius at distance.
 
@@ -17,10 +17,11 @@ like a human driver focusing on the car ahead rather than the horizon.
 """
 import numpy as np
 
-LOOKAHEAD_DISTANCE = 80.0   # meters — model is reliable up to ~100m
+LOOKAHEAD_DISTANCE = 50.0   # meters — reduced from 80m to avoid lane-line hugging
 MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
-MAX_LOOKAHEAD_T = 4.0       # seconds — model reliability drops beyond ~5s
+MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
+CURVE_THRESHOLD = 0.002     # 1/m (~500m radius) — fall back to stock in curves
 
 # T_IDXS from ModelConstants (copied to avoid import dependency)
 _T_IDXS = [10.0 * (i / 32) ** 2 for i in range(33)]
@@ -57,7 +58,7 @@ def _get_lead_distance():
 def compute_lookahead_curvature(model_v2, v_ego):
   """Compute curvature from model orientation at lookahead distance.
 
-  Lookahead distance is 80m, or lead vehicle distance if closer.
+  Lookahead distance is 50m, or lead vehicle distance if closer.
   Returns (curvature, lookahead_t) or (None, 0) if data unavailable.
   """
   if v_ego < MIN_SPEED:
@@ -98,9 +99,15 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing):
   """Hook callback for controls.curvature_correction.
 
   Replaces the stock short-lookahead curvature with a longer-lookahead
-  version. During lane changes, falls back to stock to preserve responsiveness.
+  version. Falls back to stock curvature in curves (where lane centering
+  needs the accurate short-lookahead) and during lane changes.
   """
   if not _is_enabled() or lane_changing:
+    return default_curvature
+
+  # In curves, fall back to stock — look ahead sees past the apex and
+  # fights lane centering's correction for the current curve position.
+  if abs(default_curvature) > CURVE_THRESHOLD:
     return default_curvature
 
   curvature, _ = compute_lookahead_curvature(model_v2, v_ego)
