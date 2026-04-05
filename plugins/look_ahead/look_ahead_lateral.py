@@ -53,11 +53,11 @@ _sm = None
 
 
 def _get_sm():
-  """Lazy init SubMaster for radarState and carState."""
+  """Lazy init SubMaster for radarState, carState, and deviceState."""
   global _sm
   if _sm is None:
     import cereal.messaging as messaging
-    _sm = messaging.SubMaster(['radarState', 'carState'])
+    _sm = messaging.SubMaster(['radarState', 'carState', 'deviceState'])
   _sm.update(0)
   return _sm
 
@@ -78,7 +78,7 @@ def _get_lead_distance():
 _offset_estimate = None
 _offset_last_pub = 0.0
 _offset_pub = None
-_atexit_registered = False
+_prev_started = True
 
 
 def _load_offset():
@@ -123,19 +123,23 @@ def _update_offset_estimate(desired_curvature, v_ego):
   Any consistent non-zero value is the sensor offset. Uses very slow
   exponential smoothing to converge over multiple drives.
 
-  Saves to disk via atexit when controlsd exits (route end).
+  Saves to disk on onroad→offroad transition (deviceState.started goes False).
   """
-  global _offset_estimate, _atexit_registered
+  global _offset_estimate, _prev_started
   import time
   _load_offset()
 
-  # Register atexit handler once — saves offset when controlsd exits
-  if not _atexit_registered:
-    import atexit
-    atexit.register(_save_offset)
-    _atexit_registered = True
-
   now = time.monotonic()
+
+  # Detect onroad→offroad transition → save offset to disk
+  try:
+    sm = _get_sm()
+    started = sm['deviceState'].started
+    if _prev_started and not started:
+      _save_offset()
+    _prev_started = started
+  except Exception:
+    pass
 
   # Always publish current estimate (even if not updating)
   _publish_offset(now)
