@@ -33,8 +33,8 @@ CURVE_THRESHOLD = 0.002     # 1/m (~500m radius) — fall back to stock in curve
 
 # Steering angle offset estimation
 OFFSET_MIN_SPEED = 15.0     # m/s — only estimate on highway-like roads
-OFFSET_ALPHA = 0.002        # exponential smoothing — very slow convergence
 OFFSET_MAX = 3.0            # deg — sanity clamp, real offsets are typically < 2°
+OFFSET_MIN_SAMPLES = 3000   # minimum samples before updating (~30s of straight highway at 100Hz)
 OFFSET_PUB_INTERVAL = 1.0   # seconds between plugin bus publishes
 
 # T_IDXS from ModelConstants (copied to avoid import dependency)
@@ -77,6 +77,7 @@ def _get_lead_distance():
 
 # --- Steering angle offset estimator ---
 _offset_estimate = None
+_offset_samples = []       # collected during this drive
 _offset_last_pub = 0.0
 _offset_pub = None
 _prev_started = True
@@ -94,7 +95,21 @@ def _load_offset():
 
 
 def _save_offset():
-  """Save offset to disk — called once when car stops (route end)."""
+  """Compute median from this drive's samples and save if enough data.
+
+  Called once on onroad→offroad transition. Requires at least
+  OFFSET_MIN_SAMPLES (~30s of straight highway driving) to update.
+  """
+  global _offset_estimate, _offset_samples
+  if len(_offset_samples) < OFFSET_MIN_SAMPLES:
+    _offset_samples.clear()
+    return
+
+  new_offset = float(np.median(_offset_samples))
+  new_offset = max(-OFFSET_MAX, min(OFFSET_MAX, new_offset))
+  _offset_estimate = new_offset
+  _offset_samples.clear()
+
   try:
     os.makedirs(_DATA_DIR, exist_ok=True)
     with open(os.path.join(_DATA_DIR, 'SteerAngleOffset'), 'w') as f:
@@ -118,21 +133,23 @@ def _publish_offset(now):
 
 
 def _update_offset_estimate(desired_curvature, v_ego):
-  """Update steering angle offset estimate on straight roads.
+  """Collect steering angle samples on straight roads for offset estimation.
 
   On straight roads at highway speed, the steering angle should be ~0.
-  Any consistent non-zero value is the sensor offset. Uses very slow
-  exponential smoothing to converge over multiple drives.
+  Any consistent non-zero value is the sensor offset. Samples are collected
+  during the drive, and the median is computed and saved at route end.
 
-  Saves to disk on onroad→offroad transition (deviceState.started goes False).
+  Requires OFFSET_MIN_SAMPLES (~30s of straight highway) to update.
+  The offset is a physical sensor property — once converged it shouldn't
+  change between drives.
   """
-  global _offset_estimate, _prev_started
+  global _prev_started
   import time
   _load_offset()
 
   now = time.monotonic()
 
-  # Detect onroad→offroad transition → save offset to disk
+  # Detect onroad→offroad transition → compute median and save
   try:
     sm = _get_sm()
     started = sm['deviceState'].started
@@ -145,6 +162,7 @@ def _update_offset_estimate(desired_curvature, v_ego):
   # Always publish current estimate (even if not updating)
   _publish_offset(now)
 
+  # Collect samples on straight highway
   if v_ego < OFFSET_MIN_SPEED or abs(desired_curvature) > 0.0005:
     return
 
@@ -154,9 +172,7 @@ def _update_offset_estimate(desired_curvature, v_ego):
   except Exception:
     return
 
-  # Exponential smoothing — converges slowly to avoid noise
-  _offset_estimate = (1 - OFFSET_ALPHA) * _offset_estimate + OFFSET_ALPHA * angle
-  _offset_estimate = max(-OFFSET_MAX, min(OFFSET_MAX, _offset_estimate))
+  _offset_samples.append(angle)
 
 
 # --- Curvature computation ---
