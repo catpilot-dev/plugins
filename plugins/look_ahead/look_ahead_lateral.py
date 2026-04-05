@@ -34,6 +34,7 @@ CURVE_THRESHOLD = 0.002     # 1/m (~500m radius) — fall back to stock in curve
 # Steering angle offset estimation
 OFFSET_MIN_SPEED = 15.0     # m/s — only estimate on highway-like roads
 OFFSET_ALPHA = 0.002        # exponential smoothing — very slow convergence
+OFFSET_MAX = 3.0            # deg — sanity clamp, real offsets are typically < 2°
 OFFSET_PUB_INTERVAL = 1.0   # seconds between plugin bus publishes
 
 # T_IDXS from ModelConstants (copied to avoid import dependency)
@@ -87,7 +88,7 @@ def _load_offset():
     return
   try:
     with open(os.path.join(_DATA_DIR, 'SteerAngleOffset')) as f:
-      _offset_estimate = float(f.read().strip())
+      _offset_estimate = max(-OFFSET_MAX, min(OFFSET_MAX, float(f.read().strip())))
   except (FileNotFoundError, OSError, ValueError):
     _offset_estimate = 0.0
 
@@ -155,6 +156,7 @@ def _update_offset_estimate(desired_curvature, v_ego):
 
   # Exponential smoothing — converges slowly to avoid noise
   _offset_estimate = (1 - OFFSET_ALPHA) * _offset_estimate + OFFSET_ALPHA * angle
+  _offset_estimate = max(-OFFSET_MAX, min(OFFSET_MAX, _offset_estimate))
 
 
 # --- Curvature computation ---
