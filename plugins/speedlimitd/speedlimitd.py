@@ -438,6 +438,7 @@ class SpeedLimitMiddleware:
           self.last_highway_type = hw
       else:
         self.last_way_ref = ''
+        self.last_road_name = ''
 
     # --- Read lane data from vision model ---
     if self.sm.updated['modelV2']:
