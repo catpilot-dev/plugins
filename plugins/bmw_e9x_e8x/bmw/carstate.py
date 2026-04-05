@@ -9,9 +9,9 @@ import cereal.messaging as messaging
 ButtonType = structs.CarState.ButtonEvent.Type
 
 # Resume button hold duration thresholds (in frames at 100Hz = 10ms per frame)
-# Short press minimum: 20ms (2 frames)
+# Short press minimum: 10ms (1 frame)
 # Long press threshold: 500ms (49 frames) — triggers gap adjust / personality cycle
-RESUME_SHORT_PRESS_MIN_FRAMES = 2
+RESUME_SHORT_PRESS_MIN_FRAMES = 1 
 RESUME_LONG_PRESS_FRAMES = 49
 
 
@@ -209,7 +209,7 @@ class CarState(CarStateBase):
           type=ButtonType.gapAdjustCruise
         ))
       elif self.resume_button_hold_frames < RESUME_SHORT_PRESS_MIN_FRAMES:
-        pass  # Too short (<250ms) — reject accidental stalk touch
+        pass  
       elif self.cruise_state_enabled:
         # Short press while engaged: toggle speed limit confirm
         msg = self._sl_sub.drain('speedLimitState')
