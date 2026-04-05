@@ -52,7 +52,8 @@ class CarState(CarStateBase):
     self.prev_cruise_enabled = False  # Track previous openpilot cruise state for resume button logic
     self.resume_button_hold_frames = 0  # Track how many frames resume button has been held (v4 duration-based logic)
     self.steer_fault_counter = 0  # Debounce: consecutive frames with raw fault bits set
-    self.steer_angle_offset = 0.8  # deg — SZL sensor zero offset (positive = sensor reads left of true center)
+    self.steer_angle_offset = self._load_steer_angle_offset()
+    self._offset_sub = None
 
     self.right_blinker_pressed = False
     self.left_blinker_pressed = False
@@ -72,6 +73,9 @@ class CarState(CarStateBase):
     cp_PT = can_parsers[Bus.pt]
     cp_F = can_parsers[Bus.body]
     cp_aux = can_parsers[Bus.alt]
+
+    # Update offset from look_ahead plugin bus (published at 1 Hz)
+    self._update_steer_angle_offset()
 
     ret = structs.CarState()
 
@@ -244,6 +248,40 @@ class CarState(CarStateBase):
     if self.cruise_state_enabled and not self.out.cruiseState.enabled:
       return True
     return False
+
+  @staticmethod
+  def _load_steer_angle_offset():
+    """Load persisted offset from look_ahead plugin data. Falls back to 0."""
+    try:
+      import os
+      path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          '..', 'look_ahead', 'data', 'SteerAngleOffset')
+      with open(os.path.normpath(path)) as f:
+        return float(f.read().strip())
+    except (FileNotFoundError, OSError, ValueError):
+      return 0.0
+
+  def _update_steer_angle_offset(self):
+    """Update offset from look_ahead plugin bus (steer_angle_offset topic)."""
+    try:
+      import os
+      socket_path = '/tmp/plugin_bus/steer_angle_offset'
+      if self._offset_sub is not None and not os.path.exists(socket_path):
+        try:
+          self._offset_sub.close()
+        except Exception:
+          pass
+        self._offset_sub = None
+      if self._offset_sub is None and os.path.exists(socket_path):
+        from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+        self._offset_sub = PluginSub(['steer_angle_offset'])
+      if self._offset_sub is not None:
+        msg = self._offset_sub.drain('steer_angle_offset')
+        if msg is not None:
+          _, data = msg
+          self.steer_angle_offset = float(data.get('offset', self.steer_angle_offset))
+    except Exception:
+      pass
 
   @staticmethod
   def get_can_parsers(CP):
