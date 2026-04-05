@@ -224,11 +224,11 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing):
 
   Also estimates steering angle offset on straight roads.
   """
+  # Offset estimation always runs (independent of Look Ahead toggle)
+  _update_offset_estimate(default_curvature, v_ego)
+
   if not _is_enabled() or lane_changing:
     return default_curvature
-
-  # Estimate steering angle offset on straight roads
-  _update_offset_estimate(default_curvature, v_ego)
 
   # In curves, fall back to stock — look ahead sees past the apex and
   # fights lane centering's correction for the current curve position.
