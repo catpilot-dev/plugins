@@ -78,7 +78,7 @@ def _get_lead_distance():
 _offset_estimate = None
 _offset_last_pub = 0.0
 _offset_pub = None
-_offset_was_driving = False  # track driving state for save-on-stop
+_atexit_registered = False
 
 
 def _load_offset():
@@ -123,22 +123,22 @@ def _update_offset_estimate(desired_curvature, v_ego):
   Any consistent non-zero value is the sensor offset. Uses very slow
   exponential smoothing to converge over multiple drives.
 
-  Saves to disk when car stops (route end) for persistence across reboots.
+  Saves to disk via atexit when controlsd exits (route end).
   """
-  global _offset_estimate, _offset_was_driving
+  global _offset_estimate, _atexit_registered
   import time
   _load_offset()
+
+  # Register atexit handler once — saves offset when controlsd exits
+  if not _atexit_registered:
+    import atexit
+    atexit.register(_save_offset)
+    _atexit_registered = True
 
   now = time.monotonic()
 
   # Always publish current estimate (even if not updating)
   _publish_offset(now)
-
-  # Detect route end: was driving, now stopped → save
-  driving = v_ego > MIN_SPEED
-  if _offset_was_driving and not driving:
-    _save_offset()
-  _offset_was_driving = driving
 
   if v_ego < OFFSET_MIN_SPEED or abs(desired_curvature) > 0.0005:
     return
