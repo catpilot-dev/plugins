@@ -195,6 +195,11 @@ def _update_offset_estimate(desired_curvature, v_ego):
   if now - _block_start >= OFFSET_BLOCK_DURATION:
     block_median = float(np.median(_block_samples))
     _block_medians.append(block_median)
+
+    # Update live estimate once we have enough blocks
+    if len(_block_medians) >= OFFSET_MIN_BLOCKS:
+      _offset_estimate = float(np.median(_block_medians))
+      _offset_estimate = max(-OFFSET_MAX, min(OFFSET_MAX, _offset_estimate))
     _block_samples.clear()
     _block_start = 0.0
 
