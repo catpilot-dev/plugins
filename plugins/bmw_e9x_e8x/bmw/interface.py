@@ -84,7 +84,7 @@ class CarInterface(CarInterfaceBase):
     ret.safetyConfigs[0].safetyParam = 0
 
     ret.steerControlType = structs.CarParams.SteerControlType.torque
-    ret.steerActuatorDelay = 0.26
+    ret.steerActuatorDelay = 0.36
     ret.steerLimitTimer = 0.4
 
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning, steering_angle_deadzone_deg=0.0)
