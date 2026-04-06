@@ -247,14 +247,12 @@ class CarState(CarStateBase):
 
   @staticmethod
   def _load_steer_angle_offset():
-    """Load persisted offset from look_ahead plugin data. Falls back to 0."""
+    """Load persisted offset from plugin data dir. Falls back to 0."""
     try:
-      import os
-      path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          '..', 'look_ahead', 'data', 'SteerAngleOffset')
-      with open(os.path.normpath(path)) as f:
-        return float(f.read().strip())
-    except (FileNotFoundError, OSError, ValueError):
+      from config import read_plugin_param
+      val = read_plugin_param('bmw-e9x-e8x', 'SteerAngleOffset')
+      return float(val) if val else 0.0
+    except (ValueError, Exception):
       return 0.0
 
   def _update_steer_angle_offset(self):
@@ -275,7 +273,14 @@ class CarState(CarStateBase):
         msg = self._offset_sub.drain('steer_angle_offset')
         if msg is not None:
           _, data = msg
-          self.steer_angle_offset = float(data.get('offset', self.steer_angle_offset))
+          new_offset = float(data.get('offset', self.steer_angle_offset))
+          if new_offset != self.steer_angle_offset:
+            self.steer_angle_offset = new_offset
+            try:
+              from config import write_plugin_param
+              write_plugin_param('bmw-e9x-e8x', 'SteerAngleOffset', '%.4f' % new_offset)
+            except Exception:
+              pass
     except Exception:
       pass
 
