@@ -20,10 +20,6 @@ _cached_way_ref = ''
 _cached_road_name = ''
 
 
-def _has_cjk(text):
-  return any('\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf' for c in text)
-
-
 def _is_enabled():
   try:
     with open(os.path.join(_PLUGIN_DIR, 'data', 'RoadInfoOverlay')) as f:
@@ -62,24 +58,16 @@ def on_render_overlay(default, content_rect):
 
   way_ref, road_name = _read_road_info()
 
-  if not way_ref and not road_name:
+  if not way_ref:
     return None
 
   # Lazy imports — must not be at module level
   import pyray as rl
   from openpilot.system.ui.lib.application import FontWeight
-  from fonts import get_font, get_cjk_font, measure
+  from fonts import get_font, measure
 
-  # Build display text: "S20 外环高速" or just road name
-  if way_ref and road_name and way_ref != road_name:
-    text = f"{way_ref}  {road_name}"
-  elif way_ref:
-    text = way_ref
-  else:
-    text = road_name
-
-  # Use CJK font for Chinese characters
-  font = get_cjk_font(FONT_SIZE) if _has_cjk(text) else get_font(FontWeight.SEMI_BOLD)
+  text = way_ref
+  font = get_font(FontWeight.SEMI_BOLD)
   if font is None:
     return None
   text_size = measure(font, text, FONT_SIZE)
@@ -94,8 +82,7 @@ def on_render_overlay(default, content_rect):
   bg_rect = rl.Rectangle(x - pad, y - pad / 2, text_size.x + pad * 2, text_size.y + pad)
   rl.draw_rectangle_rounded(bg_rect, 0.3, 10, rl.Color(0, 0, 0, 128))
 
-  # Draw text — use ref color if wayRef present, otherwise name color
-  color = rl.Color(100, 200, 255, 220) if way_ref else rl.Color(200, 200, 200, 200)
+  color = rl.Color(100, 200, 255, 220)
   rl.draw_text_ex(font, text, rl.Vector2(x, y), FONT_SIZE, 0, color)
 
   return None
