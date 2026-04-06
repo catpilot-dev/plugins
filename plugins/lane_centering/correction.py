@@ -101,9 +101,20 @@ class LaneCenteringCorrection:
       return self._smooth_correction(0.0, winding_down=True)
 
     curvature = model_v2.action.desiredCurvature
-    path_y = model_v2.position.y[0]
-    right_y = model_v2.laneLines[2].y[0]
-    left_y = model_v2.laneLines[1].y[0]
+
+    # Read lane positions at actuator delay distance (not t=0) to match
+    # the stock desiredCurvature time horizon. Prevents the correction
+    # from fighting the curvature when speed changes (e.g. curve braking).
+    # X_IDXS: idx 0=0m, 7=9.2m, 8=12m. At 60-80 kph, 0.56s ≈ 9-12m.
+    delay_dist = v_ego * 0.56
+    X_IDXS = [192.0 * (i / 32) ** 2 for i in range(33)]
+    # Find the closest spatial index
+    idx = min(range(len(X_IDXS)), key=lambda i: abs(X_IDXS[i] - delay_dist))
+    idx = min(idx, len(model_v2.position.y) - 1, len(model_v2.laneLines[1].y) - 1, len(model_v2.laneLines[2].y) - 1)
+
+    path_y = model_v2.position.y[idx]
+    right_y = model_v2.laneLines[2].y[idx]
+    left_y = model_v2.laneLines[1].y[idx]
 
     # Dynamic lane width estimation when both lanes are confident.
     # When measured width is out of valid range (e.g. > 4.5m due to turn
