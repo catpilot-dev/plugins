@@ -248,7 +248,7 @@ def _is_enabled():
     return True  # default on
 
 
-def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing):
+def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, **kwargs):
   """Hook callback for controls.curvature_correction.
 
   Replaces the stock short-lookahead curvature with a longer-lookahead

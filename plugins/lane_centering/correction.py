@@ -62,21 +62,9 @@ class LaneCenteringCorrection:
     self.smoothed_lane_center = None
     self.estimated_lane_width = None
     self.prev_offset = 0.0
-    self._delay_sm = None
+    self.lat_delay = self.DEFAULT_LAT_DELAY
     # Diagnostics (published to plugin bus by hook)
     self.diag = {}
-
-  def _get_lat_delay(self):
-    """Get lateral delay from liveDelay SubMaster."""
-    try:
-      if self._delay_sm is None:
-        import cereal.messaging as messaging
-        self._delay_sm = messaging.SubMaster(['liveDelay'])
-      self._delay_sm.update(0)
-      val = float(self._delay_sm['liveDelay'].lateralDelay)
-      return val if val > 0 else self.DEFAULT_LAT_DELAY
-    except (TypeError, ValueError, Exception):
-      return self.DEFAULT_LAT_DELAY
 
   def _reset_lane_tracking(self):
     self.active = False
@@ -88,8 +76,10 @@ class LaneCenteringCorrection:
     self.prev_correction = smooth_value(target, self.prev_correction, tau, DT_MDL)
     return self.prev_correction
 
-  def update(self, model_v2, v_ego):
+  def update(self, model_v2, v_ego, lat_delay=None):
     self.diag = {}
+    if lat_delay is not None:
+      self.lat_delay = lat_delay
 
     # Skip if lane detection data not available
     if len(model_v2.laneLineProbs) < 3:
@@ -120,8 +110,7 @@ class LaneCenteringCorrection:
     # Read lane positions at actuator delay distance (not t=0) to match
     # the stock desiredCurvature time horizon. Prevents the correction
     # from fighting the curvature when speed changes (e.g. curve braking).
-    lat_delay = self._get_lat_delay()
-    delay_dist = v_ego * lat_delay
+    delay_dist = v_ego * self.lat_delay
     X_IDXS = [192.0 * (i / 32) ** 2 for i in range(33)]
     idx = min(range(len(X_IDXS)), key=lambda i: abs(X_IDXS[i] - delay_dist))
     idx = min(idx, len(model_v2.position.y) - 1, len(model_v2.laneLines[1].y) - 1, len(model_v2.laneLines[2].y) - 1)
@@ -225,7 +214,7 @@ _prev_active = False
 _lcc_pub = None   # publishes lane_centering_state (active + diagnostics)
 
 
-def on_curvature_correction(curvature, model_v2, v_ego, lane_changing):
+def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, **kwargs):
   global _lcc, _enabled, _prev_active, _lcc_pub
 
   # Feature toggle (Driving panel) — independent of plugin lifecycle
@@ -239,7 +228,7 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing):
     _lcc = LaneCenteringCorrection()
   if lane_changing:
     return curvature
-  correction = _lcc.update(model_v2, v_ego)
+  correction = _lcc.update(model_v2, v_ego, lat_delay=kwargs.get('lat_delay'))
 
   # Publish active state and diagnostics to plugin bus
   try:
