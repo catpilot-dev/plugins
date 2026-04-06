@@ -53,7 +53,6 @@ class CarController(CarControllerBase):
       self.cruise_bus = CanBus.F_CAN
 
     self.packer = CANPacker(dbc_name[Bus.pt])
-    self.torque_filtered = 0.0  # low-pass filtered torque output
 
     self.dcc_last_tick_time = 0
 
@@ -137,12 +136,6 @@ class CarController(CarControllerBase):
         apply_torque = apply_dist_to_meas_limits(new_steer, self.apply_torque_last, CS.out.steeringTorqueEps,
                                            CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
                                            CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
-        # Low-pass filter: smooth out high-frequency torque noise.
-        # BMW front wheel alignment provides natural self-centering force —
-        # small rapid torque changes fight it instead of letting the wheels settle.
-        alpha = CarControllerParams.STEER_TORQUE_LPF_ALPHA
-        self.torque_filtered = (1 - alpha) * self.torque_filtered + alpha * apply_torque
-        apply_torque = self.torque_filtered
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, apply_torque))
       elif not CS.cruise_stalk_cancel and not CS.out.brakePressed and not CS.out.gasPressed and self.apply_torque_last != 0:
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.SoftOff, self.apply_torque_last))
