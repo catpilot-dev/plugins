@@ -29,7 +29,6 @@ LOOKAHEAD_DISTANCE = 50.0   # meters — reduced from 80m to avoid lane-line hug
 MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
-CURVE_THRESHOLD = 0.002     # 1/m (~500m radius) — fall back to stock in curves
 
 # Steering angle offset estimation
 OFFSET_MIN_SPEED = 15.0     # m/s — only estimate on highway-like roads
@@ -259,13 +258,13 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing):
   if not _is_enabled() or lane_changing:
     return default_curvature
 
-  # In curves, fall back to stock — look ahead sees past the apex and
-  # fights lane centering's correction for the current curve position.
-  if abs(default_curvature) > CURVE_THRESHOLD:
-    return default_curvature
-
   curvature, _ = compute_lookahead_curvature(model_v2, v_ego)
   if curvature is None:
     return default_curvature
 
-  return curvature
+  # Use look ahead only when road ahead is straighter than current —
+  # smooth transition on curve exits and straights, responsive on curve entry.
+  if abs(curvature) < abs(default_curvature):
+    return curvature
+
+  return default_curvature
