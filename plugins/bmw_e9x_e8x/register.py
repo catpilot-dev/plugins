@@ -342,9 +342,10 @@ def on_lat_controller_init(result, lac, CP):
 
   Highway KP is unchanged (0.8 at 120+ kph).
   """
-  BMW_KP_SPEEDS = [1, 2.0, 5, 10, 15, 30]
-  BMW_KP_VALUES = [50, 20, 5, 2.0, 1.2, 0.8]
-  lac.pid._k_p = [BMW_KP_SPEEDS, BMW_KP_VALUES]
+  # Flat KP=0.85 — proven for BMW hydraulic steering in openpilot 0.10.1.
+  # Speed-dependent KP is designed for EPS cars; hydraulic assist provides
+  # its own speed-dependent gain, so flat KP works correctly.
+  lac.pid._k_p = [[0], [0.85]]
   return result
 
 
