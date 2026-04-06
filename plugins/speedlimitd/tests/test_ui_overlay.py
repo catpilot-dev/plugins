@@ -156,38 +156,6 @@ class TestUpdateState:
     assert overlay._speed_limit_source == 0
     assert overlay._speed_limit_confirmed is True
 
-  def test_ceiling_computed_when_confirmed(self, overlay, mock_openpilot):
-    """Ceiling = limit * (1 + offset%) when confirmed."""
-    overlay._ensure_init()
-    overlay._sl_data = {'speedLimit': 80.0, 'source': 0, 'confirmed': True}
-    overlay._update_state()
-    assert overlay.speed_limit_capping is True
-    assert overlay.speed_limit_ceiling == pytest.approx(88.0)
-
-  def test_ceiling_uses_tiered_offset(self, overlay, mock_openpilot):
-    """Ceiling uses tiered offset: >60 kph → 10%, 51-60 → 30%, ≤50 → 40%."""
-    overlay._ensure_init()
-
-    overlay._sl_data = {'speedLimit': 100.0, 'source': 0, 'confirmed': True}
-    overlay._update_state()
-    assert overlay.speed_limit_ceiling == pytest.approx(110.0)
-
-    overlay._sl_data = {'speedLimit': 60.0, 'source': 0, 'confirmed': True}
-    overlay._update_state()
-    assert overlay.speed_limit_ceiling == pytest.approx(78.0)
-
-    overlay._sl_data = {'speedLimit': 40.0, 'source': 0, 'confirmed': True}
-    overlay._update_state()
-    assert overlay.speed_limit_ceiling == pytest.approx(56.0)
-
-  def test_ceiling_zero_when_unconfirmed(self, overlay, mock_openpilot):
-    """Ceiling is 0 when not confirmed."""
-    overlay._ensure_init()
-    overlay._sl_data = {'speedLimit': 80.0, 'source': 0, 'confirmed': False}
-    overlay._update_state()
-    assert overlay.speed_limit_capping is False
-    assert overlay.speed_limit_ceiling == 0.0
-
   def test_speed_limit_unconfirmed(self, overlay, mock_openpilot):
     overlay._ensure_init()
     overlay._sl_data = {'speedLimit': 60.0, 'source': 1, 'confirmed': False}

@@ -34,8 +34,6 @@ _font_medium = None
 _speed_limit = 0.0
 _speed_limit_source = 2  # roadTypeInference default
 _speed_limit_confirmed = False
-speed_limit_capping = False  # True when confirmed limit is actively capping MAX
-speed_limit_ceiling = 0.0    # Effective ceiling: limit + offset (km/h)
 _tap_hold_until = 0.0  # Hold local confirmed state until this time (monotonic)
 
 
@@ -58,7 +56,7 @@ _sl_data = None
 
 def _update_state():
   """Read speedLimitState from plugin bus."""
-  global _speed_limit, _speed_limit_source, _speed_limit_confirmed, speed_limit_capping, speed_limit_ceiling
+  global _speed_limit, _speed_limit_source, _speed_limit_confirmed
   global _sl_sub, _sl_data
   import time
 
@@ -92,20 +90,6 @@ def _update_state():
     _speed_limit_source = _sl_data.get('source', 2)
     if time.monotonic() >= _tap_hold_until:
       _speed_limit_confirmed = _sl_data.get('confirmed', False)
-    speed_limit_capping = _speed_limit_confirmed and _speed_limit > 0
-    if speed_limit_capping:
-      if _speed_limit <= 50:
-        offset_pct = 40
-      elif _speed_limit <= 60:
-        offset_pct = 30
-      else:
-        offset_pct = 10
-      speed_limit_ceiling = _speed_limit * (1 + offset_pct / 100.0)
-    else:
-      speed_limit_ceiling = 0.0
-  else:
-    speed_limit_capping = False
-    speed_limit_ceiling = 0.0
 
 
 def _sign_geometry(content_rect):
@@ -193,20 +177,10 @@ def on_state_subscriptions(services):
 def on_hud_set_speed_override(default, max_color, set_speed_color, set_speed, is_metric):
   """Hook callback for ui.hud_set_speed_override.
 
-  When speed limit is actively capping cruise, dim the MAX block and show
-  the ceiling speed instead of the user's set speed.
+  MAX block always shows user's set cruise speed. Speed limit info is
+  shown in the speed limit sign overlay instead.
   """
-  if not speed_limit_capping or speed_limit_ceiling <= 0:
-    return default
-
-  import pyray as rl
-  KM_TO_MILE = 0.621371
-  ceiling = speed_limit_ceiling if is_metric else speed_limit_ceiling * KM_TO_MILE
-  return {
-    "max_color": rl.Color(max_color.r, max_color.g, max_color.b, 128),
-    "set_speed_color": rl.Color(255, 255, 255, 128),
-    "set_speed_text": str(round(ceiling)),
-  }
+  return default
 
 
 def _show_sign_enabled():
