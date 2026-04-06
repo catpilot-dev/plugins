@@ -29,6 +29,7 @@ LOOKAHEAD_DISTANCE = 50.0   # meters — reduced from 80m to avoid lane-line hug
 MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
+BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
 
 # Steering angle offset estimation
 OFFSET_MIN_SPEED = 15.0     # m/s — only estimate on highway-like roads
@@ -51,6 +52,10 @@ def _curv_from_plan(yaws, yaw_rates, v_ego, action_t):
 
 
 _sm = None
+
+
+_blend_factor = 0.0  # 0 = stock, 1 = look ahead
+_blend_last_time = 0.0
 
 
 def _get_sm():
@@ -262,9 +267,20 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing):
   if curvature is None:
     return default_curvature
 
-  # Use look ahead only when road ahead is straighter than current —
-  # smooth transition on curve exits and straights, responsive on curve entry.
-  if abs(curvature) < abs(default_curvature):
-    return curvature
+  # Smooth blend between stock and look ahead.
+  # Target: look ahead when road straightens, stock when road curves more.
+  # Blend factor ramps at BLEND_RATE per second for smooth transitions.
+  global _blend_factor, _blend_last_time
+  import time
+  now = time.monotonic()
+  dt = min(now - _blend_last_time, 0.1) if _blend_last_time > 0 else 0.01
+  _blend_last_time = now
 
-  return default_curvature
+  target = 1.0 if abs(curvature) < abs(default_curvature) else 0.0
+  max_step = BLEND_RATE * dt
+  if target > _blend_factor:
+    _blend_factor = min(_blend_factor + max_step, target)
+  else:
+    _blend_factor = max(_blend_factor - max_step, target)
+
+  return default_curvature + _blend_factor * (curvature - default_curvature)
