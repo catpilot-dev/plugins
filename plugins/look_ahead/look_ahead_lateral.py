@@ -168,7 +168,9 @@ def _update_offset_estimate(desired_curvature, v_ego):
 
   try:
     sm = _get_sm()
-    angle = sm['carState'].steeringAngleDeg
+    # carState.steeringAngleDeg has the offset already subtracted,
+    # so add it back to get the raw sensor value for estimation.
+    angle = sm['carState'].steeringAngleDeg + _offset_estimate
   except Exception:
     return
 
