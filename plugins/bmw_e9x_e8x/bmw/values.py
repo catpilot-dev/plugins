@@ -20,8 +20,9 @@ class CarControllerParams: #controls running @ 100hz
   STEER_DELTA_UP = 0.1       # Nm/10ms
   STEER_DELTA_DOWN = 0.2     # Nm/10ms (near-symmetric with DELTA_UP to reduce oscillation)
   STEER_ERROR_MAX = 999     # max delta between torque cmd and torque motor
-  STEER_TORQUE_LPF_ALPHA = 0.10  # low-pass filter: fc ≈ 1.8 Hz at 100Hz, cuts 41% of 2.4 Hz
-                                  # oscillation while preserving 87% of 1 Hz curve response.
+  STEER_TORQUE_LPF_ALPHA = 0.05  # low-pass filter: fc ≈ 0.8 Hz at 100Hz, cuts 67% of 2.4 Hz
+                                  # oscillation. Matches human steering bandwidth (< 1 Hz) and
+                                  # the servo's physical response time (0.46s step to 90%).
 
   # STEER_BACKLASH = 1 #deg
   def __init__(self, CP):
