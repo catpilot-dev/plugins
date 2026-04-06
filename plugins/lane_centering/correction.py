@@ -53,6 +53,8 @@ class LaneCenteringCorrection:
   # Derivative damping — reduce correction when offset is improving
   KD = 0.5  # damping factor on offset rate of change
 
+  DEFAULT_LAT_DELAY = 0.56   # fallback: steerActuatorDelay + 0.2
+
   def __init__(self):
     self.prev_correction = 0.0
     self.active = False
@@ -60,8 +62,21 @@ class LaneCenteringCorrection:
     self.smoothed_lane_center = None
     self.estimated_lane_width = None
     self.prev_offset = 0.0
+    self._delay_sm = None
     # Diagnostics (published to plugin bus by hook)
     self.diag = {}
+
+  def _get_lat_delay(self):
+    """Get lateral delay from liveDelay SubMaster."""
+    try:
+      if self._delay_sm is None:
+        import cereal.messaging as messaging
+        self._delay_sm = messaging.SubMaster(['liveDelay'])
+      self._delay_sm.update(0)
+      val = float(self._delay_sm['liveDelay'].lateralDelay)
+      return val if val > 0 else self.DEFAULT_LAT_DELAY
+    except (TypeError, ValueError, Exception):
+      return self.DEFAULT_LAT_DELAY
 
   def _reset_lane_tracking(self):
     self.active = False
@@ -105,10 +120,9 @@ class LaneCenteringCorrection:
     # Read lane positions at actuator delay distance (not t=0) to match
     # the stock desiredCurvature time horizon. Prevents the correction
     # from fighting the curvature when speed changes (e.g. curve braking).
-    # X_IDXS: idx 0=0m, 7=9.2m, 8=12m. At 60-80 kph, 0.56s ≈ 9-12m.
-    delay_dist = v_ego * 0.56
+    lat_delay = self._get_lat_delay()
+    delay_dist = v_ego * lat_delay
     X_IDXS = [192.0 * (i / 32) ** 2 for i in range(33)]
-    # Find the closest spatial index
     idx = min(range(len(X_IDXS)), key=lambda i: abs(X_IDXS[i] - delay_dist))
     idx = min(idx, len(model_v2.position.y) - 1, len(model_v2.laneLines[1].y) - 1, len(model_v2.laneLines[2].y) - 1)
 
