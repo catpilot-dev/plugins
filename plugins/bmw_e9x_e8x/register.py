@@ -333,7 +333,18 @@ def on_desire_post_update(desire, lane_change_state, lane_change_direction, cars
 
 
 def on_lat_controller_init(result, lac, CP):
-  """No-op — adaptive gains in latcontrol_torque.py now compute KP/KI from LiveDelay."""
+  """Replace stock speed-dependent KP with BMW hydraulic steering schedule.
+
+  Stock KP is tuned for EPS cars with high low-speed gain. BMW's hydraulic
+  power steering has strong self-centering and assist at low speed — the
+  stock KP overcompensates, causing oscillation in tight curves (2.8 Hz
+  at 50 kph with stock KP=2.33, reduced to 1.38 with BMW schedule).
+
+  Highway KP is unchanged (0.8 at 120+ kph).
+  """
+  BMW_KP_SPEEDS = [1, 2.0, 5, 10, 15, 30]
+  BMW_KP_VALUES = [50, 20, 5, 2.0, 1.2, 0.8]
+  lac.pid._k_p = [BMW_KP_SPEEDS, BMW_KP_VALUES]
   return result
 
 
