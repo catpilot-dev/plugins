@@ -34,7 +34,8 @@ CURVE_THRESHOLD = 0.002     # 1/m (~500m radius) — fall back to stock in curve
 # Steering angle offset estimation
 OFFSET_MIN_SPEED = 15.0     # m/s — only estimate on highway-like roads
 OFFSET_MAX = 3.0            # deg — sanity clamp, real offsets are typically < 2°
-OFFSET_MIN_SAMPLES = 3000   # minimum samples before updating (~30s of straight highway at 100Hz)
+OFFSET_BLOCK_DURATION = 5.0 # seconds — minimum consecutive straight driving per block
+OFFSET_MIN_BLOCKS = 10      # blocks needed for a valid estimate
 OFFSET_PUB_INTERVAL = 1.0   # seconds between plugin bus publishes
 
 # T_IDXS from ModelConstants (copied to avoid import dependency)
@@ -77,7 +78,9 @@ def _get_lead_distance():
 
 # --- Steering angle offset estimator ---
 _offset_estimate = None
-_offset_samples = []       # collected during this drive
+_block_samples = []        # current block being collected
+_block_start = 0.0         # monotonic time when current block started
+_block_medians = []        # median of each completed block this drive
 _offset_last_pub = 0.0
 _offset_pub = None
 _prev_started = True
@@ -95,20 +98,23 @@ def _load_offset():
 
 
 def _save_offset():
-  """Compute median from this drive's samples and save if enough data.
+  """Compute median of block medians and save if enough valid blocks.
 
-  Called once on onroad→offroad transition. Requires at least
-  OFFSET_MIN_SAMPLES (~30s of straight highway driving) to update.
+  Called once on onroad→offroad transition. Each block is 5+ seconds of
+  consecutive straight highway driving. Requires 10 valid blocks (~50s total).
+  Median-of-medians is robust to individual block outliers (road camber, wind).
   """
-  global _offset_estimate, _offset_samples
-  if len(_offset_samples) < OFFSET_MIN_SAMPLES:
-    _offset_samples.clear()
+  global _offset_estimate, _block_medians, _block_samples
+  _block_samples.clear()
+
+  if len(_block_medians) < OFFSET_MIN_BLOCKS:
+    _block_medians.clear()
     return
 
-  new_offset = float(np.median(_offset_samples))
+  new_offset = float(np.median(_block_medians))
   new_offset = max(-OFFSET_MAX, min(OFFSET_MAX, new_offset))
   _offset_estimate = new_offset
-  _offset_samples.clear()
+  _block_medians.clear()
 
   try:
     os.makedirs(_DATA_DIR, exist_ok=True)
@@ -133,23 +139,23 @@ def _publish_offset(now):
 
 
 def _update_offset_estimate(desired_curvature, v_ego):
-  """Collect steering angle samples on straight roads for offset estimation.
+  """Collect steering angle samples in consecutive blocks on straight roads.
 
-  On straight roads at highway speed, the steering angle should be ~0.
-  Any consistent non-zero value is the sensor offset. Samples are collected
-  during the drive, and the median is computed and saved at route end.
+  Each block requires 5+ seconds of uninterrupted straight highway driving.
+  If the car enters a curve or slows down, the current block is discarded.
+  At route end, the median of all block medians is the offset estimate.
+  Requires 10 valid blocks (~50s of straight highway) to update.
 
-  Requires OFFSET_MIN_SAMPLES (~30s of straight highway) to update.
   The offset is a physical sensor property — once converged it shouldn't
   change between drives.
   """
-  global _prev_started
+  global _prev_started, _block_samples, _block_start
   import time
   _load_offset()
 
   now = time.monotonic()
 
-  # Detect onroad→offroad transition → compute median and save
+  # Detect onroad→offroad transition → compute median-of-medians and save
   try:
     sm = _get_sm()
     started = sm['deviceState'].started
@@ -162,8 +168,13 @@ def _update_offset_estimate(desired_curvature, v_ego):
   # Always publish current estimate (even if not updating)
   _publish_offset(now)
 
-  # Collect samples on straight highway
-  if v_ego < OFFSET_MIN_SPEED or abs(desired_curvature) > 0.0005:
+  # Check if conditions are met for sampling
+  on_straight = v_ego >= OFFSET_MIN_SPEED and abs(desired_curvature) < 0.0005
+
+  if not on_straight:
+    # Conditions broken — discard current block
+    _block_samples.clear()
+    _block_start = 0.0
     return
 
   try:
@@ -174,7 +185,18 @@ def _update_offset_estimate(desired_curvature, v_ego):
   except Exception:
     return
 
-  _offset_samples.append(angle)
+  # Start new block
+  if not _block_samples:
+    _block_start = now
+
+  _block_samples.append(angle)
+
+  # Complete block after 5 seconds of consecutive data
+  if now - _block_start >= OFFSET_BLOCK_DURATION:
+    block_median = float(np.median(_block_samples))
+    _block_medians.append(block_median)
+    _block_samples.clear()
+    _block_start = 0.0
 
 
 # --- Curvature computation ---
