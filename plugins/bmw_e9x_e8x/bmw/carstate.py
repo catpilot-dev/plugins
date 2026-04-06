@@ -250,7 +250,7 @@ class CarState(CarStateBase):
     """Load persisted offset from plugin data dir. Falls back to 0."""
     try:
       from config import read_plugin_param
-      val = read_plugin_param('bmw-e9x-e8x', 'SteerAngleOffset')
+      val = read_plugin_param('bmw_e9x_e8x', 'SteerAngleOffset')
       return float(val) if val else 0.0
     except (ValueError, Exception):
       return 0.0
@@ -278,7 +278,7 @@ class CarState(CarStateBase):
             self.steer_angle_offset = new_offset
             try:
               from config import write_plugin_param
-              write_plugin_param('bmw-e9x-e8x', 'SteerAngleOffset', '%.4f' % new_offset)
+              write_plugin_param('bmw_e9x_e8x', 'SteerAngleOffset', '%.4f' % new_offset)
             except Exception:
               pass
     except Exception:
