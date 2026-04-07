@@ -139,6 +139,7 @@ class CarController(CarControllerBase):
                                            CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
         # Hysteresis: suppress small torque oscillations (servo buzz) without phase lag.
         # Holds last output until input moves beyond ±hyst_gap, preserving mean offset.
+        self.apply_torque_pre_hyst = apply_torque
         self.torque_steady = apply_hysteresis(apply_torque, self.torque_steady, CarControllerParams.STEER_TORQUE_HYST)
         apply_torque = self.torque_steady
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, apply_torque))
@@ -153,8 +154,8 @@ class CarController(CarControllerBase):
     self.cruise_enabled_prev = CC.enabled
 
     new_actuators = actuators.as_builder()
-    new_actuators.torque = self.apply_torque_last / CarControllerParams.STEER_MAX
-    new_actuators.torqueOutputCan = self.apply_torque_last
+    new_actuators.torque = getattr(self, 'apply_torque_pre_hyst', 0.0) / CarControllerParams.STEER_MAX  # pre-hysteresis (normalized)
+    new_actuators.torqueOutputCan = self.apply_torque_last  # post-hysteresis (Nm)
 
     new_actuators.speed = v_target
 
