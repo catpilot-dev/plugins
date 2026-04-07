@@ -53,6 +53,7 @@ class CarController(CarControllerBase):
       self.cruise_bus = CanBus.F_CAN
 
     self.packer = CANPacker(dbc_name[Bus.pt])
+    self.torque_filtered = 0.0
 
     self.dcc_last_tick_time = 0
 
@@ -136,10 +137,14 @@ class CarController(CarControllerBase):
         apply_torque = apply_dist_to_meas_limits(new_steer, self.apply_torque_last, CS.out.steeringTorqueEps,
                                            CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
                                            CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
-        # Deadband: suppress small torque commands that only make the servo buzz
-        # without moving the wheel through hydraulic friction.
-        if abs(apply_torque) < CarControllerParams.STEER_TORQUE_DEADBAND:
-          apply_torque = 0
+        # LPF on straights: filter 3-5 Hz servo buzz from model curvature noise.
+        # In curves, pass through unfiltered for responsive steering.
+        if abs(actuators.curvature) < 0.001:
+          alpha = CarControllerParams.STEER_TORQUE_LPF_ALPHA
+          self.torque_filtered = (1 - alpha) * self.torque_filtered + alpha * apply_torque
+          apply_torque = self.torque_filtered
+        else:
+          self.torque_filtered = apply_torque
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, apply_torque))
       elif not CS.cruise_stalk_cancel and not CS.out.brakePressed and not CS.out.gasPressed and self.apply_torque_last != 0:
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.SoftOff, self.apply_torque_last))
