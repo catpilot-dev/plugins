@@ -20,9 +20,8 @@ class CarControllerParams: #controls running @ 100hz
   STEER_DELTA_UP = 0.1       # Nm/10ms
   STEER_DELTA_DOWN = 0.2     # Nm/10ms (near-symmetric with DELTA_UP to reduce oscillation)
   STEER_ERROR_MAX = 999     # max delta between torque cmd and torque motor
-  STEER_TORQUE_DEADBAND = 0.5  # Nm — suppress torque below this on straights.
-                                # 0.5 Nm ≈ 0.14 m/s² lat accel ≈ 0.0003 curvature at 75 kph.
-                                # Below this, hydraulic friction absorbs it — servo just buzzes.
+  STEER_TORQUE_LPF_ALPHA = 0.159  # LPF fc≈3Hz at 100Hz — filters 3-5Hz servo buzz on straights
+                                   # while preserving mean torque offset and gentle corrections.
 
   # STEER_BACKLASH = 1 #deg
   def __init__(self, CP):
