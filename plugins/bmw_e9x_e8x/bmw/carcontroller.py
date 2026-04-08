@@ -134,28 +134,29 @@ class CarController(CarControllerBase):
     if self.flags & BmwFlags.STEPPER_SERVO_CAN:
       if CC.enabled and CC.latActive:
         new_steer = actuators.torque * CarControllerParams.STEER_MAX
+        # Rate limiter tracks pre-hysteresis torque so it can ramp freely
         apply_torque = apply_dist_to_meas_limits(new_steer, self.apply_torque_last, CS.out.steeringTorqueEps,
                                            CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
                                            CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
+        self.apply_torque_last = apply_torque
         # Hysteresis: suppress small torque oscillations (servo buzz) without phase lag.
-        # Holds last output until input moves beyond ±hyst_gap, preserving mean offset.
-        self.apply_torque_pre_hyst = apply_torque
+        # Applied after rate limiter; only affects CAN output, not rate limiter feedback.
         self.torque_steady = apply_hysteresis(apply_torque, self.torque_steady, CarControllerParams.STEER_TORQUE_HYST)
-        apply_torque = self.torque_steady
-        can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, apply_torque))
+        can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, self.torque_steady))
       elif not CS.cruise_stalk_cancel and not CS.out.brakePressed and not CS.out.gasPressed and self.apply_torque_last != 0:
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.SoftOff, self.apply_torque_last))
-        apply_torque = CS.out.steeringTorqueEps
+        self.apply_torque_last = CS.out.steeringTorqueEps
+        self.torque_steady = self.apply_torque_last
       else:
-        apply_torque = 0
+        self.apply_torque_last = 0
+        self.torque_steady = 0.0
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.Off))
-      self.apply_torque_last = apply_torque
 
     self.cruise_enabled_prev = CC.enabled
 
     new_actuators = actuators.as_builder()
-    new_actuators.torque = getattr(self, 'apply_torque_pre_hyst', 0.0) / CarControllerParams.STEER_MAX  # pre-hysteresis (normalized)
-    new_actuators.torqueOutputCan = self.apply_torque_last  # post-hysteresis (Nm)
+    new_actuators.torque = self.apply_torque_last / CarControllerParams.STEER_MAX  # pre-hysteresis (normalized)
+    new_actuators.torqueOutputCan = self.torque_steady  # post-hysteresis (Nm)
 
     new_actuators.speed = v_target
 
