@@ -95,13 +95,6 @@ def on_state_subscriptions(services):
   return services
 
 
-def on_torqued_allowed_cars(allowed_cars):
-  """Hook callback: add BMW to torqued's live torque learning allowlist."""
-  if 'bmw' not in allowed_cars:
-    allowed_cars.append('bmw')
-  return allowed_cars
-
-
 def on_post_actuators(default, actuators, CS, long_plan):
   """Hook callback: inject vTarget from longitudinal planner into actuators.speed."""
   if len(long_plan.speeds):
@@ -232,106 +225,6 @@ def on_vehicle_settings(items, CP):
   return items
 
 
-# --- Consecutive lane change state (per-process, used by desire hooks) ---
-
-class _ConsecutiveLCState:
-  prev_steering_button = False
-  consecutive_requested = False
-  desire_gap = 0
-
-_clc = _ConsecutiveLCState()
-
-
-def _is_consecutive_enabled():
-  return _read_param('ConsecutiveLaneChange') != '0'
-
-
-def on_pre_lane_change(result, dh, carstate):
-  """Handle consecutive lane change before state machine runs.
-
-  Two jobs:
-  1. When desire_gap counts down to 0, reset state to laneChangeStarting
-     with ll_prob=1.0 so the state machine fades normally.
-  2. When consecutive_requested and ll_prob faded, set desire_gap BEFORE
-     the state machine can transition to laneChangeFinishing.
-  """
-  if not _is_consecutive_enabled():
-    return result
-
-  from cereal import log
-
-  # Job 1: after gap frame, reset to fresh laneChangeStarting
-  if _clc.desire_gap > 0:
-    _clc.desire_gap -= 1
-    if _clc.desire_gap == 0:
-      dh.lane_change_state = log.LaneChangeState.laneChangeStarting
-      dh.lane_change_ll_prob = 1.0
-      dh.lane_change_timer = 0.0
-    return result
-
-  # Job 2: intercept before state machine transitions starting→finishing
-  # The state machine fades ll_prob by 2*DT_MDL per frame, then checks < 0.01.
-  # We must intercept BEFORE the fade crosses 0.01, so check < 0.11 (0.01 + 2*0.05).
-  # This gives us one frame of margin to set ll_prob=1.0 before the state machine
-  # can transition to finishing.
-  if _clc.consecutive_requested \
-      and dh.lane_change_state == log.LaneChangeState.laneChangeStarting \
-      and dh.lane_change_ll_prob < 0.11:
-    one_blinker = carstate.leftBlinker != carstate.rightBlinker
-    if one_blinker:
-      _clc.desire_gap = 1
-      _clc.consecutive_requested = False
-      dh.lane_change_ll_prob = 1.0  # block state machine's starting→finishing transition
-
-  return result
-
-
-def on_post_lane_change(result, dh, carstate, one_blinker, below_lane_change_speed, lane_change_prob):
-  """Detect consecutive lane change triggers after state machine."""
-  if not _is_consecutive_enabled():
-    _clc.prev_steering_button = False
-    return result
-
-  from cereal import log
-
-  # BMW uses VoiceControl button (steeringPressed) but not gas pedal for consecutive trigger
-  steering_button = carstate.steeringPressed and not carstate.gasPressed
-  rising_edge = steering_button and not _clc.prev_steering_button
-  _clc.prev_steering_button = steering_button
-
-  if dh.lane_change_state in (log.LaneChangeState.off, log.LaneChangeState.preLaneChange):
-    _clc.consecutive_requested = False
-    _clc.desire_gap = 0
-
-  elif dh.lane_change_state == log.LaneChangeState.laneChangeStarting:
-    # Only count a press as consecutive when the lane change is already committed (ll_prob < 0.5,
-    # i.e. >0.25s in). The initiating press fires at ll_prob=1.0 and must NOT be counted —
-    # otherwise it immediately schedules a second lane change the user never requested.
-    if rising_edge and one_blinker and dh.lane_change_ll_prob < 0.5:
-      _clc.consecutive_requested = True
-    # Note: the actual desire_gap trigger for ll_prob < 0.01 is in on_pre_lane_change
-    # (runs BEFORE state machine) to prevent the starting→finishing race condition.
-
-  elif dh.lane_change_state == log.LaneChangeState.laneChangeFinishing:
-    # consecutive_requested may have been set during laneChangeStarting but the
-    # state machine transitioned to finishing in the same frame (race condition).
-    # Honor it here — no need for a fresh rising_edge.
-    if (_clc.consecutive_requested or (rising_edge and not carstate.gasPressed)) \
-        and one_blinker and not below_lane_change_speed:
-      _clc.desire_gap = 1
-      _clc.consecutive_requested = False
-
-  return result
-
-
-def on_desire_post_update(desire, lane_change_state, lane_change_direction, carstate):
-  """Override desire to none during consecutive gap frame for model rising edge."""
-  if _clc.desire_gap > 0:
-    from cereal import log
-    return log.Desire.none
-  return desire
-
-
 def on_lat_controller_init(result, lac, CP):
   """Tune lateral controller for BMW hydraulic power steering.
 
@@ -352,8 +245,8 @@ def on_lat_controller_init(result, lac, CP):
   # lateral acceleration — so LAF is higher (less torque commanded).
   # At high speed, assist weakens — LAF is lower (more torque needed).
   # Values derived from regression of lat_accel vs cmd_torque in route 24f.
-  LAF_SPEEDS = [8, 22]     # m/s: ~30, 80 kph
-  LAF_VALUES = [5.5, 3.0]  # linear: strong hydraulic assist at low speed needs less motor torque
+  LAF_SPEEDS = [8.3, 11.1, 13.9, 16.7, 19.4, 22.2]  # m/s: 30, 40, 50, 60, 70, 80 kph
+  LAF_VALUES = [5.5, 5.0,  4.5,  4.0,  3.5,  3.0]   # each point independently tunable
 
   # Wrap update() to set speed-dependent LAF before each PID cycle.
   # torqued's update_live_torque_params runs before update(), but our wrapper
