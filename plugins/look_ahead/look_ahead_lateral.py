@@ -30,6 +30,7 @@ MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
 STRAIGHT_THRESHOLD = 0.002  # 1/m (~500m radius) — stock must be straight to activate
+LC_STRAIGHT_THRESHOLD = 0.006  # 1/m — relaxed threshold during lane changes to smooth curvature spike
 BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
 
 # Steering angle offset estimation
@@ -261,7 +262,7 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   # Offset estimation always runs (independent of Look Ahead toggle)
   _update_offset_estimate(default_curvature, v_ego)
 
-  if not _is_enabled() or lane_changing:
+  if not _is_enabled():
     return default_curvature
 
   curvature, _ = compute_lookahead_curvature(model_v2, v_ego)
@@ -277,9 +278,11 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   dt = min(now - _blend_last_time, 0.1) if _blend_last_time > 0 else 0.01
   _blend_last_time = now
 
-  # Only activate look ahead when stock says we're on a straight.
-  # In curves, always follow stock — prevents cutting lanes on curve exits.
-  on_straight = abs(default_curvature) < STRAIGHT_THRESHOLD
+  # During lane changes, use relaxed threshold so look_ahead stays active.
+  # The 50m-ahead curvature is already settled in the target lane, so blending
+  # naturally smooths the aggressive curvature spike from the model.
+  threshold = LC_STRAIGHT_THRESHOLD if lane_changing else STRAIGHT_THRESHOLD
+  on_straight = abs(default_curvature) < threshold
   target = 1.0 if on_straight and abs(curvature) < abs(default_curvature) else 0.0
   max_step = BLEND_RATE * dt
   if target > _blend_factor:
