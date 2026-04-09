@@ -48,7 +48,8 @@ class CarState(CarStateBase):
     self.prev_cruise_stalk_resume = self.cruise_stalk_resume
     self.prev_cruise_stalk_cancel = self.cruise_stalk_cancel
     self.prev_cruise_enabled = False  # Track previous openpilot cruise state for resume button logic
-    self.resume_button_hold_frames = 0  # Track how many frames resume button has been held (v4 duration-based logic)
+    self.resume_button_hold_frames = 0
+    self.resume_press_engaged = False  # Was cruise engaged when resume button was first pressed?
     self.steer_fault_counter = 0  # Debounce: consecutive frames with raw fault bits set
     self.steer_angle_offset = self._load_steer_angle_offset()
     self._offset_sub = None
@@ -197,7 +198,9 @@ class CarState(CarStateBase):
 
     if self.cruise_stalk_resume:
       if not self.prev_cruise_stalk_resume:
+        # Rising edge: capture whether cruise was already engaged at press time
         self.resume_button_hold_frames = 0
+        self.resume_press_engaged = self.cruise_state_enabled
       else:
         self.resume_button_hold_frames += 1
 
@@ -211,7 +214,7 @@ class CarState(CarStateBase):
           pressed=False,
           type=ButtonType.gapAdjustCruise
         ))
-      elif self.cruise_state_enabled:
+      elif self.resume_press_engaged:
         # Short press while engaged: toggle speed limit confirm
         msg = self._sl_sub.drain('speedLimitState')
         if msg is not None:
