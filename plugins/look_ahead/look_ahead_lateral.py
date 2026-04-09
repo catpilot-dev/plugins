@@ -27,7 +27,8 @@ _DATA_DIR = os.path.join(_PLUGIN_DIR, 'data')
 
 MIN_LOOKAHEAD_DIST = 20.0   # meters — floor for confidence-based distance
 MAX_LOOKAHEAD_DIST = 100.0  # meters — cap even if model is very confident
-CONFIDENCE_THRESHOLD = 0.7  # use model predictions up to where yStd confidence > 70%
+CONFIDENCE_THRESHOLD = 0.7      # use model predictions up to where yStd confidence > 70%
+LC_CONFIDENCE_THRESHOLD = 0.5   # relaxed during lane changes — look past the swerve to target lane
 MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
@@ -214,13 +215,14 @@ def _update_offset_estimate(desired_curvature, v_ego):
 
 # --- Curvature computation ---
 
-def _confidence_distance(model_v2):
+def _confidence_distance(model_v2, lane_changing=False):
   """Find the farthest distance where model lateral confidence > threshold.
 
   Uses position.yStd from the model: confidence = 1 / (1 + yStd).
-  Adapts naturally to conditions — shorter on curves/lane changes,
-  longer on clear straights.
+  During lane changes, uses a relaxed threshold to look past the swerve
+  to where the car is settled in the target lane.
   """
+  threshold = LC_CONFIDENCE_THRESHOLD if lane_changing else CONFIDENCE_THRESHOLD
   try:
     pos = model_v2.position
     x = pos.x
@@ -230,24 +232,24 @@ def _confidence_distance(model_v2):
     # Walk backwards to find last point above threshold
     for i in range(len(x) - 1, -1, -1):
       conf = 1.0 / (1.0 + yStd[i])
-      if conf > CONFIDENCE_THRESHOLD:
+      if conf > threshold:
         return max(MIN_LOOKAHEAD_DIST, min(MAX_LOOKAHEAD_DIST, x[i]))
   except (AttributeError, IndexError):
     pass
   return MIN_LOOKAHEAD_DIST
 
 
-def compute_lookahead_curvature(model_v2, v_ego):
+def compute_lookahead_curvature(model_v2, v_ego, lane_changing=False):
   """Compute curvature from model orientation at lookahead distance.
 
-  Lookahead distance is dynamic based on model confidence (>70%),
+  Lookahead distance is dynamic based on model confidence,
   or lead vehicle distance if closer.
   Returns (curvature, lookahead_t) or (None, 0) if data unavailable.
   """
   if v_ego < MIN_SPEED:
     return None, 0
 
-  lookahead_dist = _confidence_distance(model_v2)
+  lookahead_dist = _confidence_distance(model_v2, lane_changing)
   lead_dist = _get_lead_distance()
   if lead_dist is not None and lead_dist < lookahead_dist:
     lookahead_dist = lead_dist
@@ -291,7 +293,7 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   if not _is_enabled():
     return default_curvature
 
-  curvature, _ = compute_lookahead_curvature(model_v2, v_ego)
+  curvature, _ = compute_lookahead_curvature(model_v2, v_ego, lane_changing)
   if curvature is None:
     return default_curvature
 
