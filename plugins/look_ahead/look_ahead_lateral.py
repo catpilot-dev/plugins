@@ -25,7 +25,9 @@ import numpy as np
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_PLUGIN_DIR, 'data')
 
-LOOKAHEAD_DISTANCE = 50.0   # meters — reduced from 80m to avoid lane-line hugging
+MIN_LOOKAHEAD_DIST = 20.0   # meters — floor for confidence-based distance
+MAX_LOOKAHEAD_DIST = 100.0  # meters — cap even if model is very confident
+CONFIDENCE_THRESHOLD = 0.7  # use model predictions up to where yStd confidence > 70%
 MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
@@ -212,16 +214,40 @@ def _update_offset_estimate(desired_curvature, v_ego):
 
 # --- Curvature computation ---
 
+def _confidence_distance(model_v2):
+  """Find the farthest distance where model lateral confidence > threshold.
+
+  Uses position.yStd from the model: confidence = 1 / (1 + yStd).
+  Adapts naturally to conditions — shorter on curves/lane changes,
+  longer on clear straights.
+  """
+  try:
+    pos = model_v2.position
+    x = pos.x
+    yStd = pos.yStd
+    if len(x) < 5 or len(yStd) < 5:
+      return MIN_LOOKAHEAD_DIST
+    # Walk backwards to find last point above threshold
+    for i in range(len(x) - 1, -1, -1):
+      conf = 1.0 / (1.0 + yStd[i])
+      if conf > CONFIDENCE_THRESHOLD:
+        return max(MIN_LOOKAHEAD_DIST, min(MAX_LOOKAHEAD_DIST, x[i]))
+  except (AttributeError, IndexError):
+    pass
+  return MIN_LOOKAHEAD_DIST
+
+
 def compute_lookahead_curvature(model_v2, v_ego):
   """Compute curvature from model orientation at lookahead distance.
 
-  Lookahead distance is 50m, or lead vehicle distance if closer.
+  Lookahead distance is dynamic based on model confidence (>70%),
+  or lead vehicle distance if closer.
   Returns (curvature, lookahead_t) or (None, 0) if data unavailable.
   """
   if v_ego < MIN_SPEED:
     return None, 0
 
-  lookahead_dist = LOOKAHEAD_DISTANCE
+  lookahead_dist = _confidence_distance(model_v2)
   lead_dist = _get_lead_distance()
   if lead_dist is not None and lead_dist < lookahead_dist:
     lookahead_dist = lead_dist
