@@ -12,9 +12,7 @@ Full BMW E8x/E9x car interface for openpilot:
 - **Stepper servo steering** — Ocelot stepper servo on F-CAN/AUX-CAN
 - **Panda safety model** — BMW safety rules (bmw.h, safety model ID 35)
 - **Cruise ceiling memory** — remembers cruise speed across disengage/re-engage within a drive
-- **Consecutive lane change** — press steering button during lane change to chain consecutive changes
 - **Temperature overlay** — coolant and oil temps on the onroad HUD
-- **Live torque learning** — registers BMW in torqued's allowed cars list
 - **Vehicle settings** — brand-specific settings panel with car name and emblem
 - **Speed limit toggle** — short press resume button while engaged to confirm/cancel speed limit
 
@@ -29,13 +27,9 @@ Full BMW E8x/E9x car interface for openpilot:
 
 | Hook | Function | Description |
 |------|----------|-------------|
-| `torqued.allowed_cars` | on_torqued_allowed_cars | Enable live torque learning for BMW |
 | `controls.post_actuators` | on_post_actuators | DCC vTarget override |
 | `car.cruise_initialized` | on_cruise_initialized | Cruise ceiling memory on engage |
 | `ui.vehicle_settings` | on_vehicle_settings | Vehicle panel items |
-| `desire.pre_lane_change` | on_pre_lane_change | Consecutive lane change gap countdown |
-| `desire.post_lane_change` | on_post_lane_change | Lane change trigger from steering button |
-| `desire.post_update` | on_desire_post_update | Modify desire signals |
 | `ui.state_subscriptions` | on_state_subscriptions | Subscribe to carState for temps |
 | `ui.render_overlay` | on_render_overlay | Temperature overlay + resume button handler |
 

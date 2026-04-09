@@ -25,11 +25,6 @@
     }
   },
   "hooks": {
-    "torqued.allowed_cars": {
-      "module": "register",
-      "function": "on_torqued_allowed_cars",
-      "priority": 50
-    },
     "controls.post_actuators": {
       "module": "register",
       "function": "on_post_actuators",
