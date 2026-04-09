@@ -333,19 +333,38 @@ def on_desire_post_update(desire, lane_change_state, lane_change_direction, cars
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Replace stock speed-dependent KP with BMW hydraulic steering schedule.
+  """Tune lateral controller for BMW hydraulic power steering.
 
-  Stock KP is tuned for EPS cars with high low-speed gain. BMW's hydraulic
-  power steering has strong self-centering and assist at low speed — the
-  stock KP overcompensates, causing oscillation in tight curves (2.8 Hz
-  at 50 kph with stock KP=2.33, reduced to 1.38 with BMW schedule).
+  1. Flat KP=0.85 — stock speed-dependent KP is for EPS cars; hydraulic
+     assist provides its own speed-dependent gain.
 
-  Highway KP is unchanged (0.8 at 120+ kph).
+  2. Speed-dependent latAccelFactor — hydraulic assist amplifies motor torque
+     more at low speed. Fixed LAF overestimates torque needed at low speed,
+     causing overshoot and oscillation. Scale LAF with speed so the controller
+     commands appropriate torque at all speeds.
   """
-  # Flat KP=0.85 — proven for BMW hydraulic steering in openpilot 0.10.1.
-  # Speed-dependent KP is designed for EPS cars; hydraulic assist provides
-  # its own speed-dependent gain, so flat KP works correctly.
+  from openpilot.common.numpy_fast import interp
+
   lac.pid._k_p = [[0], [0.85]]
+
+  # Speed-dependent latAccelFactor for hydraulic power steering.
+  # At low speed, hydraulic assist is strong — same motor torque produces more
+  # lateral acceleration — so LAF is higher (less torque commanded).
+  # At high speed, assist weakens — LAF is lower (more torque needed).
+  # Values derived from regression of lat_accel vs cmd_torque in route 24f.
+  LAF_SPEEDS = [8, 22]     # m/s: ~30, 80 kph
+  LAF_VALUES = [5.5, 3.0]  # linear: strong hydraulic assist at low speed needs less motor torque
+
+  # Wrap update() to set speed-dependent LAF before each PID cycle.
+  # torqued's update_live_torque_params runs before update(), but our wrapper
+  # overrides LAF with the speed-appropriate value before the PID uses it.
+  original_update = lac.update
+
+  def update_wrapper(active, CS, *args, **kwargs):
+    lac.torque_params.latAccelFactor = interp(CS.vEgo, LAF_SPEEDS, LAF_VALUES)
+    return original_update(active, CS, *args, **kwargs)
+
+  lac.update = update_wrapper
   return result
 
 
