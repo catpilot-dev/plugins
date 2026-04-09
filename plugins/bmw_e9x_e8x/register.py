@@ -246,7 +246,7 @@ def on_lat_controller_init(result, lac, CP):
   # At high speed, assist weakens — LAF is lower (more torque needed).
   # Values derived from regression of lat_accel vs cmd_torque in route 24f.
   LAF_SPEEDS = [8.3, 11.1, 13.9, 16.7, 19.4, 22.2]  # m/s: 30, 40, 50, 60, 70, 80 kph
-  LAF_VALUES = [5.5, 5.0,  4.5,  4.0,  3.5,  3.0]   # each point independently tunable
+  LAF_VALUES = [6.5, 5.5,  5.0,  4.0,  3.5,  3.0]   # boosted <60 kph from R250 torque analysis
 
   # Wrap update() to set speed-dependent LAF before each PID cycle.
   # torqued's update_live_torque_params runs before update(), but our wrapper
