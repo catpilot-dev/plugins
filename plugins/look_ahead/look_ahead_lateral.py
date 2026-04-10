@@ -28,12 +28,12 @@ _DATA_DIR = os.path.join(_PLUGIN_DIR, 'data')
 MIN_LOOKAHEAD_DIST = 20.0   # meters — floor for confidence-based distance
 MAX_LOOKAHEAD_DIST = 100.0  # meters — cap even if model is very confident
 CONFIDENCE_THRESHOLD = 0.7      # use model predictions up to where yStd confidence > 70%
-LC_CONFIDENCE_THRESHOLD = 0.5   # relaxed during lane changes — look past the swerve to target lane
 MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
 STRAIGHT_THRESHOLD = 0.002  # 1/m (~500m radius) — stock must be straight to activate
-LC_STRAIGHT_THRESHOLD = 0.006  # 1/m — relaxed threshold during lane changes to smooth curvature spike
+LC_LOOKAHEAD_T = 2.0        # seconds — lane change preview time (mid-swerve, not settled end state)
+LC_STRAIGHT_THRESHOLD = 0.006  # 1/m — relaxed threshold during lane changes
 BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
 
 # Longitudinal: confidence-based speed cap
@@ -243,14 +243,12 @@ def _update_offset_estimate(desired_curvature, v_ego):
 
 # --- Curvature computation ---
 
-def _confidence_distance(model_v2, lane_changing=False):
+def _confidence_distance(model_v2):
   """Find the farthest distance where model lateral confidence > threshold.
 
   Uses position.yStd from the model: confidence = 1 / (1 + yStd).
-  During lane changes, uses a relaxed threshold to look past the swerve
-  to where the car is settled in the target lane.
   """
-  threshold = LC_CONFIDENCE_THRESHOLD if lane_changing else CONFIDENCE_THRESHOLD
+  threshold = CONFIDENCE_THRESHOLD
   try:
     pos = model_v2.position
     x = pos.x
@@ -277,7 +275,13 @@ def compute_lookahead_curvature(model_v2, v_ego, lane_changing=False):
   if v_ego < MIN_SPEED:
     return None, 0
 
-  lookahead_dist = _confidence_distance(model_v2, lane_changing)
+  if lane_changing:
+    # During lane changes, use fixed 2s preview — mid-swerve distance
+    # where the model sees the actual lateral movement, not the settled end state.
+    lookahead_dist = v_ego * LC_LOOKAHEAD_T
+  else:
+    lookahead_dist = _confidence_distance(model_v2)
+
   lead_dist = _get_lead_distance()
   if lead_dist is not None and lead_dist < lookahead_dist:
     lookahead_dist = lead_dist
