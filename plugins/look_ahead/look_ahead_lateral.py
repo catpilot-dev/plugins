@@ -68,6 +68,24 @@ _sm = None
 _blend_factor = 0.0  # 0 = stock, 1 = look ahead
 _blend_last_time = 0.0
 
+# Kalman filter for look_ahead curvature — smooths model prediction noise
+# from camera vibration / uneven road surfaces
+_curv_kf = None
+
+def _get_curv_kf():
+  global _curv_kf
+  if _curv_kf is None:
+    import numpy as np
+    from openpilot.common.simple_kalman import KF1D, get_kalman_gain
+    dt = 0.01  # 100 Hz control rate
+    A = [[1.0, dt], [0.0, 1.0]]        # state: [curvature, curvature_rate]
+    C = [[1.0, 0.0]]                    # measure curvature directly
+    Q = [[0.0, 0.0], [0.0, 0.5]]       # curvature_rate can change, but slowly
+    R = 5.0                             # high R = noisy measurement, trust filter state more
+    K = get_kalman_gain(dt, np.array(A), np.array(C), np.array(Q), R)
+    _curv_kf = KF1D(x0=[[0.0], [0.0]], A=A, C=C[0], K=K)
+  return _curv_kf
+
 # Longitudinal speed cap state
 _speed_cap_pub = None
 _prev_conf_dist = 0.0
@@ -410,4 +428,14 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   else:
     _blend_factor = max(_blend_factor - max_step, target)
 
-  return default_curvature + _blend_factor * (curvature - default_curvature)
+  blended = default_curvature + _blend_factor * (curvature - default_curvature)
+
+  # Kalman filter the output to smooth model prediction noise from
+  # camera vibration and road surface irregularities.
+  # Only filter when look_ahead is active; reset KF when blend drops to zero.
+  kf = _get_curv_kf()
+  if _blend_factor < 0.01:
+    kf.set_x([[blended], [0.0]])
+    return blended
+  filtered = kf.update(blended)
+  return filtered[0]
