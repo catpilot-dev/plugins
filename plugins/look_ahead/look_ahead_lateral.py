@@ -36,6 +36,12 @@ STRAIGHT_THRESHOLD = 0.002  # 1/m (~500m radius) — stock must be straight to a
 LC_STRAIGHT_THRESHOLD = 0.006  # 1/m — relaxed threshold during lane changes to smooth curvature spike
 BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
 
+# Longitudinal: confidence-based speed cap
+PREVIEW_TIME = 5.0          # seconds — minimum forward visibility time at current speed
+MAX_LAT_ACCEL_CAP = 1.5     # m/s² — comfortable lateral acceleration limit for speed cap
+MIN_CAP_SPEED = 20.0        # km/h — don't cap below this (already crawling)
+MAX_CAP_SPEED = 120.0       # km/h — above this, no cap needed
+
 # Steering angle offset estimation
 OFFSET_MIN_SPEED = 15.0     # m/s — only estimate on highway-like roads
 OFFSET_MAX = 3.0            # deg — sanity clamp, real offsets are typically < 2°
@@ -61,6 +67,10 @@ _sm = None
 
 _blend_factor = 0.0  # 0 = stock, 1 = look ahead
 _blend_last_time = 0.0
+
+# Longitudinal speed cap state
+_speed_cap_pub = None
+_prev_conf_dist = 0.0
 
 
 def _get_sm():
@@ -278,6 +288,84 @@ def _is_enabled():
     return True  # default on
 
 
+def _boundary_curvature(model_v2, conf_dist):
+  """Estimate curvature at the confidence boundary distance."""
+  try:
+    pos = model_v2.position
+    x = pos.x
+    y = pos.y
+    if len(x) < 5 or len(y) < 5:
+      return 0.0
+    import numpy as np
+    px = np.array(x)
+    py = np.array(y)
+    idx = np.searchsorted(px, conf_dist)
+    if idx < 2 or idx >= len(px) - 1:
+      return 0.0
+    dx = px[idx+1] - px[idx-1]
+    dy = py[idx+1] - py[idx-1]
+    d2y = py[idx+1] - 2*py[idx] + py[idx-1]
+    if abs(dx) < 0.1:
+      return 0.0
+    dydx = dy / dx
+    d2x = dx / 2
+    d2ydx2 = d2y / (d2x * dx)
+    return abs(d2ydx2) / (1 + dydx**2)**1.5
+  except (AttributeError, IndexError):
+    return 0.0
+
+
+def _compute_speed_cap(model_v2, v_ego):
+  """Compute safe speed from confidence distance and boundary curvature.
+
+  Two signals:
+  1. Visibility: don't drive faster than confidence_distance / PREVIEW_TIME
+  2. Curvature at boundary: v_safe = sqrt(MAX_LAT_ACCEL / curvature)
+  Returns speed cap in km/h, or 0 if no constraint.
+  """
+  if v_ego < MIN_SPEED:
+    return 0
+
+  conf_dist = _confidence_distance(model_v2)
+  needed_dist = min(v_ego * PREVIEW_TIME, MAX_LOOKAHEAD_DIST)
+
+  # No constraint if we can see far enough ahead (or at the model's range limit)
+  if conf_dist >= needed_dist:
+    return 0
+
+  # Visibility-based cap
+  vis_safe_ms = conf_dist / PREVIEW_TIME
+  vis_safe_kph = vis_safe_ms * 3.6
+
+  # Curvature at the confidence boundary
+  boundary_curv = _boundary_curvature(model_v2, conf_dist)
+  if boundary_curv > 0.001:
+    curv_safe_ms = (MAX_LAT_ACCEL_CAP / boundary_curv) ** 0.5
+    curv_safe_kph = curv_safe_ms * 3.6
+    safe_kph = min(vis_safe_kph, curv_safe_kph)
+  else:
+    safe_kph = vis_safe_kph
+
+  if safe_kph >= MAX_CAP_SPEED:
+    return 0
+  if safe_kph < MIN_CAP_SPEED:
+    safe_kph = MIN_CAP_SPEED
+
+  return int(safe_kph)
+
+
+def _publish_speed_cap(speed_cap_kph):
+  """Publish speed cap to speedlimitd via plugin bus."""
+  global _speed_cap_pub
+  try:
+    if _speed_cap_pub is None:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+      _speed_cap_pub = PluginPub('lookahead_speed_cap')
+    _speed_cap_pub.send({'speed_cap': speed_cap_kph})
+  except Exception:
+    pass
+
+
 def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, **kwargs):
   """Hook callback for controls.curvature_correction.
 
@@ -289,6 +377,10 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   """
   # Offset estimation always runs (independent of Look Ahead toggle)
   _update_offset_estimate(default_curvature, v_ego)
+
+  # Longitudinal: publish confidence-based speed cap to speedlimitd
+  speed_cap = _compute_speed_cap(model_v2, v_ego)
+  _publish_speed_cap(speed_cap)
 
   if not _is_enabled():
     return default_curvature

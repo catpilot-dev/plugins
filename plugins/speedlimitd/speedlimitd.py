@@ -371,9 +371,14 @@ class SpeedLimitMiddleware:
     try:
       from openpilot.selfdrive.plugins.plugin_bus import PluginSub
       self._cmd_sub = PluginSub(['speedlimit_cmd_car', 'speedlimit_cmd_ui'])
+      self._la_cap_sub = PluginSub(['lookahead_speed_cap'])
       self._cmd_init_t = time.monotonic()
     except ImportError:
       self._cmd_sub = None
+      self._la_cap_sub = None
+
+    self.lookahead_cap: int = 0
+    self._lookahead_cap_hold_until: float = 0.0
 
     # YOLO detection state (placeholder for future integration)
     self.yolo_speed: int = 0
@@ -492,6 +497,20 @@ class SpeedLimitMiddleware:
         # Hold expired — allow cap to relax
         self.curvature_cap = raw_curv_cap
 
+    # --- Look ahead confidence-based speed cap ---
+    if self._la_cap_sub is not None:
+      msg = self._la_cap_sub.drain('lookahead_speed_cap')
+      if msg is not None:
+        _, data = msg
+        raw_la_cap = int(data.get('speed_cap', 0)) if isinstance(data, dict) else 0
+        if raw_la_cap > 0 and (raw_la_cap < self.lookahead_cap or self.lookahead_cap == 0):
+          self.lookahead_cap = raw_la_cap
+          self._lookahead_cap_hold_until = now + 3.0
+        elif now < self._lookahead_cap_hold_until:
+          pass  # Hold current cap
+        else:
+          self.lookahead_cap = raw_la_cap
+
     # --- YOLO timeout ---
     if self.yolo_speed > 0 and (now - self.yolo_last_seen) > self.yolo_timeout:
       self.yolo_speed = 0
@@ -528,6 +547,8 @@ class SpeedLimitMiddleware:
       candidates.append((float(yolo_speed), 1, 0.8))    # yoloDetection
     if self.curvature_cap >= MIN_SPEED_LIMIT:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
+    if self.lookahead_cap >= MIN_SPEED_LIMIT:
+      candidates.append((float(self.lookahead_cap), 5, 0.7))  # lookaheadConfidence
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # roadTypeInference
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
@@ -546,11 +567,12 @@ class SpeedLimitMiddleware:
         self._displayed_speed_limit = _step_speed_limit(self._displayed_speed_limit, target)
         self._last_step_time = now
 
-    # Curvature cap override — clamp displayed limit immediately
-    if self.curvature_cap >= MIN_SPEED_LIMIT:
-      curv_snapped = snap_to_standard_speed(self.curvature_cap)
-      if curv_snapped < self._displayed_speed_limit:
-        self._displayed_speed_limit = curv_snapped
+    # Safety caps override — clamp displayed limit immediately (bypass gradual transition)
+    for cap in (self.curvature_cap, self.lookahead_cap):
+      if cap >= MIN_SPEED_LIMIT:
+        cap_snapped = snap_to_standard_speed(cap)
+        if cap_snapped < self._displayed_speed_limit:
+          self._displayed_speed_limit = cap_snapped
 
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
@@ -587,6 +609,7 @@ class SpeedLimitMiddleware:
       'roadName': self.last_road_name,
       'laneCount': self.lane_count_stable,
       'curvatureCap': self.curvature_cap,
+      'lookaheadCap': self.lookahead_cap,
     })
 
 
