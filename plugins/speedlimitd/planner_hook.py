@@ -71,7 +71,11 @@ def on_v_cruise(v_cruise, v_ego, sm):
     if _lead_overrides_limit(sm, speed_limit):
       return v_cruise
 
-    offset_pct = _effective_offset_percent(speed_limit)
+    # No offset when speed limit is driven by safety caps (curvature/lookahead)
+    if _sl_data.get('safetyCapped', False):
+      offset_pct = 0
+    else:
+      offset_pct = _effective_offset_percent(speed_limit)
     v_limit = speed_limit * (1 + offset_pct / 100.0) * CV.KPH_TO_MS
     if v_limit < v_cruise:
       return v_limit

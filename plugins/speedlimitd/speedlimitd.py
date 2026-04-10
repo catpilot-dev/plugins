@@ -568,11 +568,13 @@ class SpeedLimitMiddleware:
         self._last_step_time = now
 
     # Safety caps override — clamp displayed limit immediately (bypass gradual transition)
+    safety_capped = False
     for cap in (self.curvature_cap, self.lookahead_cap):
       if cap >= MIN_SPEED_LIMIT:
         cap_snapped = snap_to_standard_speed(cap)
         if cap_snapped < self._displayed_speed_limit:
           self._displayed_speed_limit = cap_snapped
+          safety_capped = True
 
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
@@ -610,6 +612,7 @@ class SpeedLimitMiddleware:
       'laneCount': self.lane_count_stable,
       'curvatureCap': self.curvature_cap,
       'lookaheadCap': self.lookahead_cap,
+      'safetyCapped': safety_capped,
     })
 
 
