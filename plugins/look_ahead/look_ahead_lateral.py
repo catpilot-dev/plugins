@@ -32,7 +32,7 @@ MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
 STRAIGHT_THRESHOLD = 0.002  # 1/m (~500m radius) — stock must be straight to activate
-LC_LOOKAHEAD_T = 2.0        # seconds — lane change preview time (mid-swerve, not settled end state)
+LC_LOOKAHEAD_T = 3.0        # seconds — lane change preview time (3s smooths 12-49% vs model; 2s amplifies)
 LC_STRAIGHT_THRESHOLD = 0.006  # 1/m — relaxed threshold during lane changes
 BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
 
