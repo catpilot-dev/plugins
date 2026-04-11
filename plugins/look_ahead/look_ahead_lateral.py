@@ -33,6 +33,7 @@ MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
 STRAIGHT_THRESHOLD = 0.002  # 1/m (~500m radius) — stock must be straight to activate
 BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
+MAX_CURVATURE_RATE = 0.006  # 1/m/s — fixed rate limit; matches smooth feel at 100 kph
 
 # Longitudinal: confidence-based speed cap
 PREVIEW_TIME = 5.0          # seconds — minimum forward visibility time at current speed
@@ -65,6 +66,7 @@ _sm = None
 
 _blend_factor = 0.0  # 0 = stock, 1 = look ahead
 _blend_last_time = 0.0
+_prev_output_curv = 0.0  # for curvature rate limiting
 
 # Kalman filter for look_ahead curvature — smooths model prediction noise
 # from camera vibration / uneven road surfaces
@@ -438,4 +440,13 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   # No reset on blend changes; KF tracks continuously for seamless transitions.
   kf = _get_curv_kf()
   filtered = kf.update(blended)
-  return filtered[0]
+  output = filtered[0]
+
+  # Curvature rate limit — fixed 0.006/s matches smooth feel at 100 kph.
+  # Applied after KF so both noise and rate are controlled.
+  global _prev_output_curv
+  max_delta = MAX_CURVATURE_RATE * dt
+  output = max(_prev_output_curv - max_delta, min(_prev_output_curv + max_delta, output))
+  _prev_output_curv = output
+
+  return output
