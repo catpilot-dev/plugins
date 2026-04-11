@@ -434,12 +434,8 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
 
   blended = default_curvature + _blend_factor * (curvature - default_curvature)
 
-  # Kalman filter the output to smooth model prediction noise from
-  # camera vibration and road surface irregularities.
-  # Only filter when look_ahead is active; reset KF when blend drops to zero.
+  # Kalman filter always runs — smooths noise and curve→straight transitions.
+  # No reset on blend changes; KF tracks continuously for seamless transitions.
   kf = _get_curv_kf()
-  if _blend_factor < 0.01:
-    kf.set_x([[blended], [0.0]])
-    return blended
   filtered = kf.update(blended)
   return filtered[0]
