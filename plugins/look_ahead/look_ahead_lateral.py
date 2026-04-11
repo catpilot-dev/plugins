@@ -27,7 +27,7 @@ _DATA_DIR = os.path.join(_PLUGIN_DIR, 'data')
 
 MIN_LOOKAHEAD_DIST = 20.0   # meters — floor for confidence-based distance
 MAX_LOOKAHEAD_DIST = 100.0  # meters — cap even if model is very confident
-CONFIDENCE_THRESHOLD = 0.7      # use model predictions up to where yStd confidence > 70%
+CONFIDENCE_THRESHOLD = 0.6      # use model predictions up to where yStd confidence > 60%
 MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
