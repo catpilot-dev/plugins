@@ -20,7 +20,7 @@ class CarControllerParams: #controls running @ 100hz
   STEER_DELTA_UP = 0.1       # Nm/10ms
   STEER_DELTA_DOWN = 0.2     # Nm/10ms (near-symmetric with DELTA_UP to reduce oscillation)
   STEER_ERROR_MAX = 999     # max delta between torque cmd and torque motor
-  STEER_TORQUE_HYST = 0.1  # Nm — reduced from 0.3; KF handles curvature noise now.
+  STEER_TORQUE_HYST = 0.2  # Nm — KF handles curvature noise, hyst for residual servo buzz.
 
   # STEER_BACKLASH = 1 #deg
   def __init__(self, CP):
