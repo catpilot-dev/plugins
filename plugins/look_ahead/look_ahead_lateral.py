@@ -401,8 +401,12 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   _update_offset_estimate(default_curvature, v_ego)
 
   # Longitudinal: publish confidence-based speed cap to speedlimitd
-  speed_cap = _compute_speed_cap(model_v2, v_ego)
-  _publish_speed_cap(speed_cap)
+  # Disable during lane changes — low confidence is from the swerve, not a blind road
+  if not lane_changing:
+    speed_cap = _compute_speed_cap(model_v2, v_ego)
+    _publish_speed_cap(speed_cap)
+  else:
+    _publish_speed_cap(0)
 
   if not _is_enabled():
     return default_curvature
