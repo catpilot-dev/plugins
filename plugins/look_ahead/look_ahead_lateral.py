@@ -32,8 +32,6 @@ MIN_LOOKAHEAD_T = 1.0       # seconds — floor at low speed
 MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
 STRAIGHT_THRESHOLD = 0.002  # 1/m (~500m radius) — stock must be straight to activate
-LC_LOOKAHEAD_T = 3.0        # seconds — lane change preview time (3s smooths 12-49% vs model; 2s amplifies)
-LC_STRAIGHT_THRESHOLD = 0.006  # 1/m — relaxed threshold during lane changes
 BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
 
 # Longitudinal: confidence-based speed cap
@@ -265,7 +263,7 @@ def _confidence_distance(model_v2):
   return MIN_LOOKAHEAD_DIST
 
 
-def compute_lookahead_curvature(model_v2, v_ego, lane_changing=False):
+def compute_lookahead_curvature(model_v2, v_ego):
   """Compute curvature from model orientation at lookahead distance.
 
   Lookahead distance is dynamic based on model confidence,
@@ -275,12 +273,7 @@ def compute_lookahead_curvature(model_v2, v_ego, lane_changing=False):
   if v_ego < MIN_SPEED:
     return None, 0
 
-  if lane_changing:
-    # During lane changes, use fixed 2s preview — mid-swerve distance
-    # where the model sees the actual lateral movement, not the settled end state.
-    lookahead_dist = v_ego * LC_LOOKAHEAD_T
-  else:
-    lookahead_dist = _confidence_distance(model_v2)
+  lookahead_dist = _confidence_distance(model_v2)
 
   lead_dist = _get_lead_distance()
   if lead_dist is not None and lead_dist < lookahead_dist:
@@ -411,7 +404,7 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   if not _is_enabled():
     return default_curvature
 
-  curvature, _ = compute_lookahead_curvature(model_v2, v_ego, lane_changing)
+  curvature, _ = compute_lookahead_curvature(model_v2, v_ego)
   if curvature is None:
     return default_curvature
 
@@ -424,12 +417,15 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   dt = min(now - _blend_last_time, 0.1) if _blend_last_time > 0 else 0.01
   _blend_last_time = now
 
-  # During lane changes, use relaxed threshold so look_ahead stays active.
-  # The 50m-ahead curvature is already settled in the target lane, so blending
-  # naturally smooths the aggressive curvature spike from the model.
-  threshold = LC_STRAIGHT_THRESHOLD if lane_changing else STRAIGHT_THRESHOLD
-  on_straight = abs(default_curvature) < threshold
-  target = 1.0 if on_straight and abs(curvature) < abs(default_curvature) else 0.0
+  # During lane changes, disable look_ahead blend — let the model's own curvature
+  # drive the lane change. Look_ahead was over-dampening (28-51%) the swerve,
+  # causing lag, hesitation, and aborted lane changes. KF alone handles noise.
+  if lane_changing:
+    on_straight = False
+    target = 0.0
+  else:
+    on_straight = abs(default_curvature) < STRAIGHT_THRESHOLD
+    target = 1.0 if on_straight and abs(curvature) < abs(default_curvature) else 0.0
   max_step = BLEND_RATE * dt
   if target > _blend_factor:
     _blend_factor = min(_blend_factor + max_step, target)
