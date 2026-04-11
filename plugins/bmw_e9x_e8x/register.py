@@ -236,7 +236,7 @@ def on_lat_controller_init(result, lac, CP):
      causing overshoot and oscillation. Scale LAF with speed so the controller
      commands appropriate torque at all speeds.
   """
-  from openpilot.common.numpy_fast import interp
+  import numpy as np
 
   lac.pid._k_p = [[0], [0.85]]
 
@@ -254,7 +254,7 @@ def on_lat_controller_init(result, lac, CP):
   original_update = lac.update
 
   def update_wrapper(active, CS, *args, **kwargs):
-    lac.torque_params.latAccelFactor = interp(CS.vEgo, LAF_SPEEDS, LAF_VALUES)
+    lac.torque_params.latAccelFactor = float(np.interp(CS.vEgo, LAF_SPEEDS, LAF_VALUES))
     return original_update(active, CS, *args, **kwargs)
 
   lac.update = update_wrapper
