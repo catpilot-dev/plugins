@@ -365,6 +365,7 @@ class SpeedLimitMiddleware:
     # Confirmation state — starts unconfirmed until user explicitly confirms
     self.confirmed: bool = False
     self.confirmed_value: float = 0.0
+    self._confirm_debounce_until: float = 0.0
 
     # Plugin bus: receive toggle commands from carstate/UI
     # Messages buffered before _cmd_init_t are stale (from a previous session)
@@ -584,8 +585,9 @@ class SpeedLimitMiddleware:
       cmd = self._cmd_sub.drain()
       if cmd is not None and time.monotonic() - self._cmd_init_t > 2.0:
         _, data = cmd
-        if isinstance(data, dict) and data.get('action') == 'toggle_confirm':
+        if isinstance(data, dict) and data.get('action') == 'toggle_confirm' and now > self._confirm_debounce_until:
           self.confirmed = not self.confirmed
+          self._confirm_debounce_until = now + 1.0  # 1s debounce
           try:
             from openpilot.common.swaglog import cloudlog
             cloudlog.info(f"speedlimitd: confirmed toggled to {self.confirmed}")
