@@ -241,6 +241,8 @@ def on_lat_controller_init(result, lac, CP):
 
   from collections import deque
   from bmw.values import CarControllerParams as CCP
+
+  _lat_pub = None
   TORQUE_STEP = CCP.STEER_DELTA_UP * 2 / CCP.STEER_MAX  # 2 control steps per model frame (50Hz)
   CURVATURE_DEADZONE_PCT = 0.025  # 2.5% of desired curvature
   CURVATURE_DEADZONE_MIN = 0.00002  # absolute floor (~50000m radius)
@@ -263,9 +265,9 @@ def on_lat_controller_init(result, lac, CP):
     delayed_desired = curvature_buffer[0]
     error = delayed_desired - measured_curvature
 
-    pid_log.actualLateralAccel = float(measured_curvature)   # actual curvature
-    pid_log.desiredLateralAccel = float(delayed_desired)     # delayed desired curvature
-    pid_log.error = float(error)                             # curvature error
+    pid_log.actualLateralAccel = float(measured_curvature * CS.vEgo ** 2)
+    pid_log.desiredLateralAccel = float(delayed_desired * CS.vEgo ** 2)
+    pid_log.error = float(error)
 
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
@@ -284,11 +286,29 @@ def on_lat_controller_init(result, lac, CP):
     output = max(-1.0, min(1.0, state['torque']))
 
     pid_log.active = True
-    pid_log.output = float(output)                           # torque sent to CAN (normalized)
-    pid_log.p = float(desired_curvature)                     # current desired (non-delayed)
-    pid_log.i = float(state['torque'])                       # accumulated torque state
-    pid_log.f = float(deadzone)                              # active deadzone
+    pid_log.output = float(-output)
+    pid_log.p = float(error)
+    pid_log.i = 0.0
+    pid_log.f = 0.0
     pid_log.saturated = bool(abs(output) > 0.99)
+
+    # Log incremental controller state to plugin bus
+    nonlocal _lat_pub
+    try:
+      if _lat_pub is None:
+        from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+        _lat_pub = PluginPub('bmw_lat_control')
+      _lat_pub.send({
+        'measuredCurvature': float(measured_curvature),
+        'delayedDesired': float(delayed_desired),
+        'currentDesired': float(desired_curvature),
+        'error': float(error),
+        'deadzone': float(deadzone),
+        'torqueState': float(state['torque']),
+        'output': float(output),
+      })
+    except Exception:
+      pass
 
     # BMW CAN torque is right-positive, actuators.torque is left-positive → negate
     return -output, 0.0, pid_log
