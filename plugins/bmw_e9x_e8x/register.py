@@ -283,14 +283,15 @@ def on_lat_controller_init(result, lac, CP):
     output = max(-1.0, min(1.0, output))
 
     pid_log.active = True
-    pid_log.output = float(-output)
+    pid_log.output = float(output)
     pid_log.p = float(error)
     pid_log.i = float(state['torque'])
     pid_log.f = float(FRICTION)
     pid_log.saturated = bool(abs(output) > 0.99)
 
-    # Convention: left is positive, return negated
-    return -output, 0.0, pid_log
+    # output is already left-positive (positive error = need left = positive torque)
+    # actuators.torque convention: left is positive
+    return output, 0.0, pid_log
 
   lac.update = update_incremental
   return result
