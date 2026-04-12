@@ -68,7 +68,6 @@ _blend_last_time = 0.0
 
 # Longitudinal speed cap state
 _speed_cap_pub = None
-_prev_conf_dist = 0.0
 
 
 def _get_sm():
