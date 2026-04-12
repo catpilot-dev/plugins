@@ -239,11 +239,9 @@ def on_lat_controller_init(result, lac, CP):
   import math
   from cereal import log
 
-  STEER_MAX = 12.0          # Nm — CarControllerParams.STEER_MAX
-  DELTA_UP = 0.1            # Nm per 10ms (control step)
-  STEPS_PER_MODEL_FRAME = 2 # model runs at 50Hz = 20ms = 2 control steps
-  TORQUE_STEP = DELTA_UP * STEPS_PER_MODEL_FRAME / STEER_MAX  # normalized per model frame
-  FRICTION = 0.15           # normalized — initial offset to overcome hydraulic resistance
+  from bmw.values import CarControllerParams as CCP
+  TORQUE_STEP = CCP.STEER_DELTA_UP * 2 / CCP.STEER_MAX  # 2 control steps per model frame (50Hz)
+  FRICTION = CCP.STEER_FRICTION
   CURVATURE_DEADZONE = 0.00005  # ~20000m radius — hold torque when on target
 
   state = {'torque': 0.0}
