@@ -263,9 +263,9 @@ def on_lat_controller_init(result, lac, CP):
     delayed_desired = curvature_buffer[0]
     error = delayed_desired - measured_curvature
 
-    pid_log.actualLateralAccel = float(measured_curvature * CS.vEgo ** 2)
-    pid_log.desiredLateralAccel = float(delayed_desired * CS.vEgo ** 2)
-    pid_log.error = float(error)
+    pid_log.actualLateralAccel = float(measured_curvature)   # actual curvature
+    pid_log.desiredLateralAccel = float(delayed_desired)     # delayed desired curvature
+    pid_log.error = float(error)                             # curvature error
 
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
@@ -284,10 +284,10 @@ def on_lat_controller_init(result, lac, CP):
     output = max(-1.0, min(1.0, state['torque']))
 
     pid_log.active = True
-    pid_log.output = float(output)
-    pid_log.p = float(error)
-    pid_log.i = float(state['torque'])
-    pid_log.f = 0.0
+    pid_log.output = float(output)                           # torque sent to CAN (normalized)
+    pid_log.p = float(desired_curvature)                     # current desired (non-delayed)
+    pid_log.i = float(state['torque'])                       # accumulated torque state
+    pid_log.f = float(deadzone)                              # active deadzone
     pid_log.saturated = bool(abs(output) > 0.99)
 
     # BMW CAN torque is right-positive, actuators.torque is left-positive → negate
