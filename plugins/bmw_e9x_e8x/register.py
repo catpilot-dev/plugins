@@ -298,9 +298,8 @@ def on_lat_controller_init(result, lac, CP):
     pid_log.f = float(FRICTION)
     pid_log.saturated = bool(abs(output) > 0.99)
 
-    # output is already left-positive (positive error = need left = positive torque)
-    # actuators.torque convention: left is positive
-    return output, 0.0, pid_log
+    # BMW CAN torque is right-positive, actuators.torque is left-positive → negate
+    return -output, 0.0, pid_log
 
   lac.update = update_incremental
   return result
