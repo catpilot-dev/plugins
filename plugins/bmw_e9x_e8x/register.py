@@ -226,38 +226,73 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Tune lateral controller for BMW hydraulic power steering.
+  """Replace stock lateral controller with incremental torque for BMW hydraulic steering.
 
-  1. Flat KP=0.85 — stock speed-dependent KP is for EPS cars; hydraulic
-     assist provides its own speed-dependent gain.
+  Stock latcontrol_torque works in lateral acceleration domain with LAF/friction
+  feedforward — inappropriate for hydraulic + stepper servo where the torque→accel
+  relationship is nonlinear and speed-dependent (Servotronic).
 
-  2. Speed-dependent latAccelFactor — hydraulic assist amplifies motor torque
-     more at low speed. Fixed LAF overestimates torque needed at low speed,
-     causing overshoot and oscillation. Scale LAF with speed so the controller
-     commands appropriate torque at all speeds.
+  Incremental approach: step torque up/down by DELTA per model frame based on
+  curvature error. No LAF, no acceleration domain, no complex feedforward.
+  Self-calibrating — if hydraulic gain changes, just keeps stepping until on target.
   """
-  import numpy as np
+  import math
+  from cereal import log
 
-  lac.pid._k_p = [[0], [0.85]]
+  STEER_MAX = 12.0          # Nm — CarControllerParams.STEER_MAX
+  DELTA_UP = 0.1            # Nm per 10ms (control step)
+  STEPS_PER_MODEL_FRAME = 2 # model runs at 50Hz = 20ms = 2 control steps
+  TORQUE_STEP = DELTA_UP * STEPS_PER_MODEL_FRAME / STEER_MAX  # normalized per model frame
+  FRICTION = 0.15           # normalized — initial offset to overcome hydraulic resistance
+  CURVATURE_DEADZONE = 0.00005  # ~20000m radius — hold torque when on target
 
-  # Speed-dependent latAccelFactor for hydraulic power steering.
-  # At low speed, hydraulic assist is strong — same motor torque produces more
-  # lateral acceleration — so LAF is higher (less torque commanded).
-  # At high speed, assist weakens — LAF is lower (more torque needed).
-  # Values derived from regression of lat_accel vs cmd_torque in route 24f.
-  LAF_SPEEDS = [8.3, 11.1, 13.9, 16.7, 19.4, 22.2]  # m/s: 30, 40, 50, 60, 70, 80 kph
-  LAF_VALUES = [6.5, 5.8,  5.1,  4.4,  3.7,  3.0]   # linear -0.7/10kph, matches Servotronic assist curve
+  state = {'torque': 0.0}
 
-  # Wrap update() to set speed-dependent LAF before each PID cycle.
-  # torqued's update_live_torque_params runs before update(), but our wrapper
-  # overrides LAF with the speed-appropriate value before the PID uses it.
   original_update = lac.update
 
-  def update_wrapper(active, CS, *args, **kwargs):
-    lac.torque_params.latAccelFactor = float(np.interp(CS.vEgo, LAF_SPEEDS, LAF_VALUES))
-    return original_update(active, CS, *args, **kwargs)
+  def update_incremental(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
+    pid_log = log.ControlsState.LateralTorqueState.new_message()
+    pid_log.version = 1
 
-  lac.update = update_wrapper
+    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
+    error = desired_curvature - measured_curvature
+
+    pid_log.actualLateralAccel = float(measured_curvature * CS.vEgo ** 2)
+    pid_log.desiredLateralAccel = float(desired_curvature * CS.vEgo ** 2)
+    pid_log.error = float(error)
+
+    if not active or CS.vEgo < 5.0:
+      state['torque'] = 0.0
+      pid_log.active = False
+      return 0.0, 0.0, pid_log
+
+    # Incremental torque: step toward the curvature target
+    if error > CURVATURE_DEADZONE:
+      state['torque'] += TORQUE_STEP
+    elif error < -CURVATURE_DEADZONE:
+      state['torque'] -= TORQUE_STEP
+
+    # Add friction in the direction of desired curvature
+    if abs(desired_curvature) > CURVATURE_DEADZONE:
+      friction_sign = 1.0 if desired_curvature > 0 else -1.0
+      output = state['torque'] + friction_sign * FRICTION
+    else:
+      output = state['torque']
+
+    # Clamp to normalized range
+    output = max(-1.0, min(1.0, output))
+
+    pid_log.active = True
+    pid_log.output = float(-output)
+    pid_log.p = float(error)
+    pid_log.i = float(state['torque'])
+    pid_log.f = float(FRICTION)
+    pid_log.saturated = bool(abs(output) > 0.99)
+
+    # Convention: left is positive, return negated
+    return -output, 0.0, pid_log
+
+  lac.update = update_incremental
   return result
 
 
