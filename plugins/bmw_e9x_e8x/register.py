@@ -243,7 +243,8 @@ def on_lat_controller_init(result, lac, CP):
   from bmw.values import CarControllerParams as CCP
   TORQUE_STEP = CCP.STEER_DELTA_UP * 2 / CCP.STEER_MAX  # 2 control steps per model frame (50Hz)
   FRICTION = CCP.STEER_FRICTION
-  CURVATURE_DEADZONE = 0.00005  # ~20000m radius — hold torque when on target
+  CURVATURE_DEADZONE_PCT = 0.025  # 2.5% of desired curvature
+  CURVATURE_DEADZONE_MIN = 0.00002  # absolute floor (~50000m radius)
   ACTUATOR_DELAY = 0.5          # seconds — hydraulic + stepper + CAN delay
   DT = 0.01                     # 100 Hz control loop
   DELAY_FRAMES = int(ACTUATOR_DELAY / DT)  # 50 frames
@@ -273,13 +274,15 @@ def on_lat_controller_init(result, lac, CP):
       return 0.0, 0.0, pid_log
 
     # Incremental torque: step toward the curvature target
-    if error > CURVATURE_DEADZONE:
+    # Deadzone scales with desired curvature — tighter on straights, wider in curves
+    deadzone = max(abs(delayed_desired) * CURVATURE_DEADZONE_PCT, CURVATURE_DEADZONE_MIN)
+    if error > deadzone:
       state['torque'] += TORQUE_STEP
-    elif error < -CURVATURE_DEADZONE:
+    elif error < -deadzone:
       state['torque'] -= TORQUE_STEP
 
     # Add friction in the direction of desired curvature
-    if abs(desired_curvature) > CURVATURE_DEADZONE:
+    if abs(desired_curvature) > CURVATURE_DEADZONE_MIN:
       friction_sign = 1.0 if desired_curvature > 0 else -1.0
       output = state['torque'] + friction_sign * FRICTION
     else:
