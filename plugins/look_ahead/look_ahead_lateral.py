@@ -33,7 +33,6 @@ MAX_LOOKAHEAD_T = 3.0       # seconds — model reliability drops beyond ~5s
 MIN_SPEED = 5.0             # m/s — below this, don't override
 STRAIGHT_THRESHOLD = 0.002  # 1/m (~500m radius) — stock must be straight to activate
 BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
-MAX_LATERAL_JERK = 2.0      # m/s³ — stock is 5.0; 2.0 for smoother lane changes
 
 # Longitudinal: confidence-based speed cap
 PREVIEW_TIME = 5.0          # seconds — minimum forward visibility time at current speed
@@ -66,25 +65,6 @@ _sm = None
 
 _blend_factor = 0.0  # 0 = stock, 1 = look ahead
 _blend_last_time = 0.0
-_prev_output_curv = 0.0  # for curvature rate limiting
-
-# Kalman filter for look_ahead curvature — smooths model prediction noise
-# from camera vibration / uneven road surfaces
-_curv_kf = None
-
-def _get_curv_kf():
-  global _curv_kf
-  if _curv_kf is None:
-    import numpy as np
-    from openpilot.common.simple_kalman import KF1D, get_kalman_gain
-    dt = 0.01  # 100 Hz control rate
-    A = [[1.0, dt], [0.0, 1.0]]        # state: [curvature, curvature_rate]
-    C = [[1.0, 0.0]]                    # measure curvature directly
-    Q = [[0.0, 0.0], [0.0, 0.5]]       # curvature_rate can change, but slowly
-    R = 5.0                             # high R = noisy measurement, trust filter state more
-    K = get_kalman_gain(dt, np.array(A), np.array(C), np.array(Q), R)
-    _curv_kf = KF1D(x0=[[0.0], [0.0]], A=A, C=C[0], K=K)
-  return _curv_kf
 
 # Longitudinal speed cap state
 _speed_cap_pub = None
@@ -434,20 +414,4 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   else:
     _blend_factor = max(_blend_factor - max_step, target)
 
-  blended = default_curvature + _blend_factor * (curvature - default_curvature)
-
-  # Kalman filter always runs — smooths noise and curve→straight transitions.
-  # No reset on blend changes; KF tracks continuously for seamless transitions.
-  kf = _get_curv_kf()
-  filtered = kf.update(blended)
-  output = filtered[0]
-
-  # Curvature rate limit — 2.0 m/s³ lateral jerk (stock is 5.0).
-  # Speed-dependent: more room at low speed, tighter at high speed.
-  global _prev_output_curv
-  v = max(v_ego, 1.0)
-  max_delta = (MAX_LATERAL_JERK / (v ** 2)) * dt
-  output = max(_prev_output_curv - max_delta, min(_prev_output_curv + max_delta, output))
-  _prev_output_curv = output
-
-  return output
+  return default_curvature + _blend_factor * (curvature - default_curvature)
