@@ -20,6 +20,7 @@ class CarControllerParams: #controls running @ 100hz
   STEER_DELTA_UP = 0.1       # Nm/10ms
   STEER_DELTA_DOWN = 0.1     # Nm/10ms — symmetric with DELTA_UP for incremental controller
   STEER_ERROR_MAX = 999     # max delta between torque cmd and torque motor
+  STEER_FRICTION = 0.15     # normalized — hydraulic friction offset for incremental controller
 
   # STEER_BACKLASH = 1 #deg
   def __init__(self, CP):
