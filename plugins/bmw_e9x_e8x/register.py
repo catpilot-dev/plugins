@@ -251,8 +251,6 @@ def on_lat_controller_init(result, lac, CP):
   state = {'torque': 0.0}
   curvature_buffer = deque([0.0] * DELAY_FRAMES, maxlen=DELAY_FRAMES)
 
-  original_update = lac.update
-
   def update_incremental(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 1
