@@ -242,7 +242,6 @@ def on_lat_controller_init(result, lac, CP):
   from collections import deque
   from bmw.values import CarControllerParams as CCP
   TORQUE_STEP = CCP.STEER_DELTA_UP * 2 / CCP.STEER_MAX  # 2 control steps per model frame (50Hz)
-  FRICTION = CCP.STEER_FRICTION
   CURVATURE_DEADZONE_PCT = 0.025  # 2.5% of desired curvature
   CURVATURE_DEADZONE_MIN = 0.00002  # absolute floor (~50000m radius)
   ACTUATOR_DELAY = 0.5          # seconds — hydraulic + stepper + CAN delay
@@ -281,21 +280,14 @@ def on_lat_controller_init(result, lac, CP):
     elif error < -deadzone:
       state['torque'] -= TORQUE_STEP
 
-    # Add friction in the direction of desired curvature
-    if abs(desired_curvature) > CURVATURE_DEADZONE_MIN:
-      friction_sign = 1.0 if desired_curvature > 0 else -1.0
-      output = state['torque'] + friction_sign * FRICTION
-    else:
-      output = state['torque']
-
     # Clamp to normalized range
-    output = max(-1.0, min(1.0, output))
+    output = max(-1.0, min(1.0, state['torque']))
 
     pid_log.active = True
     pid_log.output = float(output)
     pid_log.p = float(error)
     pid_log.i = float(state['torque'])
-    pid_log.f = float(FRICTION)
+    pid_log.f = 0.0
     pid_log.saturated = bool(abs(output) > 0.99)
 
     # BMW CAN torque is right-positive, actuators.torque is left-positive → negate
