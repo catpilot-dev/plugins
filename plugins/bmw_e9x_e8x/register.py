@@ -239,12 +239,17 @@ def on_lat_controller_init(result, lac, CP):
   import math
   from cereal import log
 
+  from collections import deque
   from bmw.values import CarControllerParams as CCP
   TORQUE_STEP = CCP.STEER_DELTA_UP * 2 / CCP.STEER_MAX  # 2 control steps per model frame (50Hz)
   FRICTION = CCP.STEER_FRICTION
   CURVATURE_DEADZONE = 0.00005  # ~20000m radius — hold torque when on target
+  ACTUATOR_DELAY = 0.5          # seconds — hydraulic + stepper + CAN delay
+  DT = 0.01                     # 100 Hz control loop
+  DELAY_FRAMES = int(ACTUATOR_DELAY / DT)  # 50 frames
 
   state = {'torque': 0.0}
+  curvature_buffer = deque([0.0] * DELAY_FRAMES, maxlen=DELAY_FRAMES)
 
   original_update = lac.update
 
@@ -253,10 +258,15 @@ def on_lat_controller_init(result, lac, CP):
     pid_log.version = 1
 
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
-    error = desired_curvature - measured_curvature
+
+    # Buffer desired curvature and compare delayed setpoint vs current measurement.
+    # The current measurement reflects commands sent ACTUATOR_DELAY ago.
+    curvature_buffer.append(desired_curvature)
+    delayed_desired = curvature_buffer[0]
+    error = delayed_desired - measured_curvature
 
     pid_log.actualLateralAccel = float(measured_curvature * CS.vEgo ** 2)
-    pid_log.desiredLateralAccel = float(desired_curvature * CS.vEgo ** 2)
+    pid_log.desiredLateralAccel = float(delayed_desired * CS.vEgo ** 2)
     pid_log.error = float(error)
 
     if not active or CS.vEgo < 5.0:
