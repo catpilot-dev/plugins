@@ -325,23 +325,8 @@ def on_lat_controller_init(result, lac, CP):
     state['torque'] = ff + state['correction']
     output = max(-1.0, min(1.0, state['torque']))
 
-    # --- Online learning ---
-    # When model demand is stable (delta ≈ 0) and curvature is significant,
-    # the current output torque is the right steady-state for this curvature.
-    # Update the gain table toward the observed gain.
-    if abs(delta) < deadzone and curv_abs > 0.0005 and abs(output) > 0.01:
-      observed_gain = abs(output) / curv_abs
-      current_gain = _get_gain(curv_abs)
-      # Find nearest table entry and nudge it
-      idx = int(np.searchsorted(GAIN_CURV, curv_abs))
-      idx = max(0, min(idx, len(learned_gain) - 1))
-      learned_gain[idx] += LEARN_RATE * (observed_gain - learned_gain[idx])
-
-    # Persist learned gains periodically (~10s)
-    _save_counter[0] += 1
-    if _save_counter[0] >= 1000:
-      _save_learned_gain(learned_gain)
-      _save_counter[0] = 0
+    # Online learning disabled — observing own output creates positive feedback.
+    # TODO: use steeringTorqueEps (actual car response) for learning instead.
 
     pid_log.actualLateralAccel = float(curv_abs)
     pid_log.desiredLateralAccel = float(desired_curvature * CS.vEgo**2)
