@@ -244,7 +244,8 @@ def on_lat_controller_init(result, lac, CP):
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
-  TORQUE_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1 Nm normalized
+  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.5 Nm normalized — full stepper capability per model frame
+  MAX_DELTA = 0.0008             # max expected frame-to-frame curvature change (from route data)
   DEADZONE_PCT = 0.05            # 5% of current desired_curvature
   DEADZONE_MIN = 0.0001          # absolute floor — filters model prediction noise
 
@@ -272,12 +273,13 @@ def on_lat_controller_init(result, lac, CP):
       pid_log.active = False
       return 0.0, 0.0, pid_log
 
-    # Step torque only when model demand changes beyond deadzone
+    # Step torque proportional to delta magnitude — scaled to stepper capability
+    # Small drift → gentle step, sharp curve entry → full step
     deadzone = max(abs(desired_curvature) * DEADZONE_PCT, DEADZONE_MIN)
-    if delta > deadzone:
-      state['torque'] += TORQUE_STEP
-    elif delta < -deadzone:
-      state['torque'] -= TORQUE_STEP
+    if abs(delta) > deadzone:
+      scale = min(abs(delta) / MAX_DELTA, 1.0)  # 0..1 based on how large the delta is
+      step = scale * MAX_STEP
+      state['torque'] += step if delta > 0 else -step
 
     output = max(-1.0, min(1.0, state['torque']))
 
