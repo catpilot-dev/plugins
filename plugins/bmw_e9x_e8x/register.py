@@ -244,43 +244,39 @@ def on_lat_controller_init(result, lac, CP):
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
-  TORQUE_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1 Nm normalized per 100Hz call
+  TORQUE_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1 Nm normalized
   DEADZONE_PCT = 0.05            # 5% of current desired_curvature
-  DEADZONE_MIN = 0.0001          # absolute floor — filters model prediction noise on straights
-  ACTUATOR_DELAY = 0.5           # seconds
-  DT = 0.01                      # 100 Hz control loop
-  DELAY_FRAMES = int(ACTUATOR_DELAY / DT)  # 50 frames
+  DEADZONE_MIN = 0.0001          # absolute floor — filters model prediction noise
 
-  state = {'torque': 0.0}
-  curvature_ring = deque([0.0] * DELAY_FRAMES, maxlen=DELAY_FRAMES)
+  state = {'torque': 0.0, 'prev_desired': 0.0}
 
   def update_incremental(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 1
 
-    # Record current desired_curvature into ring buffer
-    curvature_ring.append(desired_curvature)
-    curvature_half_sec_ago = curvature_ring[0]
+    # Compare with previous frame's desired_curvature (model updates at ~20Hz).
+    # Delta tells us how the model's demand is changing frame-to-frame.
+    # Positive delta = model wants more left curvature → step torque up.
+    # Zero delta = model is satisfied with current tracking → hold torque.
+    prev = state['prev_desired']
+    delta = desired_curvature - prev
+    state['prev_desired'] = desired_curvature
 
-    # Error: how much has the model's demand changed over the actuator delay period?
-    # If the car was tracking perfectly, this would be zero (demand unchanged).
-    # If the car drifted, the model corrects → demand changes → error is non-zero.
-    error = desired_curvature - curvature_half_sec_ago
-
-    pid_log.actualLateralAccel = float(curvature_half_sec_ago * CS.vEgo**2)
+    pid_log.actualLateralAccel = float(prev * CS.vEgo**2)
     pid_log.desiredLateralAccel = float(desired_curvature * CS.vEgo**2)
-    pid_log.error = float(error)
+    pid_log.error = float(delta)
 
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
+      state['prev_desired'] = 0.0
       pid_log.active = False
       return 0.0, 0.0, pid_log
 
-    # Incremental: step torque based on how the model's demand is changing
+    # Step torque only when model demand changes beyond deadzone
     deadzone = max(abs(desired_curvature) * DEADZONE_PCT, DEADZONE_MIN)
-    if error > deadzone:
+    if delta > deadzone:
       state['torque'] += TORQUE_STEP
-    elif error < -deadzone:
+    elif delta < -deadzone:
       state['torque'] -= TORQUE_STEP
 
     output = max(-1.0, min(1.0, state['torque']))
@@ -289,7 +285,7 @@ def on_lat_controller_init(result, lac, CP):
     pid_log.output = float(-output)
     pid_log.p = float(desired_curvature)   # current demand
     pid_log.i = float(state['torque'])      # accumulated torque
-    pid_log.f = float(curvature_half_sec_ago)  # demand 0.5s ago
+    pid_log.f = float(prev)                  # previous frame demand
     pid_log.saturated = bool(abs(output) > 0.99)
 
     # Log to plugin bus
@@ -300,8 +296,8 @@ def on_lat_controller_init(result, lac, CP):
         _lat_pub = PluginPub('bmw_lat_control')
       _lat_pub.send({
         'desiredNow': float(desired_curvature),
-        'desiredDelayed': float(curvature_half_sec_ago),
-        'error': float(error),
+        'desiredPrev': float(prev),
+        'delta': float(delta),
         'torqueState': float(state['torque']),
         'output': float(output),
       })
