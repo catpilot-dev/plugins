@@ -228,84 +228,106 @@ def on_vehicle_settings(items, CP):
 def on_lat_controller_init(result, lac, CP):
   """Replace stock lateral controller with incremental torque for BMW hydraulic steering.
 
-  Stock latcontrol_torque works in lateral acceleration domain with LAF/friction
-  feedforward — inappropriate for hydraulic + stepper servo where the torque→accel
-  relationship is nonlinear and speed-dependent (Servotronic).
+  Uses model curvature prediction at the actuator delay distance as the control
+  signal. The model sees the road AND the car's tracking error through the camera,
+  so its prediction at v_ego × delay naturally encodes what torque is needed.
 
-  Incremental approach: step torque up/down by DELTA per model frame based on
-  curvature error. No LAF, no acceleration domain, no complex feedforward.
-  Self-calibrating — if hydraulic gain changes, just keeps stepping until on target.
+  No measured_curvature, no steering angle, no vehicle model, no LAF.
+  The model IS the sensor — at 5m it's >99% confident and includes drift correction.
   """
-  import math
+  import numpy as np
   from cereal import log
-
-  from collections import deque
+  import cereal.messaging as messaging
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
-  TORQUE_STEP = CCP.STEER_DELTA_UP * 2 / CCP.STEER_MAX  # 2 control steps per model frame (50Hz)
-  CURVATURE_DEADZONE_PCT = 0.025  # 2.5% of desired curvature
-  CURVATURE_DEADZONE_MIN = 0.00002  # absolute floor (~50000m radius)
-  ACTUATOR_DELAY = 0.5          # seconds — hydraulic + stepper + CAN delay
-  DT = 0.01                     # 100 Hz control loop
-  DELAY_FRAMES = int(ACTUATOR_DELAY / DT)  # 50 frames
+  TORQUE_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1 Nm normalized per 100Hz call
+  CURVATURE_DEADZONE = 0.00005   # hold torque when model says nearly straight
+  ACTUATOR_DELAY = 0.5           # seconds
 
-  state = {'torque': 0.0}
-  curvature_buffer = deque([0.0] * DELAY_FRAMES, maxlen=DELAY_FRAMES)
+  state = {'torque': 0.0, 'sm': None}
+
+  def _get_sm():
+    if state['sm'] is None:
+      state['sm'] = messaging.SubMaster(['modelV2'])
+    state['sm'].update(0)
+    return state['sm']
+
+  def _curvature_at_dist(pos_x, pos_y, dist):
+    """Estimate curvature at a given distance from model position predictions."""
+    if len(pos_x) < 5 or len(pos_y) < 5:
+      return None
+    idx = np.searchsorted(pos_x, dist)
+    if idx < 2 or idx >= len(pos_x) - 1:
+      return None
+    dx = pos_x[idx+1] - pos_x[idx-1]
+    if abs(dx) < 0.1:
+      return None
+    dy = pos_y[idx+1] - pos_y[idx-1]
+    d2y = pos_y[idx+1] - 2*pos_y[idx] + pos_y[idx-1]
+    dydx = dy / dx
+    d2x = dx / 2
+    d2ydx2 = d2y / (d2x * dx)
+    return float(d2ydx2 / (1 + dydx**2)**1.5)
 
   def update_incremental(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 1
 
-    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
+    # Model prediction at actuator delay distance
+    # This is where the car will BE when current torque command takes effect.
+    # The model includes lane tracking correction — if car is drifting,
+    # the curvature at this distance encodes the correction needed.
+    sm = _get_sm()
+    mv = sm['modelV2']
+    pos_x = np.array(mv.position.x) if len(mv.position.x) > 0 else np.array([])
+    pos_y = np.array(mv.position.y) if len(mv.position.y) > 0 else np.array([])
 
-    # Buffer desired curvature and compare delayed setpoint vs current measurement.
-    # The current measurement reflects commands sent ACTUATOR_DELAY ago.
-    curvature_buffer.append(desired_curvature)
-    delayed_desired = curvature_buffer[0]
-    error = delayed_desired - measured_curvature
+    delay_dist = max(CS.vEgo * ACTUATOR_DELAY, 3.0)  # minimum 3m
+    target_curv = _curvature_at_dist(pos_x, pos_y, delay_dist)
 
-    pid_log.actualLateralAccel = float(measured_curvature * CS.vEgo ** 2)
-    pid_log.desiredLateralAccel = float(delayed_desired * CS.vEgo ** 2)
-    pid_log.error = float(error)
+    if target_curv is None:
+      target_curv = 0.0
+
+    pid_log.actualLateralAccel = float(desired_curvature * CS.vEgo**2)  # stock field
+    pid_log.desiredLateralAccel = float(target_curv * CS.vEgo**2)
+    pid_log.error = float(target_curv)
 
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
       pid_log.active = False
       return 0.0, 0.0, pid_log
 
-    # Incremental torque: step toward the curvature target
-    # Deadzone scales with desired curvature — tighter on straights, wider in curves
-    deadzone = max(abs(delayed_desired) * CURVATURE_DEADZONE_PCT, CURVATURE_DEADZONE_MIN)
-    if error > deadzone:
+    # Incremental: the model's curvature prediction IS the control signal.
+    # Positive curvature = turn left → add positive torque
+    # Negative curvature = turn right → add negative torque
+    # Near zero = straight → hold torque
+    if target_curv > CURVATURE_DEADZONE:
       state['torque'] += TORQUE_STEP
-    elif error < -deadzone:
+    elif target_curv < -CURVATURE_DEADZONE:
       state['torque'] -= TORQUE_STEP
 
-    # Clamp to normalized range
     output = max(-1.0, min(1.0, state['torque']))
 
     pid_log.active = True
     pid_log.output = float(-output)
-    pid_log.p = float(error)
-    pid_log.i = 0.0
-    pid_log.f = 0.0
+    pid_log.p = float(target_curv)
+    pid_log.i = float(state['torque'])
+    pid_log.f = float(delay_dist)
     pid_log.saturated = bool(abs(output) > 0.99)
 
-    # Log incremental controller state to plugin bus
+    # Log to plugin bus
     nonlocal _lat_pub
     try:
       if _lat_pub is None:
         from openpilot.selfdrive.plugins.plugin_bus import PluginPub
         _lat_pub = PluginPub('bmw_lat_control')
       _lat_pub.send({
-        'measuredCurvature': float(measured_curvature),
-        'delayedDesired': float(delayed_desired),
-        'currentDesired': float(desired_curvature),
-        'error': float(error),
-        'deadzone': float(deadzone),
+        'targetCurv': float(target_curv),
+        'delayDist': float(delay_dist),
         'torqueState': float(state['torque']),
         'output': float(output),
+        'vEgo': float(CS.vEgo),
       })
     except Exception:
       pass
