@@ -226,68 +226,100 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Replace stock lateral controller with incremental torque for BMW hydraulic steering.
+  """Incremental torque controller with curvature-dependent gain + online learning.
 
-  Compares desired_curvature[now] vs desired_curvature[0.5s ago] to determine
-  the rate of change of the model's demand. The model updates each frame with
-  camera feedback — if the car drifts, the model adjusts desired_curvature.
+  Two components:
+  1. Steady-state feedforward: torque = desired_curvature × gain(|curvature|)
+     Prior gain table from route data. Handles sustained curves.
+  2. Incremental correction: frame-to-frame delta adjusts torque for transitions.
 
-  error = desired_curvature[now] - desired_curvature[-0.5s]
-  positive error → model wants MORE curvature → add torque
-  negative error → model wants LESS curvature → reduce torque
-  zero → model demand stable → hold torque
-
-  No measured_curvature, no steering angle, no vehicle model, no LAF.
+  Online learner: when delta ≈ 0 (model satisfied), record the actual
+  curvature→torque relationship and update the gain table.
   """
   from cereal import log
-  from collections import deque
+  import numpy as np
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
-  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.5 Nm normalized — full stepper capability per model frame
-  MAX_DELTA = 0.0008             # max expected frame-to-frame curvature change (from route data)
-  DEADZONE_PCT = 0.05            # 5% of current desired_curvature
-  DEADZONE_MIN = 0.0001          # absolute floor — filters model prediction noise
 
-  state = {'torque': 0.0, 'prev_desired': 0.0}
+  # Prior gain table from route data analysis (|curvature| → |normalized torque gain|)
+  # Sign is handled separately — gain is always positive here.
+  # At small curvature, more gain needed (overcoming friction).
+  # At large curvature, less gain (hydraulic assist kicks in).
+  GAIN_CURV = [0.0002, 0.001, 0.003, 0.01]
+  GAIN_VAL  = [100.0,  55.0,  35.0,  20.0]
+
+  # Incremental parameters
+  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.5 Nm per model frame
+  MAX_DELTA = 0.0008
+  DEADZONE_PCT = 0.05
+  DEADZONE_MIN = 0.0001
+
+  # Online learning: exponential moving average of observed gain
+  LEARN_RATE = 0.01  # slow adaptation
+  learned_gain = list(GAIN_VAL)  # mutable copy
+
+  state = {'torque': 0.0, 'prev_desired': 0.0, 'correction': 0.0}
+
+  def _get_gain(curv_abs):
+    """Interpolate gain from the (possibly learned) table."""
+    return float(np.interp(curv_abs, GAIN_CURV, learned_gain))
 
   def update_incremental(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 1
 
-    # Compare with previous frame's desired_curvature (model updates at ~20Hz).
-    # Delta tells us how the model's demand is changing frame-to-frame.
-    # Positive delta = model wants more left curvature → step torque up.
-    # Zero delta = model is satisfied with current tracking → hold torque.
     prev = state['prev_desired']
     delta = desired_curvature - prev
     state['prev_desired'] = desired_curvature
 
-    pid_log.actualLateralAccel = float(prev * CS.vEgo**2)
-    pid_log.desiredLateralAccel = float(desired_curvature * CS.vEgo**2)
-    pid_log.error = float(delta)
-
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
+      state['correction'] = 0.0
       state['prev_desired'] = 0.0
       pid_log.active = False
+      pid_log.error = 0.0
       return 0.0, 0.0, pid_log
 
-    # Step torque proportional to delta magnitude — scaled to stepper capability
-    # Small drift → gentle step, sharp curve entry → full step
-    deadzone = max(abs(desired_curvature) * DEADZONE_PCT, DEADZONE_MIN)
-    if abs(delta) > deadzone:
-      scale = min(abs(delta) / MAX_DELTA, 1.0)  # 0..1 based on how large the delta is
-      step = scale * MAX_STEP
-      state['torque'] += step if delta > 0 else -step
+    # --- Steady-state feedforward ---
+    curv_abs = abs(desired_curvature)
+    gain = _get_gain(curv_abs)
+    ff = desired_curvature * gain  # normalized torque (left-positive)
 
+    # --- Incremental correction for transitions ---
+    deadzone = max(curv_abs * DEADZONE_PCT, DEADZONE_MIN)
+    if abs(delta) > deadzone:
+      scale = min(abs(delta) / MAX_DELTA, 1.0)
+      step = scale * MAX_STEP
+      state['correction'] += step if delta > 0 else -step
+
+    # Decay correction toward zero — ff handles steady state
+    state['correction'] *= 0.995
+
+    # Combined output
+    state['torque'] = ff + state['correction']
     output = max(-1.0, min(1.0, state['torque']))
 
+    # --- Online learning ---
+    # When model demand is stable (delta ≈ 0) and curvature is significant,
+    # the current output torque is the right steady-state for this curvature.
+    # Update the gain table toward the observed gain.
+    if abs(delta) < deadzone and curv_abs > 0.0005 and abs(output) > 0.01:
+      observed_gain = abs(output) / curv_abs
+      current_gain = _get_gain(curv_abs)
+      # Find nearest table entry and nudge it
+      idx = int(np.searchsorted(GAIN_CURV, curv_abs))
+      idx = max(0, min(idx, len(learned_gain) - 1))
+      learned_gain[idx] += LEARN_RATE * (observed_gain - learned_gain[idx])
+
+    pid_log.actualLateralAccel = float(curv_abs)
+    pid_log.desiredLateralAccel = float(desired_curvature * CS.vEgo**2)
+    pid_log.error = float(delta)
     pid_log.active = True
     pid_log.output = float(-output)
-    pid_log.p = float(desired_curvature)   # current demand
-    pid_log.i = float(state['torque'])      # accumulated torque
-    pid_log.f = float(prev)                  # previous frame demand
+    pid_log.p = float(ff)                      # feedforward
+    pid_log.i = float(state['correction'])      # incremental correction
+    pid_log.f = float(gain)                     # current gain
     pid_log.saturated = bool(abs(output) > 0.99)
 
     # Log to plugin bus
@@ -297,11 +329,12 @@ def on_lat_controller_init(result, lac, CP):
         from openpilot.selfdrive.plugins.plugin_bus import PluginPub
         _lat_pub = PluginPub('bmw_lat_control')
       _lat_pub.send({
-        'desiredNow': float(desired_curvature),
-        'desiredPrev': float(prev),
-        'delta': float(delta),
-        'torqueState': float(state['torque']),
+        'desired': float(desired_curvature),
+        'ff': float(ff),
+        'correction': float(state['correction']),
         'output': float(output),
+        'gain': float(gain),
+        'learnedGain': list(learned_gain),
       })
     except Exception:
       pass
