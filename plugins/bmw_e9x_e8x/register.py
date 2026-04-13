@@ -245,7 +245,8 @@ def on_lat_controller_init(result, lac, CP):
 
   _lat_pub = None
   TORQUE_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1 Nm normalized per 100Hz call
-  CURVATURE_DEADZONE = 0.00005   # hold torque when demand is stable
+  DEADZONE_PCT = 0.025           # 2.5% of current desired_curvature
+  DEADZONE_MIN = 0.00005         # absolute floor for near-zero curvature
   ACTUATOR_DELAY = 0.5           # seconds
   DT = 0.01                      # 100 Hz control loop
   DELAY_FRAMES = int(ACTUATOR_DELAY / DT)  # 50 frames
@@ -276,9 +277,10 @@ def on_lat_controller_init(result, lac, CP):
       return 0.0, 0.0, pid_log
 
     # Incremental: step torque based on how the model's demand is changing
-    if error > CURVATURE_DEADZONE:
+    deadzone = max(abs(desired_curvature) * DEADZONE_PCT, DEADZONE_MIN)
+    if error > deadzone:
       state['torque'] += TORQUE_STEP
-    elif error < -CURVATURE_DEADZONE:
+    elif error < -deadzone:
       state['torque'] -= TORQUE_STEP
 
     output = max(-1.0, min(1.0, state['torque']))
