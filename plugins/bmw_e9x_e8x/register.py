@@ -282,16 +282,18 @@ def on_lat_controller_init(result, lac, CP):
       return 0.0, 0.0, pid_log
 
     # --- Steady-state feedforward ---
+    # desired_curvature is left-positive, internal torque is right-positive
     curv_abs = abs(desired_curvature)
     gain = _get_gain(curv_abs)
-    ff = desired_curvature * gain  # normalized torque (left-positive)
+    ff = -desired_curvature * gain  # negate: left-pos curvature → right-pos torque
 
     # --- Incremental correction for transitions ---
+    # delta is left-positive, correction is right-positive → negate
     deadzone = max(curv_abs * DEADZONE_PCT, DEADZONE_MIN)
     if abs(delta) > deadzone:
       scale = min(abs(delta) / MAX_DELTA, 1.0)
       step = scale * MAX_STEP
-      state['correction'] += step if delta > 0 else -step
+      state['correction'] += -step if delta > 0 else step  # negate: left-pos delta → right-pos correction
 
     # Decay correction toward zero — ff handles steady state
     state['correction'] *= 0.995
@@ -339,7 +341,8 @@ def on_lat_controller_init(result, lac, CP):
     except Exception:
       pass
 
-    # BMW CAN torque is right-positive, actuators.torque is left-positive → negate
+    # Internal convention: right-positive (same as stock latcontrol_torque)
+    # actuators.torque convention: left-positive → negate at return
     return -output, 0.0, pid_log
 
   lac.update = update_incremental
