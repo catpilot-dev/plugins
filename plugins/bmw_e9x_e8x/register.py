@@ -226,21 +226,21 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Incremental torque controller with curvature-dependent gain + online learning.
+  """Closed-loop torque controller with curvature-dependent gain.
 
   Two components:
   1. Steady-state feedforward: torque = desired_curvature × gain(|curvature|)
      Prior gain table from route data. Handles sustained curves.
-  2. Incremental correction: frame-to-frame delta adjusts torque for transitions.
-
-  Online learner: when delta ≈ 0 (model satisfied), record the actual
-  curvature→torque relationship and update the gain table.
+  2. Error-based correction: measured_curvature (from IMU gyro) vs desired_curvature
+     drives incremental torque adjustments to close the loop.
   """
   from cereal import log
   import numpy as np
+  from cereal import messaging
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
+  _sm = messaging.SubMaster(['livePose'])
 
   # Prior gain table from route data analysis (|curvature| → |normalized torque gain|)
   # Sign is handled separately — gain is always positive here.
@@ -249,14 +249,13 @@ def on_lat_controller_init(result, lac, CP):
   GAIN_CURV = [0.0002, 0.001, 0.003, 0.01]
   GAIN_VAL  = [100.0,  55.0,  35.0,  20.0]
 
-  # Incremental parameters
+  # Correction parameters
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.5 Nm per model frame
-  MAX_DELTA = 0.0008
+  MAX_ERROR = 0.0008
   DEADZONE_PCT = 0.05
   DEADZONE_MIN = 0.0001
 
   # Online learning: exponential moving average of observed gain
-  LEARN_RATE = 0.02  # ~10s to converge during steady curves
   GAIN_FILE = os.path.join(_PLUGIN_DIR, 'data', 'learned_gain.json')
 
   def _load_learned_gain():
@@ -270,19 +269,9 @@ def on_lat_controller_init(result, lac, CP):
       pass
     return list(GAIN_VAL)
 
-  def _save_learned_gain(gains):
-    try:
-      import json
-      os.makedirs(os.path.dirname(GAIN_FILE), exist_ok=True)
-      with open(GAIN_FILE, 'w') as f:
-        json.dump(gains, f)
-    except (OSError, TypeError):
-      pass
-
   learned_gain = _load_learned_gain()
-  _save_counter = [0]  # save every ~10s (1000 frames at 100Hz)
 
-  state = {'torque': 0.0, 'prev_desired': 0.0, 'correction': 0.0}
+  state = {'torque': 0.0, 'correction': 0.0}
 
   def _get_gain(curv_abs):
     """Interpolate gain from the (possibly learned) table."""
@@ -292,14 +281,21 @@ def on_lat_controller_init(result, lac, CP):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 1
 
-    prev = state['prev_desired']
-    delta = desired_curvature - prev
-    state['prev_desired'] = desired_curvature
+    # Measured curvature from livePose (IMU gyro + velocity, time-synced)
+    # angularVelocityDevice.z is right-positive (rad/s)
+    # desired_curvature is left-positive → negate gyro
+    _sm.update(0)
+    lp = _sm['livePose']
+    avz = lp.angularVelocityDevice.z
+    vego = lp.velocityDevice.x
+    measured_curvature = -avz / max(vego, 1.0)
+
+    # Curvature tracking error (left-positive convention)
+    error = desired_curvature - measured_curvature
 
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
       state['correction'] = 0.0
-      state['prev_desired'] = 0.0
       pid_log.active = False
       pid_log.error = 0.0
       return 0.0, 0.0, pid_log
@@ -310,13 +306,13 @@ def on_lat_controller_init(result, lac, CP):
     gain = _get_gain(curv_abs)
     ff = -desired_curvature * gain  # negate: left-pos curvature → right-pos torque
 
-    # --- Incremental correction for transitions ---
-    # delta is left-positive, correction is right-positive → negate
+    # --- Error-based correction (closed loop) ---
+    # error is left-positive, correction is right-positive → negate
     deadzone = max(curv_abs * DEADZONE_PCT, DEADZONE_MIN)
-    if abs(delta) > deadzone:
-      scale = min(abs(delta) / MAX_DELTA, 1.0)
+    if abs(error) > deadzone:
+      scale = min(abs(error) / MAX_ERROR, 1.0)
       step = scale * MAX_STEP
-      state['correction'] += -step if delta > 0 else step  # negate: left-pos delta → right-pos correction
+      state['correction'] += -step if error > 0 else step  # negate: left-pos error → right-pos correction
 
     # Decay correction toward zero — ff handles steady state
     state['correction'] *= 0.995
@@ -325,16 +321,13 @@ def on_lat_controller_init(result, lac, CP):
     state['torque'] = ff + state['correction']
     output = max(-1.0, min(1.0, state['torque']))
 
-    # Online learning disabled — observing own output creates positive feedback.
-    # TODO: use steeringTorqueEps (actual car response) for learning instead.
-
-    pid_log.actualLateralAccel = float(curv_abs)
-    pid_log.desiredLateralAccel = float(desired_curvature * CS.vEgo**2)
-    pid_log.error = float(delta)
+    pid_log.actualLateralAccel = float(measured_curvature)
+    pid_log.desiredLateralAccel = float(desired_curvature)
+    pid_log.error = float(error)
     pid_log.active = True
     pid_log.output = float(-output)
     pid_log.p = float(ff)                      # feedforward
-    pid_log.i = float(state['correction'])      # incremental correction
+    pid_log.i = float(state['correction'])      # error-based correction
     pid_log.f = float(gain)                     # current gain
     pid_log.saturated = bool(abs(output) > 0.99)
 
@@ -346,6 +339,8 @@ def on_lat_controller_init(result, lac, CP):
         _lat_pub = PluginPub('bmw_lat_control')
       _lat_pub.send({
         'desired': float(desired_curvature),
+        'measured': float(measured_curvature),
+        'error': float(error),
         'ff': float(ff),
         'correction': float(state['correction']),
         'output': float(output),
