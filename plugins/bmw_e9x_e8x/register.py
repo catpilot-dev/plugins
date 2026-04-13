@@ -246,7 +246,7 @@ def on_lat_controller_init(result, lac, CP):
   _lat_pub = None
   TORQUE_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1 Nm normalized per 100Hz call
   DEADZONE_PCT = 0.025           # 2.5% of current desired_curvature
-  DEADZONE_MIN = 0.00005         # absolute floor for near-zero curvature
+  DEADZONE_MIN = 0.0001          # absolute floor — filters model prediction noise on straights
   ACTUATOR_DELAY = 0.5           # seconds
   DT = 0.01                      # 100 Hz control loop
   DELAY_FRAMES = int(ACTUATOR_DELAY / DT)  # 50 frames
