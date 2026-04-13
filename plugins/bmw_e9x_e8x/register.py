@@ -257,7 +257,30 @@ def on_lat_controller_init(result, lac, CP):
 
   # Online learning: exponential moving average of observed gain
   LEARN_RATE = 0.01  # slow adaptation
-  learned_gain = list(GAIN_VAL)  # mutable copy
+  GAIN_FILE = os.path.join(_PLUGIN_DIR, 'data', 'learned_gain.json')
+
+  def _load_learned_gain():
+    try:
+      import json
+      with open(GAIN_FILE) as f:
+        vals = json.load(f)
+      if len(vals) == len(GAIN_VAL):
+        return vals
+    except (FileNotFoundError, OSError, ValueError):
+      pass
+    return list(GAIN_VAL)
+
+  def _save_learned_gain(gains):
+    try:
+      import json
+      os.makedirs(os.path.dirname(GAIN_FILE), exist_ok=True)
+      with open(GAIN_FILE, 'w') as f:
+        json.dump(gains, f)
+    except (OSError, TypeError):
+      pass
+
+  learned_gain = _load_learned_gain()
+  _save_counter = [0]  # save every ~10s (1000 frames at 100Hz)
 
   state = {'torque': 0.0, 'prev_desired': 0.0, 'correction': 0.0}
 
@@ -313,6 +336,12 @@ def on_lat_controller_init(result, lac, CP):
       idx = int(np.searchsorted(GAIN_CURV, curv_abs))
       idx = max(0, min(idx, len(learned_gain) - 1))
       learned_gain[idx] += LEARN_RATE * (observed_gain - learned_gain[idx])
+
+    # Persist learned gains periodically (~10s)
+    _save_counter[0] += 1
+    if _save_counter[0] >= 1000:
+      _save_learned_gain(learned_gain)
+      _save_counter[0] = 0
 
     pid_log.actualLateralAccel = float(curv_abs)
     pid_log.desiredLateralAccel = float(desired_curvature * CS.vEgo**2)
