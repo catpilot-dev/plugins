@@ -256,7 +256,7 @@ def on_lat_controller_init(result, lac, CP):
   DEADZONE_MIN = 0.0001
 
   # Online learning: exponential moving average of observed gain
-  LEARN_RATE = 0.01  # slow adaptation
+  LEARN_RATE = 0.02  # ~10s to converge during steady curves
   GAIN_FILE = os.path.join(_PLUGIN_DIR, 'data', 'learned_gain.json')
 
   def _load_learned_gain():
