@@ -281,16 +281,28 @@ def on_lat_controller_init(result, lac, CP):
       measured_curvature = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
       error = desired_curvature - measured_curvature
 
-      # Skip correction if error is already decreasing (previous correction working)
-      error_improving = (abs(error) < abs(state['prev_error'])) and (error * state['prev_error'] > 0)
+      prev_error = state['prev_error']
       state['prev_error'] = error
 
-      if abs(error) > DEADZONE and not error_improving:
+      same_sign = error * prev_error > 0
+      error_worsening = same_sign and abs(error) > abs(prev_error)
+      error_sign_changed = prev_error != 0 and not same_sign and abs(error) > DEADZONE
+
+      if error_worsening:
+        # Error growing — only correct the new portion
+        delta_error = error - prev_error
+        plant_gain = PLANT_GAIN_K / max(CS.vEgo, 8.0) ** 2
+        correction = delta_error / plant_gain
+        step = max(-MAX_STEP, min(MAX_STEP, correction))
+        state['step_remaining'] = step
+      elif error_sign_changed:
+        # Overshot or new curve direction — correct full error
         plant_gain = PLANT_GAIN_K / max(CS.vEgo, 8.0) ** 2
         correction = error / plant_gain
         step = max(-MAX_STEP, min(MAX_STEP, correction))
         state['step_remaining'] = step
       else:
+        # Error improving or within deadzone — hold, let existing torque work
         state['step_remaining'] = 0
 
       pid_log.actualLateralAccel = float(measured_curvature)
