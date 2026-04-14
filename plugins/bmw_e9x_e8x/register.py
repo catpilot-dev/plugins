@@ -226,31 +226,24 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Incremental P torque controller at 100Hz with delay compensation.
+  """Incremental P torque controller at 100Hz.
 
-  Each control frame (100Hz), torque steps proportionally to error:
-    correction = 0.5 * (error / MAX_CURVATURE_ERROR) * MAX_STEP
-    torque += clamp(correction, -MAX_STEP, MAX_STEP)
+  Each control frame (100Hz), torque steps proportionally to curvature
+  error between desired (from controlsd, rate-limited + look_ahead 50m)
+  and measured (from livePose at 100Hz, Kalman filtered).
 
-  livePose now publishes at 100Hz (Kalman filtered gyro), giving
-  clean measured_curvature every control frame. No raw gyro needed.
+  error = desired_curvature - measured_curvature
+  correction = 0.5 * (error / MAX_CURVATURE_ERROR) * MAX_STEP
+  torque += clamp(correction, -MAX_STEP, MAX_STEP)
 
-  Scaling from measured data:
-  - MAX_CURVATURE_ERROR = 0.00016 (per control frame, from route P99)
-  - MAX_STEP = 0.00833 (0.1Nm / 12Nm per CAN frame)
+  50% per step → 97% corrected in 5 steps (one model frame).
   """
   from cereal import log
   from cereal import messaging
-  from collections import deque
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
   _sm = messaging.SubMaster(['livePose'])
-
-  DT = 0.01  # 100Hz control loop
-  LAT_DELAY = 0.5  # fixed delay matching control/model frame timing
-  BUFFER_SECONDS = 1.5
-  BUFFER_LEN = int(BUFFER_SECONDS / DT)
 
   # Max torque change per control frame (CAN safety limit, 1 CAN frame at 100Hz)
   MAX_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1/12 = 0.00833 per control frame
@@ -266,27 +259,18 @@ def on_lat_controller_init(result, lac, CP):
   DEADZONE = 0.0001
 
   state = {'torque': 0.0}
-  desired_buffer = deque([0.0] * BUFFER_LEN, maxlen=BUFFER_LEN)
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = 6
-
-    # Buffer desired curvature for delay compensation
-    desired_buffer.append(desired_curvature)
+    pid_log.version = 7
 
     # Measured curvature from livePose at 100Hz (Kalman filtered)
-    # Right-positive convention (negative = left turn)
     _sm.update(0)
     lp = _sm['livePose']
     measured_curvature = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
 
-    # Delay-compensated desired: what we asked for LAT_DELAY ago
-    delay_frames = int(min(LAT_DELAY / DT, BUFFER_LEN - 1))
-    delayed_desired = desired_buffer[-1 - delay_frames]
-
-    # Curvature tracking error (right-positive convention)
-    error = delayed_desired - measured_curvature
+    # Curvature error: desired (rate-limited, look_ahead) vs measured (now)
+    error = desired_curvature - measured_curvature
 
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
@@ -303,7 +287,7 @@ def on_lat_controller_init(result, lac, CP):
     output = max(-1.0, min(1.0, state['torque']))
 
     pid_log.actualLateralAccel = float(measured_curvature)
-    pid_log.desiredLateralAccel = float(delayed_desired)
+    pid_log.desiredLateralAccel = float(desired_curvature)
     pid_log.error = float(error)
     pid_log.active = True
     pid_log.output = float(output)
@@ -318,7 +302,6 @@ def on_lat_controller_init(result, lac, CP):
         _lat_pub = PluginPub('bmw_lat_control')
       _lat_pub.send({
         'desired': float(desired_curvature),
-        'delayed_desired': float(delayed_desired),
         'measured': float(measured_curvature),
         'error': float(error),
         'torque': float(state['torque']),
