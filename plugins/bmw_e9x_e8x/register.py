@@ -226,12 +226,20 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Closed-loop integrator torque controller with delay compensation.
+  """Incremental P torque controller at 100Hz with delay compensation.
 
-  Pure I controller: integrates curvature error to produce torque.
-  Compares measured_curvature (livePose IMU gyro, what the car does NOW)
-  against desired_curvature from lat_delay ago (what we ASKED for then).
-  This accounts for actuator delay so the integrator doesn't wind up.
+  Each control frame (100Hz), torque steps proportionally to error:
+    correction = 0.5 * (error / MAX_CURVATURE_ERROR) * MAX_STEP
+    torque += clamp(correction, -MAX_STEP, MAX_STEP)
+
+  measured_curvature at 100Hz via livePose (20Hz baseline) + raw gyro
+  delta interpolation (bias-free via differencing).
+
+  Scaling from measured data, no tunable gains:
+  - MAX_CURVATURE_ERROR = 0.00016 (per control frame, from route P99)
+  - MAX_STEP = 0.00833 (0.1Nm / 12Nm per CAN frame)
+
+  measured_curvature from livePose IMU gyro (avz/vx, right-positive).
   """
   from cereal import log
   from cereal import messaging
@@ -239,44 +247,68 @@ def on_lat_controller_init(result, lac, CP):
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
-  _sm = messaging.SubMaster(['livePose'])
+  _sm = messaging.SubMaster(['livePose', 'gyroscope'])
 
   DT = 0.01  # 100Hz control loop
+  LAT_DELAY = 0.5  # fixed delay matching control/model frame timing
   BUFFER_SECONDS = 1.5
   BUFFER_LEN = int(BUFFER_SECONDS / DT)
 
-  # Rate limit: max torque change per frame
-  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.5 Nm per model frame
-  # Error scaling: error at which we apply full step
-  MAX_ERROR = 0.0008
+  # Max torque change per control frame (CAN safety limit, 1 CAN frame at 100Hz)
+  MAX_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1/12 = 0.00833 per control frame
+
+  # Max curvature error per control frame (route data P99 at 20Hz / 5)
+  MAX_CURVATURE_ERROR = 0.0008 / 5  # 0.00016
+
+  # P weight: fraction of error correction per control frame
+  # 5 control frames per model frame — 50% gives gentle ramp, tune from test drive
+  P_WEIGHT = 0.5
+
   # Deadzone: ignore tiny errors (noise)
   DEADZONE = 0.0001
 
   state = {'torque': 0.0}
   desired_buffer = deque([0.0] * BUFFER_LEN, maxlen=BUFFER_LEN)
 
+  # 100Hz measured curvature: livePose (20Hz) + gyro delta interpolation (100Hz)
+  gyro_state = {
+    'lp_curvature': 0.0,    # last livePose curvature
+    'lp_gyro_z': 0.0,       # raw gyro Z at last livePose update
+    'lp_vego': 1.0,         # velocity at last livePose update
+  }
+
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = 3
+    pid_log.version = 5
 
     # Buffer desired curvature for delay compensation
     desired_buffer.append(desired_curvature)
 
-    # Measured curvature from livePose (IMU gyro + velocity, time-synced)
-    # Both angularVelocityDevice.z and desired_curvature use right-positive
-    # convention (negative = left turn). Verified against route data:
-    # left turn → avz < 0, desired_curvature < 0, steeringAngle > 0
+    # Measured curvature at 100Hz:
+    # - livePose (20Hz): calibrated baseline from Kalman filter
+    # - gyroscope (100Hz): raw delta interpolation between livePose updates
+    # Both use right-positive convention (negative = left turn)
     _sm.update(0)
-    lp = _sm['livePose']
-    avz = lp.angularVelocityDevice.z
-    vego = lp.velocityDevice.x
-    measured_curvature = avz / max(vego, 1.0)
 
-    # Delay-compensated desired: what we asked for lat_delay ago
-    delay_frames = int(min(lat_delay / DT, BUFFER_LEN - 1))
+    # New model frame: update baseline and reset I-term
+    if _sm.updated['livePose']:
+      lp = _sm['livePose']
+      avz = lp.angularVelocityDevice.z
+      vego = lp.velocityDevice.x
+      gyro_state['lp_curvature'] = avz / max(vego, 1.0)
+      gyro_state['lp_vego'] = max(vego, 1.0)
+      gyro_state['lp_gyro_z'] = _sm['gyroscope'].gyroUncalibrated.v[2]
+
+    # Interpolate with raw gyro delta (removes bias since we diff)
+    raw_gyro_z = _sm['gyroscope'].gyroUncalibrated.v[2]
+    gyro_delta = raw_gyro_z - gyro_state['lp_gyro_z']
+    measured_curvature = gyro_state['lp_curvature'] + gyro_delta / gyro_state['lp_vego']
+
+    # Delay-compensated desired: what we asked for LAT_DELAY ago
+    delay_frames = int(min(LAT_DELAY / DT, BUFFER_LEN - 1))
     delayed_desired = desired_buffer[-1 - delay_frames]
 
-    # Curvature tracking error (left-positive convention)
+    # Curvature tracking error (right-positive convention)
     error = delayed_desired - measured_curvature
 
     if not active or CS.vEgo < 5.0:
@@ -285,13 +317,11 @@ def on_lat_controller_init(result, lac, CP):
       pid_log.error = 0.0
       return 0.0, 0.0, pid_log
 
-    # Integrate error into torque (rate-limited)
-    # error > 0 (need more right curvature) → torque += positive → -output = negative actuator → right turn
-    # error < 0 (need more left curvature) → torque += negative → -output = positive actuator → left turn
+    # P correction: proportional to error, rate-limited
     if abs(error) > DEADZONE:
-      scale = min(abs(error) / MAX_ERROR, 1.0)
-      step = scale * MAX_STEP
-      state['torque'] += step if error > 0 else -step
+      correction = P_WEIGHT * (error / MAX_CURVATURE_ERROR) * MAX_STEP
+      step = max(-MAX_STEP, min(MAX_STEP, correction))
+      state['torque'] += step
 
     output = max(-1.0, min(1.0, state['torque']))
 
@@ -300,7 +330,7 @@ def on_lat_controller_init(result, lac, CP):
     pid_log.error = float(error)
     pid_log.active = True
     pid_log.output = float(output)
-    pid_log.i = float(state['torque'])
+    pid_log.p = float(correction if abs(error) > DEADZONE else 0.0)
     pid_log.saturated = bool(abs(output) > 0.99)
 
     # Log to plugin bus
@@ -316,7 +346,6 @@ def on_lat_controller_init(result, lac, CP):
         'error': float(error),
         'torque': float(state['torque']),
         'output': float(output),
-        'lat_delay': float(lat_delay),
       })
     except Exception:
       pass
