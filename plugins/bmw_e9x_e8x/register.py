@@ -232,8 +232,8 @@ def on_lat_controller_init(result, lac, CP):
   convert curvature error directly to torque, then spreads across 5
   control frames (100Hz) for smooth CAN output.
 
-  correction_torque = curvature_error / plant_gain
-  plant_gain = 2.0 / vEgo² (measured from route data, R²=0.98)
+  correction_torque = curvature_error / PLANT_GAIN
+  PLANT_GAIN = 0.006 (median from route data, fixed — rate limiter dominates)
 
   - desired: from controlsd (curv_from_psis at t+0.5s, safety-limited)
   - measured: curv_from_psis at t+0.01s (same formula, same model source)
@@ -253,10 +253,11 @@ def on_lat_controller_init(result, lac, CP):
   SPREAD_FRAMES = 20
   STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES  # 0.00208 per CAN frame
 
-  # Plant gain: curvature change per unit normalized torque at +0.5s delay
-  # Measured from route data: gain ∝ 1/v² (R²=0.98), k=2.0
-  # Physical: curvature = torque × hydraulic_gain / (inertia × v²)
-  PLANT_GAIN_K = 2.0
+  # Plant gain: curvature change per unit normalized torque
+  # Median from route data across all speeds: 0.006
+  # Speed-dependent gain (2.0/v²) not needed — correction is rate-limited
+  # by STEP_PER_FRAME anyway, and delta-error prevents accumulation.
+  PLANT_GAIN = 0.006
 
   # Deadzone: ignore tiny errors (noise)
   DEADZONE = 0.0001
@@ -310,14 +311,14 @@ def on_lat_controller_init(result, lac, CP):
       error_worsening = same_sign and abs(state['delta_error']) > DEADZONE and abs(state['error']) > abs(prev_error)
       error_sign_changed = prev_error != 0 and not same_sign and abs(state['error']) > DEADZONE
 
-      state['plant_gain'] = PLANT_GAIN_K / max(CS.vEgo, 8.0) ** 2
+      state['plant_gain'] = PLANT_GAIN
 
       if error_worsening:
-        correction = state['delta_error'] / state['plant_gain']
+        correction = state['delta_error'] / PLANT_GAIN
         state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
         state['action'] = 'worsening'
       elif error_sign_changed:
-        correction = state['error'] / state['plant_gain']
+        correction = state['error'] / PLANT_GAIN
         state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
         state['action'] = 'sign_change'
       else:
