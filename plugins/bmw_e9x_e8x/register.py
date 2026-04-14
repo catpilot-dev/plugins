@@ -259,17 +259,18 @@ def on_lat_controller_init(result, lac, CP):
   # Deadzone: ignore tiny errors (noise)
   DEADZONE = 0.0001
 
-  state = {'torque': 0.0, 'step_remaining': 0}
+  state = {'torque': 0.0, 'step_remaining': 0, 'prev_error': 0.0}
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = 9
+    pid_log.version = 10
 
     _sm.update(0)
 
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
       state['step_remaining'] = 0
+      state['prev_error'] = 0.0
       pid_log.active = False
       pid_log.error = 0.0
       return 0.0, 0.0, pid_log
@@ -280,9 +281,13 @@ def on_lat_controller_init(result, lac, CP):
       measured_curvature = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
       error = desired_curvature - measured_curvature
 
-      if abs(error) > DEADZONE:
+      # Skip correction if error is already decreasing (previous correction working)
+      error_improving = (abs(error) < abs(state['prev_error'])) and (error * state['prev_error'] > 0)
+      state['prev_error'] = error
+
+      if abs(error) > DEADZONE and not error_improving:
         plant_gain = PLANT_GAIN_K / max(CS.vEgo, 8.0) ** 2
-        correction = error / plant_gain  # torque needed to produce this curvature change
+        correction = error / plant_gain
         step = max(-MAX_STEP, min(MAX_STEP, correction))
         state['step_remaining'] = step
       else:
