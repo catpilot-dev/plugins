@@ -87,13 +87,6 @@ def _register_interfaces():
 _register_interfaces()
 
 
-def on_state_subscriptions(services):
-  """Hook callback: add liveTorqueParameters and liveDelay to UI SubMaster."""
-  for svc in ('liveTorqueParameters', 'liveDelay'):
-    if svc not in services:
-      services.append(svc)
-  return services
-
 
 def on_post_actuators(default, actuators, CS, long_plan):
   """Hook callback: inject vTarget from longitudinal planner into actuators.speed."""
@@ -136,69 +129,6 @@ def _write_param(key, value):
   with open(os.path.join(data_dir, key), 'w') as f:
     f.write(value)
 
-
-_torque_cache = {"val": "Not calibrated", "t": 0.0}
-
-def _torque_value():
-  import time
-  now = time.monotonic()
-  if now - _torque_cache["t"] < 10.0:
-    return _torque_cache["val"]
-  _torque_cache["t"] = now
-  try:
-    lt = None
-    from openpilot.selfdrive.ui.ui_state import ui_state
-    sm = ui_state.sm
-    if sm.recv_frame.get('liveTorqueParameters', 0) > 0:
-      lt = sm['liveTorqueParameters']
-    else:
-      from openpilot.common.params import Params
-      from cereal import log
-      data = Params().get('LiveTorqueParameters')
-      if data:
-        with log.Event.from_bytes(data) as evt:
-          lt = evt.liveTorqueParameters
-    if lt:
-      status = "Estimated" if lt.useParams and lt.liveValid else f"Estimating {lt.calPerc}%"
-      _torque_cache["val"] = f"{status} | F={lt.latAccelFactorFiltered:.2f} f={lt.frictionCoefficientFiltered:.3f}"
-  except Exception:
-    pass
-  return _torque_cache["val"]
-
-
-_delay_cache = {"val": "Not calibrated", "t": 0.0}
-
-def _delay_value():
-  import time
-  now = time.monotonic()
-  if now - _delay_cache["t"] < 10.0:
-    return _delay_cache["val"]
-  _delay_cache["t"] = now
-  try:
-    ld = None
-    from openpilot.selfdrive.ui.ui_state import ui_state
-    sm = ui_state.sm
-    if sm.recv_frame.get('liveDelay', 0) > 0:
-      ld = sm['liveDelay']
-    else:
-      from openpilot.common.params import Params
-      from cereal import log
-      data = Params().get('LiveDelay')
-      if data:
-        with log.Event.from_bytes(data) as evt:
-          ld = evt.liveDelay
-    if ld:
-      s = str(ld.status).split('.')[-1]
-      if s == 'estimated':
-        status = "Estimated"
-      elif s == 'invalid':
-        status = "Invalid"
-      else:
-        status = f"Estimating {ld.calPerc}%"
-      _delay_cache["val"] = f"{status} | {ld.lateralDelay:.2f}s"
-  except Exception:
-    pass
-  return _delay_cache["val"]
 
 
 def on_vehicle_settings(items, CP):
