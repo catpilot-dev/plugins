@@ -262,7 +262,7 @@ def on_lat_controller_init(result, lac, CP):
   state = {
     'torque': 0.0, 'step_remaining': 0, 'prev_error': 0.0,
     # Debug: last model frame values
-    'measured': 0.0, 'error': 0.0, 'delta_error': 0.0,
+    'measured': 0.0, 'error': 0.0, 'delta_error': 0.0, 'log_prev_error': 0.0,
     'plant_gain': 0.0, 'action': 'hold',
   }
 
@@ -287,6 +287,7 @@ def on_lat_controller_init(result, lac, CP):
       state['error'] = desired_curvature - state['measured']
 
       prev_error = state['prev_error']
+      state['log_prev_error'] = prev_error
       state['prev_error'] = state['error']
 
       same_sign = state['error'] * prev_error > 0
@@ -333,7 +334,7 @@ def on_lat_controller_init(result, lac, CP):
         'desired': float(desired_curvature),
         'measured': float(state['measured']),
         'error': float(state['error']),
-        'prev_error': float(state['prev_error']),
+        'prev_error': float(state['log_prev_error']),
         'delta_error': float(state['delta_error']),
         'plant_gain': float(state['plant_gain']),
         'step': float(state['step_remaining']),
