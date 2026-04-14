@@ -362,8 +362,8 @@ class SpeedLimitMiddleware:
     self._gps_lon: float = 0.0
     self._gps_valid: bool = False
 
-    # Confirmation state — starts unconfirmed until user explicitly confirms
-    self.confirmed: bool = False
+    # Confirmation state — starts confirmed so speed limit is active immediately
+    self.confirmed: bool = True
     self.confirmed_value: float = 0.0
     self._confirm_debounce_until: float = 0.0
 
