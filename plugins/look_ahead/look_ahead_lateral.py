@@ -364,6 +364,8 @@ def _publish_speed_cap(speed_cap_kph):
 
 LOOKAHEAD_T = 1.5  # seconds — fixed look-ahead for curvature smoothing
 
+_la_pub = None
+
 def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, **kwargs):
   """Hook callback for controls.curvature_correction.
 
@@ -387,19 +389,40 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
     _publish_speed_cap(0)
 
   if not _is_enabled() or v_ego < MIN_SPEED:
+    _publish_la_status(default_curvature, default_curvature, v_ego, 'disabled')
     return default_curvature
 
   # Only look ahead on straights — in curves, stock 0.5s is more accurate.
   # At curve exit, 1.5s would see the straight too early → cut the turn.
   if abs(default_curvature) > STRAIGHT_THRESHOLD:
+    _publish_la_status(default_curvature, default_curvature, v_ego, 'curve')
     return default_curvature
 
   try:
     yaws = list(model_v2.orientation.z)
     yaw_rates = list(model_v2.orientationRate.z)
     if len(yaws) >= 20 and len(yaw_rates) >= 2:
-      return float(_curv_from_plan(yaws, yaw_rates, v_ego, LOOKAHEAD_T))
+      la_curvature = float(_curv_from_plan(yaws, yaw_rates, v_ego, LOOKAHEAD_T))
+      _publish_la_status(default_curvature, la_curvature, v_ego, 'lookahead_1.5s')
+      return la_curvature
   except (AttributeError, IndexError):
     pass
 
+  _publish_la_status(default_curvature, default_curvature, v_ego, 'fallback')
   return default_curvature
+
+
+def _publish_la_status(stock_curv, output_curv, v_ego, mode):
+  global _la_pub
+  try:
+    if _la_pub is None:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+      _la_pub = PluginPub('look_ahead_lateral')
+    _la_pub.send({
+      'stock_curvature': float(stock_curv),
+      'output_curvature': float(output_curv),
+      'mode': mode,
+      'vEgo': float(v_ego),
+    })
+  except Exception:
+    pass
