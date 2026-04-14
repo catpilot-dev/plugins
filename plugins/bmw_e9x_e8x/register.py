@@ -274,6 +274,7 @@ def on_lat_controller_init(result, lac, CP):
   gyro_state = {
     'lp_curvature': 0.0,    # last livePose curvature
     'lp_gyro_z': 0.0,       # raw gyro Z at last livePose update
+    'lp_vego': 1.0,         # livePose velocity (stale <0.1m/s in 50ms)
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -295,12 +296,13 @@ def on_lat_controller_init(result, lac, CP):
       avz = lp.angularVelocityDevice.z
       vego = lp.velocityDevice.x
       gyro_state['lp_curvature'] = avz / max(vego, 1.0)
+      gyro_state['lp_vego'] = max(vego, 1.0)
       gyro_state['lp_gyro_z'] = _sm['gyroscope'].gyroUncalibrated.v[2]
 
     # Interpolate with raw gyro delta (removes bias since we diff)
     raw_gyro_z = _sm['gyroscope'].gyroUncalibrated.v[2]
     gyro_delta = raw_gyro_z - gyro_state['lp_gyro_z']
-    measured_curvature = gyro_state['lp_curvature'] + gyro_delta / max(CS.vEgo, 1.0)
+    measured_curvature = gyro_state['lp_curvature'] + gyro_delta / max(gyro_state['lp_vego'], 1.0)
 
     # Delay-compensated desired: what we asked for LAT_DELAY ago
     delay_frames = int(min(LAT_DELAY / DT, BUFFER_LEN - 1))
