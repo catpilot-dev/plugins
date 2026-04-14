@@ -35,7 +35,7 @@ STRAIGHT_THRESHOLD = 0.002  # 1/m (~500m radius) — stock must be straight to a
 BLEND_RATE = 2.0            # blend factor change per second (0→1 in 0.5s)
 
 # Longitudinal: confidence-based speed cap
-PREVIEW_TIME = 5.0          # seconds — minimum forward visibility time at current speed
+PREVIEW_TIME = 3.0          # seconds — minimum forward visibility time at current speed
 MAX_LAT_ACCEL_CAP = 1.5     # m/s² — comfortable lateral acceleration limit for speed cap
 MIN_CAP_SPEED = 20.0        # km/h — don't cap below this (already crawling)
 MAX_CAP_SPEED = 120.0       # km/h — above this, no cap needed
