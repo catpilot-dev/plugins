@@ -235,15 +235,16 @@ def on_lat_controller_init(result, lac, CP):
   correction_torque = curvature_error / plant_gain
   plant_gain = 2.0 / vEgo² (measured from route data, R²=0.98)
 
-  desired_curvature from controlsd is already forward-looking (modeld computes
-  at t=lat_delay+DT_MDL ≈ t+0.5s) and safety-limited (clip_curvature).
+  - desired: from controlsd (curv_from_psis at t+0.5s, safety-limited)
+  - measured: curv_from_psis at t+0.01s (same formula, same model source)
+  Same formula, same domain — error is purely the curvature change needed.
   """
   from cereal import log
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
-  _sm = messaging.SubMaster(['livePose'])
+  _sm = messaging.SubMaster(['modelV2'])
 
   # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
@@ -281,10 +282,23 @@ def on_lat_controller_init(result, lac, CP):
       pid_log.error = 0.0
       return 0.0, 0.0, pid_log
 
-    # On livePose update (20Hz): compute correction, split into 5 steps
-    if _sm.updated['livePose']:
-      lp = _sm['livePose']
-      state['measured'] = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
+    # On modelV2 update (20Hz): compute measured curvature using same formula as desired
+    # desired_curvature uses curv_from_psis(psi_target, psi_rate, v, action_t) at t+0.5s
+    # measured uses the same formula at T_IDXS[1] ≈ t+0.01s (current state)
+    if _sm.updated['modelV2']:
+      m = _sm['modelV2']
+      try:
+        yaws = list(m.orientation.z)
+        yaw_rates = list(m.orientationRate.z)
+        if len(yaws) > 1 and len(yaw_rates) > 0:
+          v = max(CS.vEgo, 5.0)
+          # T_IDXS[1] = 0.01s
+          psi_target = yaws[1]
+          psi_rate = yaw_rates[0]
+          action_t = 0.01
+          state['measured'] = 2.0 * psi_target / (v * action_t) - psi_rate / v
+      except (AttributeError, IndexError):
+        pass
       state['error'] = desired_curvature - state['measured']
 
       prev_error = state['prev_error']
