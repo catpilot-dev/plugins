@@ -134,8 +134,28 @@ Only same-sign pairs (positive torque → positive curvature change) are valid.
 | Straight osc Hz | 1.9 | 8-16 |
 | Overall err_std | 0.066 | 0.00167 |
 
+**Lane change performance (single, non-consecutive, laneChangeStarting→off):**
+
+| LC | Direction | Speed | Duration | Error MAE |
+|----|-----------|-------|----------|-----------|
+| 1 | left | 70 km/h | 7.2s | 0.00109 |
+| 2 | right | 87 km/h | 6.8s | 0.00093 |
+| 5 | left | 41 km/h | 6.0s | 0.00157 |
+| 6 | left | 69 km/h | 15.3s | 0.00091 |
+| 7 | left | 76 km/h | 3.8s | 0.00073 |
+| 10 | right | 70 km/h | 6.4s | 0.00073 |
+| 11 | right | 47 km/h | 6.0s | 0.00199 |
+| 12 | left | 60 km/h | 6.0s | 0.00084 |
+| 15 | right | 88 km/h | 6.0s | 0.00125 |
+| 16 | left | 48 km/h | 4.9s | 0.00089 |
+
+- Mean MAE: **0.00099**, Best: **0.00073** (76 km/h), Worst: 0.00199 (47 km/h)
+- Mean duration: 6.7s — 0.2s spreading is only 3% of total maneuver
+- Near perfect path following, no abrupt jerk
+- Higher speed → tighter tracking (less Servotronic nonlinearity)
+
 **TODO:**
+- [ ] Test drive with 0.2s spreading — compare lane change and straight-lane performance
 - [ ] Tune straight-lane damping — consider torque decay when error is within deadzone
 - [ ] Evaluate with look_ahead plugin re-enabled (noise reduction on straights)
 - [ ] Test PLANT_GAIN sensitivity: try 0.004 (median) vs 0.006 (mean)
-- [ ] Measure plant gain online for adaptive tuning
