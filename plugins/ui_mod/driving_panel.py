@@ -187,9 +187,16 @@ class DrivingLayout(Widget):
       enabled=False,
     ))
 
-    # --- Live Torque & Lateral Delay status ---
-    items.append(text_item("Live Torque", self._torque_value))
-    items.append(text_item("Lateral Delay", self._delay_value))
+    # --- Live Torque & Lateral Delay status (only for torqued-supported brands) ---
+    CP = ui_state.CP
+    if CP is not None and CP.lateralTuning.which() == 'torque':
+      try:
+        from openpilot.selfdrive.locationd.torqued import ALLOWED_CARS
+        if getattr(CP, 'brand', '') in ALLOWED_CARS:
+          items.append(text_item("Live Torque", self._torque_value))
+          items.append(text_item("Lateral Delay", self._delay_value))
+      except ImportError:
+        pass
 
     # --- Vehicle-specific settings (populated by car plugins) ---
     CP = ui_state.CP
