@@ -248,8 +248,9 @@ def on_lat_controller_init(result, lac, CP):
   # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
 
-  # Per control frame: 1/5 of model frame step
-  STEP_PER_FRAME = MAX_STEP / 5  # 0.00833 per CAN frame
+  # Spread correction across 20 CAN frames (0.2s / 4 model frames) for smooth response
+  SPREAD_FRAMES = 20
+  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES  # 0.00208 per CAN frame
 
   # Plant gain: curvature change per unit normalized torque at +0.5s delay
   # Measured from route data: gain ∝ 1/v² (R²=0.98), k=2.0
