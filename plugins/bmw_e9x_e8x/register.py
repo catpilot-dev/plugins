@@ -226,14 +226,13 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Incremental P torque controller at 20Hz model frame rate.
+  """Incremental P torque controller.
 
-  Steps torque once per model frame (50ms) when livePose updates.
+  Computes correction once per model frame (20Hz) from curvature error,
+  then spreads it across 5 control frames (100Hz) for smooth CAN output.
+
   desired_curvature from controlsd is already forward-looking (look_ahead
-  plugin, 50m) and safety-limited (clip_curvature). The controller simply
-  corrects the error between desired and measured curvature.
-
-  One step per 50ms prevents torque accumulation during actuator delay.
+  plugin, t+0.5s) and safety-limited (clip_curvature).
   """
   from cereal import log
   from cereal import messaging
@@ -245,48 +244,55 @@ def on_lat_controller_init(result, lac, CP):
   # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
 
+  # Per control frame: 1/5 of model frame step
+  STEP_PER_FRAME = MAX_STEP / 5  # 0.00833 per CAN frame
+
   # Max curvature error per model frame (route data P99 at 20Hz)
   MAX_CURVATURE_ERROR = 0.0008
 
-  # P weight: fraction of error correction per model frame
-  P_WEIGHT = 0.5
+  # P weight: full correction at P99 error (0.0008), proportional below
+  P_WEIGHT = 1.0
 
   # Deadzone: ignore tiny errors (noise)
   DEADZONE = 0.0001
 
-  state = {'torque': 0.0}
+  state = {'torque': 0.0, 'step_remaining': 0}
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = 8
+    pid_log.version = 9
 
     _sm.update(0)
 
-    # Only step once per model frame (when livePose updates at 20Hz)
-    if not _sm.updated['livePose']:
-      output = max(-1.0, min(1.0, state['torque']))
-      pid_log.active = active and CS.vEgo >= 5.0
-      pid_log.output = float(output)
-      return -output, 0.0, pid_log
-
-    # Measured curvature from livePose (Kalman filtered)
-    lp = _sm['livePose']
-    measured_curvature = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
-
-    # Curvature error: desired (look_ahead + safety limited) vs measured (now)
-    error = desired_curvature - measured_curvature
-
     if not active or CS.vEgo < 5.0:
       state['torque'] = 0.0
+      state['step_remaining'] = 0
       pid_log.active = False
       pid_log.error = 0.0
       return 0.0, 0.0, pid_log
 
-    # P correction: proportional to error, rate-limited
-    if abs(error) > DEADZONE:
-      correction = P_WEIGHT * (error / MAX_CURVATURE_ERROR) * MAX_STEP
-      step = max(-MAX_STEP, min(MAX_STEP, correction))
-      state['torque'] += step
+    # On livePose update (20Hz): compute correction, split into 5 steps
+    if _sm.updated['livePose']:
+      lp = _sm['livePose']
+      measured_curvature = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
+      error = desired_curvature - measured_curvature
+
+      if abs(error) > DEADZONE:
+        correction = P_WEIGHT * (error / MAX_CURVATURE_ERROR) * MAX_STEP
+        step = max(-MAX_STEP, min(MAX_STEP, correction))
+        state['step_remaining'] = step
+      else:
+        state['step_remaining'] = 0
+
+      pid_log.actualLateralAccel = float(measured_curvature)
+      pid_log.desiredLateralAccel = float(desired_curvature)
+      pid_log.error = float(error)
+
+    # Every control frame (100Hz): apply 1/5 of the correction
+    if state['step_remaining'] != 0:
+      small_step = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, state['step_remaining']))
+      state['torque'] += small_step
+      state['step_remaining'] -= small_step
 
     output = max(-1.0, min(1.0, state['torque']))
 
