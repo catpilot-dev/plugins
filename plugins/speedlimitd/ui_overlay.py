@@ -48,6 +48,7 @@ def _ensure_init():
     ui_state = _ui_state
     _font_bold = font_bold
     _font_medium = get_font(FontWeight.MEDIUM)
+    _ensure_tap_pub()  # create PUB socket early so ZMQ handshake completes before first tap
 
 
 _sl_sub = None
@@ -146,9 +147,21 @@ def _draw_speed_limit_sign(content_rect):
 _tap_pub = None
 
 
+def _ensure_tap_pub():
+  """Eagerly create the tap command publisher so ZMQ subscription handshake
+  completes before the user ever taps (avoids slow-joiner message loss)."""
+  global _tap_pub
+  if _tap_pub is None:
+    try:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+      _tap_pub = PluginPub('speedlimit_cmd_ui')
+    except Exception:
+      pass
+
+
 def _handle_tap(content_rect):
   """Check for tap on speed limit sign — toggle confirmed state via plugin bus."""
-  global _speed_limit_confirmed, _tap_hold_until, _tap_pub
+  global _speed_limit_confirmed, _tap_hold_until
   cx, cy, r = _sign_geometry(content_rect)
   for ev in gui_app.mouse_events:
     if not ev.left_released:
@@ -159,13 +172,11 @@ def _handle_tap(content_rect):
       import time
       _speed_limit_confirmed = not _speed_limit_confirmed
       _tap_hold_until = time.monotonic() + 2.0  # hold local state until speedlimitd catches up
-      try:
-        if _tap_pub is None:
-          from openpilot.selfdrive.plugins.plugin_bus import PluginPub
-          _tap_pub = PluginPub('speedlimit_cmd_ui')
-        _tap_pub.send({'action': 'toggle_confirm'})
-      except Exception:
-        pass
+      if _tap_pub is not None:
+        try:
+          _tap_pub.send({'action': 'toggle_confirm'})
+        except Exception:
+          pass
       break
 
 
