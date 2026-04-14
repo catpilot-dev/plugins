@@ -232,14 +232,12 @@ def on_lat_controller_init(result, lac, CP):
     correction = 0.5 * (error / MAX_CURVATURE_ERROR) * MAX_STEP
     torque += clamp(correction, -MAX_STEP, MAX_STEP)
 
-  measured_curvature at 100Hz via livePose (20Hz baseline) + raw gyro
-  delta interpolation (bias-free via differencing).
+  livePose now publishes at 100Hz (Kalman filtered gyro), giving
+  clean measured_curvature every control frame. No raw gyro needed.
 
-  Scaling from measured data, no tunable gains:
+  Scaling from measured data:
   - MAX_CURVATURE_ERROR = 0.00016 (per control frame, from route P99)
   - MAX_STEP = 0.00833 (0.1Nm / 12Nm per CAN frame)
-
-  measured_curvature from livePose IMU gyro (avz/vx, right-positive).
   """
   from cereal import log
   from cereal import messaging
@@ -247,7 +245,7 @@ def on_lat_controller_init(result, lac, CP):
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
-  _sm = messaging.SubMaster(['livePose', 'gyroscope'])
+  _sm = messaging.SubMaster(['livePose'])
 
   DT = 0.01  # 100Hz control loop
   LAT_DELAY = 0.5  # fixed delay matching control/model frame timing
@@ -270,39 +268,18 @@ def on_lat_controller_init(result, lac, CP):
   state = {'torque': 0.0}
   desired_buffer = deque([0.0] * BUFFER_LEN, maxlen=BUFFER_LEN)
 
-  # 100Hz measured curvature: livePose (20Hz) + gyro delta interpolation (100Hz)
-  gyro_state = {
-    'lp_curvature': 0.0,    # last livePose curvature
-    'lp_gyro_z': 0.0,       # raw gyro Z at last livePose update
-    'lp_vego': 1.0,         # livePose velocity (stale <0.1m/s in 50ms)
-  }
-
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = 5
+    pid_log.version = 6
 
     # Buffer desired curvature for delay compensation
     desired_buffer.append(desired_curvature)
 
-    # Measured curvature at 100Hz:
-    # - livePose (20Hz): calibrated baseline from Kalman filter
-    # - gyroscope (100Hz): raw delta interpolation between livePose updates
-    # Both use right-positive convention (negative = left turn)
+    # Measured curvature from livePose at 100Hz (Kalman filtered)
+    # Right-positive convention (negative = left turn)
     _sm.update(0)
-
-    # New model frame: update baseline and reset I-term
-    if _sm.updated['livePose']:
-      lp = _sm['livePose']
-      avz = lp.angularVelocityDevice.z
-      vego = lp.velocityDevice.x
-      gyro_state['lp_curvature'] = avz / max(vego, 1.0)
-      gyro_state['lp_vego'] = max(vego, 1.0)
-      gyro_state['lp_gyro_z'] = _sm['gyroscope'].gyroUncalibrated.v[2]
-
-    # Interpolate with raw gyro delta (removes bias since we diff)
-    raw_gyro_z = _sm['gyroscope'].gyroUncalibrated.v[2]
-    gyro_delta = raw_gyro_z - gyro_state['lp_gyro_z']
-    measured_curvature = gyro_state['lp_curvature'] + gyro_delta / max(gyro_state['lp_vego'], 1.0)
+    lp = _sm['livePose']
+    measured_curvature = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
 
     # Delay-compensated desired: what we asked for LAT_DELAY ago
     delay_frames = int(min(LAT_DELAY / DT, BUFFER_LEN - 1))
