@@ -389,6 +389,11 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   if not _is_enabled() or v_ego < MIN_SPEED:
     return default_curvature
 
+  # Only look ahead on straights — in curves, stock 0.5s is more accurate.
+  # At curve exit, 1.5s would see the straight too early → cut the turn.
+  if abs(default_curvature) > STRAIGHT_THRESHOLD:
+    return default_curvature
+
   try:
     yaws = list(model_v2.orientation.z)
     yaw_rates = list(model_v2.orientationRate.z)
