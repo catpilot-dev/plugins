@@ -232,8 +232,8 @@ def on_lat_controller_init(result, lac, CP):
   convert curvature error directly to torque, then spreads across 5
   control frames (100Hz) for smooth CAN output.
 
-  correction_torque = curvature_error / PLANT_GAIN
-  PLANT_GAIN = 0.002 (measured from route data: delta_curv[t+0.5s] / delta_torque[t])
+  correction_torque = curvature_error / plant_gain
+  plant_gain = 2.0 / vEgo² (measured from route data, R²=0.98)
 
   desired_curvature from controlsd is already forward-looking (modeld computes
   at t=lat_delay+DT_MDL ≈ t+0.5s) and safety-limited (clip_curvature).
@@ -252,8 +252,9 @@ def on_lat_controller_init(result, lac, CP):
   STEP_PER_FRAME = MAX_STEP / 5  # 0.00833 per CAN frame
 
   # Plant gain: curvature change per unit normalized torque at +0.5s delay
-  # Measured from route data: median of delta_curvature[t+0.5s] / delta_torque[t]
-  PLANT_GAIN = 0.002
+  # Measured from route data: gain ∝ 1/v² (R²=0.98), k=2.0
+  # Physical: curvature = torque × hydraulic_gain / (inertia × v²)
+  PLANT_GAIN_K = 2.0
 
   # Deadzone: ignore tiny errors (noise)
   DEADZONE = 0.0001
@@ -280,7 +281,8 @@ def on_lat_controller_init(result, lac, CP):
       error = desired_curvature - measured_curvature
 
       if abs(error) > DEADZONE:
-        correction = error / PLANT_GAIN  # torque needed to produce this curvature change
+        plant_gain = PLANT_GAIN_K / max(CS.vEgo, 8.0) ** 2
+        correction = error / plant_gain  # torque needed to produce this curvature change
         step = max(-MAX_STEP, min(MAX_STEP, correction))
         state['step_remaining'] = step
       else:
