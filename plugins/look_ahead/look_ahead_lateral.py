@@ -362,14 +362,12 @@ def _publish_speed_cap(speed_cap_kph):
     pass
 
 
-ACTUATOR_DELAY_T = 0.5  # seconds — BMW hydraulic steering delay
-
 def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, **kwargs):
   """Hook callback for controls.curvature_correction.
 
-  Returns curvature at t+0.5s from model trajectory to compensate
-  actuator delay. Applied always — straights, curves, lane changes.
-  controlsd's clip_curvature applies safety limits afterward.
+  Replaces the stock short-lookahead curvature with a longer-lookahead
+  version. Falls back to stock curvature in curves (where lane centering
+  needs the accurate short-lookahead) and during lane changes.
 
   Also estimates steering angle offset on straight roads.
   """
@@ -377,21 +375,42 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
   _update_offset_estimate(default_curvature, v_ego)
 
   # Longitudinal: publish confidence-based speed cap to speedlimitd
+  # Disable during lane changes — low confidence is from the swerve, not a blind road
   if not lane_changing:
     speed_cap = _compute_speed_cap(model_v2, v_ego)
     _publish_speed_cap(speed_cap)
   else:
     _publish_speed_cap(0)
 
-  if v_ego < MIN_SPEED:
+  if not _is_enabled():
     return default_curvature
 
-  try:
-    yaws = list(model_v2.orientation.z)
-    yaw_rates = list(model_v2.orientationRate.z)
-    if len(yaws) >= 20 and len(yaw_rates) >= 2:
-      return float(_curv_from_plan(yaws, yaw_rates, v_ego, ACTUATOR_DELAY_T))
-  except (AttributeError, IndexError):
-    pass
+  curvature, _ = compute_lookahead_curvature(model_v2, v_ego)
+  if curvature is None:
+    return default_curvature
 
-  return default_curvature
+  # Smooth blend between stock and look ahead.
+  # Target: look ahead when road straightens, stock when road curves more.
+  # Blend factor ramps at BLEND_RATE per second for smooth transitions.
+  global _blend_factor, _blend_last_time
+  import time
+  now = time.monotonic()
+  dt = min(now - _blend_last_time, 0.1) if _blend_last_time > 0 else 0.01
+  _blend_last_time = now
+
+  # During lane changes, disable look_ahead blend — let the model's own curvature
+  # drive the lane change. Look_ahead was over-dampening (28-51%) the swerve,
+  # causing lag, hesitation, and aborted lane changes. KF alone handles noise.
+  if lane_changing:
+    on_straight = False
+    target = 0.0
+  else:
+    on_straight = abs(default_curvature) < STRAIGHT_THRESHOLD
+    target = 1.0 if on_straight and abs(curvature) < abs(default_curvature) else 0.0
+  max_step = BLEND_RATE * dt
+  if target > _blend_factor:
+    _blend_factor = min(_blend_factor + max_step, target)
+  else:
+    _blend_factor = max(_blend_factor - max_step, target)
+
+  return default_curvature + _blend_factor * (curvature - default_curvature)

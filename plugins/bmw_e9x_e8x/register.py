@@ -235,8 +235,8 @@ def on_lat_controller_init(result, lac, CP):
   correction_torque = curvature_error / PLANT_GAIN
   PLANT_GAIN = 0.002 (measured from route data: delta_curv[t+0.5s] / delta_torque[t])
 
-  desired_curvature from controlsd is already forward-looking (look_ahead
-  plugin, t+0.5s) and safety-limited (clip_curvature).
+  desired_curvature from controlsd is already forward-looking (modeld computes
+  at t=lat_delay+DT_MDL ≈ t+0.5s) and safety-limited (clip_curvature).
   """
   from cereal import log
   from cereal import messaging
