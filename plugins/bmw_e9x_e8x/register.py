@@ -226,17 +226,14 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Incremental P torque controller at 100Hz.
+  """Incremental P torque controller at 20Hz model frame rate.
 
-  Each control frame (100Hz), torque steps proportionally to curvature
-  error between desired (from controlsd, rate-limited + look_ahead 50m)
-  and measured (from livePose at 100Hz, Kalman filtered).
+  Steps torque once per model frame (50ms) when livePose updates.
+  desired_curvature from controlsd is already forward-looking (look_ahead
+  plugin, 50m) and safety-limited (clip_curvature). The controller simply
+  corrects the error between desired and measured curvature.
 
-  error = desired_curvature - measured_curvature
-  correction = 0.5 * (error / MAX_CURVATURE_ERROR) * MAX_STEP
-  torque += clamp(correction, -MAX_STEP, MAX_STEP)
-
-  50% per step → 97% corrected in 5 steps (one model frame).
+  One step per 50ms prevents torque accumulation during actuator delay.
   """
   from cereal import log
   from cereal import messaging
@@ -245,14 +242,13 @@ def on_lat_controller_init(result, lac, CP):
   _lat_pub = None
   _sm = messaging.SubMaster(['livePose'])
 
-  # Max torque change per control frame (CAN safety limit, 1 CAN frame at 100Hz)
-  MAX_STEP = CCP.STEER_DELTA_UP / CCP.STEER_MAX  # 0.1/12 = 0.00833 per control frame
+  # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
+  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
 
-  # Max curvature error per control frame (route data P99 at 20Hz / 5)
-  MAX_CURVATURE_ERROR = 0.0008 / 5  # 0.00016
+  # Max curvature error per model frame (route data P99 at 20Hz)
+  MAX_CURVATURE_ERROR = 0.0008
 
-  # P weight: fraction of error correction per control frame
-  # 5 control frames per model frame — 50% gives gentle ramp, tune from test drive
+  # P weight: fraction of error correction per model frame
   P_WEIGHT = 0.5
 
   # Deadzone: ignore tiny errors (noise)
@@ -262,14 +258,22 @@ def on_lat_controller_init(result, lac, CP):
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = 7
+    pid_log.version = 8
 
-    # Measured curvature from livePose at 100Hz (Kalman filtered)
     _sm.update(0)
+
+    # Only step once per model frame (when livePose updates at 20Hz)
+    if not _sm.updated['livePose']:
+      output = max(-1.0, min(1.0, state['torque']))
+      pid_log.active = active and CS.vEgo >= 5.0
+      pid_log.output = float(output)
+      return -output, 0.0, pid_log
+
+    # Measured curvature from livePose (Kalman filtered)
     lp = _sm['livePose']
     measured_curvature = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
 
-    # Curvature error: desired (rate-limited, look_ahead) vs measured (now)
+    # Curvature error: desired (look_ahead + safety limited) vs measured (now)
     error = desired_curvature - measured_curvature
 
     if not active or CS.vEgo < 5.0:
