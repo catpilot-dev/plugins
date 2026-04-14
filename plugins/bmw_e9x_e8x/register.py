@@ -259,7 +259,12 @@ def on_lat_controller_init(result, lac, CP):
   # Deadzone: ignore tiny errors (noise)
   DEADZONE = 0.0001
 
-  state = {'torque': 0.0, 'step_remaining': 0, 'prev_error': 0.0}
+  state = {
+    'torque': 0.0, 'step_remaining': 0, 'prev_error': 0.0,
+    # Debug: last model frame values
+    'measured': 0.0, 'error': 0.0, 'delta_error': 0.0,
+    'plant_gain': 0.0, 'action': 'hold',
+  }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
@@ -278,36 +283,30 @@ def on_lat_controller_init(result, lac, CP):
     # On livePose update (20Hz): compute correction, split into 5 steps
     if _sm.updated['livePose']:
       lp = _sm['livePose']
-      measured_curvature = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
-      error = desired_curvature - measured_curvature
+      state['measured'] = lp.angularVelocityDevice.z / max(lp.velocityDevice.x, 1.0)
+      state['error'] = desired_curvature - state['measured']
 
       prev_error = state['prev_error']
-      state['prev_error'] = error
+      state['prev_error'] = state['error']
 
-      same_sign = error * prev_error > 0
-      error_worsening = same_sign and abs(error) > abs(prev_error)
-      error_sign_changed = prev_error != 0 and not same_sign and abs(error) > DEADZONE
+      same_sign = state['error'] * prev_error > 0
+      state['delta_error'] = state['error'] - prev_error
+      error_worsening = same_sign and abs(state['delta_error']) > DEADZONE and abs(state['error']) > abs(prev_error)
+      error_sign_changed = prev_error != 0 and not same_sign and abs(state['error']) > DEADZONE
+
+      state['plant_gain'] = PLANT_GAIN_K / max(CS.vEgo, 8.0) ** 2
 
       if error_worsening:
-        # Error growing — only correct the new portion
-        delta_error = error - prev_error
-        plant_gain = PLANT_GAIN_K / max(CS.vEgo, 8.0) ** 2
-        correction = delta_error / plant_gain
-        step = max(-MAX_STEP, min(MAX_STEP, correction))
-        state['step_remaining'] = step
+        correction = state['delta_error'] / state['plant_gain']
+        state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
+        state['action'] = 'worsening'
       elif error_sign_changed:
-        # Overshot or new curve direction — correct full error
-        plant_gain = PLANT_GAIN_K / max(CS.vEgo, 8.0) ** 2
-        correction = error / plant_gain
-        step = max(-MAX_STEP, min(MAX_STEP, correction))
-        state['step_remaining'] = step
+        correction = state['error'] / state['plant_gain']
+        state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
+        state['action'] = 'sign_change'
       else:
-        # Error improving or within deadzone — hold, let existing torque work
         state['step_remaining'] = 0
-
-      pid_log.actualLateralAccel = float(measured_curvature)
-      pid_log.desiredLateralAccel = float(desired_curvature)
-      pid_log.error = float(error)
+        state['action'] = 'hold'
 
     # Every control frame (100Hz): apply 1/5 of the correction
     if state['step_remaining'] != 0:
@@ -317,15 +316,14 @@ def on_lat_controller_init(result, lac, CP):
 
     output = max(-1.0, min(1.0, state['torque']))
 
-    pid_log.actualLateralAccel = float(measured_curvature)
+    pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(desired_curvature)
-    pid_log.error = float(error)
+    pid_log.error = float(state['error'])
     pid_log.active = True
     pid_log.output = float(output)
-    pid_log.p = float(correction if abs(error) > DEADZONE else 0.0)
     pid_log.saturated = bool(abs(output) > 0.99)
 
-    # Log to plugin bus
+    # Log to plugin bus (all debug fields for offline analysis)
     nonlocal _lat_pub
     try:
       if _lat_pub is None:
@@ -333,10 +331,16 @@ def on_lat_controller_init(result, lac, CP):
         _lat_pub = PluginPub('bmw_lat_control')
       _lat_pub.send({
         'desired': float(desired_curvature),
-        'measured': float(measured_curvature),
-        'error': float(error),
+        'measured': float(state['measured']),
+        'error': float(state['error']),
+        'prev_error': float(state['prev_error']),
+        'delta_error': float(state['delta_error']),
+        'plant_gain': float(state['plant_gain']),
+        'step': float(state['step_remaining']),
         'torque': float(state['torque']),
         'output': float(output),
+        'vEgo': float(CS.vEgo),
+        'action': state['action'],
       })
     except Exception:
       pass
