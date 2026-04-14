@@ -228,8 +228,12 @@ def on_vehicle_settings(items, CP):
 def on_lat_controller_init(result, lac, CP):
   """Incremental P torque controller.
 
-  Computes correction once per model frame (20Hz) from curvature error,
-  then spreads it across 5 control frames (100Hz) for smooth CAN output.
+  Computes correction once per model frame (20Hz) using plant gain to
+  convert curvature error directly to torque, then spreads across 5
+  control frames (100Hz) for smooth CAN output.
+
+  correction_torque = curvature_error / PLANT_GAIN
+  PLANT_GAIN = 0.002 (measured from route data: delta_curv[t+0.5s] / delta_torque[t])
 
   desired_curvature from controlsd is already forward-looking (look_ahead
   plugin, t+0.5s) and safety-limited (clip_curvature).
@@ -247,11 +251,9 @@ def on_lat_controller_init(result, lac, CP):
   # Per control frame: 1/5 of model frame step
   STEP_PER_FRAME = MAX_STEP / 5  # 0.00833 per CAN frame
 
-  # Max curvature error per model frame (route data P99 at 20Hz)
-  MAX_CURVATURE_ERROR = 0.0008
-
-  # P weight: full correction at P99 error (0.0008), proportional below
-  P_WEIGHT = 1.0
+  # Plant gain: curvature change per unit normalized torque at +0.5s delay
+  # Measured from route data: median of delta_curvature[t+0.5s] / delta_torque[t]
+  PLANT_GAIN = 0.002
 
   # Deadzone: ignore tiny errors (noise)
   DEADZONE = 0.0001
@@ -278,7 +280,7 @@ def on_lat_controller_init(result, lac, CP):
       error = desired_curvature - measured_curvature
 
       if abs(error) > DEADZONE:
-        correction = P_WEIGHT * (error / MAX_CURVATURE_ERROR) * MAX_STEP
+        correction = error / PLANT_GAIN  # torque needed to produce this curvature change
         step = max(-MAX_STEP, min(MAX_STEP, correction))
         state['step_remaining'] = step
       else:
