@@ -392,6 +392,12 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
     _publish_la_status(default_curvature, default_curvature, v_ego, 'disabled')
     return default_curvature
 
+  # During lane changes, 1.5s sees past the swerve → dampens the maneuver.
+  # Use stock 0.5s for accurate lane change tracking.
+  if lane_changing:
+    _publish_la_status(default_curvature, default_curvature, v_ego, 'lane_change')
+    return default_curvature
+
   # Only look ahead on straights — in curves, stock 0.5s is more accurate.
   # At curve exit, 1.5s would see the straight too early → cut the turn.
   if abs(default_curvature) > STRAIGHT_THRESHOLD:
