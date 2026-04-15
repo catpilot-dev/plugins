@@ -362,19 +362,18 @@ def _publish_speed_cap(speed_cap_kph):
     pass
 
 
-LOOKAHEAD_T = 1.5  # seconds — fixed look-ahead for curvature smoothing
-
 _la_pub = None
 
 def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, **kwargs):
   """Hook callback for controls.curvature_correction.
 
-  Fixed 1.5s look-ahead: replaces stock curvature (at ~0.5s) with
-  curvature from model trajectory at t=1.5s. Smooths model noise —
-  at 120 km/h, 1.5s = 50m ahead, 3x further than stock.
+  Dynamic confidence-based look-ahead: replaces stock curvature (at ~0.5s)
+  with curvature from model trajectory at a distance where the model is
+  confident (yStd confidence > 60%). Lookahead time varies 1.0-3.0s
+  depending on model confidence and speed. Capped to lead vehicle distance.
 
-  Applied always (straights, curves, lane changes). controlsd's
-  clip_curvature handles safety limiting afterward.
+  On straights this smooths model noise — at 80 km/h with 50m confidence,
+  lookahead_t = 2.25s (vs stock 0.5s).
 
   Also estimates steering angle offset and publishes speed cap.
   """
@@ -392,27 +391,22 @@ def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, *
     _publish_la_status(default_curvature, default_curvature, v_ego, 'disabled')
     return default_curvature
 
-  # During lane changes, 1.5s sees past the swerve → dampens the maneuver.
+  # During lane changes, far look-ahead sees past the swerve → dampens the maneuver.
   # Use stock 0.5s for accurate lane change tracking.
   if lane_changing:
     _publish_la_status(default_curvature, default_curvature, v_ego, 'lane_change')
     return default_curvature
 
   # Only look ahead on straights — in curves, stock 0.5s is more accurate.
-  # At curve exit, 1.5s would see the straight too early → cut the turn.
+  # At curve exit, far look-ahead would see the straight too early → cut the turn.
   if abs(default_curvature) > STRAIGHT_THRESHOLD:
     _publish_la_status(default_curvature, default_curvature, v_ego, 'curve')
     return default_curvature
 
-  try:
-    yaws = list(model_v2.orientation.z)
-    yaw_rates = list(model_v2.orientationRate.z)
-    if len(yaws) >= 20 and len(yaw_rates) >= 2:
-      la_curvature = float(_curv_from_plan(yaws, yaw_rates, v_ego, LOOKAHEAD_T))
-      _publish_la_status(default_curvature, la_curvature, v_ego, 'lookahead_1.5s')
-      return la_curvature
-  except (AttributeError, IndexError):
-    pass
+  la_curvature, lookahead_t = compute_lookahead_curvature(model_v2, v_ego)
+  if la_curvature is not None:
+    _publish_la_status(default_curvature, la_curvature, v_ego, 'lookahead_%.1fs' % lookahead_t)
+    return la_curvature
 
   _publish_la_status(default_curvature, default_curvature, v_ego, 'fallback')
   return default_curvature
