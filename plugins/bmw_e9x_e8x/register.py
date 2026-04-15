@@ -189,8 +189,9 @@ def on_lat_controller_init(result, lac, CP):
   # by STEP_PER_FRAME anyway, and delta-error prevents accumulation.
   PLANT_GAIN = 0.006
 
-  # Deadzone: ignore tiny errors (noise)
-  DEADZONE = 0.0001
+  # Deadzone: half of P99 frame-to-frame curvature change (0.0008)
+  # Errors below this are model/sensor noise, not real drift
+  DEADZONE = 0.0004
 
   state = {
     'torque': 0.0, 'step_remaining': 0, 'prev_error': 0.0,
