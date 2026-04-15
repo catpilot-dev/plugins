@@ -179,9 +179,11 @@ def on_lat_controller_init(result, lac, CP):
   # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
 
-  # Spread correction across 20 CAN frames (0.2s / 4 model frames) for smooth response
-  SPREAD_FRAMES = 20
-  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES  # 0.00208 per CAN frame
+  # Spread correction across 10 CAN frames (0.1s / 2 model frames)
+  # 2.4s to saturate (12Nm) — responsive enough for tight turns
+  # Straight-lane buzz handled by DEADZONE, not spreading
+  SPREAD_FRAMES = 10
+  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES  # 0.00417 per CAN frame
 
   # Plant gain: curvature change per unit normalized torque
   # Median from route data across all speeds: 0.006
