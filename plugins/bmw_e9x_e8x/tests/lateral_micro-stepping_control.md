@@ -18,7 +18,7 @@ Incremental P torque controller that corrects curvature error through micro-step
 | PLANT_GAIN | 0.006 | Route data median (delta_curv / delta_torque at +0.5s) |
 | MAX_STEP | 0.04167 | CAN rate limit: 0.1 Nm/10ms × 5 frames / 12 Nm max |
 | STEP_PER_FRAME | 0.00208 | MAX_STEP / 20 (spread across 0.2s) |
-| DEADZONE | 0.0001 | Noise filter on curvature error |
+| HYST_GAP | 0.0004 | Hysteresis on curvature error — suppresses zero crossings without muting actions |
 
 ### Curvature Sources
 
@@ -28,10 +28,11 @@ Incremental P torque controller that corrects curvature error through micro-step
 ### Error Correction Logic
 
 ```
-error = desired_curvature - measured_curvature
+raw_error = desired_curvature - measured_curvature
+error = apply_hysteresis(raw_error, error_steady, HYST_GAP)
 delta_error = error - prev_error
 
-if error worsening (same sign, |delta_error| > DEADZONE, |error| > |prev|):
+if error worsening (same sign, |delta_error| > 0, |error| > |prev|):
     correction = delta_error / PLANT_GAIN    # incremental only
 elif error sign changed (overshot or new curve):
     correction = error / PLANT_GAIN          # full reset
@@ -155,10 +156,11 @@ Only same-sign pairs (positive torque → positive curvature change) are valid.
 - Higher speed → tighter tracking (less Servotronic nonlinearity)
 
 **TODO:**
-- [x] ~~Test drive with 0.2s spreading~~ → replaced by 0.1s spreading (SPREAD_FRAMES=10), tested in 0000025f
-- [x] ~~Tune straight-lane damping~~ → DEADZONE 0.0001→0.0004 (half of P99 frame-to-frame noise), oscillation dropped from 8-16Hz to 1.9-2.6Hz
-- [ ] Evaluate with look_ahead plugin re-enabled (noise reduction on straights)
+- [x] ~~Test drive with 0.2s spreading~~ → 0.1s tested in 0000025f, reverted to 0.2s (lane change smoothness)
+- [x] ~~Tune straight-lane damping~~ → deadzone replaced by hysteresis 0.0004 (89% fewer zero crossings, no phase lag; 4-frame window tried but adds phase lag)
+- [x] ~~Evaluate with look_ahead plugin re-enabled~~ → fixed 1.0s lookahead (39% fewer actions vs stock 0.5s, 3% more MAE). Dynamic confidence-based (1.0-3.0s) tested but model prediction error dominates beyond 1.0s. 1.5s adds prediction error without reducing zero crossings.
 - [ ] Test PLANT_GAIN sensitivity: try 0.004 (median) vs 0.006 (mean)
+- [ ] Test drive with hysteresis + 1.0s lookahead combined (next route)
 
 ### Route 0000025f — Second Test Drive
 
@@ -259,5 +261,26 @@ Only same-sign pairs (positive torque → positive curvature change) are valid.
 - Faster spreading (0.1s vs 0.2s) improved responsiveness without introducing jerk
 - Torque hit 1.000 max (saturation) vs 0.911 in 0000025d — tighter curves attempted
 - Low-speed (<55 km/h) lane changes remain weakest: MAE 0.00147-0.00282 vs <0.00055 at 80+ km/h
+
+### Post-0000025f Tuning (offline analysis on route data)
+
+**Spreading**: Reverted 10→20 frames (0.1s→0.2s). 0.1s caused abrupt lane changes despite better straight-lane metrics.
+
+**Noise filter comparison** (straights, 1.5s lookahead):
+- Deadzone 0.0004: mutes actions (204) but zero crossings unchanged (2294)
+- 4-frame window: adds phase lag, increases actions (24213) — worse
+- **Hysteresis 0.0004**: 89% fewer zero crossings (2294→242), 1057 actions — no phase lag
+
+**Lookahead comparison** (straights, with hysteresis 0.0004):
+
+| Metric | Stock 0.5s | LA 1.0s | LA 1.5s |
+|---|---|---|---|
+| Zero crossings | 236 | **220** | 242 |
+| Total actions | 1688 | **1036** | 1177 |
+| MAE | **0.000204** | 0.000211 | 0.000245 |
+
+Model prediction error grows with lookahead distance — beyond 1.0s, prediction error outweighs noise smoothing. 1.0s is the sweet spot: 39% fewer actions, only 3% more MAE.
+
+**Current config**: SPREAD_FRAMES=20, PLANT_GAIN=0.006, hysteresis 0.0004, look_ahead 1.0s fixed
 
 **Evaluation scripts**: `tests/eval_micro_stepping.py` (curvature metrics, speed bins, oscillation, lane changes), `tests/analyze_lateral.py` (PID term decomposition, per-segment timeline, calibration convergence)
