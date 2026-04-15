@@ -181,7 +181,7 @@ def on_lat_controller_init(result, lac, CP):
 
   # Spread correction across 20 CAN frames (0.2s / 4 model frames)
   # 4.8s to saturate (12Nm) — smooth lane changes, no abrupt jerk
-  # Straight-lane buzz handled by DEADZONE, not spreading
+  # Straight-lane buzz handled by hysteresis, not spreading
   SPREAD_FRAMES = 20
   STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES  # 0.00208 per CAN frame
 
@@ -191,18 +191,15 @@ def on_lat_controller_init(result, lac, CP):
   # by STEP_PER_FRAME anyway, and delta-error prevents accumulation.
   PLANT_GAIN = 0.006
 
-  # Deadzone: half of P99 frame-to-frame curvature change (0.0008)
-  # Errors below this are model/sensor noise, not real drift
-  DEADZONE = 0.0004
-
-  # Moving window: average error over 4 model frames (0.2s) to cancel noise.
-  # Matches SPREAD_FRAMES duration — correction and measurement on same timescale.
-  ERROR_WINDOW = 4
-  from collections import deque
-  _error_history = deque(maxlen=ERROR_WINDOW)
+  # Hysteresis on raw error: suppresses zero crossings (stepper direction reversals)
+  # from model noise without muting actions like a deadzone does.
+  # Gap 0.0004: 89% fewer zero crossings on straights (2294→242) with 1.5s lookahead.
+  HYST_GAP = 0.0004
+  from opendbc.car import apply_hysteresis
 
   state = {
     'torque': 0.0, 'step_remaining': 0, 'prev_error': 0.0,
+    'error_steady': 0.0,  # hysteresis-filtered error
     # Debug: last model frame values
     'measured': 0.0, 'error': 0.0, 'delta_error': 0.0, 'log_prev_error': 0.0,
     'plant_gain': 0.0, 'action': 'hold',
@@ -218,7 +215,7 @@ def on_lat_controller_init(result, lac, CP):
       state['torque'] = 0.0
       state['step_remaining'] = 0
       state['prev_error'] = 0.0
-      _error_history.clear()
+      state['error_steady'] = 0.0
       pid_log.active = False
       pid_log.error = 0.0
       return 0.0, 0.0, pid_log
@@ -241,11 +238,9 @@ def on_lat_controller_init(result, lac, CP):
       except (AttributeError, IndexError):
         pass
 
-      # Raw error this frame, then average over 4-frame window (0.2s)
-      # Noise cancels within the window; real drift persists
       raw_error = desired_curvature - state['measured']
-      _error_history.append(raw_error)
-      state['error'] = sum(_error_history) / len(_error_history)
+      state['error_steady'] = apply_hysteresis(raw_error, state['error_steady'], HYST_GAP)
+      state['error'] = state['error_steady']
 
       prev_error = state['prev_error']
       state['log_prev_error'] = prev_error
@@ -253,8 +248,8 @@ def on_lat_controller_init(result, lac, CP):
 
       same_sign = state['error'] * prev_error > 0
       state['delta_error'] = state['error'] - prev_error
-      error_worsening = same_sign and abs(state['delta_error']) > DEADZONE and abs(state['error']) > abs(prev_error)
-      error_sign_changed = prev_error != 0 and not same_sign and abs(state['error']) > DEADZONE
+      error_worsening = same_sign and abs(state['delta_error']) > 1e-6 and abs(state['error']) > abs(prev_error)
+      error_sign_changed = prev_error != 0 and not same_sign and abs(state['error']) > 1e-6
 
       state['plant_gain'] = PLANT_GAIN
 
