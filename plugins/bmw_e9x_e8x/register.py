@@ -195,6 +195,12 @@ def on_lat_controller_init(result, lac, CP):
   # Errors below this are model/sensor noise, not real drift
   DEADZONE = 0.0004
 
+  # Moving window: average error over 4 model frames (0.2s) to cancel noise.
+  # Matches SPREAD_FRAMES duration — correction and measurement on same timescale.
+  ERROR_WINDOW = 4
+  from collections import deque
+  _error_history = deque(maxlen=ERROR_WINDOW)
+
   state = {
     'torque': 0.0, 'step_remaining': 0, 'prev_error': 0.0,
     # Debug: last model frame values
@@ -212,6 +218,7 @@ def on_lat_controller_init(result, lac, CP):
       state['torque'] = 0.0
       state['step_remaining'] = 0
       state['prev_error'] = 0.0
+      _error_history.clear()
       pid_log.active = False
       pid_log.error = 0.0
       return 0.0, 0.0, pid_log
@@ -233,7 +240,12 @@ def on_lat_controller_init(result, lac, CP):
           state['measured'] = 2.0 * psi_target / (v * action_t) - psi_rate / v
       except (AttributeError, IndexError):
         pass
-      state['error'] = desired_curvature - state['measured']
+
+      # Raw error this frame, then average over 4-frame window (0.2s)
+      # Noise cancels within the window; real drift persists
+      raw_error = desired_curvature - state['measured']
+      _error_history.append(raw_error)
+      state['error'] = sum(_error_history) / len(_error_history)
 
       prev_error = state['prev_error']
       state['log_prev_error'] = prev_error
