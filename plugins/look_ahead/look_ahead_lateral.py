@@ -364,55 +364,22 @@ def _publish_speed_cap(speed_cap_kph):
 
 _la_pub = None
 
-LOOKAHEAD_T = 1.0  # seconds — fixed look-ahead for straight-lane smoothing
-
 def on_curvature_correction(default_curvature, model_v2, v_ego, lane_changing, **kwargs):
   """Hook callback for controls.curvature_correction.
 
-  Fixed 1.0s look-ahead: replaces stock curvature (at ~0.5s) with curvature
-  from model trajectory at t=1.0s on straights. 1.0s is the sweet spot —
-  39% fewer stepper actions than stock 0.5s with only 3% more MAE, while
-  1.5s+ adds prediction error without further reducing zero crossings.
-
-  Also estimates steering angle offset and publishes speed cap.
+  Curvature lookahead is now handled directly in the BMW micro-stepping
+  controller (register.py). This hook only runs side effects:
+  - Steering angle offset estimation
+  - Confidence-based speed cap for speedlimitd
   """
-  # Offset estimation always runs
   _update_offset_estimate(default_curvature, v_ego)
 
-  # Longitudinal: confidence-based speed cap
   if not lane_changing:
     speed_cap = _compute_speed_cap(model_v2, v_ego)
     _publish_speed_cap(speed_cap)
   else:
     _publish_speed_cap(0)
 
-  if not _is_enabled() or v_ego < MIN_SPEED:
-    _publish_la_status(default_curvature, default_curvature, v_ego, 'disabled')
-    return default_curvature
-
-  # During lane changes, look-ahead sees past the swerve → dampens the maneuver.
-  # Use stock 0.5s for accurate lane change tracking.
-  if lane_changing:
-    _publish_la_status(default_curvature, default_curvature, v_ego, 'lane_change')
-    return default_curvature
-
-  # Only look ahead on straights — in curves, stock 0.5s is more accurate.
-  # At curve exit, look-ahead would see the straight too early → cut the turn.
-  if abs(default_curvature) > STRAIGHT_THRESHOLD:
-    _publish_la_status(default_curvature, default_curvature, v_ego, 'curve')
-    return default_curvature
-
-  try:
-    yaws = list(model_v2.orientation.z)
-    yaw_rates = list(model_v2.orientationRate.z)
-    if len(yaws) >= 20 and len(yaw_rates) >= 2:
-      la_curvature = float(_curv_from_plan(yaws, yaw_rates, v_ego, LOOKAHEAD_T))
-      _publish_la_status(default_curvature, la_curvature, v_ego, 'lookahead_1.0s')
-      return la_curvature
-  except (AttributeError, IndexError):
-    pass
-
-  _publish_la_status(default_curvature, default_curvature, v_ego, 'fallback')
   return default_curvature
 
 
