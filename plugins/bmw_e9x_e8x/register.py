@@ -197,8 +197,9 @@ def on_lat_controller_init(result, lac, CP):
 
   # Hysteresis on raw error: suppresses zero crossings (stepper direction reversals)
   # from model noise without muting actions like a deadzone does.
-  # Gap 0.001: 63% fewer ZC than 0.0004 on straights, MAE +25% but less busy steering.
-  HYST_GAP = 0.001
+  # Gap 0.0008: lowest MAE (0.000187) on straights, matches P95 of raw error (0.000874).
+  # 53% fewer ZC than 0.0004, without under-responding like 0.001.
+  HYST_GAP = 0.0008
   from opendbc.car import apply_hysteresis
 
   # Comfort limits on desired curvature (stricter than ISO/stock)
