@@ -176,12 +176,10 @@ def on_lat_controller_init(result, lac, CP):
   _sm = messaging.SubMaster(['modelV2'])
   _T_IDXS = [10.0 * (i / 32) ** 2 for i in range(33)]
 
-  # Look-ahead time: 1.0s on straights (smooths model noise), 0.5s in curves
-  # (stock timing, more accurate for tight tracking). 1.0s is the sweet spot —
-  # beyond it, model prediction error outweighs noise smoothing.
-  LOOKAHEAD_STRAIGHT = 1.0
-  LOOKAHEAD_CURVE = 0.5
-  STRAIGHT_THRESHOLD = 0.002  # 1/m — above this, use curve lookahead
+  # Look-ahead time: 0.5s (stock timing). With hysteresis 0.001, noise is
+  # already filtered — longer lookahead adds prediction error without benefit.
+  # 0.5s tested with 54 ZC vs 110 ZC at 1.0s on straights (route 00000263).
+  LOOKAHEAD_T = 0.5
 
   # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
@@ -192,10 +190,10 @@ def on_lat_controller_init(result, lac, CP):
   SPREAD_FRAMES = 20
   STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES  # 0.00208 per CAN frame
 
-  # Plant gain: curvature change per unit normalized torque
-  # Reduced from 0.006 (mean) to 0.004 (closer to median) — 0.006 over-corrects
-  # at highway speeds where actual gain is ~0.003, causing abrupt lane changes.
-  PLANT_GAIN = 0.004
+  # Plant gain: 2/v² — mirrors vehicle dynamics (curvature response ∝ 1/v²).
+  # At higher speed, same torque produces less curvature change because lateral
+  # force scales with v². At 100 kph: 0.0026, at 50 kph: 0.0104.
+  PLANT_GAIN_COEFF = 2.0  # gain = PLANT_GAIN_COEFF / v²
 
   # Hysteresis on raw error: suppresses zero crossings (stepper direction reversals)
   # from model noise without muting actions like a deadzone does.
@@ -238,10 +236,9 @@ def on_lat_controller_init(result, lac, CP):
           action_t = 0.01
           state['measured'] = 2.0 * yaws[1] / (v * action_t) - psi_rate / v
 
-          # Desired curvature: lookahead depends on current curvature
-          la_t = LOOKAHEAD_STRAIGHT if abs(state['measured']) < STRAIGHT_THRESHOLD else LOOKAHEAD_CURVE
-          psi_la = float(np.interp(la_t, _T_IDXS, yaws))
-          raw_desired = 2.0 * psi_la / (v * la_t) - psi_rate / v
+          # Desired curvature at lookahead time
+          psi_la = float(np.interp(LOOKAHEAD_T, _T_IDXS, yaws))
+          raw_desired = 2.0 * psi_la / (v * LOOKAHEAD_T) - psi_rate / v
 
           # Comfort jerk + accel limits on desired curvature
           max_curv_rate = MAX_LATERAL_JERK / (v ** 2)
@@ -264,14 +261,15 @@ def on_lat_controller_init(result, lac, CP):
       error_worsening = same_sign and abs(state['delta_error']) > 1e-6 and abs(state['error']) > abs(prev_error)
       error_sign_changed = prev_error != 0 and not same_sign and abs(state['error']) > 1e-6
 
-      state['plant_gain'] = PLANT_GAIN
+      plant_gain = PLANT_GAIN_COEFF / (v ** 2)
+      state['plant_gain'] = plant_gain
 
       if error_worsening:
-        correction = state['delta_error'] / PLANT_GAIN
+        correction = state['delta_error'] / plant_gain
         state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
         state['action'] = 'worsening'
       elif error_sign_changed:
-        correction = state['error'] / PLANT_GAIN
+        correction = state['error'] / plant_gain
         state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
         state['action'] = 'sign_change'
       else:
