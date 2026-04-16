@@ -156,25 +156,32 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Incremental P torque controller.
+  """Incremental P torque controller — self-contained curvature tracking.
 
-  Computes correction once per model frame (20Hz) using plant gain to
-  convert curvature error directly to torque, then spreads across 5
-  control frames (100Hz) for smooth CAN output.
+  Both desired and measured curvature computed from modelV2 orientation
+  using curv_from_psis. No dependency on controlsd's desired curvature.
 
-  correction_torque = curvature_error / PLANT_GAIN
-  PLANT_GAIN = 0.006 (median from route data, fixed — rate limiter dominates)
+  - measured: curv_from_psis at t=0.01s (current vehicle state)
+  - desired: curv_from_psis at t=LOOKAHEAD_T (1.0s on straights, 0.5s in curves)
+  Same formula, same source — error is purely the curvature change needed.
 
-  - desired: from controlsd (curv_from_psis at t+0.5s, safety-limited)
-  - measured: curv_from_psis at t+0.01s (same formula, same model source)
-  Same formula, same domain — error is purely the curvature change needed.
+  Runs even when disengaged (shadow torque) for seamless engage transition.
   """
   from cereal import log
   from cereal import messaging
+  import numpy as np
   from bmw.values import CarControllerParams as CCP
 
   _lat_pub = None
   _sm = messaging.SubMaster(['modelV2'])
+  _T_IDXS = [10.0 * (i / 32) ** 2 for i in range(33)]
+
+  # Look-ahead time: 1.0s on straights (smooths model noise), 0.5s in curves
+  # (stock timing, more accurate for tight tracking). 1.0s is the sweet spot —
+  # beyond it, model prediction error outweighs noise smoothing.
+  LOOKAHEAD_STRAIGHT = 1.0
+  LOOKAHEAD_CURVE = 0.5
+  STRAIGHT_THRESHOLD = 0.002  # 1/m — above this, use curve lookahead
 
   # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
@@ -186,10 +193,9 @@ def on_lat_controller_init(result, lac, CP):
   STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES  # 0.00208 per CAN frame
 
   # Plant gain: curvature change per unit normalized torque
-  # Median from route data across all speeds: 0.006
-  # Speed-dependent gain (2.0/v²) not needed — correction is rate-limited
-  # by STEP_PER_FRAME anyway, and delta-error prevents accumulation.
-  PLANT_GAIN = 0.006
+  # Reduced from 0.006 (mean) to 0.004 (closer to median) — 0.006 over-corrects
+  # at highway speeds where actual gain is ~0.003, causing abrupt lane changes.
+  PLANT_GAIN = 0.004
 
   # Hysteresis on raw error: suppresses zero crossings (stepper direction reversals)
   # from model noise without muting actions like a deadzone does.
@@ -197,11 +203,17 @@ def on_lat_controller_init(result, lac, CP):
   HYST_GAP = 0.001
   from opendbc.car import apply_hysteresis
 
+  # Comfort limits on desired curvature (stricter than ISO/stock)
+  MAX_LATERAL_JERK = 2.5      # m/s³ (stock: 5.0)
+  MAX_LATERAL_ACCEL = 1.0     # m/s² (stock: 3.0)
+  DT_MDL = 0.05               # 20Hz model frame
+
   state = {
-    'torque': 0.0, 'step_remaining': 0, 'prev_error': 0.0,
+    'torque': 0.0, 'step_remaining': 0,
     'error_steady': 0.0,  # hysteresis-filtered error
     # Debug: last model frame values
-    'measured': 0.0, 'error': 0.0, 'delta_error': 0.0, 'log_prev_error': 0.0,
+    'desired': 0.0, 'measured': 0.0, 'error': 0.0,
+    'delta_error': 0.0, 'log_prev_error': 0.0,
     'plant_gain': 0.0, 'action': 'hold',
   }
 
@@ -211,41 +223,42 @@ def on_lat_controller_init(result, lac, CP):
 
     _sm.update(0)
 
-    if not active or CS.vEgo < 5.0:
-      state['torque'] = 0.0
-      state['step_remaining'] = 0
-      state['prev_error'] = 0.0
-      state['error_steady'] = 0.0
-      pid_log.active = False
-      pid_log.error = 0.0
-      return 0.0, 0.0, pid_log
-
-    # On modelV2 update (20Hz): compute measured curvature using same formula as desired
-    # desired_curvature uses curv_from_psis(psi_target, psi_rate, v, action_t) at t+0.5s
-    # measured uses the same formula at T_IDXS[1] ≈ t+0.01s (current state)
+    # Runs every frame, even when disengaged — shadow-computes torque so
+    # engage transition is seamless (no ramp-up from zero in curves).
     if _sm.updated['modelV2']:
       m = _sm['modelV2']
       try:
         yaws = list(m.orientation.z)
         yaw_rates = list(m.orientationRate.z)
-        if len(yaws) > 1 and len(yaw_rates) > 0:
+        if len(yaws) >= 20 and len(yaw_rates) >= 2:
           v = max(CS.vEgo, 5.0)
-          # T_IDXS[1] = 0.01s
-          psi_target = yaws[1]
           psi_rate = yaw_rates[0]
+
+          # Measured curvature at t≈0.01s
           action_t = 0.01
-          state['measured'] = 2.0 * psi_target / (v * action_t) - psi_rate / v
+          state['measured'] = 2.0 * yaws[1] / (v * action_t) - psi_rate / v
+
+          # Desired curvature: lookahead depends on current curvature
+          la_t = LOOKAHEAD_STRAIGHT if abs(state['measured']) < STRAIGHT_THRESHOLD else LOOKAHEAD_CURVE
+          psi_la = float(np.interp(la_t, _T_IDXS, yaws))
+          raw_desired = 2.0 * psi_la / (v * la_t) - psi_rate / v
+
+          # Comfort jerk + accel limits on desired curvature
+          max_curv_rate = MAX_LATERAL_JERK / (v ** 2)
+          clipped = float(np.clip(raw_desired,
+                                  state['desired'] - max_curv_rate * DT_MDL,
+                                  state['desired'] + max_curv_rate * DT_MDL))
+          max_curv = MAX_LATERAL_ACCEL / (v ** 2)
+          state['desired'] = float(np.clip(clipped, -max_curv, max_curv))
       except (AttributeError, IndexError):
         pass
 
-      raw_error = desired_curvature - state['measured']
+      raw_error = state['desired'] - state['measured']
       state['error_steady'] = apply_hysteresis(raw_error, state['error_steady'], HYST_GAP)
+      state['log_prev_error'] = state['error']
       state['error'] = state['error_steady']
 
-      prev_error = state['prev_error']
-      state['log_prev_error'] = prev_error
-      state['prev_error'] = state['error']
-
+      prev_error = state['log_prev_error']
       same_sign = state['error'] * prev_error > 0
       state['delta_error'] = state['error'] - prev_error
       error_worsening = same_sign and abs(state['delta_error']) > 1e-6 and abs(state['error']) > abs(prev_error)
@@ -265,7 +278,7 @@ def on_lat_controller_init(result, lac, CP):
         state['step_remaining'] = 0
         state['action'] = 'hold'
 
-    # Every control frame (100Hz): apply 1/5 of the correction
+    # Every control frame (100Hz): apply micro-step to shadow torque
     if state['step_remaining'] != 0:
       small_step = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, state['step_remaining']))
       state['torque'] += small_step
@@ -273,8 +286,13 @@ def on_lat_controller_init(result, lac, CP):
 
     output = max(-1.0, min(1.0, state['torque']))
 
+    if not active or CS.vEgo < 5.0:
+      pid_log.active = False
+      pid_log.error = 0.0
+      return 0.0, 0.0, pid_log
+
     pid_log.actualLateralAccel = float(state['measured'])
-    pid_log.desiredLateralAccel = float(desired_curvature)
+    pid_log.desiredLateralAccel = float(state['desired'])
     pid_log.error = float(state['error'])
     pid_log.active = True
     pid_log.output = float(output)
@@ -287,7 +305,7 @@ def on_lat_controller_init(result, lac, CP):
         from openpilot.selfdrive.plugins.plugin_bus import PluginPub
         _lat_pub = PluginPub('bmw_lat_control')
       _lat_pub.send({
-        'desired': float(desired_curvature),
+        'desired': float(state['desired']),
         'measured': float(state['measured']),
         'error': float(state['error']),
         'prev_error': float(state['log_prev_error']),
