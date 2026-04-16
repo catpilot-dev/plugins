@@ -283,4 +283,71 @@ Model prediction error grows with lookahead distance — beyond 1.0s, prediction
 
 **Current config**: SPREAD_FRAMES=20, PLANT_GAIN=0.006, hysteresis 0.0004, look_ahead 1.0s fixed
 
+### Route 00000262 — Third Test Drive (hysteresis + 1.0s lookahead)
+
+**Config**: Incremental P controller, PLANT_GAIN=0.006, SPREAD_FRAMES=20 (0.2s), hysteresis 0.0004, look_ahead 1.0s fixed
+
+**Overall: 115,826 engaged samples**
+
+| Metric | Value |
+|--------|-------|
+| Error MAE | 0.00036 |
+| Error P95 | 0.00155 |
+| Error P99 | 0.00337 |
+| Correlation (desired vs measured) | +0.962 |
+| Torque range | [-0.856, +0.630] |
+| Torque MAE | 0.080 |
+| Speed range | 9.6 - 25.0 m/s |
+
+**By speed:**
+
+| Speed | MAE | Std |
+|-------|-----|-----|
+| 5-10 m/s (18-36 km/h) | 0.00236 | 0.00186 |
+| 10-15 m/s (36-54 km/h) | 0.00086 | 0.00102 |
+| 15-20 m/s (54-72 km/h) | 0.00036 | 0.00052 |
+| 20-25 m/s (72-90 km/h) | 0.00018 | 0.00028 |
+
+**By curvature:**
+
+| Curvature | MAE | Std |
+|-----------|-----|-----|
+| < 0.0005 (straight) | 0.00018 | 0.00031 |
+| 0.0005 - 0.001 | 0.00036 | 0.00051 |
+| 0.001 - 0.003 | 0.00069 | 0.00077 |
+| 0.003 - 0.010 | 0.00093 | 0.00102 |
+| > 0.010 | 0.00232 | 0.00185 |
+
+**Straight-lane oscillation (|desired| < 0.001):**
+
+| Speed | Steer std | Osc freq | Error MAE |
+|-------|-----------|----------|-----------|
+| 40-55 km/h | 3.76° | 2.0 Hz | 0.00057 |
+| 55-70 km/h | 2.39° | 2.3 Hz | 0.00026 |
+| 70-80 km/h | 2.00° | 2.5 Hz | 0.00016 |
+| 80-90 km/h | 1.85° | 2.6 Hz | 0.00015 |
+
+**Lane change performance (26 lane changes):**
+
+- Mean MAE: **0.00080**, Best: **0.00039** (87 km/h right), Worst: 0.00152 (55 km/h left)
+- Mean duration: 5.8s
+
+**Comparison across all routes:**
+
+| | 0000025d | 0000025f | 00000262 |
+|---|---|---|---|
+| Config | DZ=0.0001, no LA | DZ=0.0004, no LA | Hyst 0.0004, LA 1.0s |
+| Error MAE | 0.00122 | 0.00033 | 0.00036 |
+| Error P95 | 0.00350 | 0.00127 | 0.00155 |
+| Correlation | +0.812 | +0.948 | **+0.962** |
+| Straight osc Hz | 8-16 | 1.9-2.6 | 2.0-2.6 |
+| LC mean MAE | 0.00099 | 0.00079 | 0.00080 |
+| Driving feel | oscillation on straights | smooth, abrupt LC (10-frame) | **best — smooth straights + smooth LC** |
+
+**Observations:**
+- Best correlation yet (+0.962) — hysteresis + 1.0s lookahead complement each other
+- No torque saturation (max 0.856 vs 1.0 limit)
+- Low-speed (<55 km/h) lane changes remain the weakest area
+- Best subjective driving feel reported
+
 **Evaluation scripts**: `tests/eval_micro_stepping.py` (curvature metrics, speed bins, oscillation, lane changes), `tests/analyze_lateral.py` (PID term decomposition, per-segment timeline, calibration convergence)
