@@ -15,15 +15,20 @@ Incremental P torque controller that corrects curvature error through micro-step
 
 | Parameter | Value | Source |
 |-----------|-------|--------|
-| PLANT_GAIN | 0.006 | Route data median (delta_curv / delta_torque at +0.5s) |
+| PLANT_GAIN | 2/v² | Vehicle dynamics: curvature response ∝ 1/v². 0.0026 at 100kph, 0.0104 at 50kph |
 | MAX_STEP | 0.04167 | CAN rate limit: 0.1 Nm/10ms × 5 frames / 12 Nm max |
 | STEP_PER_FRAME | 0.00208 | MAX_STEP / 20 (spread across 0.2s) |
-| HYST_GAP | 0.0004 | Hysteresis on curvature error — suppresses zero crossings without muting actions |
+| HYST_GAP | 0.001 | Hysteresis on curvature error — suppresses zero crossings without muting actions |
+| LOOKAHEAD_T | 0.5 | Fixed 0.5s — with hysteresis, noise is already filtered; longer adds prediction error |
+| MAX_LATERAL_JERK | 2.5 | m/s³ comfort limit on desired curvature rate (stock: 5.0) |
+| MAX_LATERAL_ACCEL | 1.0 | m/s² comfort limit on desired curvature magnitude (stock: 3.0) |
 
 ### Curvature Sources
 
-- **desired_curvature**: from controlsd → `curv_from_psis(yaws, yaw_rates, vEgo, lat_delay + DT_MDL)` at t≈+0.5s, safety-limited by `clip_curvature`
-- **measured_curvature**: from modelV2 → `curv_from_psis(yaws[1], yaw_rates[0], vEgo, 0.01)` at t≈0.01s
+Self-contained — both computed directly from modelV2, no controlsd dependency:
+- **desired_curvature**: `curv_from_psis(yaws, yaw_rates, vEgo, 0.5)` at t=0.5s, rate-limited by comfort jerk/accel limits
+- **measured_curvature**: `curv_from_psis(yaws[1], yaw_rates[0], vEgo, 0.01)` at t≈0.01s
+- Shadow torque runs continuously even when disengaged for seamless engage transition
 
 ### Error Correction Logic
 
@@ -33,9 +38,9 @@ error = apply_hysteresis(raw_error, error_steady, HYST_GAP)
 delta_error = error - prev_error
 
 if error worsening (same sign, |delta_error| > 0, |error| > |prev|):
-    correction = delta_error / PLANT_GAIN    # incremental only
+    correction = delta_error / (2/v²)         # incremental only
 elif error sign changed (overshot or new curve):
-    correction = error / PLANT_GAIN          # full reset
+    correction = error / (2/v²)              # full reset
 else:
     correction = 0                           # hold, let existing torque work
 
@@ -51,7 +56,7 @@ Filter: |delta_torque| > 0.017 (0.2 Nm / 12 Nm) per model frame to exclude noise
 
 Only same-sign pairs (positive torque → positive curvature change) are valid.
 
-**Plant gain ∝ 1/v²** (R²=0.98) due to Servotronic hydraulic assist, but with micro-stepping the rate limiter dominates, so a fixed median value is used.
+**Plant gain ∝ 1/v²** (R²=0.98) due to vehicle dynamics (lateral force ∝ v²). Now used directly as speed-dependent gain: PLANT_GAIN = 2/v².
 
 | Percentile | Gain | Inverse |
 |---|---|---|
@@ -124,7 +129,7 @@ Only same-sign pairs (positive torque → positive curvature change) are valid.
 - Lane changing: near perfect, no abrupt jerk
 - Tight curves: no torque saturation (max ±0.91 vs ±1.0 limit)
 - Straight lanes: oscillation 8-16 Hz at 2-4.5° std — needs damping
-- Lower speed → more oscillation (Servotronic higher gain at low speed)
+- Lower speed → more oscillation (higher plant gain at low speed, vehicle dynamics ∝ 1/v²)
 
 **Comparison with stock PID (route 00000230):**
 
@@ -153,7 +158,7 @@ Only same-sign pairs (positive torque → positive curvature change) are valid.
 - Mean MAE: **0.00099**, Best: **0.00073** (76 km/h), Worst: 0.00199 (47 km/h)
 - Mean duration: 6.7s — 0.2s spreading is only 3% of total maneuver
 - Near perfect path following, no abrupt jerk
-- Higher speed → tighter tracking (less Servotronic nonlinearity)
+- Higher speed → tighter tracking (smaller curvature errors at speed)
 
 **TODO:**
 - [x] ~~Test drive with 0.2s spreading~~ → 0.1s tested in 0000025f, reverted to 0.2s (lane change smoothness)
@@ -271,17 +276,17 @@ Only same-sign pairs (positive torque → positive curvature change) are valid.
 - 4-frame window: adds phase lag, increases actions (24213) — worse
 - **Hysteresis 0.0004**: 89% fewer zero crossings (2294→242), 1057 actions — no phase lag
 
-**Lookahead comparison** (straights, with hysteresis 0.0004):
+**Lookahead comparison** (straights, route 00000263 with hysteresis 0.001):
 
-| Metric | Stock 0.5s | LA 1.0s | LA 1.5s |
-|---|---|---|---|
-| Zero crossings | 236 | **220** | 242 |
-| Total actions | 1688 | **1036** | 1177 |
-| MAE | **0.000204** | 0.000211 | 0.000245 |
+| Metric | 0.5s | 0.75s | 1.0s | 1.5s |
+|---|---|---|---|---|
+| Zero crossings | **54** | 94 | 110 | 122 |
+| Total actions | **235** | 470 | 633 | 751 |
+| MAE | **0.000218** | 0.000256 | 0.000295 | 0.000351 |
 
-Model prediction error grows with lookahead distance — beyond 1.0s, prediction error outweighs noise smoothing. 1.0s is the sweet spot: 39% fewer actions, only 3% more MAE.
+With hysteresis 0.001, noise is already filtered — longer lookahead only adds model prediction error. 0.5s (stock timing) is optimal.
 
-**Current config**: SPREAD_FRAMES=20, PLANT_GAIN=0.006, hysteresis 0.0004, look_ahead 1.0s fixed
+**Current config**: SPREAD_FRAMES=20, PLANT_GAIN=2/v², hysteresis 0.001, lookahead 0.5s, comfort limits (jerk 2.5, accel 1.0), self-contained curvature, shadow torque
 
 ### Route 00000262 — Third Test Drive (hysteresis + 1.0s lookahead)
 
@@ -342,12 +347,88 @@ Model prediction error grows with lookahead distance — beyond 1.0s, prediction
 | Correlation | +0.812 | +0.948 | **+0.962** |
 | Straight osc Hz | 8-16 | 1.9-2.6 | 2.0-2.6 |
 | LC mean MAE | 0.00099 | 0.00079 | 0.00080 |
-| Driving feel | oscillation on straights | smooth, abrupt LC (10-frame) | **best — smooth straights + smooth LC** |
+| Driving feel | oscillation on straights | smooth, abrupt LC (10-frame) | smooth straights + smooth LC |
 
 **Observations:**
 - Best correlation yet (+0.962) — hysteresis + 1.0s lookahead complement each other
 - No torque saturation (max 0.856 vs 1.0 limit)
 - Low-speed (<55 km/h) lane changes remain the weakest area
-- Best subjective driving feel reported
+
+### Route 00000263 — Fourth Test Drive (self-contained, comfort limits, PG=0.004)
+
+**Config**: Self-contained curvature (both from modelV2), PLANT_GAIN=0.004 fixed, SPREAD_FRAMES=20, hysteresis 0.001, lookahead 1.0s→0.5s (curves), comfort limits (jerk 2.5 m/s³, accel 1.0 m/s²)
+
+**Changes from 00000262**: Self-contained curvature (no controlsd dependency), PLANT_GAIN 0.006→0.004, hysteresis 0.0004→0.001, comfort jerk/accel limits added, shadow torque for seamless engage
+
+**Overall: 91,368 engaged samples**
+
+| Metric | Value |
+|--------|-------|
+| Error MAE | 0.00042 |
+| Error P95 | 0.00144 |
+| Error P99 | 0.00249 |
+| Correlation (desired vs measured) | +0.945 |
+| Torque range | [-0.684, 1.000] |
+| Torque MAE | 0.089 |
+| Speed range | 8.1 - 24.4 m/s |
+
+**By speed:**
+
+| Speed | MAE | Std |
+|-------|-----|-----|
+| 5-10 m/s (18-36 km/h) | 0.00109 | 0.00131 |
+| 10-15 m/s (36-54 km/h) | 0.00065 | 0.00065 |
+| 15-20 m/s (54-72 km/h) | 0.00031 | 0.00042 |
+| 20-25 m/s (72-90 km/h) | 0.00017 | 0.00023 |
+
+**By curvature:**
+
+| Curvature | MAE | Std |
+|-----------|-----|-----|
+| < 0.0005 (straight) | 0.00022 | 0.00028 |
+| 0.0005 - 0.001 | 0.00036 | 0.00038 |
+| 0.001 - 0.003 | 0.00074 | 0.00071 |
+| 0.003 - 0.010 | 0.00094 | 0.00099 |
+
+**Straight-lane oscillation (|desired| < 0.001):**
+
+| Speed | Steer std | Osc freq | Error MAE |
+|-------|-----------|----------|-----------|
+| 40-55 km/h | 2.80° | 2.2 Hz | 0.00042 |
+| 55-70 km/h | 1.88° | 2.6 Hz | 0.00024 |
+| 70-80 km/h | 1.62° | 2.2 Hz | 0.00015 |
+| 80-90 km/h | 1.89° | 2.8 Hz | 0.00013 |
+
+**Lane change performance (12 lane changes):**
+
+- Mean MAE: **0.00072**, Best: **0.00029** (85 km/h right), Worst: 0.00123 (50 km/h right)
+- Mean duration: 6.0s
+
+**Comparison 00000262 vs 00000263:**
+
+| | 00000262 | 00000263 | Change |
+|---|---|---|---|
+| Config | Hyst 0.0004, PG 0.006, controlsd | Hyst 0.001, PG 0.004, self-contained | |
+| Error MAE | 0.00036 | 0.00042 | +17% (gentler controller) |
+| Error P95 | 0.00155 | 0.00144 | **-7%** |
+| Error P99 | 0.00337 | 0.00249 | **-26%** |
+| LC mean MAE | 0.00080 | **0.00072** | **-10%** |
+| Steer std 70-80kph | 2.00° | **1.62°** | **-19%** |
+| Steer std 40-55kph | 3.76° | **2.80°** | **-26%** |
+
+**Observations:**
+- Lane changes much smoother — comfort limits (1.0 m/s², 2.5 m/s³) + lower plant gain
+- P99 error dropped 26% — fewer extreme corrections
+- Steer std improved across all speeds — hysteresis 0.001 less busy
+- Tight turns smooth — lower plant gain ramps torque more gradually
+- Slight oscillation remains at 50 kph — vehicle dynamics: same torque produces more curvature change at low speed (∝ 1/v²) → addressed by speed-dependent plant gain (2/v²) in next route
+- MAE slightly higher (+17%) — expected, controller is intentionally gentler
+- Torque hit 1.000 saturation once — worth monitoring
+
+**Post-route analysis** (offline simulation on route 00000263 data):
+- Lookahead 0.5s optimal: 54 ZC vs 110 ZC at 1.0s on straights. With hysteresis 0.001, noise already filtered — longer lookahead only adds prediction error.
+- Speed-dependent plant gain (2/v²) equalizes correction across speeds. Fixed 0.004 over-corrected 4x at 40 kph vs 80 kph.
+
+**Current config (post-263 tuning)**: SPREAD_FRAMES=20, PLANT_GAIN=2/v², hysteresis 0.001, lookahead 0.5s fixed, comfort limits (jerk 2.5, accel 1.0), self-contained curvature from modelV2, shadow torque
 
 **Evaluation scripts**: `tests/eval_micro_stepping.py` (curvature metrics, speed bins, oscillation, lane changes), `tests/analyze_lateral.py` (PID term decomposition, per-segment timeline, calibration convergence)
