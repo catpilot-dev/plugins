@@ -177,10 +177,10 @@ def on_lat_controller_init(result, lac, CP):
   _T_IDXS = [10.0 * (i / 32) ** 2 for i in range(33)]
 
   # Adaptive time indices based on camera visibility.
-  # Camera height 1.19m, bonnet length ~2m, bonnet edge ~0.8m → min visible 6.1m.
-  # Measured = nearest T_IDXS where v*t >= 6.1m (road the camera can actually see)
+  # Measured = nearest T_IDXS where v*t >= MIN_VISIBLE_DIST (road camera can see)
   # Desired = next T_IDXS (one index ahead, ~1-2m further on road)
-  MIN_VISIBLE_DIST = 6.1  # meters, from camera geometry
+  # MIN_VISIBLE_DIST computed from camera geometry in CarControllerParams.
+  MIN_VISIBLE_DIST = CCP.MIN_VISIBLE_DIST
 
   # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame

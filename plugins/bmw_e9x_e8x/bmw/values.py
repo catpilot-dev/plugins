@@ -21,7 +21,15 @@ class CarControllerParams: #controls running @ 100hz
   STEER_DELTA_DOWN = 0.1     # Nm/10ms — symmetric with DELTA_UP for incremental controller
   STEER_ERROR_MAX = 999     # max delta between torque cmd and torque motor
 
-  # STEER_BACKLASH = 1 #deg
+  # Camera visibility geometry (meters)
+  # Used to select T_IDXS for curvature measurement — camera can only see
+  # road beyond MIN_VISIBLE_DIST, below that is occluded by the bonnet.
+  # d_min = BONNET_LENGTH × CAM_HEIGHT / (CAM_HEIGHT - BONNET_EDGE_HEIGHT)
+  CAM_HEIGHT = 1.19           # from liveCalibration.height (comma3 behind windshield)
+  BONNET_LENGTH = 2.0         # camera to front edge of bonnet (est. from E90 front overhang ~820mm + windshield setback ~1180mm)
+  BONNET_EDGE_HEIGHT = 0.8    # bonnet front edge height from ground (est. from E90 overall height 1421mm, ground clearance 130mm)
+  MIN_VISIBLE_DIST = BONNET_LENGTH * CAM_HEIGHT / (CAM_HEIGHT - BONNET_EDGE_HEIGHT)  # ~6.1m
+
   def __init__(self, CP):
     pass
 
