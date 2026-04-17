@@ -172,7 +172,6 @@ def on_lat_controller_init(result, lac, CP):
   import numpy as np
   from bmw.values import CarControllerParams as CCP
 
-  _lat_pub = None
   _sm = messaging.SubMaster(['modelV2'])
   _T_IDXS = [10.0 * (i / 32) ** 2 for i in range(33)]
 
@@ -205,6 +204,7 @@ def on_lat_controller_init(result, lac, CP):
 
   state = {
     'torque': 0.0, 'step_remaining': 0,
+    'lat_pub': None,  # PluginPub for debug logging
     # Debug: last model frame values
     'desired': 0.0, 'measured': 0.0, 'error': 0.0,
     'delta_error': 0.0, 'log_prev_error': 0.0,
@@ -297,12 +297,11 @@ def on_lat_controller_init(result, lac, CP):
     pid_log.saturated = bool(abs(output) > 0.99)
 
     # Log to plugin bus (all debug fields for offline analysis)
-    nonlocal _lat_pub
     try:
-      if _lat_pub is None:
+      if state['lat_pub'] is None:
         from openpilot.selfdrive.plugins.plugin_bus import PluginPub
-        _lat_pub = PluginPub('bmw_lat_control')
-      _lat_pub.send({
+        state['lat_pub'] = PluginPub('bmw_lat_control')
+      state['lat_pub'].send({
         'desired': float(state['desired']),
         'measured': float(state['measured']),
         'error': float(state['error']),
