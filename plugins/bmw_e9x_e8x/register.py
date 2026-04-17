@@ -176,10 +176,11 @@ def on_lat_controller_init(result, lac, CP):
   _sm = messaging.SubMaster(['modelV2'])
   _T_IDXS = [10.0 * (i / 32) ** 2 for i in range(33)]
 
-  # Look-ahead time: 0.5s (stock timing). With hysteresis 0.001, noise is
-  # already filtered — longer lookahead adds prediction error without benefit.
-  # 0.5s tested with 54 ZC vs 110 ZC at 1.0s on straights (route 00000263).
-  LOOKAHEAD_T = 0.5
+  # Adaptive time indices based on camera visibility.
+  # Camera height 1.19m, bonnet length ~2m, bonnet edge ~0.8m → min visible 6.1m.
+  # Measured = nearest T_IDXS where v*t >= 6.1m (road the camera can actually see)
+  # Desired = next T_IDXS (one index ahead, ~1-2m further on road)
+  MIN_VISIBLE_DIST = 6.1  # meters, from camera geometry
 
   # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
@@ -201,11 +202,6 @@ def on_lat_controller_init(result, lac, CP):
   # Both set to half of P99 frame-to-frame curvature change (0.0008).
   DEADZONE = 0.0004
   DELTA_THRESHOLD = 0.0004
-
-  # Comfort limits on desired curvature (stricter than ISO/stock)
-  MAX_LATERAL_JERK = 2.5      # m/s³ (stock: 5.0)
-  MAX_LATERAL_ACCEL = 1.0     # m/s² (stock: 3.0)
-  DT_MDL = 0.05               # 20Hz model frame
 
   state = {
     'torque': 0.0, 'step_remaining': 0,
@@ -232,21 +228,20 @@ def on_lat_controller_init(result, lac, CP):
           v = max(CS.vEgo, 5.0)
           psi_rate = yaw_rates[0]
 
-          # Measured curvature at t≈0.01s
-          action_t = 0.01
-          state['measured'] = 2.0 * yaws[1] / (v * action_t) - psi_rate / v
+          # Find nearest T_IDXS where camera can see the road (v*t >= 6.1m)
+          meas_idx = len(_T_IDXS) - 2  # fallback
+          for i in range(1, len(_T_IDXS) - 1):
+            if v * _T_IDXS[i] >= MIN_VISIBLE_DIST:
+              meas_idx = i
+              break
+          des_idx = meas_idx + 1
 
-          # Desired curvature at lookahead time
-          psi_la = float(np.interp(LOOKAHEAD_T, _T_IDXS, yaws))
-          raw_desired = 2.0 * psi_la / (v * LOOKAHEAD_T) - psi_rate / v
-
-          # Comfort jerk + accel limits on desired curvature
-          max_curv_rate = MAX_LATERAL_JERK / (v ** 2)
-          clipped = float(np.clip(raw_desired,
-                                  state['desired'] - max_curv_rate * DT_MDL,
-                                  state['desired'] + max_curv_rate * DT_MDL))
-          max_curv = MAX_LATERAL_ACCEL / (v ** 2)
-          state['desired'] = float(np.clip(clipped, -max_curv, max_curv))
+          t_meas = _T_IDXS[meas_idx]
+          t_des = _T_IDXS[des_idx]
+          psi_meas = float(np.interp(t_meas, _T_IDXS, yaws))
+          psi_des = float(np.interp(t_des, _T_IDXS, yaws))
+          state['measured'] = 2.0 * psi_meas / (v * t_meas) - psi_rate / v
+          state['desired'] = 2.0 * psi_des / (v * t_des) - psi_rate / v
       except (AttributeError, IndexError):
         pass
 
