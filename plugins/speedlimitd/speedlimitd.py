@@ -228,6 +228,78 @@ def curvature_speed_cap(model_msg) -> int:
   return snap_to_standard_speed(int(safe_speed_kph))
 
 
+def confidence_speed_cap(model_msg, v_ego) -> int:
+  """Cap speed based on model confidence distance.
+
+  If the model can't see far enough ahead at current speed, cap speed to
+  what the visible distance supports. Also considers curvature at the
+  confidence boundary.
+
+  Moved from look_ahead plugin — runs directly on modelV2 in speedlimitd.
+  """
+  CONFIDENCE_THRESHOLD = 0.6
+  MIN_DIST = 20.0
+  MAX_DIST = 100.0
+  PREVIEW_TIME = 3.0          # seconds of forward visibility needed
+  MAX_LAT_ACCEL_CAP = 1.5     # m/s² for speed cap
+  MIN_CAP_SPEED = 20.0        # km/h
+  MAX_CAP_SPEED = 120.0       # km/h
+
+  if v_ego < 5.0:
+    return 0
+
+  # Find confidence distance — farthest point where yStd confidence > threshold
+  conf_dist = MIN_DIST
+  try:
+    pos = model_msg.position
+    x = list(pos.x)
+    yStd = list(pos.yStd)
+    if len(x) >= 5 and len(yStd) >= 5:
+      for i in range(len(x) - 1, -1, -1):
+        conf = 1.0 / (1.0 + yStd[i])
+        if conf > CONFIDENCE_THRESHOLD:
+          conf_dist = max(MIN_DIST, min(MAX_DIST, x[i]))
+          break
+  except (AttributeError, IndexError):
+    pass
+
+  needed_dist = min(v_ego * PREVIEW_TIME, MAX_DIST)
+  if conf_dist >= needed_dist:
+    return 0
+
+  # Visibility-based cap
+  vis_safe_kph = (conf_dist / PREVIEW_TIME) * 3.6
+
+  # Curvature at confidence boundary
+  try:
+    pos = model_msg.position
+    px, py = list(pos.x), list(pos.y)
+    if len(px) >= 5 and len(py) >= 5:
+      import numpy as np
+      pxa, pya = np.array(px), np.array(py)
+      idx = np.searchsorted(pxa, conf_dist)
+      if 2 <= idx < len(pxa) - 1:
+        dx = pxa[idx+1] - pxa[idx-1]
+        dy = pya[idx+1] - pya[idx-1]
+        d2y = pya[idx+1] - 2*pya[idx] + pya[idx-1]
+        if abs(dx) >= 0.1:
+          dydx = dy / dx
+          d2ydx2 = d2y / ((dx/2) * dx)
+          boundary_curv = abs(d2ydx2) / (1 + dydx**2)**1.5
+          if boundary_curv > 0.001:
+            curv_safe_kph = ((MAX_LAT_ACCEL_CAP / boundary_curv) ** 0.5) * 3.6
+            vis_safe_kph = min(vis_safe_kph, curv_safe_kph)
+  except (AttributeError, IndexError):
+    pass
+
+  if vis_safe_kph >= MAX_CAP_SPEED:
+    return 0
+  if vis_safe_kph < MIN_CAP_SPEED:
+    vis_safe_kph = MIN_CAP_SPEED
+
+  return int(vis_safe_kph)
+
+
 def vision_speed_cap(model_msg) -> int:
   """Cap speed when vision confidently sees a narrow road (≤2 lanes).
 
@@ -372,11 +444,9 @@ class SpeedLimitMiddleware:
     try:
       from openpilot.selfdrive.plugins.plugin_bus import PluginSub
       self._cmd_sub = PluginSub(['speedlimit_cmd_car', 'speedlimit_cmd_ui'])
-      self._la_cap_sub = PluginSub(['lookahead_speed_cap'])
       self._cmd_init_t = time.monotonic()
     except ImportError:
       self._cmd_sub = None
-      self._la_cap_sub = None
 
     self.lookahead_cap: int = 0
     self._lookahead_cap_hold_until: float = 0.0
@@ -498,19 +568,20 @@ class SpeedLimitMiddleware:
         # Hold expired — allow cap to relax
         self.curvature_cap = raw_curv_cap
 
-    # --- Look ahead confidence-based speed cap ---
-    if self._la_cap_sub is not None:
-      msg = self._la_cap_sub.drain('lookahead_speed_cap')
-      if msg is not None:
-        _, data = msg
-        raw_la_cap = int(data.get('speed_cap', 0)) if isinstance(data, dict) else 0
-        if raw_la_cap > 0 and (raw_la_cap < self.lookahead_cap or self.lookahead_cap == 0):
-          self.lookahead_cap = raw_la_cap
-          self._lookahead_cap_hold_until = now + 3.0
-        elif now < self._lookahead_cap_hold_until:
-          pass  # Hold current cap
-        else:
-          self.lookahead_cap = raw_la_cap
+    # --- Confidence-based speed cap (moved from look_ahead plugin) ---
+    if self.sm.updated['modelV2']:
+      try:
+        v_ego = max(list(model.velocity.x)[0], 0.0) if hasattr(model, 'velocity') else 0.0
+      except (IndexError, AttributeError):
+        v_ego = 0.0
+      raw_la_cap = confidence_speed_cap(model, v_ego)
+      if raw_la_cap > 0 and (raw_la_cap < self.lookahead_cap or self.lookahead_cap == 0):
+        self.lookahead_cap = raw_la_cap
+        self._lookahead_cap_hold_until = now + 3.0
+      elif now < self._lookahead_cap_hold_until:
+        pass  # Hold current cap
+      else:
+        self.lookahead_cap = raw_la_cap
 
     # --- YOLO timeout ---
     if self.yolo_speed > 0 and (now - self.yolo_last_seen) > self.yolo_timeout:
