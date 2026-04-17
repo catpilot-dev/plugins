@@ -30,8 +30,9 @@ Full BMW E8x/E9x car interface for openpilot:
 | `controls.post_actuators` | on_post_actuators | DCC vTarget override |
 | `car.cruise_initialized` | on_cruise_initialized | Cruise ceiling memory on engage |
 | `ui.vehicle_settings` | on_vehicle_settings | Vehicle panel items |
-| `ui.state_subscriptions` | on_state_subscriptions | Subscribe to carState for temps |
 | `ui.render_overlay` | on_render_overlay | Temperature overlay + resume button handler |
+| `controls.lat_controller_init` | on_lat_controller_init | Incremental P curvature controller |
+| `device.health_check` | on_health_check | Plugin health check |
 
 ## CAN Bus Layout
 
