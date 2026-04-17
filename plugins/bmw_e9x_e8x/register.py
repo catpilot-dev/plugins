@@ -195,12 +195,12 @@ def on_lat_controller_init(result, lac, CP):
   # force scales with v². At 100 kph: 0.0026, at 50 kph: 0.0104.
   PLANT_GAIN_COEFF = 2.0  # gain = PLANT_GAIN_COEFF / v²
 
-  # Hysteresis on raw error: suppresses zero crossings (stepper direction reversals)
-  # from model noise without muting actions like a deadzone does.
-  # Gap 0.0008: lowest MAE (0.000187) on straights, matches P95 of raw error (0.000874).
-  # 53% fewer ZC than 0.0004, without under-responding like 0.001.
-  HYST_GAP = 0.0008
-  from opendbc.car import apply_hysteresis
+  # Two-layer noise suppression (model output is already clean):
+  # 1. DELTA_THRESHOLD: min |delta_error| to trigger worsening — ignores noise below P99
+  # 2. STEPPER_DEADZONE: min |error| to trigger sign_change — stepper ignores small errors
+  # Result: 83 actions vs 364 (hysteresis) on route 263, 16x fewer than raw.
+  DELTA_THRESHOLD = 0.0004   # catches real error trends early
+  STEPPER_DEADZONE = 0.0008  # stepper only acts on significant errors
 
   # Comfort limits on desired curvature (stricter than ISO/stock)
   MAX_LATERAL_JERK = 2.5      # m/s³ (stock: 5.0)
@@ -209,7 +209,6 @@ def on_lat_controller_init(result, lac, CP):
 
   state = {
     'torque': 0.0, 'step_remaining': 0,
-    'error_steady': 0.0,  # hysteresis-filtered error
     # Debug: last model frame values
     'desired': 0.0, 'measured': 0.0, 'error': 0.0,
     'delta_error': 0.0, 'log_prev_error': 0.0,
@@ -251,16 +250,14 @@ def on_lat_controller_init(result, lac, CP):
       except (AttributeError, IndexError):
         pass
 
-      raw_error = state['desired'] - state['measured']
-      state['error_steady'] = apply_hysteresis(raw_error, state['error_steady'], HYST_GAP)
       state['log_prev_error'] = state['error']
-      state['error'] = state['error_steady']
+      state['error'] = state['desired'] - state['measured']
 
       prev_error = state['log_prev_error']
       same_sign = state['error'] * prev_error > 0
       state['delta_error'] = state['error'] - prev_error
-      error_worsening = same_sign and abs(state['delta_error']) > 1e-6 and abs(state['error']) > abs(prev_error)
-      error_sign_changed = prev_error != 0 and not same_sign and abs(state['error']) > 1e-6
+      error_worsening = same_sign and abs(state['delta_error']) > DELTA_THRESHOLD and abs(state['error']) > abs(prev_error)
+      error_sign_changed = prev_error != 0 and not same_sign and abs(state['error']) > STEPPER_DEADZONE
 
       plant_gain = PLANT_GAIN_COEFF / (v ** 2)
       state['plant_gain'] = plant_gain
