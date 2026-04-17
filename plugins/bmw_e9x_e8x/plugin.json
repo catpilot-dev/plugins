@@ -40,11 +40,6 @@
       "function": "on_vehicle_settings",
       "priority": 50
     },
-    "ui.state_subscriptions": {
-      "module": "register",
-      "function": "on_state_subscriptions",
-      "priority": 50
-    },
     "ui.render_overlay": {
       "module": "ui_overlay",
       "function": "on_render_overlay",
