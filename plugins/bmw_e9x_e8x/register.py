@@ -195,12 +195,13 @@ def on_lat_controller_init(result, lac, CP):
   # force scales with v². At 100 kph: 0.0026, at 50 kph: 0.0104.
   PLANT_GAIN_COEFF = 2.0  # gain = PLANT_GAIN_COEFF / v²
 
-  # Model output is already clean — two thresholds derived from noise floor:
-  # DEADZONE: symmetrical ±0.0004 around zero, stepper holds within this band
-  # DELTA_THRESHOLD: min |delta_error| to trigger worsening correction
-  # Both set to half of P99 frame-to-frame curvature change (0.0008).
-  DEADZONE = 0.0004
-  DELTA_THRESHOLD = 0.0004
+  # DELTA_PCT: adaptive delta threshold — 10% of |prev_error|. Error must grow by
+  # at least 10% to trigger worsening. Filters P95+ of noise on straights.
+  DELTA_PCT = 0.10
+
+  # STEPPER_DEADZONE: on output torque. Suppress imperceptible corrections.
+  # 5% of max torque = 0.6 Nm — below human lateral acceleration perception.
+  STEPPER_DEADZONE = 0.05
 
   state = {
     'torque': 0.0, 'step_remaining': 0,
@@ -249,17 +250,11 @@ def on_lat_controller_init(result, lac, CP):
       state['error'] = state['desired'] - state['measured']
 
       prev_error = state['log_prev_error']
-
-      # Deadzone: stepper holds when error is within ±DEADZONE
-      if abs(state['error']) < DEADZONE:
-        state['delta_error'] = 0.0
-        error_worsening = False
-        error_sign_changed = False
-      else:
-        same_sign = state['error'] * prev_error > 0
-        state['delta_error'] = state['error'] - prev_error
-        error_worsening = same_sign and abs(state['delta_error']) > DELTA_THRESHOLD and abs(state['error']) > abs(prev_error)
-        error_sign_changed = prev_error != 0 and not same_sign
+      same_sign = state['error'] * prev_error > 0
+      state['delta_error'] = state['error'] - prev_error
+      delta_threshold = DELTA_PCT * abs(prev_error)
+      error_worsening = same_sign and abs(state['delta_error']) > delta_threshold and abs(state['error']) > abs(prev_error)
+      error_sign_changed = prev_error != 0 and not same_sign
 
       plant_gain = PLANT_GAIN_COEFF / (v ** 2)
       state['plant_gain'] = plant_gain
@@ -283,6 +278,10 @@ def on_lat_controller_init(result, lac, CP):
       state['step_remaining'] -= small_step
 
     output = max(-1.0, min(1.0, state['torque']))
+
+    # Stepper deadzone: suppress imperceptible torque (< 0.1 m/s² lat accel)
+    if abs(output) < STEPPER_DEADZONE:
+      output = 0.0
 
     if not active or CS.vEgo < 5.0:
       pid_log.active = False
