@@ -156,60 +156,39 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Incremental P torque controller — self-contained curvature tracking.
+  """Incremental P torque controller — curvature tracking.
 
-  Both desired and measured curvature computed from modelV2 orientation
-  using curv_from_psis. No dependency on controlsd's desired curvature.
-
-  - measured: curv_from_psis at t=0.01s (current vehicle state)
-  - desired: curv_from_psis at t=LOOKAHEAD_T (1.0s on straights, 0.5s in curves)
-  Same formula, same source — error is purely the curvature change needed.
-
-  Resets to zero on disengage — micro-stepping converges from zero naturally.
+  - desired:  controlsd's desired_curvature (modelV2 plan at lat_action_t ~0.5s)
+  - measured: livePose yaw rate / vEgo
   """
   from cereal import log
   from cereal import messaging
-  import numpy as np
   from bmw.values import CarControllerParams as CCP
 
-  _sm = messaging.SubMaster(['modelV2'])
-  _T_IDXS = [10.0 * (i / 32) ** 2 for i in range(33)]
+  _sm = messaging.SubMaster(['livePose'])
 
-  # Adaptive time indices based on camera visibility.
-  # Measured = nearest T_IDXS where v*t >= MIN_VISIBLE_DIST (road camera can see)
-  # Desired = next T_IDXS (one index ahead, ~1-2m further on road)
-  # MIN_VISIBLE_DIST computed from camera geometry in CarControllerParams.
-  MIN_VISIBLE_DIST = CCP.MIN_VISIBLE_DIST
+  # Max torque change per measurement frame (CAN safety limit, 5 CAN frames at 20Hz)
+  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX
 
-  # Max torque change per model frame (CAN safety limit, 5 CAN frames at 20Hz)
-  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX  # 0.04167 per model frame
-
-  # Spread correction across 20 CAN frames (0.2s / 4 model frames)
-  # 4.8s to saturate (12Nm) — smooth lane changes, no abrupt jerk
-  # Straight-lane buzz handled by hysteresis, not spreading
+  # Spread correction across 20 CAN frames (0.2s) — smooth, no abrupt jerk
   SPREAD_FRAMES = 20
-  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES  # 0.00208 per CAN frame
+  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
 
-  # Plant gain: 2/v² — mirrors vehicle dynamics (curvature response ∝ 1/v²).
-  # At higher speed, same torque produces less curvature change because lateral
-  # force scales with v². At 100 kph: 0.0026, at 50 kph: 0.0104.
-  PLANT_GAIN_COEFF = 2.0  # gain = PLANT_GAIN_COEFF / v²
+  # Plant gain: 2/v² — mirrors vehicle dynamics (curvature response ∝ 1/v²)
+  PLANT_GAIN_COEFF = 2.0
 
-  # DELTA_PCT: adaptive delta threshold — 10% of |prev_error|. Error must grow by
-  # at least 10% to trigger worsening. Filters P95+ of noise on straights.
+  # Adaptive delta threshold — error must grow by ≥10% of |prev_error| to trigger
   DELTA_PCT = 0.10
 
-  # STEPPER_DEADZONE: on output torque. Suppress imperceptible corrections.
-  # 5% of max torque = 0.6 Nm — below human lateral acceleration perception.
+  # Output torque deadzone — 5% of max (~0.6 Nm), below human perception
   STEPPER_DEADZONE = 0.05
 
   state = {
-    'torque': 0.0, 'step_remaining': 0,
-    'lat_pub': None,  # PluginPub for debug logging
-    # Debug: last model frame values
+    'torque': 0.0, 'step_remaining': 0.0,
+    'lat_pub': None,
     'desired': 0.0, 'measured': 0.0, 'error': 0.0,
     'delta_error': 0.0, 'log_prev_error': 0.0,
-    'plant_gain': 0.0, 'action': 'hold', 'active': 'False'
+    'plant_gain': 0.0, 'action': 'hold',
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -218,39 +197,17 @@ def on_lat_controller_init(result, lac, CP):
 
     _sm.update(0)
 
-    # Compute curvature every frame (used for both active control and shadow torque)
-    if _sm.updated['modelV2']:
-      m = _sm['modelV2']
-      try:
-        yaws = list(m.orientation.z)
-        yaw_rates = list(m.orientationRate.z)
-        if len(yaws) >= 20 and len(yaw_rates) >= 2:
-          v = max(CS.vEgo, 5.0)
-          psi_rate = yaw_rates[0]
+    v = max(CS.vEgo, 5.0)
+    state['plant_gain'] = PLANT_GAIN_COEFF / (v ** 2)
+    state['desired'] = float(desired_curvature)
 
-          # Find nearest T_IDXS where camera can see the road (v*t >= 6.1m)
-          meas_idx = len(_T_IDXS) - 2  # fallback
-          for i in range(1, len(_T_IDXS) - 1):
-            if v * _T_IDXS[i] >= MIN_VISIBLE_DIST:
-              meas_idx = i
-              break
-          des_idx = meas_idx + 1
+    if _sm.updated['livePose']:
+      state['measured'] = float(_sm['livePose'].angularVelocityDevice.z) / v
 
-          t_meas = _T_IDXS[meas_idx]
-          t_des = _T_IDXS[des_idx]
-          psi_meas = float(np.interp(t_meas, _T_IDXS, yaws))
-          psi_des = float(np.interp(t_des, _T_IDXS, yaws))
-          state['measured'] = 2.0 * psi_meas / (v * t_meas) - psi_rate / v
-          state['desired'] = 2.0 * psi_des / (v * t_des) - psi_rate / v
-          state['plant_gain'] = PLANT_GAIN_COEFF / (v ** 2)
-      except (AttributeError, IndexError):
-        pass
+    # Base torque from measured curvature
+    state['torque'] = max(-1.0, min(1.0, state['measured'] / state['plant_gain']))
 
-    # Base torque from measured curvature + error correction — always runs.
-    if state['plant_gain'] > 0:
-      state['torque'] = max(-1.0, min(1.0, state['measured'] / state['plant_gain']))
-
-    if _sm.updated['modelV2']:
+    if _sm.updated['livePose']:
       state['log_prev_error'] = state['error']
       state['error'] = state['desired'] - state['measured']
 
@@ -261,18 +218,16 @@ def on_lat_controller_init(result, lac, CP):
       error_worsening = same_sign and abs(state['delta_error']) > delta_threshold and abs(state['error']) > abs(prev_error)
       error_sign_changed = prev_error != 0 and not same_sign
 
-      plant_gain = state['plant_gain']
-
       if error_worsening:
-        correction = state['delta_error'] / plant_gain
+        correction = state['delta_error'] / state['plant_gain']
         state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
         state['action'] = 'worsening'
       elif error_sign_changed:
-        correction = state['error'] / plant_gain
+        correction = state['error'] / state['plant_gain']
         state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
         state['action'] = 'sign_change'
       else:
-        state['step_remaining'] = 0
+        state['step_remaining'] = 0.0
         state['action'] = 'hold'
 
     if state['step_remaining'] != 0:
