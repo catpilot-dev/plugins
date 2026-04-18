@@ -218,37 +218,7 @@ def on_lat_controller_init(result, lac, CP):
 
     _sm.update(0)
 
-    if not active or CS.vEgo < 5.0:
-      # Shadow torque from measured curvature — pre-loads the torque needed
-      # for the current road geometry. On engage in a curve, the stepper
-      # starts at the right ballpark instead of ramping from zero.
-      v = max(CS.vEgo, 5.0)
-      if _sm.updated['modelV2']:
-        m = _sm['modelV2']
-        try:
-          yaws = list(m.orientation.z)
-          yaw_rates = list(m.orientationRate.z)
-          if len(yaws) >= 20 and len(yaw_rates) >= 2:
-            psi_rate = yaw_rates[0]
-            meas_idx = len(_T_IDXS) - 2
-            for i in range(1, len(_T_IDXS) - 1):
-              if v * _T_IDXS[i] >= MIN_VISIBLE_DIST:
-                meas_idx = i
-                break
-            t_meas = _T_IDXS[meas_idx]
-            psi_meas = float(np.interp(t_meas, _T_IDXS, yaws))
-            measured = 2.0 * psi_meas / (v * t_meas) - psi_rate / v
-            plant_gain = PLANT_GAIN_COEFF / (v ** 2)
-            state['torque'] = max(-1.0, min(1.0, measured / plant_gain))
-        except (AttributeError, IndexError):
-          state['torque'] = 0.0
-      state['step_remaining'] = 0
-      state['error'] = 0.0
-      state['log_prev_error'] = 0.0
-      pid_log.active = False
-      pid_log.error = 0.0
-      return 0.0, 0.0, pid_log
-
+    # Compute curvature every frame (used for both active control and shadow torque)
     if _sm.updated['modelV2']:
       m = _sm['modelV2']
       try:
@@ -272,9 +242,15 @@ def on_lat_controller_init(result, lac, CP):
           psi_des = float(np.interp(t_des, _T_IDXS, yaws))
           state['measured'] = 2.0 * psi_meas / (v * t_meas) - psi_rate / v
           state['desired'] = 2.0 * psi_des / (v * t_des) - psi_rate / v
+          state['plant_gain'] = PLANT_GAIN_COEFF / (v ** 2)
       except (AttributeError, IndexError):
         pass
 
+    # Base torque from measured curvature + error correction — always runs.
+    if state['plant_gain'] > 0:
+      state['torque'] = max(-1.0, min(1.0, state['measured'] / state['plant_gain']))
+
+    if _sm.updated['modelV2']:
       state['log_prev_error'] = state['error']
       state['error'] = state['desired'] - state['measured']
 
@@ -285,8 +261,7 @@ def on_lat_controller_init(result, lac, CP):
       error_worsening = same_sign and abs(state['delta_error']) > delta_threshold and abs(state['error']) > abs(prev_error)
       error_sign_changed = prev_error != 0 and not same_sign
 
-      plant_gain = PLANT_GAIN_COEFF / (v ** 2)
-      state['plant_gain'] = plant_gain
+      plant_gain = state['plant_gain']
 
       if error_worsening:
         correction = state['delta_error'] / plant_gain
@@ -300,7 +275,6 @@ def on_lat_controller_init(result, lac, CP):
         state['step_remaining'] = 0
         state['action'] = 'hold'
 
-    # Every control frame (100Hz): apply micro-step to shadow torque
     if state['step_remaining'] != 0:
       small_step = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, state['step_remaining']))
       state['torque'] += small_step
@@ -308,9 +282,10 @@ def on_lat_controller_init(result, lac, CP):
 
     output = max(-1.0, min(1.0, state['torque']))
 
-    # Stepper deadzone: suppress imperceptible torque (< 0.1 m/s² lat accel)
-    if abs(output) < STEPPER_DEADZONE:
-      output = 0.0
+    # Output 0 when disengaged or torque below perception threshold
+    if not active or abs(output) < STEPPER_DEADZONE:
+      pid_log.active = active
+      return 0.0, 0.0, pid_log
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
