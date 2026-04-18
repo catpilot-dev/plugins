@@ -165,7 +165,7 @@ def on_lat_controller_init(result, lac, CP):
   - desired: curv_from_psis at t=LOOKAHEAD_T (1.0s on straights, 0.5s in curves)
   Same formula, same source — error is purely the curvature change needed.
 
-  Runs even when disengaged (shadow torque) for seamless engage transition.
+  Resets to zero on disengage — micro-stepping converges from zero naturally.
   """
   from cereal import log
   from cereal import messaging
@@ -218,8 +218,15 @@ def on_lat_controller_init(result, lac, CP):
 
     _sm.update(0)
 
-    # Runs every frame, even when disengaged — shadow-computes torque so
-    # engage transition is seamless (no ramp-up from zero in curves).
+    if not active or CS.vEgo < 5.0:
+      state['torque'] = 0.0
+      state['step_remaining'] = 0
+      state['error'] = 0.0
+      state['log_prev_error'] = 0.0
+      pid_log.active = False
+      pid_log.error = 0.0
+      return 0.0, 0.0, pid_log
+
     if _sm.updated['modelV2']:
       m = _sm['modelV2']
       try:
@@ -282,11 +289,6 @@ def on_lat_controller_init(result, lac, CP):
     # Stepper deadzone: suppress imperceptible torque (< 0.1 m/s² lat accel)
     if abs(output) < STEPPER_DEADZONE:
       output = 0.0
-
-    if not active or CS.vEgo < 5.0:
-      pid_log.active = False
-      pid_log.error = 0.0
-      return 0.0, 0.0, pid_log
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
