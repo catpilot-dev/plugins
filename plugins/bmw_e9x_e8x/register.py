@@ -209,7 +209,7 @@ def on_lat_controller_init(result, lac, CP):
     # Debug: last model frame values
     'desired': 0.0, 'measured': 0.0, 'error': 0.0,
     'delta_error': 0.0, 'log_prev_error': 0.0,
-    'plant_gain': 0.0, 'action': 'hold',
+    'plant_gain': 0.0, 'action': 'hold', 'active': 'False'
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -284,13 +284,12 @@ def on_lat_controller_init(result, lac, CP):
 
     # Output 0 when disengaged or torque below perception threshold
     if not active or abs(output) < STEPPER_DEADZONE:
-      pid_log.active = active
-      return 0.0, 0.0, pid_log
+      output = 0.0
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
     pid_log.error = float(state['error'])
-    pid_log.active = True
+    pid_log.active = active
     pid_log.output = float(output)
     pid_log.saturated = bool(abs(output) > 0.99)
 
@@ -311,6 +310,7 @@ def on_lat_controller_init(result, lac, CP):
         'output': float(output),
         'vEgo': float(CS.vEgo),
         'action': state['action'],
+        'active': active,
       })
     except Exception:
       pass
