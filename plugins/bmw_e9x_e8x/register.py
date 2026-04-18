@@ -174,8 +174,9 @@ def on_lat_controller_init(result, lac, CP):
   SPREAD_FRAMES = 20
   STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
 
-  # Plant gain: 2/v² — mirrors vehicle dynamics (curvature response ∝ 1/v²)
-  PLANT_GAIN_COEFF = 2.0
+  # Plant gain: 2.5/v² — set above empirical K (~2.0-2.5 across speeds) so the
+  # base term understeers; micro-stepping closes the remaining error additively
+  PLANT_GAIN_COEFF = 2.5
 
   # Adaptive delta threshold — error must grow by ≥10% of |prev_error| to trigger
   DELTA_PCT = 0.10
