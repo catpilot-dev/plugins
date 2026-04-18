@@ -219,7 +219,29 @@ def on_lat_controller_init(result, lac, CP):
     _sm.update(0)
 
     if not active or CS.vEgo < 5.0:
-      state['torque'] = 0.0
+      # Shadow torque from measured curvature — pre-loads the torque needed
+      # for the current road geometry. On engage in a curve, the stepper
+      # starts at the right ballpark instead of ramping from zero.
+      v = max(CS.vEgo, 5.0)
+      if _sm.updated['modelV2']:
+        m = _sm['modelV2']
+        try:
+          yaws = list(m.orientation.z)
+          yaw_rates = list(m.orientationRate.z)
+          if len(yaws) >= 20 and len(yaw_rates) >= 2:
+            psi_rate = yaw_rates[0]
+            meas_idx = len(_T_IDXS) - 2
+            for i in range(1, len(_T_IDXS) - 1):
+              if v * _T_IDXS[i] >= MIN_VISIBLE_DIST:
+                meas_idx = i
+                break
+            t_meas = _T_IDXS[meas_idx]
+            psi_meas = float(np.interp(t_meas, _T_IDXS, yaws))
+            measured = 2.0 * psi_meas / (v * t_meas) - psi_rate / v
+            plant_gain = PLANT_GAIN_COEFF / (v ** 2)
+            state['torque'] = max(-1.0, min(1.0, measured / plant_gain))
+        except (AttributeError, IndexError):
+          state['torque'] = 0.0
       state['step_remaining'] = 0
       state['error'] = 0.0
       state['log_prev_error'] = 0.0
