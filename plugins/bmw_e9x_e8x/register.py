@@ -189,7 +189,19 @@ def on_lat_controller_init(result, lac, CP):
   # Friction feedforward — step torque in sign(err) direction, breaks Coulomb
   # stiction in the steering column. Stock uses 0.15; we run 0.10 (1.2 Nm).
   FRICTION_TORQUE = 0.10
-  FRICTION_DEADZONE = 0.00005   # skip noise-only ticks (~10% of straights), dither preserved
+  # Friction deadzone from physical criterion: fire when the curvature error
+  # would cause ≥OFFSET_THRESHOLD lateral drift in OFFSET_TIME seconds.
+  #   offset(T) = ½ · delta · v² · T²  ⇒  delta_threshold = 2·offset / (v·T)²
+  # With offset=0.1m, T=1s: threshold = 0.2/v². 0.1m is acceptable drift within
+  # a ~3.5m lane; smaller deltas are left to the PI to close.
+  FRICTION_OFFSET_M = 0.10
+  FRICTION_OFFSET_T = 1.0
+
+  # Persistent curvature bias in CS.yawRate — route 00000266 shows CS.yawRate/v
+  # reads ~0.00025 more right-drift than Kalman-filtered livePose or
+  # steering-angle-derived cs.curvature. Add this back to center measured on
+  # zero during true straight driving.
+  MEASURED_BIAS_CURV = 0.00025
 
   state = {
     'torque': 0.0,
@@ -206,21 +218,28 @@ def on_lat_controller_init(result, lac, CP):
     v = max(CS.vEgo, 5.0)
     state['plant_gain'] = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
     state['desired'] = float(desired_curvature)
-    # CS.yawRate is left-positive; desiredCurvature is right-positive — negate to match
-    state['measured'] = -float(CS.yawRate) / v
+    # CS.yawRate is left-positive; desiredCurvature is right-positive — negate to match.
+    # Add MEASURED_BIAS_CURV to compensate the persistent right-drift bias in DSC yaw rate.
+    state['measured'] = -float(CS.yawRate) / v + MEASURED_BIAS_CURV
 
     err = state['desired'] - state['measured']
-    state['integral'] += err
-    state['integral'] = max(-I_MAX, min(I_MAX, state['integral']))  # anti-windup
 
-    # Friction FF — step in sign(err) direction to break steering stiction.
-    if abs(err) > FRICTION_DEADZONE:
-      friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
-    else:
-      friction_ff = 0.0
+    # Deadzone from physical criterion — curvature error that would cause
+    # FRICTION_OFFSET_M lateral drift in FRICTION_OFFSET_T seconds.
+    # Below this, the controller takes NO feedback action — pure FF on desired.
+    # Above it, P + I + friction engage to close the error.
+    deadzone = (2.0 * FRICTION_OFFSET_M / (FRICTION_OFFSET_T ** 2)) / (v ** 2)
+    active_err = err if abs(err) > deadzone else 0.0
 
-    # Curvature command = measured (FF on current state) + P·err + I·integral
-    curvature_cmd = state['measured'] + KP * err + KI * state['integral']
+    # Integral accumulates only when outside deadzone (freezes when tracking well)
+    state['integral'] += active_err
+    state['integral'] = max(-I_MAX, min(I_MAX, state['integral']))
+
+    # Friction FF only engages outside deadzone
+    friction_ff = (FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE) if abs(err) > deadzone else 0.0
+
+    # Curvature command: FF on desired + (gated) P·err + I·integral
+    curvature_cmd = state['desired'] + KP * active_err + KI * state['integral']
     state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
 
     output = state['torque']
