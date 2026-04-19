@@ -16,6 +16,8 @@ PLANT_GAIN_K = 0.68
 PLANT_GAIN_B = 0.0073
 UNDERSTEER_MARGIN = 1.3
 STEPPER_DEADZONE = 0.01
+FRICTION_TORQUE = 0.10
+FRICTION_DEADZONE = 0.0001
 
 
 class MicroStepping:
@@ -38,8 +40,15 @@ class MicroStepping:
     if livepose_updated:
       self.measured = float(yaw_rate) / v
 
-    # base torque from measured curvature
-    self.torque = max(-1.0, min(1.0, self.measured / self.plant_gain))
+    # friction feedforward: sign(err) × FRICTION_TORQUE if |err| > deadzone
+    err = self.desired - self.measured
+    if abs(err) > FRICTION_DEADZONE:
+      friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
+    else:
+      friction_ff = 0.0
+
+    # base torque from measured curvature + friction
+    self.torque = max(-1.0, min(1.0, self.measured / self.plant_gain + friction_ff))
 
     if livepose_updated:
       self.delta_desired = self.desired - self.desired_prev
