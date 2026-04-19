@@ -185,9 +185,15 @@ def on_lat_controller_init(result, lac, CP):
   SPREAD_FRAMES = 5
   STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
 
-  # Plant gain: 2.5/v² — set above empirical K (~2.0-2.5 across speeds) so the
-  # base term understeers; micro-stepping closes the remaining error additively
-  PLANT_GAIN_COEFF = 2.5
+  # Plant gain: UNDERSTEER_MARGIN × (K/v² + b).
+  # K, b fitted to route data as desired·v² = K·(−torque)/v² + b·(−torque) — the
+  # K/v²+b form captures that actual plant_gain asymptotes to a floor at high v
+  # instead of decaying to zero (R² 0.44 vs 0.36 for pure K/v²).
+  # UNDERSTEER_MARGIN=1.3 inflates controller's plant_gain above fitted truth so
+  # base torque deliberately undershoots; stepper closes the remainder additively.
+  PLANT_GAIN_K = 0.68
+  PLANT_GAIN_B = 0.0073
+  UNDERSTEER_MARGIN = 1.3
 
   # Output torque deadzone — 1% of max (~0.12 Nm). Route analysis shows
   # straight-line raw torque P90 ≈ 0.09; 0.01 cuts only 21% of small action
@@ -210,7 +216,7 @@ def on_lat_controller_init(result, lac, CP):
     _sm.update(0)
 
     v = max(CS.vEgo, 5.0)
-    state['plant_gain'] = PLANT_GAIN_COEFF / (v ** 2)
+    state['plant_gain'] = UNDERSTEER_MARGIN * (PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B)
     state['desired'] = float(desired_curvature)
 
     if _sm.updated['livePose']:

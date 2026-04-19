@@ -12,7 +12,9 @@ STEER_DELTA_UP = 0.1
 MAX_STEP = STEER_DELTA_UP * 5 / STEER_MAX     # 0.04167 per measurement frame
 SPREAD_FRAMES = 5
 STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES     # 0.00833 per CAN frame
-PLANT_GAIN_COEFF = 2.5
+PLANT_GAIN_K = 0.68
+PLANT_GAIN_B = 0.0073
+UNDERSTEER_MARGIN = 1.3
 STEPPER_DEADZONE = 0.01
 
 
@@ -30,7 +32,7 @@ class MicroStepping:
 
   def update(self, active, v_ego, desired_curv, yaw_rate, livepose_updated):
     v = max(v_ego, 5.0)
-    self.plant_gain = PLANT_GAIN_COEFF / (v ** 2)
+    self.plant_gain = UNDERSTEER_MARGIN * (PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B)
     self.desired = float(desired_curv)
 
     if livepose_updated:
