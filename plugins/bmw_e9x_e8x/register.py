@@ -156,63 +156,46 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Incremental P torque controller — curvature rate tracking.
+  """PI controller with feedforward + friction — curvature tracking at 100 Hz.
 
-  - desired:  controlsd's desired_curvature (modelV2 plan at lat_action_t ~0.5s)
-  - measured: livePose yaw rate / vEgo
+    curvature_cmd = measured + Kp·(desired − measured) + Ki·integral
+    torque       = curvature_cmd / plant_gain + friction_ff
 
-  Correction signal is a backward 50ms difference on both sources:
-    delta_desired  = desired[t]  - desired[t-50ms]
-    delta_measured = measured[t] - measured[t-50ms]
-    delta_of_delta = delta_desired - delta_measured
-
-  Taking differences within each pipeline cancels constant bias between model
-  and gyro sources. Integrating delta_of_delta via micro-stepping still drives
-  measured trajectory to follow desired trajectory, without sensitivity to a
-  fixed offset between the two signals.
+  - desired:  controlsd's desired_curvature (modelV2 plan at lat_action_t ~0.5s, right-positive)
+  - measured: -CS.yawRate / vEgo (BMW DSC yaw rate from Speed CAN at 100 Hz;
+              DSC is left-positive, negated to match desiredCurvature's right-positive)
+  - Kp < 1 bakes in the understeer margin (base under-commits; I closes gap)
+  - Integral accumulates err every CAN tick, anti-windup clamped
   """
   from cereal import log
-  from cereal import messaging
-  from bmw.values import CarControllerParams as CCP
 
-  _sm = messaging.SubMaster(['livePose'])
-
-  # Max torque change per measurement frame (CAN safety limit, 5 CAN frames at 20Hz)
-  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX
-
-  # Spread correction across 5 CAN frames (50ms) — one model/livePose cycle,
-  # so each correction fully applies before the next delta_of_delta arrives
-  SPREAD_FRAMES = 5
-  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
-
-  # Plant gain: UNDERSTEER_MARGIN × (K/v² + b).
-  # K, b fitted to route data as desired·v² = K·(−torque)/v² + b·(−torque) — the
-  # K/v²+b form captures that actual plant_gain asymptotes to a floor at high v
-  # instead of decaying to zero (R² 0.44 vs 0.36 for pure K/v²).
-  # UNDERSTEER_MARGIN=1.3 inflates controller's plant_gain above fitted truth so
-  # base torque deliberately undershoots; stepper closes the remainder additively.
+  # Plant gain: K/v² + b, fit from route 00000266 regression
+  #   desired·v² = K·(−torque)/v² + b·(−torque),  K=0.68, b=0.0073, R²=0.44
+  # No multiplicative understeer margin — Kp < 1 provides it.
   PLANT_GAIN_K = 0.68
   PLANT_GAIN_B = 0.0073
-  UNDERSTEER_MARGIN = 1.3
 
-  # Output torque deadzone — 1% of max (~0.12 Nm). Route analysis shows
-  # straight-line raw torque P90 ≈ 0.09; 0.01 cuts only 21% of small action
-  # while keeping buzz ≤0.15 Hz (15× quieter than stock)
+  # PI gains. Kp = 0.8 commits 80% to desired (20% understeer margin).
+  # Ki at 100 Hz — tuned so 200 ms of steady err = 0.001 adds ~0.004 curvature
+  # contribution (≈30% torque at v=15), a modest plant-mismatch correction.
+  KP = 0.8
+  KI = 0.02
+  I_MAX = 0.005   # curvature, caps sustained I-contribution to ~40% torque at v=15
+
+  # Output torque deadzone — 1% of max (~0.12 Nm). Suppresses sub-perceptible
+  # commands; preserves corner tracking (empirical from route 00000266).
   STEPPER_DEADZONE = 0.01
 
-  # Friction feedforward — static torque step in the direction that closes the
-  # desired-measured error. Compensates for steering-column Coulomb friction
-  # that absorbs small stepper-accumulated torque and causes undershoot in
-  # curves and slow drift on straights. Stock uses 0.15; starting at 0.10.
+  # Friction feedforward — step torque in sign(err) direction, breaks Coulomb
+  # stiction in the steering column. Stock uses 0.15; we run 0.10 (1.2 Nm).
   FRICTION_TORQUE = 0.10
-  FRICTION_DEADZONE = 0.0001   # curvature error below which friction is off
+  FRICTION_DEADZONE = 0.00001   # fire on any err — dither helps anti-stiction
 
   state = {
-    'torque': 0.0, 'step_remaining': 0.0,
+    'torque': 0.0,
+    'integral': 0.0,
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
-    'desired_prev': 0.0, 'measured_prev': 0.0,
-    'delta_desired': 0.0, 'delta_measured': 0.0,
     'plant_gain': 0.0,
   }
 
@@ -220,46 +203,27 @@ def on_lat_controller_init(result, lac, CP):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 10
 
-    _sm.update(0)
-
     v = max(CS.vEgo, 5.0)
-    state['plant_gain'] = UNDERSTEER_MARGIN * (PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B)
+    state['plant_gain'] = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
     state['desired'] = float(desired_curvature)
+    # CS.yawRate is left-positive; desiredCurvature is right-positive — negate to match
+    state['measured'] = -float(CS.yawRate) / v
 
-    if _sm.updated['livePose']:
-      state['measured'] = float(_sm['livePose'].angularVelocityDevice.z) / v
-
-    # Friction feedforward: step torque in the direction that closes error.
-    # err > 0 means we want more curvature (more left) than we have → base
-    # torque needs to increase (more +state['torque'] → more -car_torque →
-    # more left). friction_ff is same sign as err.
     err = state['desired'] - state['measured']
+    state['integral'] += err
+    state['integral'] = max(-I_MAX, min(I_MAX, state['integral']))  # anti-windup
+
+    # Friction FF — step in sign(err) direction to break steering stiction.
     if abs(err) > FRICTION_DEADZONE:
       friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
     else:
       friction_ff = 0.0
 
-    # Base torque from desired curvature (true feedforward) + friction
-    # Using desired (not measured) so the base term tracks the plan instead
-    # of sustaining the current state. Drift correction is handled by friction
-    # FF and micro-stepping; base commits to the target.
-    state['torque'] = max(-1.0, min(1.0, state['desired'] / state['plant_gain'] + friction_ff))
+    # Curvature command = measured (FF on current state) + P·err + I·integral
+    curvature_cmd = state['measured'] + KP * err + KI * state['integral']
+    state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
 
-    if _sm.updated['livePose']:
-      state['delta_desired'] = state['desired'] - state['desired_prev']
-      state['delta_measured'] = state['measured'] - state['measured_prev']
-      state['desired_prev'] = state['desired']
-      state['measured_prev'] = state['measured']
-      delta_of_delta = state['delta_desired'] - state['delta_measured']
-      correction = delta_of_delta / state['plant_gain']
-      state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
-
-    if state['step_remaining'] != 0:
-      small_step = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, state['step_remaining']))
-      state['torque'] += small_step
-      state['step_remaining'] -= small_step
-
-    output = max(-1.0, min(1.0, state['torque']))
+    output = state['torque']
 
     # Output 0 when disengaged or torque below perception threshold
     if not active or abs(output) < STEPPER_DEADZONE:
@@ -267,12 +231,11 @@ def on_lat_controller_init(result, lac, CP):
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
-    pid_log.error = float(state['desired'] - state['measured'])
+    pid_log.error = float(err)
     pid_log.active = active
     pid_log.output = float(output)
     pid_log.saturated = bool(abs(output) > 0.99)
 
-    # Log to plugin bus (all debug fields for offline analysis)
     try:
       if state['lat_pub'] is None:
         from openpilot.selfdrive.plugins.plugin_bus import PluginPub
@@ -280,11 +243,9 @@ def on_lat_controller_init(result, lac, CP):
       state['lat_pub'].send({
         'desired': float(state['desired']),
         'measured': float(state['measured']),
-        'delta_desired': float(state['delta_desired']),
-        'delta_measured': float(state['delta_measured']),
-        'delta_of_delta': float(state['delta_desired'] - state['delta_measured']),
+        'err': float(err),
+        'integral': float(state['integral']),
         'plant_gain': float(state['plant_gain']),
-        'step': float(state['step_remaining']),
         'friction_ff': float(friction_ff),
         'torque': float(state['torque']),
         'output': float(output),
