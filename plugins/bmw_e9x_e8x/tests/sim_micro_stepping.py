@@ -16,7 +16,9 @@ KI = 0.02
 I_MAX = 0.005
 STEPPER_DEADZONE = 0.01
 FRICTION_TORQUE = 0.10
-FRICTION_DEADZONE = 0.00005
+FRICTION_OFFSET_M = 0.10
+FRICTION_OFFSET_T = 1.0
+MEASURED_BIAS_CURV = 0.00025
 
 
 class MicroStepping:
@@ -37,18 +39,18 @@ class MicroStepping:
     v = max(v_ego, 5.0)
     self.plant_gain = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
     self.desired = float(desired_curv)
-    self.measured = float(yaw_rate) / v
+    self.measured = float(yaw_rate) / v + MEASURED_BIAS_CURV
 
     err = self.desired - self.measured
-    self.integral += err
+    deadzone = (2.0 * FRICTION_OFFSET_M / (FRICTION_OFFSET_T ** 2)) / (v ** 2)
+    active_err = err if abs(err) > deadzone else 0.0
+
+    self.integral += active_err
     self.integral = max(-I_MAX, min(I_MAX, self.integral))
 
-    if abs(err) > FRICTION_DEADZONE:
-      friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
-    else:
-      friction_ff = 0.0
+    friction_ff = (FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE) if abs(err) > deadzone else 0.0
 
-    curvature_cmd = self.measured + KP * err + KI * self.integral
+    curvature_cmd = self.desired + KP * active_err + KI * self.integral
     self.torque = max(-1.0, min(1.0, curvature_cmd / self.plant_gain + friction_ff))
 
     out = self.torque
