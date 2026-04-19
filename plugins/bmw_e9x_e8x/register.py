@@ -200,6 +200,13 @@ def on_lat_controller_init(result, lac, CP):
   # while keeping buzz ≤0.15 Hz (15× quieter than stock)
   STEPPER_DEADZONE = 0.01
 
+  # Friction feedforward — static torque step in the direction that closes the
+  # desired-measured error. Compensates for steering-column Coulomb friction
+  # that absorbs small stepper-accumulated torque and causes undershoot in
+  # curves and slow drift on straights. Stock uses 0.15; starting at 0.10.
+  FRICTION_TORQUE = 0.10
+  FRICTION_DEADZONE = 0.0001   # curvature error below which friction is off
+
   state = {
     'torque': 0.0, 'step_remaining': 0.0,
     'lat_pub': None,
@@ -222,8 +229,18 @@ def on_lat_controller_init(result, lac, CP):
     if _sm.updated['livePose']:
       state['measured'] = float(_sm['livePose'].angularVelocityDevice.z) / v
 
-    # Base torque from measured curvature
-    state['torque'] = max(-1.0, min(1.0, state['measured'] / state['plant_gain']))
+    # Friction feedforward: step torque in the direction that closes error.
+    # err > 0 means we want more curvature (more left) than we have → base
+    # torque needs to increase (more +state['torque'] → more -car_torque →
+    # more left). friction_ff is same sign as err.
+    err = state['desired'] - state['measured']
+    if abs(err) > FRICTION_DEADZONE:
+      friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
+    else:
+      friction_ff = 0.0
+
+    # Base torque from measured curvature + friction feedforward
+    state['torque'] = max(-1.0, min(1.0, state['measured'] / state['plant_gain'] + friction_ff))
 
     if _sm.updated['livePose']:
       state['delta_desired'] = state['desired'] - state['desired_prev']
@@ -265,6 +282,7 @@ def on_lat_controller_init(result, lac, CP):
         'delta_of_delta': float(state['delta_desired'] - state['delta_measured']),
         'plant_gain': float(state['plant_gain']),
         'step': float(state['step_remaining']),
+        'friction_ff': float(friction_ff),
         'torque': float(state['torque']),
         'output': float(output),
         'vEgo': float(CS.vEgo),
