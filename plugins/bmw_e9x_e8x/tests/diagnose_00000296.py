@@ -1,21 +1,55 @@
 #!/usr/bin/env python3
-"""Diagnose route 00000296 symptoms:
-  1. Straight-line drift to left (measured_curvature biased negative on |des|<thr)
-  2. In-turn over-steer (|measured| > |desired| in curves)
+"""Diagnose drift / tracking symptoms on an engaged route:
+  1. Straight-line drift (measured_curvature mean bias vs desired)
+  2. In-turn tracking (|measured| / |desired| distribution)
+  3. Torque output bias, steady-state error by speed
 
-Test hypothesis: static steering friction not being compensated.
+Usage:  diagnose.py                              # default route 00000296
+        diagnose.py 00000297                    # by route prefix
+        diagnose.py /data/media/0/realdata/00000297--2b9bca7287--
 """
-import glob, os, zstandard, numpy as np
+import glob, os, sys, zstandard, numpy as np
 from cereal import log as caplog
 
-ROUTE = '/data/media/0/realdata/00000296--6dfdb1bbbd--'
+_DEFAULT = '/data/media/0/realdata/00000296--6dfdb1bbbd--'
+if len(sys.argv) > 1:
+  arg = sys.argv[1]
+  if arg.startswith('/'):
+    ROUTE = arg
+  else:
+    found = glob.glob(f'/data/media/0/realdata/{arg}*')
+    if not found:
+      print(f'No segments matching {arg}'); sys.exit(1)
+    ROUTE = found[0].rsplit('--', 1)[0] + '--'
+else:
+  ROUTE = _DEFAULT
+print(f'Route: {ROUTE}')
 MS_TO_KPH = 3.6
 
 
 def read_rlog(path):
+  # Tolerant of both truncated zst frames and truncated capnp messages at tail
+  # (live-recording segments).
   dctx = zstandard.ZstdDecompressor()
-  with open(path, 'rb') as f:
-    return caplog.Event.read_multiple_bytes(dctx.decompress(f.read(), max_output_size=200*1024*1024))
+  raw = b''
+  try:
+    with open(path, 'rb') as f:
+      with dctx.stream_reader(f) as reader:
+        raw = reader.read()
+  except zstandard.ZstdError:
+    pass
+  if not raw:
+    return []
+  events = []
+  it = caplog.Event.read_multiple_bytes(raw)
+  while True:
+    try:
+      events.append(next(it))
+    except StopIteration:
+      break
+    except Exception:
+      break
+  return events
 
 
 def main():

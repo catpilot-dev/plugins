@@ -6,66 +6,53 @@ from cereal import log as caplog
 ROUTE = '/data/media/0/realdata/00000266--1f1715a873--'
 MS_TO_KPH = 3.6
 
-# Micro-stepping constants (mirror plugins/bmw_e9x_e8x/register.py)
-STEER_MAX = 12.0
-STEER_DELTA_UP = 0.1
-MAX_STEP = STEER_DELTA_UP * 5 / STEER_MAX     # 0.04167 per measurement frame
-SPREAD_FRAMES = 5
-STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES     # 0.00833 per CAN frame
+# PI + FF + friction controller (mirrors plugins/bmw_e9x_e8x/register.py)
+# measured is taken from CS.yawRate at 100 Hz (BMW DSC), sign-flipped to match
+# desiredCurvature's right-positive convention.
 PLANT_GAIN_K = 0.68
 PLANT_GAIN_B = 0.0073
-UNDERSTEER_MARGIN = 1.3
+KP = 0.8
+KI = 0.02
+I_MAX = 0.005
 STEPPER_DEADZONE = 0.01
 FRICTION_TORQUE = 0.10
-FRICTION_DEADZONE = 0.0001
+FRICTION_DEADZONE = 0.00001
 
 
 class MicroStepping:
   def __init__(self):
     self.torque = 0.0
-    self.step_remaining = 0.0
+    self.integral = 0.0
     self.desired = 0.0
     self.measured = 0.0
-    self.desired_prev = 0.0
-    self.measured_prev = 0.0
+    self.plant_gain = 0.0
+    # legacy fields for analysis code compatibility
     self.delta_desired = 0.0
     self.delta_measured = 0.0
-    self.plant_gain = 0.0
 
   def update(self, active, v_ego, desired_curv, yaw_rate, livepose_updated):
+    # yaw_rate here is assumed to already be in the desired-curvature convention
+    # (sign-flipped vs CS.yawRate if callers used livePose; for CS.yawRate the
+    # caller should pass -CS.yawRate to stay consistent with register.py).
     v = max(v_ego, 5.0)
-    self.plant_gain = UNDERSTEER_MARGIN * (PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B)
+    self.plant_gain = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
     self.desired = float(desired_curv)
+    self.measured = float(yaw_rate) / v
 
-    if livepose_updated:
-      self.measured = float(yaw_rate) / v
-
-    # friction feedforward: sign(err) × FRICTION_TORQUE if |err| > deadzone
     err = self.desired - self.measured
+    self.integral += err
+    self.integral = max(-I_MAX, min(I_MAX, self.integral))
+
     if abs(err) > FRICTION_DEADZONE:
       friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
     else:
       friction_ff = 0.0
 
-    # base torque from desired curvature (true feedforward) + friction
-    self.torque = max(-1.0, min(1.0, self.desired / self.plant_gain + friction_ff))
+    curvature_cmd = self.measured + KP * err + KI * self.integral
+    self.torque = max(-1.0, min(1.0, curvature_cmd / self.plant_gain + friction_ff))
 
-    if livepose_updated:
-      self.delta_desired = self.desired - self.desired_prev
-      self.delta_measured = self.measured - self.measured_prev
-      self.desired_prev = self.desired
-      self.measured_prev = self.measured
-      delta_of_delta = self.delta_desired - self.delta_measured
-      correction = delta_of_delta / self.plant_gain
-      self.step_remaining = max(-MAX_STEP, min(MAX_STEP, correction))
-
-    if self.step_remaining != 0.0:
-      small = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, self.step_remaining))
-      self.torque += small
-      self.step_remaining -= small
-
-    out = max(-1.0, min(1.0, self.torque))
-    self.torque_raw = out  # pre-deadzone torque for deadzone analysis
+    out = self.torque
+    self.torque_raw = out
     if not active or abs(out) < STEPPER_DEADZONE:
       out = 0.0
     return -out
