@@ -156,10 +156,20 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Incremental P torque controller — curvature tracking.
+  """Incremental P torque controller — curvature rate tracking.
 
   - desired:  controlsd's desired_curvature (modelV2 plan at lat_action_t ~0.5s)
   - measured: livePose yaw rate / vEgo
+
+  Correction signal is a backward 50ms difference on both sources:
+    delta_desired  = desired[t]  - desired[t-50ms]
+    delta_measured = measured[t] - measured[t-50ms]
+    delta_of_delta = delta_desired - delta_measured
+
+  Taking differences within each pipeline cancels constant bias between model
+  and gyro sources. Integrating delta_of_delta via micro-stepping still drives
+  measured trajectory to follow desired trajectory, without sensitivity to a
+  fixed offset between the two signals.
   """
   from cereal import log
   from cereal import messaging
@@ -170,26 +180,27 @@ def on_lat_controller_init(result, lac, CP):
   # Max torque change per measurement frame (CAN safety limit, 5 CAN frames at 20Hz)
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX
 
-  # Spread correction across 20 CAN frames (0.2s) — smooth, no abrupt jerk
-  SPREAD_FRAMES = 20
+  # Spread correction across 5 CAN frames (50ms) — one model/livePose cycle,
+  # so each correction fully applies before the next delta_of_delta arrives
+  SPREAD_FRAMES = 5
   STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
 
   # Plant gain: 2.5/v² — set above empirical K (~2.0-2.5 across speeds) so the
   # base term understeers; micro-stepping closes the remaining error additively
   PLANT_GAIN_COEFF = 2.5
 
-  # Adaptive delta threshold — error must grow by ≥10% of |prev_error| to trigger
-  DELTA_PCT = 0.10
-
-  # Output torque deadzone — 5% of max (~0.6 Nm), below human perception
-  STEPPER_DEADZONE = 0.05
+  # Output torque deadzone — 1% of max (~0.12 Nm). Route analysis shows
+  # straight-line raw torque P90 ≈ 0.09; 0.01 cuts only 21% of small action
+  # while keeping buzz ≤0.15 Hz (15× quieter than stock)
+  STEPPER_DEADZONE = 0.01
 
   state = {
     'torque': 0.0, 'step_remaining': 0.0,
     'lat_pub': None,
-    'desired': 0.0, 'measured': 0.0, 'error': 0.0,
-    'delta_error': 0.0, 'log_prev_error': 0.0,
-    'plant_gain': 0.0, 'action': 'hold',
+    'desired': 0.0, 'measured': 0.0,
+    'desired_prev': 0.0, 'measured_prev': 0.0,
+    'delta_desired': 0.0, 'delta_measured': 0.0,
+    'plant_gain': 0.0,
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -209,27 +220,13 @@ def on_lat_controller_init(result, lac, CP):
     state['torque'] = max(-1.0, min(1.0, state['measured'] / state['plant_gain']))
 
     if _sm.updated['livePose']:
-      state['log_prev_error'] = state['error']
-      state['error'] = state['desired'] - state['measured']
-
-      prev_error = state['log_prev_error']
-      same_sign = state['error'] * prev_error > 0
-      state['delta_error'] = state['error'] - prev_error
-      delta_threshold = DELTA_PCT * abs(prev_error)
-      error_worsening = same_sign and abs(state['delta_error']) > delta_threshold and abs(state['error']) > abs(prev_error)
-      error_sign_changed = prev_error != 0 and not same_sign
-
-      if error_worsening:
-        correction = state['delta_error'] / state['plant_gain']
-        state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
-        state['action'] = 'worsening'
-      elif error_sign_changed:
-        correction = state['error'] / state['plant_gain']
-        state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
-        state['action'] = 'sign_change'
-      else:
-        state['step_remaining'] = 0.0
-        state['action'] = 'hold'
+      state['delta_desired'] = state['desired'] - state['desired_prev']
+      state['delta_measured'] = state['measured'] - state['measured_prev']
+      state['desired_prev'] = state['desired']
+      state['measured_prev'] = state['measured']
+      delta_of_delta = state['delta_desired'] - state['delta_measured']
+      correction = delta_of_delta / state['plant_gain']
+      state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, correction))
 
     if state['step_remaining'] != 0:
       small_step = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, state['step_remaining']))
@@ -244,7 +241,7 @@ def on_lat_controller_init(result, lac, CP):
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
-    pid_log.error = float(state['error'])
+    pid_log.error = float(state['desired'] - state['measured'])
     pid_log.active = active
     pid_log.output = float(output)
     pid_log.saturated = bool(abs(output) > 0.99)
@@ -257,15 +254,14 @@ def on_lat_controller_init(result, lac, CP):
       state['lat_pub'].send({
         'desired': float(state['desired']),
         'measured': float(state['measured']),
-        'error': float(state['error']),
-        'prev_error': float(state['log_prev_error']),
-        'delta_error': float(state['delta_error']),
+        'delta_desired': float(state['delta_desired']),
+        'delta_measured': float(state['delta_measured']),
+        'delta_of_delta': float(state['delta_desired'] - state['delta_measured']),
         'plant_gain': float(state['plant_gain']),
         'step': float(state['step_remaining']),
         'torque': float(state['torque']),
         'output': float(output),
         'vEgo': float(CS.vEgo),
-        'action': state['action'],
         'active': active,
       })
     except Exception:
