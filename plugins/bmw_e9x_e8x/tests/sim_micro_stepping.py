@@ -16,7 +16,7 @@ KI = 0.02
 I_MAX = 0.005
 STEPPER_DEADZONE = 0.01
 FRICTION_TORQUE = 0.10
-FRICTION_DEADZONE = 0.00001
+FRICTION_DEADZONE = 0.00005
 
 
 class MicroStepping:
@@ -91,8 +91,9 @@ def main():
       elif w == 'carState':
         v_ego = evt.carState.vEgo
         steer_angle = evt.carState.steeringAngleDeg
-      elif w == 'livePose':
-        yaw_rate = evt.livePose.angularVelocityDevice.z
+        # BMW DSC yawRate is left-positive; desiredCurvature is right-positive.
+        # Negate to match (same convention as register.py).
+        yaw_rate = -evt.carState.yawRate
         livepose_dirty = True
       elif w == 'controlsState' and v_ego > 3:
         cs = evt.controlsState
