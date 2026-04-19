@@ -189,7 +189,7 @@ def on_lat_controller_init(result, lac, CP):
   # Friction feedforward — step torque in sign(err) direction, breaks Coulomb
   # stiction in the steering column. Stock uses 0.15; we run 0.10 (1.2 Nm).
   FRICTION_TORQUE = 0.10
-  FRICTION_DEADZONE = 0.00001   # fire on any err — dither helps anti-stiction
+  FRICTION_DEADZONE = 0.00005   # skip noise-only ticks (~10% of straights), dither preserved
 
   state = {
     'torque': 0.0,
