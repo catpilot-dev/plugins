@@ -239,8 +239,11 @@ def on_lat_controller_init(result, lac, CP):
     else:
       friction_ff = 0.0
 
-    # Base torque from measured curvature + friction feedforward
-    state['torque'] = max(-1.0, min(1.0, state['measured'] / state['plant_gain'] + friction_ff))
+    # Base torque from desired curvature (true feedforward) + friction
+    # Using desired (not measured) so the base term tracks the plan instead
+    # of sustaining the current state. Drift correction is handled by friction
+    # FF and micro-stepping; base commits to the target.
+    state['torque'] = max(-1.0, min(1.0, state['desired'] / state['plant_gain'] + friction_ff))
 
     if _sm.updated['livePose']:
       state['delta_desired'] = state['desired'] - state['desired_prev']

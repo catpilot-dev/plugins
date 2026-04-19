@@ -47,8 +47,8 @@ class MicroStepping:
     else:
       friction_ff = 0.0
 
-    # base torque from measured curvature + friction
-    self.torque = max(-1.0, min(1.0, self.measured / self.plant_gain + friction_ff))
+    # base torque from desired curvature (true feedforward) + friction
+    self.torque = max(-1.0, min(1.0, self.desired / self.plant_gain + friction_ff))
 
     if livepose_updated:
       self.delta_desired = self.desired - self.desired_prev
