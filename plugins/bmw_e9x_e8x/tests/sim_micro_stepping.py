@@ -10,21 +10,22 @@ MS_TO_KPH = 3.6
 STEER_MAX = 12.0
 STEER_DELTA_UP = 0.1
 MAX_STEP = STEER_DELTA_UP * 5 / STEER_MAX     # 0.04167 per measurement frame
-SPREAD_FRAMES = 20
-STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES     # 0.00208 per CAN frame
-PLANT_GAIN_COEFF = 2.0
-DELTA_PCT = 0.10
-STEPPER_DEADZONE = 0.05
+SPREAD_FRAMES = 5
+STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES     # 0.00833 per CAN frame
+PLANT_GAIN_COEFF = 2.5
+STEPPER_DEADZONE = 0.01
 
 
 class MicroStepping:
   def __init__(self):
     self.torque = 0.0
     self.step_remaining = 0.0
-    self.measured = 0.0
     self.desired = 0.0
-    self.error = 0.0
-    self.prev_error = 0.0
+    self.measured = 0.0
+    self.desired_prev = 0.0
+    self.measured_prev = 0.0
+    self.delta_desired = 0.0
+    self.delta_measured = 0.0
     self.plant_gain = 0.0
 
   def update(self, active, v_ego, desired_curv, yaw_rate, livepose_updated):
@@ -39,19 +40,13 @@ class MicroStepping:
     self.torque = max(-1.0, min(1.0, self.measured / self.plant_gain))
 
     if livepose_updated:
-      self.prev_error = self.error
-      self.error = self.desired - self.measured
-      d_err = self.error - self.prev_error
-      same_sign = self.error * self.prev_error > 0
-      worsening = same_sign and abs(d_err) > DELTA_PCT * abs(self.prev_error) and abs(self.error) > abs(self.prev_error)
-      sign_changed = self.prev_error != 0 and not same_sign
-
-      if worsening:
-        self.step_remaining = max(-MAX_STEP, min(MAX_STEP, d_err / self.plant_gain))
-      elif sign_changed:
-        self.step_remaining = max(-MAX_STEP, min(MAX_STEP, self.error / self.plant_gain))
-      else:
-        self.step_remaining = 0.0
+      self.delta_desired = self.desired - self.desired_prev
+      self.delta_measured = self.measured - self.measured_prev
+      self.desired_prev = self.desired
+      self.measured_prev = self.measured
+      delta_of_delta = self.delta_desired - self.delta_measured
+      correction = delta_of_delta / self.plant_gain
+      self.step_remaining = max(-MAX_STEP, min(MAX_STEP, correction))
 
     if self.step_remaining != 0.0:
       small = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, self.step_remaining))
@@ -59,6 +54,7 @@ class MicroStepping:
       self.step_remaining -= small
 
     out = max(-1.0, min(1.0, self.torque))
+    self.torque_raw = out  # pre-deadzone torque for deadzone analysis
     if not active or abs(out) < STEPPER_DEADZONE:
       out = 0.0
     return -out
@@ -115,7 +111,10 @@ def main():
             't': t, 'v': v_ego, 'des_curv': des_curv, 'meas_curv': meas_curv,
             'curv_err': des_curv - meas_curv,
             'stock_out': stock_out, 'sim_out': sim_out,
-            'sim_meas': ms.measured, 'sim_err': ms.error,
+            'sim_raw': ms.torque_raw,
+            'sim_meas': ms.measured,
+            'sim_err': ms.desired - ms.measured,
+            'sim_dod': ms.delta_desired - ms.delta_measured,
             'steer_angle': steer_angle,
           })
 
@@ -130,6 +129,8 @@ def main():
   stock = np.array([s['stock_out'] for s in samples])
   sim = np.array([s['sim_out'] for s in samples])
   sim_err = np.array([s['sim_err'] for s in samples])
+  sim_dod = np.array([s['sim_dod'] for s in samples])
+  sim_raw = np.array([s['sim_raw'] for s in samples])
   steer = np.array([s['steer_angle'] for s in samples])
   N = len(samples)
 
@@ -166,6 +167,76 @@ def main():
     n = mask.sum()
     if n < 20: continue
     print(f'  {lbl:>22s} | {n:>6d} | {np.abs(stock[mask]).mean():>9.3f} | {np.abs(sim[mask]).mean():>9.3f} | {np.abs(stock[mask]-sim[mask]).mean():>7.3f}')
+
+  # Bias check — during straight-line engagement, desired-measured should average to ~0
+  # if there's no pipeline bias. Non-zero mean indicates model-vs-gyro offset.
+  print(f'\n{"="*80}')
+  print('SIGNAL BIAS (desired − measured) — validates the delta-of-delta redesign')
+  print(f'{"="*80}')
+  print(f'  {"Segment":>22s} | {"N":>6s} | {"mean":>9s} | {"std":>9s} | {"p05":>9s} | {"p95":>9s}')
+  for lbl, mask in [
+      ('all engaged',           np.ones_like(des, dtype=bool)),
+      ('|des|<0.0005 straight', np.abs(des) < 0.0005),
+      ('|des|<0.001  straight', np.abs(des) < 0.001),
+      ('|des|>0.003  curving',  np.abs(des) > 0.003),
+  ]:
+    n = mask.sum()
+    if n < 20: continue
+    e = curv_err[mask]
+    print(f'  {lbl:>22s} | {n:>6d} | {e.mean():>+9.6f} | {e.std():>9.6f} | {np.percentile(e,5):>+9.6f} | {np.percentile(e,95):>+9.6f}')
+
+  # delta_of_delta signal magnitude — is it big enough for stepper to act on?
+  print(f'\n{"="*80}')
+  print('DELTA_OF_DELTA SIGNAL MAGNITUDE (ΔΔ = Δdesired − Δmeasured, 50ms)')
+  print(f'{"="*80}')
+  print(f'  {"Segment":>22s} | {"N":>6s} | {"|ΔΔ| p50":>9s} | {"|ΔΔ| p95":>9s} | {"|ΔΔ| p99":>9s}')
+  for lbl, mask in [
+      ('all engaged',           np.ones_like(des, dtype=bool)),
+      ('|des|<0.0005 straight', np.abs(des) < 0.0005),
+      ('|des|>0.003  curving',  np.abs(des) > 0.003),
+  ]:
+    n = mask.sum()
+    if n < 20: continue
+    dd = np.abs(sim_dod[mask])
+    print(f'  {lbl:>22s} | {n:>6d} | {np.percentile(dd,50):>9.6f} | {np.percentile(dd,95):>9.6f} | {np.percentile(dd,99):>9.6f}')
+
+  # Deadzone sizing — on straight segments, what does the RAW sim torque look like
+  # before the deadzone cuts it? Pick threshold so P95 of straight-line buzz → 0.
+  print(f'\n{"="*80}')
+  print('STEPPER DEADZONE ANALYSIS — raw sim torque on straights (|desired| < 0.0005)')
+  print(f'{"="*80}')
+  mask_str = np.abs(des) < 0.0005
+  raw_abs = np.abs(sim_raw[mask_str])
+  print(f'  N={mask_str.sum()}  mean |raw| = {raw_abs.mean():.4f}  std = {raw_abs.std():.4f}')
+  print(f'  |raw| percentiles: '
+        f'p50={np.percentile(raw_abs,50):.4f}  '
+        f'p75={np.percentile(raw_abs,75):.4f}  '
+        f'p90={np.percentile(raw_abs,90):.4f}  '
+        f'p95={np.percentile(raw_abs,95):.4f}  '
+        f'p99={np.percentile(raw_abs,99):.4f}')
+
+  # How each candidate deadzone suppresses straight-line action
+  print(f'\n  Candidate deadzone (fraction of 12Nm) vs straight-line survival & zero-crossings:')
+  print(f'    {"deadzone":>10s} | {"Nm":>5s} | {"% cut":>7s} | {"% survives":>10s} | {"zc Hz (all)":>11s} | {"zc Hz (50-90kph)":>17s}')
+  mask_mid = (np.abs(des) < 0.0005) & (v*MS_TO_KPH >= 50) & (v*MS_TO_KPH < 90)
+  raw_all = sim_raw[mask_str]
+  raw_mid = sim_raw[mask_mid]
+  for dz in [0.00, 0.01, 0.02, 0.03, 0.05, 0.07, 0.10]:
+    out_all = np.where(np.abs(raw_all) < dz, 0.0, raw_all)
+    out_mid = np.where(np.abs(raw_mid) < dz, 0.0, raw_mid)
+    pct_cut = 100.0 * np.mean(np.abs(raw_all) < dz)
+    pct_surv = 100.0 - pct_cut
+    zc_all = np.sum(out_all[1:] * out_all[:-1] < 0) / (len(out_all) * 0.01) / 2 if len(out_all) > 10 else 0
+    zc_mid = np.sum(out_mid[1:] * out_mid[:-1] < 0) / (len(out_mid) * 0.01) / 2 if len(out_mid) > 10 else 0
+    print(f'    {dz:>10.3f} | {dz*12:>5.2f} | {pct_cut:>6.1f}% | {pct_surv:>9.1f}% | {zc_all:>10.2f} | {zc_mid:>16.2f}')
+
+  # Check that the selected deadzone does NOT eat into legitimate curving action
+  print(f'\n  Effect of deadzone on CURVING samples (|desired| > 0.003) — want %cut near 0:')
+  raw_curv = sim_raw[np.abs(des) > 0.003]
+  print(f'    {"deadzone":>10s} | {"% curving cut":>14s}')
+  for dz in [0.02, 0.03, 0.05, 0.07, 0.10]:
+    pct_cut_curv = 100.0 * np.mean(np.abs(raw_curv) < dz)
+    print(f'    {dz:>10.3f} | {pct_cut_curv:>13.1f}%')
 
   print(f'\n{"="*80}')
   print('STRAIGHT-LANE OUTPUT JITTER (|desired| < 0.001)')
