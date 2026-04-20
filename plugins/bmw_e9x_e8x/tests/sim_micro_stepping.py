@@ -13,7 +13,8 @@ PLANT_GAIN_K = 0.68
 PLANT_GAIN_B = 0.0073
 KP = 0.8
 KI = 0.02
-I_MAX_TORQUE = 0.10       # ±1.2 Nm, matches FRICTION_TORQUE authority
+P_MAX_TORQUE = 0.80
+I_MAX_TORQUE = 0.10
 FRICTION_TORQUE = 0.10
 DRIFT_TOLERANCE_M = 0.025
 DRIFT_EVAL_HORIZON_S = 0.5
@@ -46,7 +47,7 @@ class MicroStepping:
       deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
       if abs(err) > deadzone:
         base_torque = self.measured / self.plant_gain
-        p_torque = KP * err / self.plant_gain
+        p_torque = max(-P_MAX_TORQUE, min(P_MAX_TORQUE, KP * err / self.plant_gain))
         self.i_torque += KI * err / self.plant_gain
         self.i_torque = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, self.i_torque))
         friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE

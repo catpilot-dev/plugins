@@ -184,18 +184,16 @@ def on_lat_controller_init(result, lac, CP):
   PLANT_GAIN_K = 0.68
   PLANT_GAIN_B = 0.0073
 
-  # P and I gains. Kp = 0.8 commits 80% to desired (20% understeer margin).
-  # I is accumulated in TORQUE space so its cap I_MAX_TORQUE is directly
-  # comparable to FRICTION_TORQUE. Ki=0.02 with err·dt-per-tick gives ~2.5 s
-  # to saturate at constant err=0.001 — slow enough to avoid windup during
-  # transients but still closes plant-gain mismatch.
+  # Torque budget allocation (of the ±1.0 output range, excluding base FF):
+  #   P  ±0.80   (proportional response scales with err, clipped at ±P_MAX_TORQUE)
+  #   I  ±0.10   (accumulated residual, ±I_MAX_TORQUE)
+  #   F  ±0.10   (friction stiction break, ±FRICTION_TORQUE)
+  # Sum = ±1.0 → when saturation occurs, each term contributes in its slot.
   KP = 0.8
   KI = 0.02
-  I_MAX_TORQUE = 0.10   # ±1.2 Nm, matches FRICTION_TORQUE authority
-
-  # Friction feedforward — step torque in sign(err) direction, breaks Coulomb
-  # stiction in the steering column. Stock uses 0.15; we run 0.10 (1.2 Nm).
-  FRICTION_TORQUE = 0.10
+  P_MAX_TORQUE = 0.80   # ±9.6 Nm — dominates feedback, scales with err
+  I_MAX_TORQUE = 0.10   # ±1.2 Nm — matches friction authority
+  FRICTION_TORQUE = 0.10  # ±1.2 Nm — stiction breakaway
   # Feedback deadzone from physical criterion: engage P/I/friction only when
   # the curvature error would cause ≥DRIFT_TOLERANCE_M lateral drift within
   # DRIFT_EVAL_HORIZON_S seconds (horizon aligned with desired_curvature's
@@ -239,12 +237,14 @@ def on_lat_controller_init(result, lac, CP):
       deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
 
       if abs(err) > deadzone:
-        # All terms in torque space for clarity — the output is a sum of components
-        base_torque  = state['measured'] / state['plant_gain']            # FF: hold current curvature
-        p_torque     = KP * err / state['plant_gain']                     # P: proportional toward desired
-        state['i_torque'] += KI * err / state['plant_gain']               # I: accumulated residual
+        # All terms in torque space. Each clipped to its allocated budget so I
+        # and friction always have room to contribute even when P saturates.
+        base_torque = state['measured'] / state['plant_gain']                 # FF: hold current curvature
+        p_torque    = max(-P_MAX_TORQUE, min(P_MAX_TORQUE,                    # P: clipped to 80% budget
+                          KP * err / state['plant_gain']))
+        state['i_torque'] += KI * err / state['plant_gain']                   # I: accumulated residual
         state['i_torque'] = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, state['i_torque']))
-        friction_ff  = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE   # stiction break
+        friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE        # stiction break
         state['torque'] = max(-1.0, min(1.0,
                               base_torque + p_torque + state['i_torque'] + friction_ff))
       else:
