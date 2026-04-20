@@ -32,24 +32,25 @@ class MicroStepping:
     self.delta_measured = 0.0
 
   def update(self, active, v_ego, desired_curv, yaw_rate, livepose_updated):
-    # yaw_rate here is assumed to already be in the desired-curvature convention
-    # (sign-flipped vs CS.yawRate if callers used livePose; for CS.yawRate the
-    # caller should pass -CS.yawRate to stay consistent with register.py).
-    v = max(v_ego, 5.0)
-    self.plant_gain = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
+    # yaw_rate in the desired-curvature convention. Feedback only runs on
+    # livePose updates (20 Hz) to match register.py's gating; between updates,
+    # self.torque holds.
     self.desired = float(desired_curv)
-    self.measured = float(yaw_rate) / v + MEASURED_BIAS_CURV
 
-    err = self.desired - self.measured
-    deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
-    if abs(err) > deadzone:
-      self.integral = max(-I_MAX, min(I_MAX, self.integral + err))
-      friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
-      curvature_cmd = self.measured + KP * err + KI * self.integral
-      self.torque = max(-1.0, min(1.0, curvature_cmd / self.plant_gain + friction_ff))
-    else:
-      # Hold previous self.torque; reset integral
-      self.integral = 0.0
+    if livepose_updated:
+      v = max(v_ego, 5.0)
+      self.plant_gain = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
+      self.measured = float(yaw_rate) / v + MEASURED_BIAS_CURV
+
+      err = self.desired - self.measured
+      deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
+      if abs(err) > deadzone:
+        self.integral = max(-I_MAX, min(I_MAX, self.integral + err))
+        friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
+        curvature_cmd = self.measured + KP * err + KI * self.integral
+        self.torque = max(-1.0, min(1.0, curvature_cmd / self.plant_gain + friction_ff))
+      else:
+        self.integral = 0.0
 
     self.torque_raw = self.torque
     out = 0.0 if not active else self.torque
