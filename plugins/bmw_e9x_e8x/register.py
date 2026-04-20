@@ -226,25 +226,20 @@ def on_lat_controller_init(result, lac, CP):
 
     # Deadzone from physical criterion — curvature error that would cause
     # DRIFT_TOLERANCE_M lateral drift within DRIFT_EVAL_HORIZON_S seconds.
-    # Below this, the controller takes no action at all: P=0, friction=0,
-    # and integral is reset. Feedback only engages when the delta would
-    # cause meaningful drift within the lookahead horizon.
+    # Below this, hold the previously-commanded torque literally: integral is
+    # reset, no new P/friction contribution, state['torque'] is NOT updated.
+    # Above it, P + I + friction engage to close the error.
     deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
     if abs(err) > deadzone:
-      active_err = err
       state['integral'] = max(-I_MAX, min(I_MAX, state['integral'] + err))
+      friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
+      curvature_cmd = state['measured'] + KP * err + KI * state['integral']
+      state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
     else:
-      active_err = 0.0
-      state['integral'] = 0.0   # no prior-I contribution either
-
-    # Friction FF only engages outside deadzone
-    friction_ff = (FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE) if abs(err) > deadzone else 0.0
-
-    # Curvature command = hold current + P·err + I·integral
-    # Below deadzone (active_err=0, integral=0): cmd = measured → passive hold
-    # Above deadzone: P·err + I·integral close the gap toward desired
-    curvature_cmd = state['measured'] + KP * active_err + KI * state['integral']
-    state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
+      # Below deadzone: hold previous state['torque'] literally. Integral
+      # resets so the next above-deadzone event starts fresh.
+      state['integral'] = 0.0
+      friction_ff = 0.0
 
     output = 0.0 if not active else state['torque']
 
