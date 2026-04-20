@@ -14,7 +14,6 @@ PLANT_GAIN_B = 0.0073
 KP = 0.8
 KI = 0.02
 I_MAX = 0.005
-STEPPER_DEADZONE = 0.01
 FRICTION_TORQUE = 0.10
 FRICTION_OFFSET_M = 0.10
 FRICTION_OFFSET_T = 1.0
@@ -53,10 +52,8 @@ class MicroStepping:
     curvature_cmd = self.desired + KP * active_err + KI * self.integral
     self.torque = max(-1.0, min(1.0, curvature_cmd / self.plant_gain + friction_ff))
 
-    out = self.torque
-    self.torque_raw = out
-    if not active or abs(out) < STEPPER_DEADZONE:
-      out = 0.0
+    self.torque_raw = self.torque
+    out = 0.0 if not active else self.torque
     return -out
 
 
