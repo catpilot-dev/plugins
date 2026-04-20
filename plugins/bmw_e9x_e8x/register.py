@@ -214,33 +214,31 @@ def on_lat_controller_init(result, lac, CP):
     _sm.update(0)
     lp = _sm['livePose']
 
-    # velocityDevice.x is the Kalman-filtered forward velocity (m/s); fall back
-    # to CS.vEgo at stop or before filter initializes
-    v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
-    state['plant_gain'] = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
     state['desired'] = float(desired_curvature)
-    # livePose angularVelocityDevice.z is right-positive (matches desiredCurvature)
-    state['measured'] = float(lp.angularVelocityDevice.z) / v
 
-    err = state['desired'] - state['measured']
+    # Only update PI/friction/torque when a new livePose frame arrives (20 Hz).
+    # Between frames, state['torque'] holds — no fake P/I accumulation against
+    # stale measured. Below the deadzone, state['torque'] also holds (drift is
+    # sub-perceptible; let the controller sit). Integral resets so the next
+    # above-deadzone event starts fresh.
+    if _sm.updated['livePose']:
+      # velocityDevice.x is Kalman-filtered forward velocity; fall back to CS.vEgo pre-init
+      v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
+      state['plant_gain'] = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
+      state['measured'] = float(lp.angularVelocityDevice.z) / v
 
-    # Deadzone from physical criterion — curvature error that would cause
-    # DRIFT_TOLERANCE_M lateral drift within DRIFT_EVAL_HORIZON_S seconds.
-    # Below this, hold the previously-commanded torque literally: integral is
-    # reset, no new P/friction contribution, state['torque'] is NOT updated.
-    # Above it, P + I + friction engage to close the error.
-    deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
-    if abs(err) > deadzone:
-      state['integral'] = max(-I_MAX, min(I_MAX, state['integral'] + err))
-      friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
-      curvature_cmd = state['measured'] + KP * err + KI * state['integral']
-      state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
-    else:
-      # Below deadzone: hold previous state['torque'] literally. Integral
-      # resets so the next above-deadzone event starts fresh.
-      state['integral'] = 0.0
-      friction_ff = 0.0
+      err = state['desired'] - state['measured']
+      deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
 
+      if abs(err) > deadzone:
+        state['integral'] = max(-I_MAX, min(I_MAX, state['integral'] + err))
+        friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
+        curvature_cmd = state['measured'] + KP * err + KI * state['integral']
+        state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
+      else:
+        state['integral'] = 0.0
+
+    err = state['desired'] - state['measured']  # updated each tick for logging
     output = 0.0 if not active else state['torque']
 
     pid_log.actualLateralAccel = float(state['measured'])
