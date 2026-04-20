@@ -188,13 +188,14 @@ def on_lat_controller_init(result, lac, CP):
   # Friction feedforward — step torque in sign(err) direction, breaks Coulomb
   # stiction in the steering column. Stock uses 0.15; we run 0.10 (1.2 Nm).
   FRICTION_TORQUE = 0.10
-  # Friction deadzone from physical criterion: fire when the curvature error
-  # would cause ≥OFFSET_THRESHOLD lateral drift in OFFSET_TIME seconds.
-  #   offset(T) = ½ · delta · v² · T²  ⇒  delta_threshold = 2·offset / (v·T)²
-  # With offset=0.1m, T=1s: threshold = 0.2/v². 0.1m is acceptable drift within
-  # a ~3.5m lane; smaller deltas are left to the PI to close.
-  FRICTION_OFFSET_M = 0.10
-  FRICTION_OFFSET_T = 1.0
+  # Feedback deadzone from physical criterion: engage P/I/friction only when
+  # the curvature error would cause ≥DRIFT_TOLERANCE_M lateral drift within
+  # DRIFT_EVAL_HORIZON_S seconds (horizon aligned with desired_curvature's
+  # lookahead, lat_action_t ≈ 0.5s).
+  #   offset(T) = ½ · delta · v² · T²  ⇒  delta_threshold = 2·M / (v·T)²
+  # 0.025m over 0.5s = 0.05 m/s drift rate — below driver perception in a 3.5m lane.
+  DRIFT_TOLERANCE_M = 0.025
+  DRIFT_EVAL_HORIZON_S = 0.5
 
   _sm = messaging.SubMaster(['livePose'])
 
@@ -224,10 +225,10 @@ def on_lat_controller_init(result, lac, CP):
     err = state['desired'] - state['measured']
 
     # Deadzone from physical criterion — curvature error that would cause
-    # FRICTION_OFFSET_M lateral drift in FRICTION_OFFSET_T seconds.
+    # DRIFT_TOLERANCE_M lateral drift within DRIFT_EVAL_HORIZON_S seconds.
     # Below this, the controller takes NO feedback action — pure FF on desired.
     # Above it, P + I + friction engage to close the error.
-    deadzone = (2.0 * FRICTION_OFFSET_M / (FRICTION_OFFSET_T ** 2)) / (v ** 2)
+    deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
     active_err = err if abs(err) > deadzone else 0.0
 
     # Integral accumulates only when outside deadzone (freezes when tracking well)

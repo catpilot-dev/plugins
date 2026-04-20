@@ -15,9 +15,9 @@ KP = 0.8
 KI = 0.02
 I_MAX = 0.005
 FRICTION_TORQUE = 0.10
-FRICTION_OFFSET_M = 0.10
-FRICTION_OFFSET_T = 1.0
-MEASURED_BIAS_CURV = 0.00025
+DRIFT_TOLERANCE_M = 0.025
+DRIFT_EVAL_HORIZON_S = 0.5
+MEASURED_BIAS_CURV = 0.0
 
 
 class MicroStepping:
@@ -41,7 +41,7 @@ class MicroStepping:
     self.measured = float(yaw_rate) / v + MEASURED_BIAS_CURV
 
     err = self.desired - self.measured
-    deadzone = (2.0 * FRICTION_OFFSET_M / (FRICTION_OFFSET_T ** 2)) / (v ** 2)
+    deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
     active_err = err if abs(err) > deadzone else 0.0
 
     self.integral += active_err
