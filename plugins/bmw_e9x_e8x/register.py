@@ -182,10 +182,6 @@ def on_lat_controller_init(result, lac, CP):
   KI = 0.02
   I_MAX = 0.005   # curvature, caps sustained I-contribution to ~40% torque at v=15
 
-  # Output torque deadzone — 1% of max (~0.12 Nm). Suppresses sub-perceptible
-  # commands; preserves corner tracking (empirical from route 00000266).
-  STEPPER_DEADZONE = 0.01
-
   # Friction feedforward — step torque in sign(err) direction, breaks Coulomb
   # stiction in the steering column. Stock uses 0.15; we run 0.10 (1.2 Nm).
   FRICTION_TORQUE = 0.10
@@ -242,11 +238,7 @@ def on_lat_controller_init(result, lac, CP):
     curvature_cmd = state['desired'] + KP * active_err + KI * state['integral']
     state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
 
-    output = state['torque']
-
-    # Output 0 when disengaged or torque below perception threshold
-    if not active or abs(output) < STEPPER_DEADZONE:
-      output = 0.0
+    output = 0.0 if not active else state['torque']
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
