@@ -226,14 +226,16 @@ def on_lat_controller_init(result, lac, CP):
 
     # Deadzone from physical criterion — curvature error that would cause
     # DRIFT_TOLERANCE_M lateral drift within DRIFT_EVAL_HORIZON_S seconds.
-    # Below this, the controller takes NO feedback action — pure FF on desired.
-    # Above it, P + I + friction engage to close the error.
+    # Below this, the controller takes no action at all: P=0, friction=0,
+    # and integral is reset. Feedback only engages when the delta would
+    # cause meaningful drift within the lookahead horizon.
     deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
-    active_err = err if abs(err) > deadzone else 0.0
-
-    # Integral accumulates only when outside deadzone (freezes when tracking well)
-    state['integral'] += active_err
-    state['integral'] = max(-I_MAX, min(I_MAX, state['integral']))
+    if abs(err) > deadzone:
+      active_err = err
+      state['integral'] = max(-I_MAX, min(I_MAX, state['integral'] + err))
+    else:
+      active_err = 0.0
+      state['integral'] = 0.0   # no prior-I contribution either
 
     # Friction FF only engages outside deadzone
     friction_ff = (FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE) if abs(err) > deadzone else 0.0

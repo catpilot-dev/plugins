@@ -42,12 +42,14 @@ class MicroStepping:
 
     err = self.desired - self.measured
     deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
-    active_err = err if abs(err) > deadzone else 0.0
-
-    self.integral += active_err
-    self.integral = max(-I_MAX, min(I_MAX, self.integral))
-
-    friction_ff = (FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE) if abs(err) > deadzone else 0.0
+    if abs(err) > deadzone:
+      active_err = err
+      self.integral = max(-I_MAX, min(I_MAX, self.integral + err))
+      friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
+    else:
+      active_err = 0.0
+      self.integral = 0.0
+      friction_ff = 0.0
 
     curvature_cmd = self.desired + KP * active_err + KI * self.integral
     self.torque = max(-1.0, min(1.0, curvature_cmd / self.plant_gain + friction_ff))
