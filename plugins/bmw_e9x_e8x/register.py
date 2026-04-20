@@ -177,10 +177,13 @@ def on_lat_controller_init(result, lac, CP):
   """
   from cereal import log
   from cereal import messaging
+  from bmw.shadow_plant import ShadowPlantEstimator
 
   # Plant gain: K/v² + b, fit from route 00000266 regression
   #   desired·v² = K·(−torque)/v² + b·(−torque),  K=0.68, b=0.0073, R²=0.44
-  # No multiplicative understeer margin — Kp < 1 provides it.
+  # These are the INITIAL values. A shadow estimator runs online against the
+  # same 2-param model, and once validated (R² > 0.4, stable across refits,
+  # coverage across speed bins), promotes its fit to the live plant_gain.
   PLANT_GAIN_K = 0.68
   PLANT_GAIN_B = 0.0073
 
@@ -204,6 +207,7 @@ def on_lat_controller_init(result, lac, CP):
   DRIFT_EVAL_HORIZON_S = 0.5
 
   _sm = messaging.SubMaster(['livePose'])
+  _shadow = ShadowPlantEstimator(PLANT_GAIN_K, PLANT_GAIN_B)
 
   state = {
     'torque': 0.0,
@@ -227,11 +231,17 @@ def on_lat_controller_init(result, lac, CP):
     # stale measured. Below the deadzone, state['torque'] also holds (drift is
     # sub-perceptible; let the controller sit). Integral resets so the next
     # above-deadzone event starts fresh.
+    friction_ff = 0.0
     if _sm.updated['livePose']:
       # velocityDevice.x is Kalman-filtered forward velocity; fall back to CS.vEgo pre-init
       v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
-      state['plant_gain'] = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
+      state['plant_gain'] = _shadow.plant_gain(v)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
+
+      # Shadow estimator: feed (v, torque, measured) from last commanded action
+      # so fit represents plant response to our actual torque output.
+      if active:
+        _shadow.add_sample(v, state['torque'], state['measured'])
 
       err = state['desired'] - state['measured']
       deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
@@ -264,7 +274,7 @@ def on_lat_controller_init(result, lac, CP):
       if state['lat_pub'] is None:
         from openpilot.selfdrive.plugins.plugin_bus import PluginPub
         state['lat_pub'] = PluginPub('bmw_lat_control')
-      state['lat_pub'].send({
+      payload = {
         'desired': float(state['desired']),
         'measured': float(state['measured']),
         'err': float(err),
@@ -275,7 +285,9 @@ def on_lat_controller_init(result, lac, CP):
         'output': float(output),
         'vEgo': float(CS.vEgo),
         'active': active,
-      })
+      }
+      payload.update(_shadow.debug_state())
+      state['lat_pub'].send(payload)
     except Exception:
       pass
 
