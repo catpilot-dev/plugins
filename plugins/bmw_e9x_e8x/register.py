@@ -162,12 +162,15 @@ def on_lat_controller_init(result, lac, CP):
     torque       = curvature_cmd / plant_gain + friction_ff
 
   - desired:  controlsd's desired_curvature (modelV2 plan at lat_action_t ~0.5s, right-positive)
-  - measured: -CS.yawRate / vEgo (BMW DSC yaw rate from Speed CAN at 100 Hz;
-              DSC is left-positive, negated to match desiredCurvature's right-positive)
+  - measured: livePose yaw rate / velocity (Kalman-filtered, bias-corrected, 100 Hz
+              after locationd fork that drives the loop on gyroscope). Uses
+              velocityDevice.x rather than noisy CS.vEgo for a self-consistent
+              kinematic measurement from a single filter state.
   - Kp < 1 bakes in the understeer margin (base under-commits; I closes gap)
   - Integral accumulates err every CAN tick, anti-windup clamped
   """
   from cereal import log
+  from cereal import messaging
 
   # Plant gain: K/v² + b, fit from route 00000266 regression
   #   desired·v² = K·(−torque)/v² + b·(−torque),  K=0.68, b=0.0073, R²=0.44
@@ -193,11 +196,7 @@ def on_lat_controller_init(result, lac, CP):
   FRICTION_OFFSET_M = 0.10
   FRICTION_OFFSET_T = 1.0
 
-  # Persistent curvature bias in CS.yawRate — route 00000266 shows CS.yawRate/v
-  # reads ~0.00025 more right-drift than Kalman-filtered livePose or
-  # steering-angle-derived cs.curvature. Add this back to center measured on
-  # zero during true straight driving.
-  MEASURED_BIAS_CURV = 0.00025
+  _sm = messaging.SubMaster(['livePose'])
 
   state = {
     'torque': 0.0,
@@ -211,12 +210,16 @@ def on_lat_controller_init(result, lac, CP):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 10
 
-    v = max(CS.vEgo, 5.0)
+    _sm.update(0)
+    lp = _sm['livePose']
+
+    # velocityDevice.x is the Kalman-filtered forward velocity (m/s); fall back
+    # to CS.vEgo at stop or before filter initializes
+    v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
     state['plant_gain'] = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
     state['desired'] = float(desired_curvature)
-    # CS.yawRate is left-positive; desiredCurvature is right-positive — negate to match.
-    # Add MEASURED_BIAS_CURV to compensate the persistent right-drift bias in DSC yaw rate.
-    state['measured'] = -float(CS.yawRate) / v + MEASURED_BIAS_CURV
+    # livePose angularVelocityDevice.z is right-positive (matches desiredCurvature)
+    state['measured'] = float(lp.angularVelocityDevice.z) / v
 
     err = state['desired'] - state['measured']
 
