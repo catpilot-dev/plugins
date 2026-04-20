@@ -240,8 +240,10 @@ def on_lat_controller_init(result, lac, CP):
     # Friction FF only engages outside deadzone
     friction_ff = (FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE) if abs(err) > deadzone else 0.0
 
-    # Curvature command: FF on desired + (gated) P·err + I·integral
-    curvature_cmd = state['desired'] + KP * active_err + KI * state['integral']
+    # Curvature command = hold current + P·err + I·integral
+    # Below deadzone (active_err=0, integral=0): cmd = measured → passive hold
+    # Above deadzone: P·err + I·integral close the gap toward desired
+    curvature_cmd = state['measured'] + KP * active_err + KI * state['integral']
     state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
 
     output = 0.0 if not active else state['torque']

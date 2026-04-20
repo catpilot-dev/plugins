@@ -51,7 +51,7 @@ class MicroStepping:
       self.integral = 0.0
       friction_ff = 0.0
 
-    curvature_cmd = self.desired + KP * active_err + KI * self.integral
+    curvature_cmd = self.measured + KP * active_err + KI * self.integral
     self.torque = max(-1.0, min(1.0, curvature_cmd / self.plant_gain + friction_ff))
 
     self.torque_raw = self.torque
