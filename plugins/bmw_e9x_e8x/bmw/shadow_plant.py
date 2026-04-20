@@ -1,13 +1,17 @@
-"""Shadow plant-gain estimator for BMW E9x/E8x.
+"""Shadow plant-gain + friction estimator for BMW E9x/E8x.
 
 Collects (torque, v, measured_curvature) samples in speed-binned buckets and
 periodically fits the 2-parameter model:
     measured_curvature = -K · torque / v²  −  b · torque
 
-On validation (stability + R² quality + bucket coverage), promotes the fit to
-the live controller's plant_gain, then continues adapting with decay.
+Friction is estimated from the perpendicular spread of fit residuals
+converted to torque space:
+    friction = std(residual / plant_gain(v)) × 1.5
 
-Speed bins: 30 km/h to 100 km/h in 5 km/h steps = 14 bins.
+On validation (stability + R² quality + bucket coverage), promotes the fit
+to the live controller, then continues adapting with decay.
+
+Speed bins: 30 km/h to 120 km/h in 5 km/h steps = 18 bins.
 """
 from collections import deque
 import numpy as np
@@ -27,17 +31,22 @@ STABLE_REL_DELTA = 0.10            # |K_new − K_last| / |K_last| < this → st
 STABLE_CYCLES = 3                  # consecutive stable refits before first promotion
 DECAY = 0.3                        # post-promotion: new_live = 0.7·old + 0.3·fit
 MIN_ABS_TORQUE = 0.02              # samples require meaningful torque
+FRICTION_FACTOR = 1.5              # std × this = friction estimate (matches stock torqued)
+FRICTION_MIN = 0.02                # sanity bounds on estimated friction (fraction of STEER_MAX)
+FRICTION_MAX = 0.30
 
 
 class ShadowPlantEstimator:
-  def __init__(self, k_init, b_init):
+  def __init__(self, k_init, b_init, friction_init):
     self.buckets = [deque(maxlen=BUCKET_MAX) for _ in range(N_BINS)]
     # live values (used by controller)
     self.live_k = float(k_init)
     self.live_b = float(b_init)
+    self.live_friction = float(friction_init)
     # last shadow fit (for stability checks)
     self.shadow_k = float(k_init)
     self.shadow_b = float(b_init)
+    self.shadow_friction = float(friction_init)
     self.shadow_r2 = 0.0
     self.stable_count = 0
     self.validated = False
@@ -49,8 +58,9 @@ class ShadowPlantEstimator:
     if abs(torque) < MIN_ABS_TORQUE: return False
     bin_idx = int((v - MIN_VEGO_MS) / BIN_WIDTH_MS)
     if bin_idx < 0 or bin_idx >= N_BINS: return False
-    # features: x1 = -torque/v², x2 = -torque,  target y = measured_curv
-    self.buckets[bin_idx].append((-torque / (v * v), -torque, measured_curv))
+    # Store v too so friction can be estimated in torque space per-sample.
+    # features: x1 = -torque/v², x2 = -torque,  y = measured_curv,  v kept separately
+    self.buckets[bin_idx].append((-torque / (v * v), -torque, measured_curv, v))
     self.sample_count += 1
     if self.sample_count % REFIT_EVERY == 0:
       self._maybe_refit()
@@ -65,6 +75,7 @@ class ShadowPlantEstimator:
     arr = np.array(samples)
     X = arr[:, :2]
     y = arr[:, 2]
+    v_per = arr[:, 3]
     try:
       coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
     except np.linalg.LinAlgError:
@@ -74,6 +85,13 @@ class ShadowPlantEstimator:
     y_var = float(np.sum((y - y.mean()) ** 2))
     self.shadow_r2 = 1.0 - float(np.sum(resid ** 2)) / y_var if y_var > 0 else 0.0
 
+    # Friction: std of residuals converted to torque space, × 1.5 to cover ~85% of data
+    plant_gain_per = k_new / (v_per * v_per) + b_new
+    plant_gain_per = np.where(np.abs(plant_gain_per) < 1e-4, 1e-4, plant_gain_per)
+    resid_torque = resid / plant_gain_per
+    friction_new = float(np.std(resid_torque) * FRICTION_FACTOR)
+    friction_new = max(FRICTION_MIN, min(FRICTION_MAX, friction_new))  # sanity clamp
+
     # Stability: K change small vs previous shadow fit
     k_ref = max(abs(self.shadow_k), 0.1)
     stable = (abs(k_new - self.shadow_k) / k_ref < STABLE_REL_DELTA and
@@ -81,25 +99,31 @@ class ShadowPlantEstimator:
     self.stable_count = self.stable_count + 1 if stable else 0
     self.shadow_k = k_new
     self.shadow_b = b_new
+    self.shadow_friction = friction_new
 
     # Promotion
     if self.stable_count >= STABLE_CYCLES:
       if not self.validated:
         self.live_k = k_new
         self.live_b = b_new
+        self.live_friction = friction_new
         self.validated = True
       else:
         self.live_k = (1 - DECAY) * self.live_k + DECAY * k_new
         self.live_b = (1 - DECAY) * self.live_b + DECAY * b_new
+        self.live_friction = (1 - DECAY) * self.live_friction + DECAY * friction_new
 
   def plant_gain(self, v):
     return self.live_k / (v * v) + self.live_b
 
+  def friction(self):
+    return self.live_friction
+
   def debug_state(self):
     return {
       'shadow_k': self.shadow_k, 'shadow_b': self.shadow_b,
-      'shadow_r2': self.shadow_r2,
-      'live_k': self.live_k, 'live_b': self.live_b,
+      'shadow_friction': self.shadow_friction, 'shadow_r2': self.shadow_r2,
+      'live_k': self.live_k, 'live_b': self.live_b, 'live_friction': self.live_friction,
       'stable_count': self.stable_count,
       'validated': int(self.validated),
       'sample_count': self.sample_count,

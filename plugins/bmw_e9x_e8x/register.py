@@ -207,7 +207,7 @@ def on_lat_controller_init(result, lac, CP):
   DRIFT_EVAL_HORIZON_S = 0.5
 
   _sm = messaging.SubMaster(['livePose'])
-  _shadow = ShadowPlantEstimator(PLANT_GAIN_K, PLANT_GAIN_B)
+  _shadow = ShadowPlantEstimator(PLANT_GAIN_K, PLANT_GAIN_B, FRICTION_TORQUE)
 
   state = {
     'torque': 0.0,
@@ -254,7 +254,7 @@ def on_lat_controller_init(result, lac, CP):
                           KP * err / state['plant_gain']))
         state['i_torque'] += KI * err / state['plant_gain']                   # I: accumulated residual
         state['i_torque'] = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, state['i_torque']))
-        friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE        # stiction break
+        friction_ff = _shadow.friction() if err > 0 else -_shadow.friction()  # stiction break (live estimate)
         state['torque'] = max(-1.0, min(1.0,
                               base_torque + p_torque + state['i_torque'] + friction_ff))
       else:
