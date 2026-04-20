@@ -156,18 +156,24 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """PI controller with feedforward + friction — curvature tracking at 100 Hz.
+  """PI + feedforward + friction — curvature tracking at livePose rate (20 Hz).
 
-    curvature_cmd = measured + Kp·(desired − measured) + Ki·integral
-    torque       = curvature_cmd / plant_gain + friction_ff
+  All feedback terms expressed in torque space; output is a sum of components:
+    base_torque  = measured / plant_gain            # FF: hold current curvature
+    p_torque     = Kp · err / plant_gain            # P: push toward desired
+    i_torque    += Ki · err / plant_gain            # I: accumulated residual  (±I_MAX_TORQUE)
+    friction_ff  = ±FRICTION_TORQUE · sign(err)     # stiction break
+    torque       = base + p + i + friction          # (clamped ±1)
 
   - desired:  controlsd's desired_curvature (modelV2 plan at lat_action_t ~0.5s, right-positive)
-  - measured: livePose yaw rate / velocity (Kalman-filtered, bias-corrected, 100 Hz
-              after locationd fork that drives the loop on gyroscope). Uses
-              velocityDevice.x rather than noisy CS.vEgo for a self-consistent
-              kinematic measurement from a single filter state.
+  - measured: livePose.angularVelocityDevice.z / livePose.velocityDevice.x
+              (Kalman-filtered, bias-corrected, fused with cameraOdometry)
   - Kp < 1 bakes in the understeer margin (base under-commits; I closes gap)
-  - Integral accumulates err every CAN tick, anti-windup clamped
+  - I-term accumulated in torque space so I_MAX_TORQUE has same units as
+    FRICTION_TORQUE — matched feedback authority, transparent units
+  - PI + friction + torque update only on livePose arrival (20 Hz); torque
+    held constant between arrivals. Below deadzone, torque holds and i_torque
+    resets.
   """
   from cereal import log
   from cereal import messaging
@@ -178,12 +184,14 @@ def on_lat_controller_init(result, lac, CP):
   PLANT_GAIN_K = 0.68
   PLANT_GAIN_B = 0.0073
 
-  # PI gains. Kp = 0.8 commits 80% to desired (20% understeer margin).
-  # Ki at 100 Hz — tuned so 200 ms of steady err = 0.001 adds ~0.004 curvature
-  # contribution (≈30% torque at v=15), a modest plant-mismatch correction.
+  # P and I gains. Kp = 0.8 commits 80% to desired (20% understeer margin).
+  # I is accumulated in TORQUE space so its cap I_MAX_TORQUE is directly
+  # comparable to FRICTION_TORQUE. Ki=0.02 with err·dt-per-tick gives ~2.5 s
+  # to saturate at constant err=0.001 — slow enough to avoid windup during
+  # transients but still closes plant-gain mismatch.
   KP = 0.8
   KI = 0.02
-  I_MAX = 0.005   # curvature, caps sustained I-contribution to ~40% torque at v=15
+  I_MAX_TORQUE = 0.10   # ±1.2 Nm, matches FRICTION_TORQUE authority
 
   # Friction feedforward — step torque in sign(err) direction, breaks Coulomb
   # stiction in the steering column. Stock uses 0.15; we run 0.10 (1.2 Nm).
@@ -201,7 +209,7 @@ def on_lat_controller_init(result, lac, CP):
 
   state = {
     'torque': 0.0,
-    'integral': 0.0,
+    'i_torque': 0.0,         # I-term accumulated in torque space (same units as FRICTION_TORQUE)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'plant_gain': 0.0,
@@ -231,12 +239,16 @@ def on_lat_controller_init(result, lac, CP):
       deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
 
       if abs(err) > deadzone:
-        state['integral'] = max(-I_MAX, min(I_MAX, state['integral'] + err))
-        friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
-        curvature_cmd = state['measured'] + KP * err + KI * state['integral']
-        state['torque'] = max(-1.0, min(1.0, curvature_cmd / state['plant_gain'] + friction_ff))
+        # All terms in torque space for clarity — the output is a sum of components
+        base_torque  = state['measured'] / state['plant_gain']            # FF: hold current curvature
+        p_torque     = KP * err / state['plant_gain']                     # P: proportional toward desired
+        state['i_torque'] += KI * err / state['plant_gain']               # I: accumulated residual
+        state['i_torque'] = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, state['i_torque']))
+        friction_ff  = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE   # stiction break
+        state['torque'] = max(-1.0, min(1.0,
+                              base_torque + p_torque + state['i_torque'] + friction_ff))
       else:
-        state['integral'] = 0.0
+        state['i_torque'] = 0.0
 
     err = state['desired'] - state['measured']  # updated each tick for logging
     output = 0.0 if not active else state['torque']
@@ -256,7 +268,7 @@ def on_lat_controller_init(result, lac, CP):
         'desired': float(state['desired']),
         'measured': float(state['measured']),
         'err': float(err),
-        'integral': float(state['integral']),
+        'i_torque': float(state['i_torque']),
         'plant_gain': float(state['plant_gain']),
         'friction_ff': float(friction_ff),
         'torque': float(state['torque']),

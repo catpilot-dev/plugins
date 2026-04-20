@@ -13,7 +13,7 @@ PLANT_GAIN_K = 0.68
 PLANT_GAIN_B = 0.0073
 KP = 0.8
 KI = 0.02
-I_MAX = 0.005
+I_MAX_TORQUE = 0.10       # ±1.2 Nm, matches FRICTION_TORQUE authority
 FRICTION_TORQUE = 0.10
 DRIFT_TOLERANCE_M = 0.025
 DRIFT_EVAL_HORIZON_S = 0.5
@@ -23,7 +23,7 @@ MEASURED_BIAS_CURV = 0.0
 class MicroStepping:
   def __init__(self):
     self.torque = 0.0
-    self.integral = 0.0
+    self.i_torque = 0.0           # I-term in torque space
     self.desired = 0.0
     self.measured = 0.0
     self.plant_gain = 0.0
@@ -45,12 +45,15 @@ class MicroStepping:
       err = self.desired - self.measured
       deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
       if abs(err) > deadzone:
-        self.integral = max(-I_MAX, min(I_MAX, self.integral + err))
+        base_torque = self.measured / self.plant_gain
+        p_torque = KP * err / self.plant_gain
+        self.i_torque += KI * err / self.plant_gain
+        self.i_torque = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, self.i_torque))
         friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
-        curvature_cmd = self.measured + KP * err + KI * self.integral
-        self.torque = max(-1.0, min(1.0, curvature_cmd / self.plant_gain + friction_ff))
+        self.torque = max(-1.0, min(1.0,
+                           base_torque + p_torque + self.i_torque + friction_ff))
       else:
-        self.integral = 0.0
+        self.i_torque = 0.0
 
     self.torque_raw = self.torque
     out = 0.0 if not active else self.torque
