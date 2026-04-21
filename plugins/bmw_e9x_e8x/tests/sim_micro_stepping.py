@@ -11,12 +11,11 @@ MS_TO_KPH = 3.6
 # desiredCurvature's right-positive convention.
 PLANT_GAIN_K = 0.68
 PLANT_GAIN_B = 0.0073
-KP = 0.8
-KI = 0.02
-P_MAX_TORQUE = 0.80
-I_MAX_TORQUE = 0.10
+MAX_STEP = 0.1 * 5 / 12.0         # 0.04167, safety clamp per correction
+SPREAD_FRAMES = 50                # 50 CAN frames = 500 ms = plant delay
+STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
 FRICTION_TORQUE = 0.05
-FRICTION_ERR_SAT = 0.001
+FRICTION_ERR_SAT = 0.0002
 DRIFT_TOLERANCE_M = 0.025
 DRIFT_EVAL_HORIZON_S = 0.5
 MEASURED_BIAS_CURV = 0.0
@@ -25,7 +24,8 @@ MEASURED_BIAS_CURV = 0.0
 class MicroStepping:
   def __init__(self):
     self.torque = 0.0
-    self.i_torque = 0.0           # I-term in torque space
+    self.step_remaining = 0.0
+    self.prev_err = 0.0
     self.desired = 0.0
     self.measured = 0.0
     self.plant_gain = 0.0
@@ -34,9 +34,6 @@ class MicroStepping:
     self.delta_measured = 0.0
 
   def update(self, active, v_ego, desired_curv, yaw_rate, livepose_updated):
-    # yaw_rate in the desired-curvature convention. Feedback only runs on
-    # livePose updates (20 Hz) to match register.py's gating; between updates,
-    # self.torque holds.
     self.desired = float(desired_curv)
 
     if livepose_updated:
@@ -46,20 +43,37 @@ class MicroStepping:
 
       err = self.desired - self.measured
       deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
-      if abs(err) > deadzone:
-        base_torque = self.measured / self.plant_gain
-        p_torque = max(-P_MAX_TORQUE, min(P_MAX_TORQUE, KP * err / self.plant_gain))
-        self.i_torque += KI * err / self.plant_gain
-        self.i_torque = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, self.i_torque))
-        friction_scale = min(1.0, abs(err) / FRICTION_ERR_SAT)
-        friction_ff = FRICTION_TORQUE * friction_scale * (1.0 if err > 0 else -1.0)
-        self.torque = max(-1.0, min(1.0,
-                           base_torque + p_torque + self.i_torque + friction_ff))
+
+      if abs(err) < deadzone:
+        step = 0.0
       else:
-        self.i_torque = 0.0
+        same_sign = err * self.prev_err > 0
+        sign_changed = self.prev_err != 0 and not same_sign
+        worsening = same_sign and abs(err) > abs(self.prev_err)
+        if sign_changed:
+          step = err / self.plant_gain                   # full correction
+        elif worsening:
+          step = (err - self.prev_err) / self.plant_gain # delta only
+        else:
+          step = 0.0                                     # hold
+      self.step_remaining = max(-MAX_STEP, min(MAX_STEP, step))
+      self.prev_err = err
+
+    # Apply CAN-rate step
+    if abs(self.step_remaining) > 1e-9:
+      step_this_tick = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, self.step_remaining))
+      self.torque = max(-1.0, min(1.0, self.torque + step_this_tick))
+      self.step_remaining -= step_this_tick
+
+    # Friction FF (proportional ramp, applied on top)
+    err = self.desired - self.measured
+    friction_ff = 0.0
+    if abs(err) > 1e-6:
+      friction_scale = min(1.0, abs(err) / FRICTION_ERR_SAT)
+      friction_ff = FRICTION_TORQUE * friction_scale * (1.0 if err > 0 else -1.0)
 
     self.torque_raw = self.torque
-    out = 0.0 if not active else self.torque
+    out = 0.0 if not active else max(-1.0, min(1.0, self.torque + friction_ff))
     return -out
 
 

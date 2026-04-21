@@ -156,28 +156,33 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """PI + feedforward + friction — curvature tracking at livePose rate (20 Hz).
+  """Delta-error micro-stepping + friction FF — curvature tracking at 20 Hz.
 
-  All feedback terms expressed in torque space; output is a sum of components:
-    base_torque  = measured / plant_gain            # FF: hold current curvature
-    p_torque     = Kp · err / plant_gain            # P: push toward desired
-    i_torque    += Ki · err / plant_gain            # I: accumulated residual  (±I_MAX_TORQUE)
-    friction_ff  = ±FRICTION_TORQUE · sign(err)     # stiction break
-    torque       = base + p + i + friction          # (clamped ±1)
+  Feedback logic (per livePose tick):
+    err       = desired − measured
+    delta_err = err − prev_err
+    ─────────────────────────────────────────────────────────
+    |err| < deadzone     :  HOLD       (step = 0)
+    sign changed         :  FULL STEP  (step = err / plant_gain)
+    worsening same-sign  :  DELTA STEP (step = delta_err / plant_gain)
+    improving same-sign  :  HOLD       (step = 0)  ← lets plant respond
+    ─────────────────────────────────────────────────────────
+    Step clamped to ±MAX_STEP, spread over SPREAD_FRAMES CAN frames (500 ms).
 
-  - desired:  controlsd's desired_curvature (modelV2 plan at lat_action_t ~0.5s, right-positive)
-  - measured: livePose.angularVelocityDevice.z / livePose.velocityDevice.x
-              (Kalman-filtered, bias-corrected, fused with cameraOdometry)
-  - Kp < 1 bakes in the understeer margin (base under-commits; I closes gap)
-  - I-term accumulated in torque space so I_MAX_TORQUE has same units as
-    FRICTION_TORQUE — matched feedback authority, transparent units
-  - PI + friction + torque update only on livePose arrival (20 Hz); torque
-    held constant between arrivals. Below deadzone, torque holds and i_torque
-    resets.
+  Why hold-when-improving handles 0.5 s plant delay gracefully:
+    during the delay window, err appears "stuck" at its pre-correction value.
+    Delta-logic doesn't trigger more action because err isn't WORSENING — it's
+    frozen. Once plant starts responding, err decreases → still holding. Torque
+    settles at the right level without command backlog or windup.
+
+  Friction FF (separate, fast, on top of micro-stepped torque):
+    proportional ramp: scales from 0 → ±FRICTION_TORQUE over |err| 0 → FRICTION_ERR_SAT
+    added to output directly (not spread)
   """
   from cereal import log
   from cereal import messaging
   from bmw.shadow_plant import ShadowPlantEstimator
+  from bmw.values import CarControllerParams as CCP
 
   # Plant gain: K/v² + b, fit from route 00000266 regression
   #   desired·v² = K·(−torque)/v² + b·(−torque),  K=0.68, b=0.0073, R²=0.44
@@ -187,17 +192,17 @@ def on_lat_controller_init(result, lac, CP):
   PLANT_GAIN_K = 0.68
   PLANT_GAIN_B = 0.0073
 
-  # Torque budget allocation (of the ±1.0 output range, excluding base FF):
-  #   P  ±0.80   (proportional response scales with err, clipped at ±P_MAX_TORQUE)
-  #   I  ±0.10   (accumulated residual, ±I_MAX_TORQUE)
-  #   F  ±0.05   (friction stiction break, ±FRICTION_TORQUE, proportionally ramped)
-  KP = 0.8
-  KI = 0.02
-  P_MAX_TORQUE = 0.80
-  I_MAX_TORQUE = 0.10
-  FRICTION_TORQUE = 0.05      # ±0.6 Nm — smaller step reduces straight-line wheel wiggle
-  FRICTION_ERR_SAT = 0.001    # err magnitude at which friction saturates; below this,
-                              # friction scales linearly with err (no bang-bang step)
+  # Micro-stepping safety/spread limits:
+  #   MAX_STEP       : max torque change per single correction event (safety: 5 CAN × 0.1 Nm / 12 Nm max)
+  #   SPREAD_FRAMES  : 50 CAN frames = 500 ms, matches plant delay so no command backlog
+  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX          # 0.04167
+  SPREAD_FRAMES = 50
+  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES                  # applied per CAN tick
+
+  # Friction feedforward — step torque in sign(err) direction, proportionally
+  # ramped to avoid bang-bang at small err. Applied on top of micro-stepped torque.
+  FRICTION_TORQUE = 0.05      # ±0.6 Nm
+  FRICTION_ERR_SAT = 0.0002   # |err| ≥ this saturates friction at full authority
   # Feedback deadzone from physical criterion: engage P/I/friction only when
   # the curvature error would cause ≥DRIFT_TOLERANCE_M lateral drift within
   # DRIFT_EVAL_HORIZON_S seconds (horizon aligned with desired_curvature's
@@ -211,8 +216,10 @@ def on_lat_controller_init(result, lac, CP):
   _shadow = ShadowPlantEstimator(PLANT_GAIN_K, PLANT_GAIN_B, FRICTION_TORQUE)
 
   state = {
-    'torque': 0.0,
-    'i_torque': 0.0,         # I-term accumulated in torque space (same units as FRICTION_TORQUE)
+    'torque': 0.0,             # micro-stepping accumulator (output, pre-friction)
+    'step_remaining': 0.0,     # pending correction delta to apply (CAN-rate spread)
+    'prev_err': 0.0,           # err at last livePose tick (for delta-err logic)
+    'action': 'init',          # debug: last action taken (hold/full/delta)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'plant_gain': 0.0,
@@ -227,45 +234,57 @@ def on_lat_controller_init(result, lac, CP):
 
     state['desired'] = float(desired_curvature)
 
-    # Only update PI/friction/torque when a new livePose frame arrives (20 Hz).
-    # Between frames, state['torque'] holds — no fake P/I accumulation against
-    # stale measured. Below the deadzone, state['torque'] also holds (drift is
-    # sub-perceptible; let the controller sit). Integral resets so the next
-    # above-deadzone event starts fresh.
+    # livePose tick (20 Hz): decide micro-step action via delta-error logic.
+    # CAN tick (100 Hz): apply fraction of pending step toward state['torque'].
     friction_ff = 0.0
     if _sm.updated['livePose']:
-      # velocityDevice.x is Kalman-filtered forward velocity; fall back to CS.vEgo pre-init
       v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
       state['plant_gain'] = _shadow.plant_gain(v)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
 
-      # Shadow estimator: feed (v, torque, measured) from last commanded action
-      # so fit represents plant response to our actual torque output.
       if active:
         _shadow.add_sample(v, state['torque'], state['measured'])
 
       err = state['desired'] - state['measured']
       deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
+      prev_err = state['prev_err']
 
-      if abs(err) > deadzone:
-        # All terms in torque space. Each clipped to its allocated budget so I
-        # and friction always have room to contribute even when P saturates.
-        base_torque = state['measured'] / state['plant_gain']                 # FF: hold current curvature
-        p_torque    = max(-P_MAX_TORQUE, min(P_MAX_TORQUE,                    # P: clipped to 80% budget
-                          KP * err / state['plant_gain']))
-        state['i_torque'] += KI * err / state['plant_gain']                   # I: accumulated residual
-        state['i_torque'] = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, state['i_torque']))
-        # Friction FF with proportional ramp: smooth from 0 to ±FRICTION_TORQUE across
-        # ±FRICTION_ERR_SAT. No bang-bang — err near zero → small friction → no wheel wiggle.
-        friction_scale = min(1.0, abs(err) / FRICTION_ERR_SAT)
-        friction_ff = _shadow.friction() * friction_scale * (1.0 if err > 0 else -1.0)
-        state['torque'] = max(-1.0, min(1.0,
-                              base_torque + p_torque + state['i_torque'] + friction_ff))
+      # Delta-error action selection
+      if abs(err) < deadzone:
+        step = 0.0
+        state['action'] = 'hold_deadzone'
       else:
-        state['i_torque'] = 0.0
+        same_sign = err * prev_err > 0
+        sign_changed = prev_err != 0 and not same_sign
+        worsening = same_sign and abs(err) > abs(prev_err)
 
-    err = state['desired'] - state['measured']  # updated each tick for logging
-    output = 0.0 if not active else state['torque']
+        if sign_changed:
+          step = err / state['plant_gain']              # full correction
+          state['action'] = 'full'
+        elif worsening:
+          step = (err - prev_err) / state['plant_gain'] # delta correction only
+          state['action'] = 'delta'
+        else:  # improving or constant
+          step = 0.0                                     # HOLD: let plant respond
+          state['action'] = 'hold_improving'
+
+      # Set pending step (replaces any previous) with safety clamp
+      state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, step))
+      state['prev_err'] = err
+
+    # Apply CAN-rate step: fraction of remaining per 100 Hz tick
+    if abs(state['step_remaining']) > 1e-9:
+      step_this_tick = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, state['step_remaining']))
+      state['torque'] = max(-1.0, min(1.0, state['torque'] + step_this_tick))
+      state['step_remaining'] -= step_this_tick
+
+    # Friction FF (proportional ramp), added on top of micro-stepped torque
+    err = state['desired'] - state['measured']  # fresh each CAN tick for friction + logging
+    if abs(err) > 1e-6:
+      friction_scale = min(1.0, abs(err) / FRICTION_ERR_SAT)
+      friction_ff = _shadow.friction() * friction_scale * (1.0 if err > 0 else -1.0)
+
+    output = 0.0 if not active else max(-1.0, min(1.0, state['torque'] + friction_ff))
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
@@ -282,7 +301,8 @@ def on_lat_controller_init(result, lac, CP):
         'desired': float(state['desired']),
         'measured': float(state['measured']),
         'err': float(err),
-        'i_torque': float(state['i_torque']),
+        'step_remaining': float(state['step_remaining']),
+        'action': state['action'],
         'plant_gain': float(state['plant_gain']),
         'friction_ff': float(friction_ff),
         'torque': float(state['torque']),
