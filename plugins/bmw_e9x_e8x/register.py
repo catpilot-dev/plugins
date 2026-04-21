@@ -192,12 +192,15 @@ def on_lat_controller_init(result, lac, CP):
   PLANT_GAIN_K = 0.68
   PLANT_GAIN_B = 0.0073
 
-  # Micro-stepping safety/spread limits:
-  #   MAX_STEP       : max torque change per single correction event (safety: 5 CAN × 0.1 Nm / 12 Nm max)
-  #   SPREAD_FRAMES  : 50 CAN frames = 500 ms, matches plant delay so no command backlog
+  # Micro-stepping cadence:
+  #   Delta-error decision runs every ACTION_CADENCE_TICKS livePose ticks (= 250 ms).
+  #   SPREAD_FRAMES=25 CAN frames (= 250 ms) so each step fully applies before the
+  #   next decision; no overlap. Matches plant first-order time const ≈100 ms →
+  #   at 2.5τ = 250 ms, plant has responded ~91.8% to previous correction.
   MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX          # 0.04167
-  SPREAD_FRAMES = 50
-  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES                  # applied per CAN tick
+  SPREAD_FRAMES = 25
+  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
+  ACTION_CADENCE_TICKS = 5   # 5 × 50 ms = 250 ms
 
   # Friction feedforward — step torque in sign(err) direction, proportionally
   # ramped to avoid bang-bang at small err. Applied on top of micro-stepped torque.
@@ -218,7 +221,8 @@ def on_lat_controller_init(result, lac, CP):
   state = {
     'torque': 0.0,             # micro-stepping accumulator (output, pre-friction)
     'step_remaining': 0.0,     # pending correction delta to apply (CAN-rate spread)
-    'prev_err': 0.0,           # err at last livePose tick (for delta-err logic)
+    'prev_err': 0.0,           # err at last action (for delta-err logic, 250 ms ago)
+    'tick_count': 0,           # livePose tick counter; action every ACTION_CADENCE_TICKS
     'action': 'init',          # debug: last action taken (hold/full/delta)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
@@ -234,7 +238,9 @@ def on_lat_controller_init(result, lac, CP):
 
     state['desired'] = float(desired_curvature)
 
-    # livePose tick (20 Hz): decide micro-step action via delta-error logic.
+    # livePose tick (20 Hz): update measured/shadow every tick; delta-error
+    # decision only every ACTION_CADENCE_TICKS (250 ms) — gives plant time to
+    # respond to previous correction (2.5τ → ~92% response).
     # CAN tick (100 Hz): apply fraction of pending step toward state['torque'].
     friction_ff = 0.0
     if _sm.updated['livePose']:
@@ -245,32 +251,35 @@ def on_lat_controller_init(result, lac, CP):
       if active:
         _shadow.add_sample(v, state['torque'], state['measured'])
 
-      err = state['desired'] - state['measured']
-      deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
-      prev_err = state['prev_err']
+      state['tick_count'] += 1
+      if state['tick_count'] >= ACTION_CADENCE_TICKS:
+        state['tick_count'] = 0
 
-      # Delta-error action selection
-      if abs(err) < deadzone:
-        step = 0.0
-        state['action'] = 'hold_deadzone'
-      else:
-        same_sign = err * prev_err > 0
-        sign_changed = prev_err != 0 and not same_sign
-        worsening = same_sign and abs(err) > abs(prev_err)
+        err = state['desired'] - state['measured']
+        deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
+        prev_err = state['prev_err']
 
-        if sign_changed:
-          step = err / state['plant_gain']              # full correction
-          state['action'] = 'full'
-        elif worsening:
-          step = (err - prev_err) / state['plant_gain'] # delta correction only
-          state['action'] = 'delta'
-        else:  # improving or constant
-          step = 0.0                                     # HOLD: let plant respond
-          state['action'] = 'hold_improving'
+        if abs(err) < deadzone:
+          step = 0.0
+          state['action'] = 'hold_deadzone'
+        else:
+          # same_sign ≥ 0 allows prev_err=0 to trigger worsening on first sample
+          same_sign = err * prev_err >= 0
+          sign_changed = prev_err != 0 and not same_sign
+          worsening = same_sign and abs(err) > abs(prev_err)
 
-      # Set pending step (replaces any previous) with safety clamp
-      state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, step))
-      state['prev_err'] = err
+          if sign_changed:
+            step = err / state['plant_gain']              # full correction
+            state['action'] = 'full'
+          elif worsening:
+            step = (err - prev_err) / state['plant_gain'] # delta correction only
+            state['action'] = 'delta'
+          else:
+            step = 0.0                                     # HOLD — plant responding
+            state['action'] = 'hold_improving'
+
+        state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, step))
+        state['prev_err'] = err
 
     # Apply CAN-rate step: fraction of remaining per 100 Hz tick
     if abs(state['step_remaining']) > 1e-9:

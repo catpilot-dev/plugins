@@ -11,9 +11,10 @@ MS_TO_KPH = 3.6
 # desiredCurvature's right-positive convention.
 PLANT_GAIN_K = 0.68
 PLANT_GAIN_B = 0.0073
-MAX_STEP = 0.1 * 5 / 12.0         # 0.04167, safety clamp per correction
-SPREAD_FRAMES = 50                # 50 CAN frames = 500 ms = plant delay
+MAX_STEP = 0.1 * 5 / 12.0         # 0.04167
+SPREAD_FRAMES = 25                # 25 CAN frames = 250 ms = action cadence
 STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
+ACTION_CADENCE_TICKS = 5          # 5 × 50 ms livePose = 250 ms
 FRICTION_TORQUE = 0.05
 FRICTION_ERR_SAT = 0.0002
 DRIFT_TOLERANCE_M = 0.025
@@ -26,6 +27,7 @@ class MicroStepping:
     self.torque = 0.0
     self.step_remaining = 0.0
     self.prev_err = 0.0
+    self.tick_count = 0
     self.desired = 0.0
     self.measured = 0.0
     self.plant_gain = 0.0
@@ -41,23 +43,26 @@ class MicroStepping:
       self.plant_gain = PLANT_GAIN_K / (v ** 2) + PLANT_GAIN_B
       self.measured = float(yaw_rate) / v + MEASURED_BIAS_CURV
 
-      err = self.desired - self.measured
-      deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
+      self.tick_count += 1
+      if self.tick_count >= ACTION_CADENCE_TICKS:
+        self.tick_count = 0
+        err = self.desired - self.measured
+        deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
 
-      if abs(err) < deadzone:
-        step = 0.0
-      else:
-        same_sign = err * self.prev_err > 0
-        sign_changed = self.prev_err != 0 and not same_sign
-        worsening = same_sign and abs(err) > abs(self.prev_err)
-        if sign_changed:
-          step = err / self.plant_gain                   # full correction
-        elif worsening:
-          step = (err - self.prev_err) / self.plant_gain # delta only
+        if abs(err) < deadzone:
+          step = 0.0
         else:
-          step = 0.0                                     # hold
-      self.step_remaining = max(-MAX_STEP, min(MAX_STEP, step))
-      self.prev_err = err
+          same_sign = err * self.prev_err >= 0          # includes prev=0
+          sign_changed = self.prev_err != 0 and not same_sign
+          worsening = same_sign and abs(err) > abs(self.prev_err)
+          if sign_changed:
+            step = err / self.plant_gain
+          elif worsening:
+            step = (err - self.prev_err) / self.plant_gain
+          else:
+            step = 0.0
+        self.step_remaining = max(-MAX_STEP, min(MAX_STEP, step))
+        self.prev_err = err
 
     # Apply CAN-rate step
     if abs(self.step_remaining) > 1e-9:
