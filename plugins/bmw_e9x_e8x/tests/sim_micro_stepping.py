@@ -15,7 +15,8 @@ KP = 0.8
 KI = 0.02
 P_MAX_TORQUE = 0.80
 I_MAX_TORQUE = 0.10
-FRICTION_TORQUE = 0.10
+FRICTION_TORQUE = 0.05
+FRICTION_ERR_SAT = 0.001
 DRIFT_TOLERANCE_M = 0.025
 DRIFT_EVAL_HORIZON_S = 0.5
 MEASURED_BIAS_CURV = 0.0
@@ -50,7 +51,8 @@ class MicroStepping:
         p_torque = max(-P_MAX_TORQUE, min(P_MAX_TORQUE, KP * err / self.plant_gain))
         self.i_torque += KI * err / self.plant_gain
         self.i_torque = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, self.i_torque))
-        friction_ff = FRICTION_TORQUE if err > 0 else -FRICTION_TORQUE
+        friction_scale = min(1.0, abs(err) / FRICTION_ERR_SAT)
+        friction_ff = FRICTION_TORQUE * friction_scale * (1.0 if err > 0 else -1.0)
         self.torque = max(-1.0, min(1.0,
                            base_torque + p_torque + self.i_torque + friction_ff))
       else:
