@@ -218,6 +218,12 @@ def on_lat_controller_init(result, lac, CP):
   _sm = messaging.SubMaster(['livePose'])
   _shadow = ShadowPlantEstimator(PLANT_GAIN_K, PLANT_GAIN_B, FRICTION_TORQUE)
 
+  # Torque history for shadow estimator lag compensation. measured(t) reflects
+  # plant response to torque ~250 ms ago. Pair measured(t) with torque(t-250 ms)
+  # for correct plant-gain fit. Buffer size matches ACTION_CADENCE_TICKS.
+  from collections import deque as _deque
+  _torque_history = _deque(maxlen=ACTION_CADENCE_TICKS)   # 5 livePose ticks = 250 ms
+
   state = {
     'torque': 0.0,             # micro-stepping accumulator (output, pre-friction)
     'step_remaining': 0.0,     # pending correction delta to apply (CAN-rate spread)
@@ -248,8 +254,12 @@ def on_lat_controller_init(result, lac, CP):
       state['plant_gain'] = _shadow.plant_gain(v)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
 
-      if active:
-        _shadow.add_sample(v, state['torque'], state['measured'])
+      # Shadow sample: pair measured(t) with torque from 250 ms ago (ACTION_CADENCE_TICKS
+      # livePose ticks earlier) so the plant's first-order response is captured correctly.
+      _torque_history.append(state['torque'])
+      if active and len(_torque_history) == ACTION_CADENCE_TICKS:
+        lagged_torque = _torque_history[0]   # oldest, ~250 ms old
+        _shadow.add_sample(v, lagged_torque, state['measured'])
 
       state['tick_count'] += 1
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
