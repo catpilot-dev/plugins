@@ -190,13 +190,14 @@ def on_lat_controller_init(result, lac, CP):
   # Torque budget allocation (of the ±1.0 output range, excluding base FF):
   #   P  ±0.80   (proportional response scales with err, clipped at ±P_MAX_TORQUE)
   #   I  ±0.10   (accumulated residual, ±I_MAX_TORQUE)
-  #   F  ±0.10   (friction stiction break, ±FRICTION_TORQUE)
-  # Sum = ±1.0 → when saturation occurs, each term contributes in its slot.
+  #   F  ±0.05   (friction stiction break, ±FRICTION_TORQUE, proportionally ramped)
   KP = 0.8
   KI = 0.02
-  P_MAX_TORQUE = 0.80   # ±9.6 Nm — dominates feedback, scales with err
-  I_MAX_TORQUE = 0.10   # ±1.2 Nm — matches friction authority
-  FRICTION_TORQUE = 0.10  # ±1.2 Nm — stiction breakaway
+  P_MAX_TORQUE = 0.80
+  I_MAX_TORQUE = 0.10
+  FRICTION_TORQUE = 0.05      # ±0.6 Nm — smaller step reduces straight-line wheel wiggle
+  FRICTION_ERR_SAT = 0.001    # err magnitude at which friction saturates; below this,
+                              # friction scales linearly with err (no bang-bang step)
   # Feedback deadzone from physical criterion: engage P/I/friction only when
   # the curvature error would cause ≥DRIFT_TOLERANCE_M lateral drift within
   # DRIFT_EVAL_HORIZON_S seconds (horizon aligned with desired_curvature's
@@ -254,7 +255,10 @@ def on_lat_controller_init(result, lac, CP):
                           KP * err / state['plant_gain']))
         state['i_torque'] += KI * err / state['plant_gain']                   # I: accumulated residual
         state['i_torque'] = max(-I_MAX_TORQUE, min(I_MAX_TORQUE, state['i_torque']))
-        friction_ff = _shadow.friction() if err > 0 else -_shadow.friction()  # stiction break (live estimate)
+        # Friction FF with proportional ramp: smooth from 0 to ±FRICTION_TORQUE across
+        # ±FRICTION_ERR_SAT. No bang-bang — err near zero → small friction → no wheel wiggle.
+        friction_scale = min(1.0, abs(err) / FRICTION_ERR_SAT)
+        friction_ff = _shadow.friction() * friction_scale * (1.0 if err > 0 else -1.0)
         state['torque'] = max(-1.0, min(1.0,
                               base_torque + p_torque + state['i_torque'] + friction_ff))
       else:
