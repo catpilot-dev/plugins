@@ -145,6 +145,13 @@ class LaneCenteringCorrection:
       lane_width = self.estimated_lane_width if self.estimated_lane_width is not None else self.LANE_WIDTH_DEFAULT
     half_width = lane_width / 2
 
+    # Publish lane width unconditionally — speedlimitd fuses it as road-type
+    # context (3.75 → highway, 3.25 → city general, 2.5 → toll/narrow) so it
+    # must be available whenever we have a measurement, not only when the
+    # correction itself is active.
+    self.diag['lane_width'] = round(lane_width, 2)
+    self.diag['lane_width_learned'] = self.estimated_lane_width is not None
+
     # Use closest lane line as reference for lane center. The nearer line is
     # more reliable for detection and matches how a driver references "the
     # line I'm closest to." If only one is confident enough, use it.

@@ -186,6 +186,28 @@ class TestLaneWidthEstimation:
     lcc.update(model, 15.0)
     assert lcc.estimated_lane_width is None
 
+  def test_lane_width_published_in_diag(self, LCC):
+    # lane_width must be in diag whenever we have lane data, even when
+    # correction is inactive (speedlimitd fuses it as road-type context).
+    lcc = LCC()
+    # Small offset → correction stays inactive. Measured width 3.0m accepted.
+    model = make_model(curvature=0.001, path_y=0.05,
+                       left_y=-1.5, right_y=1.5, left_prob=0.8, right_prob=0.8)
+    lcc.update(model, 15.0)
+    assert lcc.active is False
+    assert 'lane_width' in lcc.diag
+    assert lcc.diag['lane_width'] == pytest.approx(3.0, abs=0.01)
+    assert lcc.diag['lane_width_learned'] is True
+
+  def test_lane_width_fallback_flagged_unlearned(self, LCC):
+    # No prior measurement → uses DEFAULT; lane_width_learned should be False.
+    lcc = LCC()
+    model = make_model(curvature=0.001, path_y=0.05,
+                       left_prob=0.2, right_prob=0.8)  # only right confident
+    lcc.update(model, 15.0)
+    assert lcc.diag.get('lane_width') == pytest.approx(lcc.LANE_WIDTH_DEFAULT, abs=0.01)
+    assert lcc.diag.get('lane_width_learned') is False
+
 
 class TestCorrectionDirection:
   def test_positive_offset_gives_negative_correction(self, LCC):
