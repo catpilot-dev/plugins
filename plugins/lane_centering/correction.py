@@ -20,15 +20,15 @@ class LaneCenteringCorrection:
     correction = lcc.update(model_v2, v_ego)
   """
 
-  # Curvature-dependent K: sharper turns need stronger correction
-  K_BP = [0.002, 0.005, 0.008, 0.012, 0.020]  # Curvature breakpoints (1/m)
-  K_V = [0.03, 0.35, 0.40, 0.50, 0.65]         # Corresponding K values
+  # Curvature-dependent K: sharper turns need stronger correction. Extended
+  # to curvature=0 (straights) so the correction engages whenever lateral
+  # offset exceeds threshold, not only in curves.
+  K_BP = [0.000, 0.002, 0.005, 0.008, 0.012, 0.020]  # Curvature breakpoints (1/m)
+  K_V  = [0.150, 0.150, 0.350, 0.400, 0.500, 0.650]   # K for straight matches gentle curves (~2s closure)
 
   MIN_PROB = 0.5           # Minimum lane detection confidence
   MIN_SPEED = 9.0          # m/s - disable at low speed
-  MIN_CURVATURE = 0.002    # 1/m (~500m radius) - activate correction
-  EXIT_CURVATURE = 0.001   # 1/m (~1000m radius) - deactivate on straight road
-  OFFSET_THRESHOLD = 0.3   # m - activate when offset exceeds this
+  OFFSET_THRESHOLD = 0.3   # m - activate when offset exceeds this (still OK on straight lane)
   OFFSET_TOLERANCE = 0.15  # m - deactivate when offset within tolerance
   SMOOTH_TAU = 0.5         # seconds - correction smoothing
   WINDDOWN_TAU = 1.0       # seconds - slower wind-down when exiting turns
@@ -163,12 +163,13 @@ class LaneCenteringCorrection:
 
     offset = path_y - self.smoothed_lane_center
 
-    # Hysteresis logic
+    # Hysteresis on offset only — runs regardless of curvature. Human-driver
+    # benchmark: 0.3 m offset is the typical "noticeable drift" threshold.
     if not self.active:
-      if abs(curvature) >= self.MIN_CURVATURE and abs(offset) >= self.OFFSET_THRESHOLD:
+      if abs(offset) >= self.OFFSET_THRESHOLD:
         self.active = True
     else:
-      if abs(curvature) < self.EXIT_CURVATURE and abs(offset) < self.OFFSET_TOLERANCE:
+      if abs(offset) < self.OFFSET_TOLERANCE:
         self.active = False
 
     if self.active:

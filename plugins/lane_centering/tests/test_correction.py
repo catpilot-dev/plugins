@@ -69,7 +69,8 @@ class TestConstants:
       assert LCC.K_V[i] >= LCC.K_V[i - 1]
 
   def test_hysteresis_thresholds(self, LCC):
-    assert LCC.MIN_CURVATURE > LCC.EXIT_CURVATURE
+    # Activation driven solely by offset now (curvature gate removed for
+    # straight-line lane centering).
     assert LCC.OFFSET_THRESHOLD > LCC.OFFSET_TOLERANCE
 
   def test_lane_width_bounds(self, LCC):
@@ -88,11 +89,13 @@ class TestHysteresis:
     lcc.update(model, 15.0)
     assert lcc.active is True
 
-  def test_no_activate_low_curvature(self, LCC):
+  def test_activate_on_straight_with_large_offset(self, LCC):
+    # On a straight road (low curvature), lane centering still activates when
+    # offset exceeds threshold — the curvature gate was removed.
     lcc = LCC()
     model = make_model(curvature=0.001, path_y=0.4)
     lcc.update(model, 15.0)
-    assert lcc.active is False
+    assert lcc.active is True
 
   def test_no_activate_small_offset(self, LCC):
     lcc = LCC()
@@ -100,13 +103,13 @@ class TestHysteresis:
     lcc.update(model, 15.0)
     assert lcc.active is False
 
-  def test_deactivate_on_straight(self, LCC):
+  def test_deactivate_on_small_offset(self, LCC):
     lcc = LCC()
     # Activate first
     model = make_model(curvature=0.005, path_y=0.4)
     lcc.update(model, 15.0)
     assert lcc.active is True
-    # Now straighten out with small offset
+    # Now settle within tolerance — deactivate regardless of curvature
     model2 = make_model(curvature=0.0005, path_y=0.05)
     lcc.update(model2, 15.0)
     assert lcc.active is False
