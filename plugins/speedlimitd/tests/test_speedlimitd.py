@@ -198,18 +198,22 @@ class TestInferSpeedFromRoadType:
 
 class TestSpeedTables:
   def test_load_cn(self, sld):
-    urban, nonurban, fallback = sld.load_speed_table('cn')
+    urban, nonurban, fallback, lane_width_class = sld.load_speed_table('cn')
     assert fallback == 40
     assert urban['motorway']['multi'] == 100
     assert nonurban['motorway']['multi'] == 120
+    # cn has lane_width_class populated; sorted descending by `min`
+    assert len(lane_width_class) >= 2
+    mins = [e['min'] for e in lane_width_class]
+    assert mins == sorted(mins, reverse=True)
 
   def test_load_de(self, sld):
-    urban, nonurban, fallback = sld.load_speed_table('de')
+    urban, nonurban, fallback, _ = sld.load_speed_table('de')
     assert fallback == 50
     assert nonurban['motorway']['multi'] == 130
 
   def test_load_au(self, sld):
-    urban, nonurban, fallback = sld.load_speed_table('au')
+    urban, nonurban, fallback, _ = sld.load_speed_table('au')
     assert fallback == 50
     assert nonurban['motorway']['multi'] == 110
 
@@ -246,7 +250,7 @@ class TestSpeedTables:
       if not fname.endswith('.toml'):
         continue
       country = fname[:-5]
-      urban, nonurban, _ = sld.load_speed_table(country)
+      urban, nonurban, _, _ = sld.load_speed_table(country)
       for table_name, table in [('urban', urban), ('nonurban', nonurban)]:
         for road_type, entry in table.items():
           assert 'multi' in entry, f"{country}/{table_name}/{road_type} missing 'multi'"
@@ -261,6 +265,58 @@ class TestSpeedTables:
         nonurban = sld.SPEED_TABLE_NONURBAN[road_type][lane]
         urban = sld.SPEED_TABLE_URBAN[road_type][lane]
         assert nonurban >= urban, f"{road_type}/{lane}: nonurban {nonurban} < urban {urban}"
+
+
+# ============================================================
+# Lane Width → Road Class Fusion
+# ============================================================
+
+class TestLaneWidthClassification:
+  def test_classify_highway_lane(self, sld):
+    assert sld.classify_by_width(3.75, sld.LANE_WIDTH_CLASS_TABLE) == 'trunk'
+
+  def test_classify_city_arterial(self, sld):
+    assert sld.classify_by_width(3.40, sld.LANE_WIDTH_CLASS_TABLE) == 'primary'
+
+  def test_classify_city_collector(self, sld):
+    assert sld.classify_by_width(3.00, sld.LANE_WIDTH_CLASS_TABLE) == 'secondary'
+
+  def test_classify_narrow_lane(self, sld):
+    assert sld.classify_by_width(2.50, sld.LANE_WIDTH_CLASS_TABLE) == 'residential'
+
+  def test_classify_no_observation(self, sld):
+    assert sld.classify_by_width(0.0, sld.LANE_WIDTH_CLASS_TABLE) == ''
+
+  def test_classify_empty_table(self, sld):
+    assert sld.classify_by_width(3.5, []) == ''
+
+
+class TestLaneWidthFusion:
+  def test_width_promotes_when_osm_unknown(self, sld):
+    # 3-lane urban road with no OSM highway type.
+    # Without width: lane_count votes 'primary' (rank 2) → urban primary = 60 km/h.
+    no_width = sld.infer_speed_from_road_type('', 3, 'city')
+    # With width hint 'trunk' (rank 3, from 3.75 m lanes) → should pick urban trunk = 80.
+    with_width = sld.infer_speed_from_road_type('', 3, 'city', width_class='trunk')
+    assert with_width > no_width
+    assert with_width == sld.SPEED_TABLE_URBAN['trunk']['multi']
+
+  def test_width_does_not_override_known_motorway(self, sld):
+    # OSM already identified the road as motorway (G-ref). Width can't override.
+    speed = sld.infer_speed_from_road_type('motorway', 4, 'freeway', width_class='residential')
+    assert speed == sld.SPEED_TABLE_NONURBAN['motorway']['multi']
+
+  def test_width_ignored_when_lane_class_higher(self, sld):
+    # 5-lane road (lane_class='trunk' urban, rank 3). Width 'primary' (rank 2)
+    # should not demote — highest-rank voter wins.
+    speed = sld.infer_speed_from_road_type('', 5, 'city', width_class='primary')
+    assert speed == sld.SPEED_TABLE_URBAN['trunk']['multi']
+
+  def test_width_breaks_tie_with_osm_tertiary(self, sld):
+    # OSM says 'secondary' (rank 1), lane_count=3 says 'primary' (rank 2),
+    # width says 'secondary' (rank 1). Primary wins — width doesn't demote.
+    speed = sld.infer_speed_from_road_type('secondary', 3, 'city', width_class='secondary')
+    assert speed == sld.SPEED_TABLE_URBAN['primary']['multi']
 
 
 # ============================================================

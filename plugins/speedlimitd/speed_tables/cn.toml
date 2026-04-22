@@ -5,6 +5,27 @@
 bbox = [18, 54, 73, 135]  # [min_lat, max_lat, min_lon, max_lon]
 default_fallback = 40
 
+# Lane width → road-type class (GB 50647, Code for Design of Urban Road Engineering).
+# Used as a fusion signal when OSM highway type is weak/unknown: the lane width
+# observed by the vision model votes a road class alongside OSM and lane count.
+# Entries are sorted by `min` descending; first match where lane_width ≥ min wins.
+#   ≥ 3.60 m  highway / urban expressway — trunk-class (≥3.75 is GB highway)
+#   ≥ 3.25 m  city arterial — primary-class (urban trunk/primary)
+#   ≥ 2.90 m  city collector / mixed — secondary-class
+#   otherwise residential / narrow
+[[lane_width_class]]
+min = 3.60
+type = "trunk"
+[[lane_width_class]]
+min = 3.25
+type = "primary"
+[[lane_width_class]]
+min = 2.90
+type = "secondary"
+[[lane_width_class]]
+min = 0.0
+type = "residential"
+
 [urban]
 motorway      = { multi = 100, single = 100 }
 motorway_link = { multi = 40,  single = 40 }

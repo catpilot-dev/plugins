@@ -18,10 +18,12 @@ from openpilot.common.realtime import Ratekeeper
 SPEED_TABLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'speed_tables')
 
 
-def load_speed_table(country: str) -> tuple[dict, dict, int]:
-  """Load urban/nonurban speed tables and fallback from a country TOML file.
+def load_speed_table(country: str) -> tuple[dict, dict, int, list]:
+  """Load urban/nonurban speed tables, fallback, and lane_width class table.
 
-  Returns (urban_table, nonurban_table, default_fallback).
+  Returns (urban_table, nonurban_table, default_fallback, lane_width_class).
+  lane_width_class is a list of {'min': float, 'type': str} dicts sorted by
+  `min` descending (so the first match on lane_width ≥ min wins).
   """
   path = os.path.join(SPEED_TABLES_DIR, f'{country}.toml')
   with open(path, 'rb') as f:
@@ -30,7 +32,25 @@ def load_speed_table(country: str) -> tuple[dict, dict, int]:
   urban = {k: dict(v) for k, v in data.get('urban', {}).items()}
   nonurban = {k: dict(v) for k, v in data.get('nonurban', {}).items()}
   fallback = data.get('default_fallback', 40)
-  return urban, nonurban, fallback
+  lane_width_class = sorted(
+    [dict(e) for e in data.get('lane_width_class', []) if 'min' in e and 'type' in e],
+    key=lambda e: e['min'], reverse=True,
+  )
+  return urban, nonurban, fallback, lane_width_class
+
+
+def classify_by_width(lane_width: float, table: list) -> str:
+  """Pick a road-type hint from observed lane_width via the cn.toml table.
+
+  Returns '' if no table entry matches (unconfigured country) or width is
+  non-positive.
+  """
+  if lane_width <= 0.0 or not table:
+    return ''
+  for entry in table:
+    if lane_width >= entry['min']:
+      return entry['type']
+  return ''
 
 
 def load_country_bboxes() -> list[tuple[str, list]]:
@@ -59,7 +79,7 @@ def country_from_gps(lat: float, lon: float, bboxes: list) -> str | None:
 
 
 # Default to China; overridden by GPS auto-detection at runtime
-SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED = load_speed_table('cn')
+SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED, LANE_WIDTH_CLASS_TABLE = load_speed_table('cn')
 
 # Standard speed limit values used in China (GB 5768)
 _STANDARD_SPEEDS = [30, 40, 50, 60, 80, 100, 120]
@@ -332,15 +352,19 @@ def vision_speed_cap(model_msg) -> int:
   return 0
 
 
-def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context: str) -> int:
-  """Look up fallback speed from road context + highway type + lane count.
+def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context: str,
+                               width_class: str = '') -> int:
+  """Look up fallback speed from road context + highway type + lane count + width.
 
   For narrow roads (≤2 lanes), vision cannot distinguish a through road from
   a link/ramp, so road-type tables are not used — speed is derived directly
   from lane count: 2 lanes → 40 km/h, 1 lane → 30 km/h.
 
-  For wider roads (≥3 lanes), lane count infers road class and the
-  appropriate speed table is consulted.
+  For wider roads (≥3 lanes), lane count and lane-width class both infer a
+  road class; the higher-ranked class wins when OSM's highway_type is weak.
+
+  width_class is a road-type hint derived from observed lane_width (via the
+  lane_width_class table in the country TOML); '' if unavailable.
   """
   # Narrow roads: use lane count directly, skip table lookup
   if lane_count <= 1:
@@ -370,16 +394,21 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
     lane_class = ''
 
   # When highway type comes from a known G/S expressway ref, trust it directly —
-  # don't let lane count promote beyond the ref classification.
-  # For inferred/lower types (secondary, primary, etc.), lane-count promotion still applies.
+  # don't let lane count or width promote beyond the ref classification.
+  # For inferred/lower types (secondary, primary, etc.), voting still applies.
   EXPRESSWAY_REFS = {'motorway', 'trunk'}
   if highway_type in EXPRESSWAY_REFS:
     effective_type = highway_type
   else:
-    rank = {'motorway': 4, 'trunk': 3, 'primary': 2, 'secondary': 1, 'tertiary': 0}
-    hw_rank = rank.get(highway_type, -1)
-    lane_rank = rank.get(lane_class, -1)
-    effective_type = lane_class if lane_rank > hw_rank else highway_type
+    rank = {'motorway': 4, 'trunk': 3, 'primary': 2, 'secondary': 1, 'tertiary': 0, 'residential': -1}
+    hw_rank = rank.get(highway_type, -2)
+    lane_rank = rank.get(lane_class, -2)
+    width_rank = rank.get(width_class, -2)
+    # Highest-ranked voter wins; width breaks ties between OSM and lane_count
+    # voters so a 3-lane road with 3.0 m lanes settles at secondary rather
+    # than being promoted to primary by lane_count alone.
+    voters = [(hw_rank, highway_type), (lane_rank, lane_class), (width_rank, width_class)]
+    _, effective_type = max(voters, key=lambda v: v[0])
 
   entry = table.get(effective_type)
   if entry:
@@ -448,6 +477,15 @@ class SpeedLimitMiddleware:
     except ImportError:
       self._cmd_sub = None
 
+    # Plugin bus: subscribe to lane_centering_state for lane_width fusion
+    try:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+      self._lc_sub = PluginSub(['lane_centering_state'])
+    except ImportError:
+      self._lc_sub = None
+    self.lane_width: float = 0.0       # smoothed m, 0 = no observation yet
+    self.lane_width_class: str = ''    # road-type hint from lane_width_class table
+
     self.lookahead_cap: int = 0
     self._lookahead_cap_hold_until: float = 0.0
 
@@ -457,7 +495,7 @@ class SpeedLimitMiddleware:
     self.yolo_timeout: float = 120.0  # seconds before YOLO detection expires
 
   def update(self):
-    global SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED
+    global SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED, LANE_WIDTH_CLASS_TABLE
     self.sm.update(0)
 
     now = time.monotonic()
@@ -473,7 +511,7 @@ class SpeedLimitMiddleware:
           country = country_from_gps(gps.latitude, gps.longitude, self.country_bboxes)
           if country:
             try:
-              SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED = load_speed_table(country)
+              SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED, LANE_WIDTH_CLASS_TABLE = load_speed_table(country)
             except FileNotFoundError:
               pass
           self.country_detected = True
@@ -583,6 +621,23 @@ class SpeedLimitMiddleware:
       else:
         self.lookahead_cap = raw_la_cap
 
+    # --- Lane width observation from lane_centering plugin ---
+    # Smoothed (EMA) across 5 Hz drain so a single noisy frame can't swing
+    # the road-class vote. lane_width_learned=False → fall back to default
+    # width from lane_centering; we ignore those to avoid false confidence.
+    if self._lc_sub is not None:
+      lc = self._lc_sub.drain()
+      if lc is not None:
+        _, data = lc
+        if isinstance(data, dict) and data.get('lane_width_learned'):
+          w = data.get('lane_width')
+          if isinstance(w, (int, float)) and w > 0:
+            if self.lane_width == 0.0:
+              self.lane_width = float(w)
+            else:
+              self.lane_width = 0.8 * self.lane_width + 0.2 * float(w)
+            self.lane_width_class = classify_by_width(self.lane_width, LANE_WIDTH_CLASS_TABLE)
+
     # --- YOLO timeout ---
     if self.yolo_speed > 0 and (now - self.yolo_last_seen) > self.yolo_timeout:
       self.yolo_speed = 0
@@ -598,7 +653,8 @@ class SpeedLimitMiddleware:
       road_ctx_for_infer = 'city'
 
     inferred_speed = infer_speed_from_road_type(
-      self.last_highway_type, self.lane_count_stable, road_ctx_for_infer
+      self.last_highway_type, self.lane_count_stable, road_ctx_for_infer,
+      width_class=self.lane_width_class,
     )
 
     # Vision cap: when vision confidently sees ≤2 lanes, cap inferred speed.
@@ -683,6 +739,8 @@ class SpeedLimitMiddleware:
       'wayRef': self.last_way_ref,
       'roadName': self.last_road_name,
       'laneCount': self.lane_count_stable,
+      'laneWidth': round(self.lane_width, 2),
+      'laneWidthClass': self.lane_width_class,
       'curvatureCap': self.curvature_cap,
       'lookaheadCap': self.lookahead_cap,
       'safetyCapped': safety_capped,
