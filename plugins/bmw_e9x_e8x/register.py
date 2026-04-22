@@ -311,12 +311,15 @@ def on_lat_controller_init(result, lac, CP):
       state['plant_gain'] = _shadow.plant_gain(v)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
 
-      # Shadow sample: pair measured(t) with torque from 250 ms ago (ACTION_CADENCE_TICKS
-      # livePose ticks earlier) so the plant's first-order response is captured correctly.
+      # Shadow sample: pair measured(t) with torque from 250 ms ago so plant's
+      # first-order response is captured correctly. Feed -state['torque'] to
+      # match the offline fit convention (desired = K·(-torque)/v² + b·(-torque))
+      # — state['torque'] is our internal accumulator (pre-negation, opposite
+      # sign to the commanded torque the offline fit sampled via lac.output).
       _torque_history.append(state['torque'])
       if active and len(_torque_history) == ACTION_CADENCE_TICKS:
-        lagged_torque = _torque_history[0]   # oldest, ~250 ms old
-        _shadow.add_sample(v, lagged_torque, state['measured'])
+        lagged_torque = _torque_history[0]
+        _shadow.add_sample(v, -lagged_torque, state['measured'])
 
       # Periodic persistence — save adaptive state to disk every ~50s
       state['save_counter'] += 1
