@@ -224,12 +224,25 @@ def on_lat_controller_init(result, lac, CP):
   from collections import deque as _deque
   _torque_history = _deque(maxlen=ACTION_CADENCE_TICKS)   # 5 livePose ticks = 250 ms
 
+  # Per-speed-bin responsiveness scale factor (adaptive). At each 250 ms decision,
+  # compare desired vs measured curvature change over window → ratio tells us how
+  # much of observed motion was commanded (vs disturbance / plant mismatch).
+  # Applied multiplicatively to step (scale < 1 → step reduced → less aggressive).
+  # Bins match shadow estimator: 30 km/h to 120 km/h in 5 km/h steps = 18 bins.
+  from bmw.shadow_plant import MIN_VEGO_MS, BIN_WIDTH_MS, N_BINS as _SCALE_N
+  _scale_by_bin = [1.0] * _SCALE_N
+  SCALE_MIN, SCALE_MAX = 0.5, 2.0
+  SCALE_EMA_ALPHA = 0.2
+
   state = {
     'torque': 0.0,             # micro-stepping accumulator (output, pre-friction)
     'step_remaining': 0.0,     # pending correction delta to apply (CAN-rate spread)
     'prev_err': 0.0,           # err at last action (for delta-err logic, 250 ms ago)
+    'prev_desired': 0.0,       # desired at last action (for window delta_desired)
+    'prev_measured': 0.0,      # measured at last action (for window delta_measured)
     'tick_count': 0,           # livePose tick counter; action every ACTION_CADENCE_TICKS
     'action': 'init',          # debug: last action taken (hold/full/delta)
+    'last_scale': 1.0,         # debug: scale factor used in last step
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'plant_gain': 0.0,
@@ -269,24 +282,50 @@ def on_lat_controller_init(result, lac, CP):
         deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
         prev_err = state['prev_err']
 
+        # Update per-speed-bin responsiveness scale (iterative learning):
+        # Compare window deltas over last 250 ms. If measured moved more than
+        # desired for a commanded maneuver, plant is over-responsive → scale
+        # down next step (gentler). Mirrors human "steered too much, try less".
+        delta_des = state['desired'] - state['prev_desired']
+        delta_meas = state['measured'] - state['prev_measured']
+        if abs(delta_des) > deadzone and abs(delta_meas) > deadzone:
+          # Both deltas are actionable — learn from this window
+          ratio = abs(delta_des) / abs(delta_meas)   # <1 if over-respond, >1 if under
+          ratio = max(SCALE_MIN, min(SCALE_MAX, ratio))
+          if MIN_VEGO_MS <= v < MIN_VEGO_MS + _SCALE_N * BIN_WIDTH_MS:
+            b_idx = int((v - MIN_VEGO_MS) / BIN_WIDTH_MS)
+            _scale_by_bin[b_idx] = (1 - SCALE_EMA_ALPHA) * _scale_by_bin[b_idx] + SCALE_EMA_ALPHA * ratio
+        state['prev_desired'] = state['desired']
+        state['prev_measured'] = state['measured']
+
+        # Look up scale factor for current speed bin (default 1.0 if outside)
+        if MIN_VEGO_MS <= v < MIN_VEGO_MS + _SCALE_N * BIN_WIDTH_MS:
+          b_idx = int((v - MIN_VEGO_MS) / BIN_WIDTH_MS)
+          scale = _scale_by_bin[b_idx]
+        else:
+          scale = 1.0
+        state['last_scale'] = scale
+
         if abs(err) < deadzone:
           step = 0.0
           state['action'] = 'hold_deadzone'
         else:
-          # same_sign ≥ 0 allows prev_err=0 to trigger worsening on first sample
-          same_sign = err * prev_err >= 0
+          same_sign = err * prev_err >= 0  # allows prev_err=0 for first sample
           sign_changed = prev_err != 0 and not same_sign
           worsening = same_sign and abs(err) > abs(prev_err)
 
           if sign_changed:
-            step = err / state['plant_gain']              # full correction
+            step = err / state['plant_gain']
             state['action'] = 'full'
           elif worsening:
-            step = (err - prev_err) / state['plant_gain'] # delta correction only
+            step = (err - prev_err) / state['plant_gain']
             state['action'] = 'delta'
           else:
-            step = 0.0                                     # HOLD — plant responding
+            step = 0.0
             state['action'] = 'hold_improving'
+
+        # Apply iterative-learning scale
+        step *= scale
 
         state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, step))
         state['prev_err'] = err
@@ -322,6 +361,7 @@ def on_lat_controller_init(result, lac, CP):
         'err': float(err),
         'step_remaining': float(state['step_remaining']),
         'action': state['action'],
+        'scale': float(state['last_scale']),
         'plant_gain': float(state['plant_gain']),
         'friction_ff': float(friction_ff),
         'torque': float(state['torque']),
