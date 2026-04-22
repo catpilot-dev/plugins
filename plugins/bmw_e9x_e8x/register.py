@@ -156,28 +156,31 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Delta-error micro-stepping + friction FF — curvature tracking at 20 Hz.
+  """Proportional micro-stepping + friction FF — curvature tracking.
 
-  Feedback logic (per livePose tick):
-    err       = desired − measured
-    delta_err = err − prev_err
-    ─────────────────────────────────────────────────────────
-    |err| < deadzone     :  HOLD       (step = 0)
-    sign changed         :  FULL STEP  (step = err / plant_gain)
-    worsening same-sign  :  DELTA STEP (step = delta_err / plant_gain)
-    improving same-sign  :  HOLD       (step = 0)  ← lets plant respond
-    ─────────────────────────────────────────────────────────
-    Step clamped to ±MAX_STEP, spread over SPREAD_FRAMES CAN frames (500 ms).
+  Feedback decision runs every ACTION_CADENCE_TICKS livePose frames (= 250 ms,
+  matches plant 2.5τ response). Between decisions, state['torque'] holds; within
+  decisions, step_remaining drains at CAN rate (100 Hz) over SPREAD_FRAMES.
 
-  Why hold-when-improving handles 0.5 s plant delay gracefully:
-    during the delay window, err appears "stuck" at its pre-correction value.
-    Delta-logic doesn't trigger more action because err isn't WORSENING — it's
-    frozen. Once plant starts responding, err decreases → still holding. Torque
-    settles at the right level without command backlog or windup.
+    err = desired − measured
+    if |err| < deadzone:  step = 0
+    else:                 step = (err / plant_gain) × scale[speed_bin]
+    step = clamp(step, ±MAX_STEP)
 
-  Friction FF (separate, fast, on top of micro-stepped torque):
-    proportional ramp: scales from 0 → ±FRICTION_TORQUE over |err| 0 → FRICTION_ERR_SAT
-    added to output directly (not spread)
+  Plant-delay handling: during 500 ms lag, err appears frozen; controller
+  applies MAX_STEP each decision → torque ramps up → plant responds → err
+  shrinks → step shrinks → torque converges. No delta-error hold needed.
+
+  Scale factor (per 5-km/h speed bin) adapts via iterative learning: each
+  decision compares window delta_desired vs delta_measured; if measured over-
+  responds, scale drops (next step gentler), under-responds → scale grows
+  (next step firmer). Mirrors human "try less / try more" motor learning.
+
+  Friction FF: proportional ramp (0 → ±FRICTION_TORQUE across |err| 0 → FRICTION_ERR_SAT),
+  added to output on top of micro-stepped torque.
+
+  Persistence: scale_by_bin + shadow K/b/friction saved to data/LatAdaptive.json
+  every ~50s, restored at init. Learning accumulates across drives.
   """
   from cereal import log
   from cereal import messaging
@@ -278,7 +281,6 @@ def on_lat_controller_init(result, lac, CP):
   state = {
     'torque': 0.0,             # micro-stepping accumulator (output, pre-friction)
     'step_remaining': 0.0,     # pending correction delta to apply (CAN-rate spread)
-    'prev_err': 0.0,           # err at last action (for delta-err logic, 250 ms ago)
     'prev_desired': 0.0,       # desired at last action (for window delta_desired)
     'prev_measured': 0.0,      # measured at last action (for window delta_measured)
     'tick_count': 0,           # livePose tick counter; action every ACTION_CADENCE_TICKS
@@ -328,7 +330,6 @@ def on_lat_controller_init(result, lac, CP):
 
         err = state['desired'] - state['measured']
         deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
-        prev_err = state['prev_err']
 
         # Update per-speed-bin responsiveness scale (iterative learning):
         # Compare window deltas over last 250 ms. If measured moved more than
@@ -354,29 +355,21 @@ def on_lat_controller_init(result, lac, CP):
           scale = 1.0
         state['last_scale'] = scale
 
+        # Proportional correction: step = err / plant_gain each 250 ms, clamped
+        # to ±MAX_STEP for safety. For big err, multiple decisions ramp torque
+        # up until plant catches up. Plant delay handled naturally: repeated
+        # clamped steps during 500 ms lag → torque accumulates → plant responds
+        # → err drops → step drops → converges. No delta-error hold-on-improving
+        # needed (that pattern left sustained curves under-corrected due to
+        # MAX_STEP clamping freezing after one step).
         if abs(err) < deadzone:
           step = 0.0
           state['action'] = 'hold_deadzone'
         else:
-          same_sign = err * prev_err >= 0  # allows prev_err=0 for first sample
-          sign_changed = prev_err != 0 and not same_sign
-          worsening = same_sign and abs(err) > abs(prev_err)
-
-          if sign_changed:
-            step = err / state['plant_gain']
-            state['action'] = 'full'
-          elif worsening:
-            step = (err - prev_err) / state['plant_gain']
-            state['action'] = 'delta'
-          else:
-            step = 0.0
-            state['action'] = 'hold_improving'
-
-        # Apply iterative-learning scale
-        step *= scale
+          step = err / state['plant_gain'] * scale
+          state['action'] = 'prop'
 
         state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, step))
-        state['prev_err'] = err
 
     # Apply CAN-rate step: fraction of remaining per 100 Hz tick
     if abs(state['step_remaining']) > 1e-9:

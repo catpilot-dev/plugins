@@ -26,7 +26,6 @@ class MicroStepping:
   def __init__(self):
     self.torque = 0.0
     self.step_remaining = 0.0
-    self.prev_err = 0.0
     self.tick_count = 0
     self.desired = 0.0
     self.measured = 0.0
@@ -52,17 +51,8 @@ class MicroStepping:
         if abs(err) < deadzone:
           step = 0.0
         else:
-          same_sign = err * self.prev_err >= 0          # includes prev=0
-          sign_changed = self.prev_err != 0 and not same_sign
-          worsening = same_sign and abs(err) > abs(self.prev_err)
-          if sign_changed:
-            step = err / self.plant_gain
-          elif worsening:
-            step = (err - self.prev_err) / self.plant_gain
-          else:
-            step = 0.0
+          step = err / self.plant_gain   # proportional, no delta
         self.step_remaining = max(-MAX_STEP, min(MAX_STEP, step))
-        self.prev_err = err
 
     # Apply CAN-rate step
     if abs(self.step_remaining) > 1e-9:
