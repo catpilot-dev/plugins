@@ -35,10 +35,16 @@ class LaneCenteringCorrection:
   MEASUREMENT_TAU = 0.2    # seconds - lane center measurement smoothing
   MAX_JUMP = 0.3           # m - max lane center change per frame
 
-  # Lane width estimation
-  LANE_WIDTH_DEFAULT = 3.5   # m - fallback (standard in China)
-  LANE_WIDTH_MIN = 2.5       # m - minimum valid for estimation
-  LANE_WIDTH_MAX = 4.5       # m - maximum valid for estimation
+  # Lane width estimation — per China standard (GB 50647):
+  #   highway / city expressway ≥60 km/h: 3.75 m
+  #   city general / mixed:               3.25–3.5 m
+  #   intersection:                       2.8–3.5 m
+  #   toll / narrow:                      2.5 m
+  # Accept measurements in [MIN=2.5, MAX=3.75]. Outside this range, fall back
+  # to DEFAULT (3.5, a reasonable middle for mixed city driving).
+  LANE_WIDTH_DEFAULT = 3.5   # m - fallback when measurement out of range
+  LANE_WIDTH_MIN = 2.5       # m - toll / narrow lane lower bound
+  LANE_WIDTH_MAX = 3.75      # m - highway upper bound (China GB standard)
   LANE_WIDTH_SMOOTH_TAU = 2.0  # seconds - width estimation smoothing
 
   # latcontrol_torque kP curve — used to normalize our correction
@@ -139,10 +145,19 @@ class LaneCenteringCorrection:
       lane_width = self.estimated_lane_width if self.estimated_lane_width is not None else self.LANE_WIDTH_DEFAULT
     half_width = lane_width / 2
 
-    # Use higher confidence lane to estimate center
-    if right_prob >= left_prob and right_prob >= self.MIN_PROB:
+    # Use closest lane line as reference for lane center. The nearer line is
+    # more reliable for detection and matches how a driver references "the
+    # line I'm closest to." If only one is confident enough, use it.
+    right_ok = right_prob >= self.MIN_PROB
+    left_ok  = left_prob  >= self.MIN_PROB
+    if right_ok and left_ok:
+      if abs(right_y) <= abs(left_y):
+        lane_center = right_y - half_width
+      else:
+        lane_center = left_y + half_width
+    elif right_ok:
       lane_center = right_y - half_width
-    elif left_prob >= self.MIN_PROB:
+    elif left_ok:
       lane_center = left_y + half_width
     else:
       self.active = False

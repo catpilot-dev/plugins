@@ -74,7 +74,8 @@ class TestConstants:
     assert LCC.OFFSET_THRESHOLD > LCC.OFFSET_TOLERANCE
 
   def test_lane_width_bounds(self, LCC):
-    assert LCC.LANE_WIDTH_MIN < LCC.LANE_WIDTH_DEFAULT < LCC.LANE_WIDTH_MAX
+    # MAX = 3.75m (China highway standard). DEFAULT = 3.5m (city mixed).
+    assert LCC.LANE_WIDTH_MIN < LCC.LANE_WIDTH_DEFAULT <= LCC.LANE_WIDTH_MAX
 
 
 class TestHysteresis:
@@ -152,22 +153,23 @@ class TestLaneWidthEstimation:
     assert lcc.estimated_lane_width is None
 
   def test_width_measured_with_both_lanes(self, LCC):
+    # Measurement of exactly 3.0m (within [MIN=2.5, MAX=3.5]) accepted.
     lcc = LCC()
-    model = make_model(left_y=-2.0, right_y=2.0, left_prob=0.8, right_prob=0.8)
+    model = make_model(left_y=-1.5, right_y=1.5, left_prob=0.8, right_prob=0.8)
     lcc.update(model, 15.0)
     assert lcc.estimated_lane_width is not None
-    assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)
+    assert lcc.estimated_lane_width == pytest.approx(3.0, abs=0.01)
 
   def test_width_fallback_when_too_wide(self, LCC):
     lcc = LCC()
-    # Learn valid width first
-    model = make_model(left_y=-2.0, right_y=2.0, left_prob=0.8, right_prob=0.8)
+    # Learn valid width first (3.0m)
+    model = make_model(left_y=-1.5, right_y=1.5, left_prob=0.8, right_prob=0.8)
     lcc.update(model, 15.0)
-    assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)
-    # Turn distorts apparent width > MAX — lane_width should fall back to default, estimate unchanged
+    assert lcc.estimated_lane_width == pytest.approx(3.0, abs=0.01)
+    # Perspective distortion → apparent width 5m > MAX (3.5m) → fall back, estimate unchanged
     wide = make_model(curvature=0.01, left_y=-2.5, right_y=2.5, left_prob=0.8, right_prob=0.8)
-    result = lcc.update(wide, 15.0)
-    assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)  # estimate unchanged
+    lcc.update(wide, 15.0)
+    assert lcc.estimated_lane_width == pytest.approx(3.0, abs=0.01)
 
   def test_width_rejected_if_too_narrow(self, LCC):
     lcc = LCC()
@@ -177,7 +179,7 @@ class TestLaneWidthEstimation:
 
   def test_width_rejected_if_too_wide(self, LCC):
     lcc = LCC()
-    model = make_model(left_y=-3.0, right_y=3.0)  # 6.0m > MAX (4.5m)
+    model = make_model(left_y=-2.0, right_y=2.0)  # 4.0m > MAX (3.75m)
     lcc.update(model, 15.0)
     assert lcc.estimated_lane_width is None
 
