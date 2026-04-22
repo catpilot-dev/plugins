@@ -32,8 +32,11 @@ STABLE_CYCLES = 3                  # consecutive stable refits before first prom
 DECAY = 0.3                        # post-promotion: new_live = 0.7·old + 0.3·fit
 MIN_ABS_TORQUE = 0.02              # samples require meaningful torque
 FRICTION_FACTOR = 1.5              # std × this = friction estimate (matches stock torqued)
-FRICTION_MIN = 0.02                # sanity bounds on estimated friction (fraction of STEER_MAX)
-FRICTION_MAX = 0.30
+# Physical breakaway for BMW hydraulic rack is ~0.5-1.5 Nm (0.04-0.13 torque
+# fraction). Stock's nominal 0.15 is likely inflated by the LAF cancellation
+# bug in get_friction; true physical friction is probably 0.06-0.13.
+FRICTION_MIN = 0.02                # 0.24 Nm lower bound
+FRICTION_MAX = 0.15                # 1.8 Nm upper bound (3.6 Nm was unphysical)
 
 
 class ShadowPlantEstimator:
