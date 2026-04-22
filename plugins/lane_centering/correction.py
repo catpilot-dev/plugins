@@ -53,7 +53,12 @@ class LaneCenteringCorrection:
   # Derivative damping — reduce correction when offset is improving
   KD = 0.5  # damping factor on offset rate of change
 
-  DEFAULT_LAT_DELAY = 0.56   # fallback: steerActuatorDelay + 0.2
+  # Sample the offset at modelV2's planning horizon (lat_action_t) — this is
+  # where desired_curvature is evaluated, so reading offset at the same
+  # lookahead makes our correction intrinsically consistent with what it
+  # modifies. Fixed 0.5s matches modelV2.action_t; removes dependency on
+  # the separately-learned liveDelay service.
+  MODEL_LAT_ACTION_T = 0.5
 
   def __init__(self):
     self.prev_correction = 0.0
@@ -62,7 +67,6 @@ class LaneCenteringCorrection:
     self.smoothed_lane_center = None
     self.estimated_lane_width = None
     self.prev_offset = 0.0
-    self.lat_delay = self.DEFAULT_LAT_DELAY
     # Diagnostics (published to plugin bus by hook)
     self.diag = {}
 
@@ -76,10 +80,8 @@ class LaneCenteringCorrection:
     self.prev_correction = smooth_value(target, self.prev_correction, tau, DT_MDL)
     return self.prev_correction
 
-  def update(self, model_v2, v_ego, lat_delay=None):
+  def update(self, model_v2, v_ego):
     self.diag = {}
-    if lat_delay is not None:
-      self.lat_delay = lat_delay
 
     # Skip if lane detection data not available
     if len(model_v2.laneLineProbs) < 3:
@@ -107,10 +109,10 @@ class LaneCenteringCorrection:
 
     curvature = model_v2.action.desiredCurvature
 
-    # Read lane positions at actuator delay distance (not t=0) to match
-    # the stock desiredCurvature time horizon. Prevents the correction
-    # from fighting the curvature when speed changes (e.g. curve braking).
-    delay_dist = v_ego * self.lat_delay
+    # Read lane positions at modelV2.action_t lookahead (not t=0) so the
+    # offset is sampled at the same point in space where desired_curvature
+    # is evaluated. Keeps our correction intrinsically time-aligned.
+    delay_dist = v_ego * self.MODEL_LAT_ACTION_T
     X_IDXS = [192.0 * (i / 32) ** 2 for i in range(33)]
     idx = min(range(len(X_IDXS)), key=lambda i: abs(X_IDXS[i] - delay_dist))
     idx = min(idx, len(model_v2.position.y) - 1, len(model_v2.laneLines[1].y) - 1, len(model_v2.laneLines[2].y) - 1)
@@ -229,7 +231,7 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, **kwargs)
     _lcc = LaneCenteringCorrection()
   if lane_changing:
     return curvature
-  correction = _lcc.update(model_v2, v_ego, lat_delay=kwargs.get('lat_delay'))
+  correction = _lcc.update(model_v2, v_ego)
 
   # Publish active state and diagnostics to plugin bus
   try:
