@@ -234,6 +234,47 @@ def on_lat_controller_init(result, lac, CP):
   SCALE_MIN, SCALE_MAX = 0.5, 2.0
   SCALE_EMA_ALPHA = 0.2
 
+  # Persistent adaptive state — survives reboot and plugin updates
+  # (install.sh preserves data/ subdirectory). Saves shadow K/b/friction + scale table.
+  import json
+  import time
+  _ADAPTIVE_PATH = os.path.join(_PLUGIN_DIR, 'data', 'LatAdaptive.json')
+  _SAVE_EVERY_TICKS = 1000  # ~50 seconds at 20 Hz
+  _ADAPTIVE_VERSION = 1
+
+  try:
+    with open(_ADAPTIVE_PATH) as _f:
+      _saved = json.load(_f)
+    if _saved.get('version') == _ADAPTIVE_VERSION:
+      _saved_bins = _saved.get('scale_by_bin', [])
+      if len(_saved_bins) == _SCALE_N:
+        _scale_by_bin = list(_saved_bins)
+      _shadow.live_k = float(_saved.get('shadow_k', PLANT_GAIN_K))
+      _shadow.live_b = float(_saved.get('shadow_b', PLANT_GAIN_B))
+      _shadow.live_friction = float(_saved.get('shadow_friction', FRICTION_TORQUE))
+      _shadow.validated = bool(_saved.get('shadow_validated', False))
+  except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+    pass  # fresh start with defaults
+
+  def _save_adaptive():
+    try:
+      data_dir = os.path.dirname(_ADAPTIVE_PATH)
+      os.makedirs(data_dir, exist_ok=True)
+      tmp = _ADAPTIVE_PATH + '.tmp'
+      with open(tmp, 'w') as f:
+        json.dump({
+          'version': _ADAPTIVE_VERSION,
+          'scale_by_bin': list(_scale_by_bin),
+          'shadow_k': _shadow.live_k,
+          'shadow_b': _shadow.live_b,
+          'shadow_friction': _shadow.live_friction,
+          'shadow_validated': _shadow.validated,
+          'updated_ts': time.time(),
+        }, f)
+      os.replace(tmp, _ADAPTIVE_PATH)  # atomic on same fs
+    except OSError:
+      pass
+
   state = {
     'torque': 0.0,             # micro-stepping accumulator (output, pre-friction)
     'step_remaining': 0.0,     # pending correction delta to apply (CAN-rate spread)
@@ -241,6 +282,7 @@ def on_lat_controller_init(result, lac, CP):
     'prev_desired': 0.0,       # desired at last action (for window delta_desired)
     'prev_measured': 0.0,      # measured at last action (for window delta_measured)
     'tick_count': 0,           # livePose tick counter; action every ACTION_CADENCE_TICKS
+    'save_counter': 0,         # periodic persistence counter
     'action': 'init',          # debug: last action taken (hold/full/delta)
     'last_scale': 1.0,         # debug: scale factor used in last step
     'lat_pub': None,
@@ -273,6 +315,12 @@ def on_lat_controller_init(result, lac, CP):
       if active and len(_torque_history) == ACTION_CADENCE_TICKS:
         lagged_torque = _torque_history[0]   # oldest, ~250 ms old
         _shadow.add_sample(v, lagged_torque, state['measured'])
+
+      # Periodic persistence — save adaptive state to disk every ~50s
+      state['save_counter'] += 1
+      if state['save_counter'] >= _SAVE_EVERY_TICKS:
+        state['save_counter'] = 0
+        _save_adaptive()
 
       state['tick_count'] += 1
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
