@@ -138,11 +138,14 @@ class TestEdgeCases:
 
   def test_jump_detection_resets(self, LCC):
     lcc = LCC()
-    model1 = make_model(curvature=0.005, path_y=0.4, right_y=1.75)
+    # Force right-lane-only reference so the jump in right_y actually moves
+    # the computed lane center (closest-lane logic would otherwise fall back
+    # to the stable left line).
+    model1 = make_model(curvature=0.005, path_y=0.4, right_y=1.75, left_prob=0.2)
     lcc.update(model1, 15.0)
 
-    # Sudden lane center jump > 0.3m
-    model2 = make_model(curvature=0.005, path_y=0.4, right_y=2.5)
+    # Sudden right-lane jump of 0.75m → lane_center jump > MAX_JUMP (0.3m)
+    model2 = make_model(curvature=0.005, path_y=0.4, right_y=2.5, left_prob=0.2)
     lcc.update(model2, 15.0)
     assert lcc.active is False
 
