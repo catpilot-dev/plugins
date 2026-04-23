@@ -156,32 +156,35 @@ def on_vehicle_settings(items, CP):
 
 
 def on_lat_controller_init(result, lac, CP):
-  """Proportional micro-stepping + friction FF — curvature tracking.
+  """Plant-inversion at 500 ms horizon in front-wheel-angle space.
 
-  Feedback decision runs every ACTION_CADENCE_TICKS livePose frames (= 250 ms,
-  matches plant 2.5τ response). Between decisions, state['torque'] holds; within
-  decisions, step_remaining drains at CAN rate (100 Hz) over SPREAD_FRAMES.
+  BMW E90 hydraulic rack has high breakaway friction and no alignment-torque
+  self-centering — the wheel holds its angle at zero torque. So:
+    - Inside tolerance: drive torque → 0 and let stiction hold. No chatter.
+    - Outside tolerance: compute the torque that would move the front wheel by
+      δ_err over 500 ms (plant-inversion accounting for first-order lag), ramp
+      to it over one 250 ms decision.
 
-    err = desired − measured
-    if |err| < deadzone:  step = 0
-    else:                 step = (err / plant_gain) × scale[speed_bin]
-    step = clamp(step, ±MAX_STEP)
+  Error in rear-axle bicycle-model front-wheel-angle space:
+    δ_des  = atan(κ_des  · L)        L = CP.wheelbase
+    δ_meas = atan(κ_meas · L)        κ_meas = yawRate / v_ego
+    δ_err  = δ_des − δ_meas
 
-  Plant-delay handling: during 500 ms lag, err appears frozen; controller
-  applies MAX_STEP each decision → torque ramps up → plant responds → err
-  shrinks → step shrinks → torque converges. No delta-error hold needed.
+  Tolerance (physical 0.025 m drift over 0.5 s, speed-adaptive, scales 1/v²):
+    tolerance = 2 · 0.025 · L / (v² · 0.5²)
 
-  Scale factor (per 5-km/h speed bin) adapts via iterative learning: each
-  decision compares window delta_desired vs delta_measured; if measured over-
-  responds, scale drops (next step gentler), under-responds → scale grows
-  (next step firmer). Mirrors human "try less / try more" motor learning.
+  Plant-inversion target torque (fraction of STEER_MAX):
+    T_peak = δ_err / (plant_gain(v) · L · PLANT_500MS_RESPONSE) · scale[bin]
+    plant_gain = K/v² + b (shadow-estimated online)
+    If |T_peak| < friction, push to ±friction to break stiction.
+    Clamp to ±T_CAP (1.25 Nm = 0.104 fraction).
 
-  Friction FF: proportional ramp (0 → ±FRICTION_TORQUE across |err| 0 → FRICTION_ERR_SAT),
-  added to output on top of micro-stepped torque.
+  Ramp: step_remaining = T_peak − state['torque'], drained over 25 CAN frames.
 
-  Persistence: scale_by_bin + shadow K/b/friction saved to data/LatAdaptive.json
-  every ~50s, restored at init. Learning accumulates across drives.
+  Scale factor (per-speed-bin) adapts via iterative learning from
+  commanded-vs-measured δ ratio. Persistent across drives via LatAdaptive.json.
   """
+  import math
   from cereal import log
   from cereal import messaging
   from bmw.shadow_plant import ShadowPlantEstimator
@@ -195,31 +198,40 @@ def on_lat_controller_init(result, lac, CP):
   PLANT_GAIN_K = 0.68
   PLANT_GAIN_B = 0.0073
 
-  # Micro-stepping cadence:
-  #   Delta-error decision runs every ACTION_CADENCE_TICKS livePose ticks (= 250 ms).
-  #   SPREAD_FRAMES=25 CAN frames (= 250 ms) so each step fully applies before the
-  #   next decision; no overlap. Matches plant first-order time const ≈100 ms →
-  #   at 2.5τ = 250 ms, plant has responded ~91.8% to previous correction.
-  MAX_STEP = CCP.STEER_DELTA_UP * 5 / CCP.STEER_MAX          # 0.04167
+  # Decision cadence & CAN-rate spreading.
+  # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
+  # SPREAD_FRAMES = 25 CAN frames × 10 ms = 250 ms ramp window; step_remaining
+  # drains into state['torque'] gradually, respecting STEER_DELTA_UP rate limit.
+  ACTION_CADENCE_TICKS = 5
   SPREAD_FRAMES = 25
-  STEP_PER_FRAME = MAX_STEP / SPREAD_FRAMES
-  ACTION_CADENCE_TICKS = 5   # 5 × 50 ms = 250 ms
+  # STEP_PER_FRAME sized to the safety cap, not the old MAX_STEP, so step_remaining
+  # can drain at the rate needed to reach T_CAP within one 250 ms decision.
+  T_CAP_NM = 1.25
+  T_CAP_FRAC = T_CAP_NM / CCP.STEER_MAX            # 0.1042 (≈2× old MAX_STEP)
+  STEP_PER_FRAME = T_CAP_FRAC / SPREAD_FRAMES
 
-  # Friction feedforward — step torque in sign(err) direction, proportionally
-  # ramped to avoid bang-bang at small err. Applied on top of micro-stepped torque.
-  FRICTION_TORQUE = 0.05      # ±0.6 Nm
-  FRICTION_ERR_SAT = 0.0002   # |err| ≥ this saturates friction at full authority
-  # Feedback deadzone from physical criterion: engage P/I/friction only when
-  # the curvature error would cause ≥DRIFT_TOLERANCE_M lateral drift within
-  # DRIFT_EVAL_HORIZON_S seconds (horizon aligned with desired_curvature's
-  # lookahead, lat_action_t ≈ 0.5s).
-  #   offset(T) = ½ · delta · v² · T²  ⇒  delta_threshold = 2·M / (v·T)²
-  # 0.025m over 0.5s = 0.05 m/s drift rate — below driver perception in a 3.5m lane.
+  # Plant-inversion horizon: we command the torque that would move the front
+  # wheel by δ_err within 500 ms. For a first-order plant with τ=100 ms, the
+  # output at +500 ms after a ramp-then-hold input is 96.8% of the input peak.
+  # Factor appears in the denominator of T_peak to compensate for this lag.
+  PLANT_500MS_RESPONSE = 0.968
+
+  # Feedback deadzone: engage only when δ_err would cause ≥DRIFT_TOLERANCE_M
+  # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
+  #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · M · L / (v·T)²
+  # 0.025 m in 0.5 s = 0.05 m/s drift — below driver perception in a 3.5 m lane.
   DRIFT_TOLERANCE_M = 0.025
   DRIFT_EVAL_HORIZON_S = 0.5
 
+  # Seed for shadow friction estimator (breakaway torque fraction). After the
+  # shadow validates, live_friction replaces this via the fit's residual std.
+  FRICTION_SEED = 0.05
+
+  # Rear-axle bicycle-model wheelbase (m). Used for κ ↔ δ conversion.
+  L = float(CP.wheelbase)
+
   _sm = messaging.SubMaster(['livePose'])
-  _shadow = ShadowPlantEstimator(PLANT_GAIN_K, PLANT_GAIN_B, FRICTION_TORQUE)
+  _shadow = ShadowPlantEstimator(PLANT_GAIN_K, PLANT_GAIN_B, FRICTION_SEED)
 
   # Torque history for shadow estimator lag compensation. measured(t) reflects
   # plant response to torque ~250 ms ago. Pair measured(t) with torque(t-250 ms)
@@ -254,7 +266,7 @@ def on_lat_controller_init(result, lac, CP):
         _scale_by_bin = list(_saved_bins)
       _shadow.live_k = float(_saved.get('shadow_k', PLANT_GAIN_K))
       _shadow.live_b = float(_saved.get('shadow_b', PLANT_GAIN_B))
-      _shadow.live_friction = float(_saved.get('shadow_friction', FRICTION_TORQUE))
+      _shadow.live_friction = float(_saved.get('shadow_friction', FRICTION_SEED))
       _shadow.validated = bool(_saved.get('shadow_validated', False))
   except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
     pass  # fresh start with defaults
@@ -279,14 +291,16 @@ def on_lat_controller_init(result, lac, CP):
       pass
 
   state = {
-    'torque': 0.0,             # micro-stepping accumulator (output, pre-friction)
-    'step_remaining': 0.0,     # pending correction delta to apply (CAN-rate spread)
-    'prev_desired': 0.0,       # desired at last action (for window delta_desired)
-    'prev_measured': 0.0,      # measured at last action (for window delta_measured)
-    'tick_count': 0,           # livePose tick counter; action every ACTION_CADENCE_TICKS
+    'torque': 0.0,             # current commanded torque fraction (ramps toward target_frac)
+    'target_frac': 0.0,        # plant-inversion target set each 250 ms decision
+    'step_remaining': 0.0,     # target_frac - torque, drained at CAN rate
+    'prev_desired': 0.0,       # desired curvature at last decision (for adaptive scale)
+    'prev_measured': 0.0,      # measured curvature at last decision (for adaptive scale)
+    'tick_count': 0,           # livePose tick counter; decide every ACTION_CADENCE_TICKS
     'save_counter': 0,         # periodic persistence counter
-    'action': 'init',          # debug: last action taken (hold/full/delta)
-    'last_scale': 1.0,         # debug: scale factor used in last step
+    'action': 'init',          # debug: hold_zero / breakaway / ramp
+    'last_scale': 1.0,         # debug: scale factor used in last decision
+    'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'plant_gain': 0.0,
@@ -294,22 +308,27 @@ def on_lat_controller_init(result, lac, CP):
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = 10
+    pid_log.version = 11
 
     _sm.update(0)
     lp = _sm['livePose']
 
     state['desired'] = float(desired_curvature)
 
-    # livePose tick (20 Hz): update measured/shadow every tick; delta-error
+    # livePose tick (20 Hz): update measured/shadow every tick; plant-inversion
     # decision only every ACTION_CADENCE_TICKS (250 ms) — gives plant time to
     # respond to previous correction (2.5τ → ~92% response).
-    # CAN tick (100 Hz): apply fraction of pending step toward state['torque'].
-    friction_ff = 0.0
+    # CAN tick (100 Hz): drain step_remaining toward T_peak_frac target.
     if _sm.updated['livePose']:
       v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
       state['plant_gain'] = _shadow.plant_gain(v)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
+
+      # Front-wheel-angle error (rear-axle bicycle model).
+      delta_des = math.atan(state['desired'] * L)
+      delta_meas = math.atan(state['measured'] * L)
+      delta_err = delta_des - delta_meas
+      state['delta_err'] = delta_err
 
       # Shadow sample: pair measured(t) with torque from 250 ms ago so plant's
       # first-order response is captured correctly. Feed -state['torque'] to
@@ -331,18 +350,17 @@ def on_lat_controller_init(result, lac, CP):
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
         state['tick_count'] = 0
 
-        err = state['desired'] - state['measured']
-        deadzone = (2.0 * DRIFT_TOLERANCE_M / (DRIFT_EVAL_HORIZON_S ** 2)) / (v ** 2)
+        # Speed-adaptive tolerance: 0.025 m lateral drift over 0.5 s horizon.
+        # δ_tol = 2·M·L / (v·T)²  — scales 1/v², matches natural correction authority.
+        tolerance = 2.0 * DRIFT_TOLERANCE_M * L / ((v * DRIFT_EVAL_HORIZON_S) ** 2)
 
-        # Update per-speed-bin responsiveness scale (iterative learning):
-        # Compare window deltas over last 250 ms. If measured moved more than
-        # desired for a commanded maneuver, plant is over-responsive → scale
-        # down next step (gentler). Mirrors human "steered too much, try less".
-        delta_des = state['desired'] - state['prev_desired']
-        delta_meas = state['measured'] - state['prev_measured']
-        if abs(delta_des) > deadzone and abs(delta_meas) > deadzone:
-          # Both deltas are actionable — learn from this window
-          ratio = abs(delta_des) / abs(delta_meas)   # <1 if over-respond, >1 if under
+        # Update per-speed-bin responsiveness scale (iterative learning). Use
+        # δ deltas over the 250 ms window; ratio = desired / measured tells us
+        # whether the plant over- or under-responded vs our commanded change.
+        _dw_des = delta_des - math.atan(state['prev_desired']  * L)
+        _dw_meas = delta_meas - math.atan(state['prev_measured'] * L)
+        if abs(_dw_des) > tolerance and abs(_dw_meas) > tolerance:
+          ratio = abs(_dw_des) / abs(_dw_meas)
           ratio = max(SCALE_MIN, min(SCALE_MAX, ratio))
           if MIN_VEGO_MS <= v < MIN_VEGO_MS + _SCALE_N * BIN_WIDTH_MS:
             b_idx = int((v - MIN_VEGO_MS) / BIN_WIDTH_MS)
@@ -358,21 +376,28 @@ def on_lat_controller_init(result, lac, CP):
           scale = 1.0
         state['last_scale'] = scale
 
-        # Proportional correction: step = err / plant_gain each 250 ms, clamped
-        # to ±MAX_STEP for safety. For big err, multiple decisions ramp torque
-        # up until plant catches up. Plant delay handled naturally: repeated
-        # clamped steps during 500 ms lag → torque accumulates → plant responds
-        # → err drops → step drops → converges. No delta-error hold-on-improving
-        # needed (that pattern left sustained curves under-corrected due to
-        # MAX_STEP clamping freezing after one step).
-        if abs(err) < deadzone:
-          step = 0.0
-          state['action'] = 'hold_deadzone'
+        # Plant-inversion target torque (fraction of STEER_MAX).
+        # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
+        # Outside tolerance → torque that would move the front wheel by δ_err
+        # within 500 ms, given plant first-order lag (0.968 asymptote fraction).
+        #   δ(500 ms) = T_frac · plant_gain(v) · L · PLANT_500MS_RESPONSE
+        # Solve for T_frac. If below breakaway friction, push to ±friction so
+        # the rack actually moves; otherwise sub-friction commands sit dead.
+        if abs(delta_err) <= tolerance:
+          target_frac = 0.0
+          state['action'] = 'hold_zero'
         else:
-          step = err / state['plant_gain'] * scale
-          state['action'] = 'prop'
+          target_frac = delta_err / (state['plant_gain'] * L * PLANT_500MS_RESPONSE) * scale
+          friction = _shadow.friction()
+          if abs(target_frac) < friction:
+            target_frac = friction * (1.0 if delta_err > 0 else -1.0)
+            state['action'] = 'breakaway'
+          else:
+            state['action'] = 'ramp'
+          target_frac = max(-T_CAP_FRAC, min(T_CAP_FRAC, target_frac))
 
-        state['step_remaining'] = max(-MAX_STEP, min(MAX_STEP, step))
+        state['target_frac'] = target_frac
+        state['step_remaining'] = target_frac - state['torque']
 
     # Apply CAN-rate step: fraction of remaining per 100 Hz tick
     if abs(state['step_remaining']) > 1e-9:
@@ -380,13 +405,8 @@ def on_lat_controller_init(result, lac, CP):
       state['torque'] = max(-1.0, min(1.0, state['torque'] + step_this_tick))
       state['step_remaining'] -= step_this_tick
 
-    # Friction FF (proportional ramp), added on top of micro-stepped torque
-    err = state['desired'] - state['measured']  # fresh each CAN tick for friction + logging
-    if abs(err) > 1e-6:
-      friction_scale = min(1.0, abs(err) / FRICTION_ERR_SAT)
-      friction_ff = _shadow.friction() * friction_scale * (1.0 if err > 0 else -1.0)
-
-    output = 0.0 if not active else max(-1.0, min(1.0, state['torque'] + friction_ff))
+    err = state['desired'] - state['measured']  # for logging only
+    output = 0.0 if not active else max(-1.0, min(1.0, state['torque']))
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
@@ -403,11 +423,12 @@ def on_lat_controller_init(result, lac, CP):
         'desired': float(state['desired']),
         'measured': float(state['measured']),
         'err': float(err),
+        'delta_err': float(state['delta_err']),
+        'target_frac': float(state['target_frac']),
         'step_remaining': float(state['step_remaining']),
         'action': state['action'],
         'scale': float(state['last_scale']),
         'plant_gain': float(state['plant_gain']),
-        'friction_ff': float(friction_ff),
         'torque': float(state['torque']),
         'output': float(output),
         'vEgo': float(CS.vEgo),
