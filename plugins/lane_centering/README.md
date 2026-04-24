@@ -29,8 +29,9 @@ openpilot's `desiredCurvature` biases toward the inside of turns:
 
 ### Activation (hysteresis)
 
-- **Activates** when offset > 0.2 m
-- **Deactivates** when offset < 0.1 m
+- **Speed-dependent threshold**: `T(v) = 0.15 + 0.01 · (v · 0.5)` m (lookahead-scaled — noise projects farther at higher speed)
+- **Activates** when offset > `T(v)` (e.g. 0.20 m at 10 m/s, 0.30 m at 30 m/s)
+- **Deactivates** when offset < `T(v) / 2`
 - **Disabled** during lane changes, below 9 m/s, or when lane confidence < 0.5
 
 ### Safety

@@ -28,14 +28,19 @@ class LaneCenteringCorrection:
 
   MIN_PROB = 0.5           # Minimum lane detection confidence
   MIN_SPEED = 9.0          # m/s - disable at low speed
-  # Hysteresis band (THRESHOLD − TOLERANCE = 0.1 m) is 4× the BMW controller's
-  # own δ-drift tolerance (0.025 m over 0.5 s in bmw_e9x_e8x/register.py).
-  # Means: when we activate, the resulting δ_des change is well above the
-  # controller's no-action zone so it reliably delivers the correction; when
-  # we deactivate, the car is still inside that zone so there's no hand-off
-  # chatter. Preserve this ratio (≥ 4×) when tuning either layer.
-  OFFSET_THRESHOLD = 0.2   # m - activate when offset exceeds this (still OK on straight lane)
-  OFFSET_TOLERANCE = 0.1   # m - deactivate when offset within tolerance
+  # Speed-dependent hysteresis. Offset is sampled at delay_dist = v·MODEL_LAT_ACTION_T
+  # ahead of the car, so small angular errors in the model's path prediction
+  # project geometrically larger at high speed (1° of yaw error → 29 cm offset
+  # at 120 kph). Fixed 0.2 m threshold triggers on noise at highway; relax it
+  # linearly with lookahead distance.
+  #   OFFSET_THRESHOLD(v) = BASE_THRESHOLD + SLOPE · (v · MODEL_LAT_ACTION_T)
+  #   OFFSET_TOLERANCE(v) = OFFSET_THRESHOLD(v) / 2       (keep 2:1 hysteresis)
+  # Sizing preserves urban behavior: at v≈10 m/s → 0.20 m threshold (matches
+  # prior fixed value); at 120 kph → 0.32 m. Hysteresis band (THRESHOLD −
+  # TOLERANCE) stays ≥ 4× the BMW controller's 0.025 m δ-drift tolerance for
+  # clean layer hand-off.
+  OFFSET_BASE_THRESHOLD = 0.15   # m - threshold at v=0
+  OFFSET_THRESHOLD_SLOPE = 0.01  # m per m of lookahead — speed-growth term
   SMOOTH_TAU = 0.5         # seconds - correction smoothing
   WINDDOWN_TAU = 1.0       # seconds - slower wind-down when exiting turns
   MEASUREMENT_TAU = 0.2    # seconds - lane center measurement smoothing
@@ -193,12 +198,17 @@ class LaneCenteringCorrection:
 
     offset = path_y - self.smoothed_lane_center
 
+    # Speed-dependent hysteresis — relax at high speed where perception noise
+    # projects larger at the lookahead sample point.
+    offset_threshold = self.OFFSET_BASE_THRESHOLD + self.OFFSET_THRESHOLD_SLOPE * delay_dist
+    offset_tolerance = offset_threshold / 2.0
+
     # Hysteresis on offset only — runs regardless of curvature.
     if not self.active:
-      if abs(offset) >= self.OFFSET_THRESHOLD:
+      if abs(offset) >= offset_threshold:
         self.active = True
     else:
-      if abs(offset) < self.OFFSET_TOLERANCE:
+      if abs(offset) < offset_tolerance:
         self.active = False
 
     if self.active:
