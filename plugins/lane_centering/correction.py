@@ -28,8 +28,8 @@ class LaneCenteringCorrection:
 
   MIN_PROB = 0.5           # Minimum lane detection confidence
   MIN_SPEED = 9.0          # m/s - disable at low speed
-  OFFSET_THRESHOLD = 0.3   # m - activate when offset exceeds this (still OK on straight lane)
-  OFFSET_TOLERANCE = 0.15  # m - deactivate when offset within tolerance
+  OFFSET_THRESHOLD = 0.15  # m - activate when offset exceeds this (still OK on straight lane)
+  OFFSET_TOLERANCE = 0.05  # m - deactivate when offset within tolerance
   SMOOTH_TAU = 0.5         # seconds - correction smoothing
   WINDDOWN_TAU = 1.0       # seconds - slower wind-down when exiting turns
   MEASUREMENT_TAU = 0.2    # seconds - lane center measurement smoothing
@@ -187,8 +187,7 @@ class LaneCenteringCorrection:
 
     offset = path_y - self.smoothed_lane_center
 
-    # Hysteresis on offset only — runs regardless of curvature. Human-driver
-    # benchmark: 0.3 m offset is the typical "noticeable drift" threshold.
+    # Hysteresis on offset only — runs regardless of curvature.
     if not self.active:
       if abs(offset) >= self.OFFSET_THRESHOLD:
         self.active = True

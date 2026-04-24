@@ -111,7 +111,7 @@ class TestHysteresis:
     lcc.update(model, 15.0)
     assert lcc.active is True
     # Now settle within tolerance — deactivate regardless of curvature
-    model2 = make_model(curvature=0.0005, path_y=0.05)
+    model2 = make_model(curvature=0.0005, path_y=0.03)
     lcc.update(model2, 15.0)
     assert lcc.active is False
 
