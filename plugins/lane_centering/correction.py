@@ -28,6 +28,12 @@ class LaneCenteringCorrection:
 
   MIN_PROB = 0.5           # Minimum lane detection confidence
   MIN_SPEED = 9.0          # m/s - disable at low speed
+  # Hysteresis band (THRESHOLD − TOLERANCE = 0.1 m) is 4× the BMW controller's
+  # own δ-drift tolerance (0.025 m over 0.5 s in bmw_e9x_e8x/register.py).
+  # Means: when we activate, the resulting δ_des change is well above the
+  # controller's no-action zone so it reliably delivers the correction; when
+  # we deactivate, the car is still inside that zone so there's no hand-off
+  # chatter. Preserve this ratio (≥ 4×) when tuning either layer.
   OFFSET_THRESHOLD = 0.2   # m - activate when offset exceeds this (still OK on straight lane)
   OFFSET_TOLERANCE = 0.1   # m - deactivate when offset within tolerance
   SMOOTH_TAU = 0.5         # seconds - correction smoothing
