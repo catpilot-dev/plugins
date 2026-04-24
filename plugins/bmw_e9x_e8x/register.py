@@ -186,6 +186,11 @@ def on_lat_controller_init(result, lac, CP):
 
   Ramp: step_remaining = T_peak − state['torque'], drained over 25 CAN frames.
 
+  Mid-cycle abort: at 100/150/200 ms post-decision, if |δ_err| has narrowed
+  to < 20 % of its value at decision, the plant is already closing the error
+  — cancel step_remaining and let plant momentum + applied torque finish.
+  Prevents over-commanding on small δ_err where v²-scaled target overshoots.
+
   Scale factor (per-speed-bin) adapts via iterative learning from
   commanded-vs-measured δ ratio. Persistent across drives via LatAdaptive.json.
   """
@@ -313,6 +318,7 @@ def on_lat_controller_init(result, lac, CP):
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
     'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
+    'check_err_0': 0.0,        # δ_err at last decision (for 100/150/200 ms abort check)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
   }
@@ -347,6 +353,18 @@ def on_lat_controller_init(result, lac, CP):
         _save_adaptive()
 
       state['tick_count'] += 1
+
+      # Mid-cycle abort at 100/150/200 ms: if |δ_err| has narrowed to below
+      # 20 % of the value at decision time, the plant is already closing the
+      # error. Stop ramping and let the already-applied torque + plant
+      # momentum finish the job. Prevents over-correction on small δ_err
+      # where the full ramp would over-respond.
+      # Only for 'ramp' action; 'hold_zero'/'breakaway' use other paths.
+      if state['tick_count'] in (2, 3, 4) and state['action'] == 'ramp':
+        if abs(delta_err) < 0.2 * abs(state['check_err_0']):
+          state['step_remaining'] = 0.0
+          state['action'] = 'cancel_narrowed'
+
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
         state['tick_count'] = 0
 
@@ -404,6 +422,8 @@ def on_lat_controller_init(result, lac, CP):
           target_frac = max(-t_cap_frac, min(t_cap_frac, target_frac))
 
         state['target_frac'] = target_frac
+        # Record δ_err at decision for 100/150/200 ms mid-cycle abort check.
+        state['check_err_0'] = delta_err
 
         # Breakaway sign-flip fast ramp: the normal drain would crawl from
         # ±friction through zero to ∓friction at STEP_PER_FRAME, sitting in
