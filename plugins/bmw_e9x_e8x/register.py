@@ -173,16 +173,16 @@ def on_lat_controller_init(result, lac, CP):
   Tolerance (physical 0.025 m drift over 0.5 s, speed-adaptive, scales 1/v²):
     tolerance = 2 · 0.025 · L / (v² · 0.5²)
 
-  Plant-inversion target torque (fraction of STEER_MAX):
-    T_peak = δ_err / (plant_gain(v) · L · PLANT_500MS_RESPONSE) · scale[bin]
-    plant_gain = K/v² + b (shadow-estimated online)
-    If |T_peak| < friction, push to ±friction to break stiction.
-    Clamp to ±T_CAP(v, δ) tracking aligning-torque physics:
+  Plant-inversion target torque, angle domain (linear tire regime):
+    τ_Nm_target = T_CAP_SLOPE · v² · δ_err / PLANT_500MS_RESPONSE · scale[bin]
+    If |target_frac| < FRICTION, push to ±FRICTION to break stiction.
+    Clamp to ±T_CAP(v, δ):
       T_CAP_NM = min(STEER_MAX, T_CAP_BASE + T_CAP_SLOPE · v²·|δ_des|)
-    Linear tire regime (a_y ≤ 3 m/s² per EU/UN-R79): τ_align ∝ v²·δ.
-    BASE covers the hydraulic rack's stiction floor. Hard stop at
-    STEER_MAX (panda limit) preserves lane authority during transient
-    over-envelope events before speedlimitd trims v.
+    Same T_CAP_SLOPE drives both target and cap — one plant characteristic
+    (τ_align = T_CAP_SLOPE · v² · δ in linear tire regime, a_y ≤ 3 m/s²).
+    BASE is the hydraulic rack's stiction floor. Hard stop at STEER_MAX
+    (panda limit) preserves lane authority during transient over-envelope
+    events before speedlimitd trims v.
 
   Ramp: step_remaining = T_peak − state['torque'], drained over 25 CAN frames.
 
@@ -192,16 +192,7 @@ def on_lat_controller_init(result, lac, CP):
   import math
   from cereal import log
   from cereal import messaging
-  from bmw.shadow_plant import ShadowPlantEstimator
   from bmw.values import CarControllerParams as CCP
-
-  # Plant gain: K/v² + b, fit from route 00000266 regression
-  #   desired·v² = K·(−torque)/v² + b·(−torque),  K=0.68, b=0.0073, R²=0.44
-  # These are the INITIAL values. A shadow estimator runs online against the
-  # same 2-param model, and once validated (R² > 0.4, stable across refits,
-  # coverage across speed bins), promotes its fit to the live plant_gain.
-  PLANT_GAIN_K = 0.68
-  PLANT_GAIN_B = 0.0073
 
   # Decision cadence & CAN-rate spreading.
   # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
@@ -209,21 +200,21 @@ def on_lat_controller_init(result, lac, CP):
   # drains into state['torque'] gradually, respecting STEER_DELTA_UP rate limit.
   ACTION_CADENCE_TICKS = 5
   SPREAD_FRAMES = 25
-  # T_CAP scales with v² · |δ_desired|: linear-tire-regime aligning torque is
-  #     τ_align = (m · L_r / L²) · (t_m + t_p) · v² · δ
-  # i.e. proportional to v² · δ. The hydraulic rack's stiction adds a
-  # speed/angle-independent floor, captured by BASE.
+  # T_CAP_SLOPE is the single plant/aligning-torque characteristic, in the
+  # front-wheel-angle (δ) domain. Linear tire regime (a_y ≤ 3 m/s² per
+  # EU/UN-R79):
+  #     τ_Nm_hold = T_CAP_SLOPE · v² · δ                 (aligning torque)
+  #     angle_plant_gain(v) = STEER_MAX / (T_CAP_SLOPE · v²)  (δ_ss per τ_frac)
   #
-  #     T_CAP(v, δ) = T_CAP_BASE_NM + T_CAP_SLOPE · v² · |δ|    (clipped to STEER_MAX)
+  # Used for both authority and target:
+  #   T_CAP(v, δ)     = T_CAP_BASE_NM + T_CAP_SLOPE · v² · |δ_des|      (capped STEER_MAX)
+  #   target_Nm       = T_CAP_SLOPE · v² · |δ_err| / PLANT_500MS_RESPONSE · scale
   #
-  # The normal operating envelope is a_y ≤ 3 m/s² (EU/UN-R79 LKA guideline)
-  # — speedlimitd's job to enforce. But if speedlimitd is slow to trim v on
-  # a tight corner, we'd rather let T_CAP climb than silently saturate and
-  # drift the car. Hard stop is the panda STEER_MAX cap.
-  #
+  # BASE covers the speed- and angle-independent stiction floor.
   # SLOPE [Nm · s²/(m²·rad)] sized from route 000002a4 segs 8/18: at v=12.8
   # m/s, δ=0.0304 rad the controller needed ~2.5 Nm vs the old fixed 1.25 Nm,
-  # giving SLOPE = 1.25 / (12.8² · 0.0304) ≈ 0.25.
+  # giving SLOPE = 1.25 / (12.8² · 0.0304) ≈ 0.25. Residual plant mismatch
+  # (derived 1/angle_plant_gain vs observed) is absorbed by scale_by_bin.
   T_CAP_BASE_NM = 1.25
   T_CAP_SLOPE = 0.25                                # Nm · s² / (m² · rad)
   # STEP_PER_FRAME stays sized to BASE so per-frame rate (0.00417 frac =
@@ -249,28 +240,25 @@ def on_lat_controller_init(result, lac, CP):
   DRIFT_TOLERANCE_M = 0.025
   DRIFT_EVAL_HORIZON_S = 0.5
 
-  # Seed for shadow friction estimator (breakaway torque fraction). After the
-  # shadow validates, live_friction replaces this via the fit's residual std.
-  FRICTION_SEED = 0.05
+  # Breakaway torque fraction (rack stiction floor). Sub-friction commands
+  # don't move the hydraulic rack, so the controller pushes target to ±friction
+  # to break stiction. Initial estimate from memory; tune if needed via a
+  # dedicated stop-and-ramp experiment (not online — see shadow-plant notes).
+  FRICTION = 0.05
 
   # Rear-axle bicycle-model wheelbase (m). Used for κ ↔ δ conversion.
   L = float(CP.wheelbase)
 
   _sm = messaging.SubMaster(['livePose'])
-  _shadow = ShadowPlantEstimator(PLANT_GAIN_K, PLANT_GAIN_B, FRICTION_SEED)
-
-  # Torque history for shadow estimator lag compensation. measured(t) reflects
-  # plant response to torque ~250 ms ago. Pair measured(t) with torque(t-250 ms)
-  # for correct plant-gain fit. Buffer size matches ACTION_CADENCE_TICKS.
-  from collections import deque as _deque
-  _torque_history = _deque(maxlen=ACTION_CADENCE_TICKS)   # 5 livePose ticks = 250 ms
 
   # Per-speed-bin responsiveness scale factor (adaptive). At each 250 ms decision,
-  # compare desired vs measured curvature change over window → ratio tells us how
-  # much of observed motion was commanded (vs disturbance / plant mismatch).
-  # Applied multiplicatively to step (scale < 1 → step reduced → less aggressive).
-  # Bins match shadow estimator: 30 km/h to 120 km/h in 5 km/h steps = 18 bins.
-  from bmw.shadow_plant import MIN_VEGO_MS, BIN_WIDTH_MS, N_BINS as _SCALE_N
+  # compare desired vs measured δ change over window → ratio tells us how much
+  # of observed motion was commanded (vs disturbance / plant mismatch).
+  # Applied multiplicatively to target (scale > 1 → target bigger → more aggressive).
+  # Bins: 30 km/h to 120 km/h in 5 km/h steps = 18 bins.
+  MIN_VEGO_MS = 30.0 / 3.6
+  BIN_WIDTH_MS = 5.0 / 3.6
+  _SCALE_N = 18
   _scale_by_bin = [1.0] * _SCALE_N
   SCALE_MIN, SCALE_MAX = 0.5, 2.0
   SCALE_EMA_ALPHA = 0.2
@@ -325,7 +313,6 @@ def on_lat_controller_init(result, lac, CP):
     'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
-    'plant_gain': 0.0,
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -337,13 +324,12 @@ def on_lat_controller_init(result, lac, CP):
 
     state['desired'] = float(desired_curvature)
 
-    # livePose tick (20 Hz): update measured/shadow every tick; plant-inversion
+    # livePose tick (20 Hz): update measured every tick; plant-inversion
     # decision only every ACTION_CADENCE_TICKS (250 ms) — gives plant time to
     # respond to previous correction (2.5τ → ~92% response).
     # CAN tick (100 Hz): drain step_remaining toward T_peak_frac target.
     if _sm.updated['livePose']:
       v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
-      state['plant_gain'] = _shadow.plant_gain(v)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
 
       # Front-wheel-angle error (rear-axle bicycle model).
@@ -351,16 +337,6 @@ def on_lat_controller_init(result, lac, CP):
       delta_meas = math.atan(state['measured'] * L)
       delta_err = delta_des - delta_meas
       state['delta_err'] = delta_err
-
-      # Shadow sample: pair measured(t) with torque from 250 ms ago so plant's
-      # first-order response is captured correctly. Feed -state['torque'] to
-      # match the offline fit convention (desired = K·(-torque)/v² + b·(-torque))
-      # — state['torque'] is our internal accumulator (pre-negation, opposite
-      # sign to the commanded torque the offline fit sampled via lac.output).
-      _torque_history.append(state['torque'])
-      if active and len(_torque_history) == ACTION_CADENCE_TICKS:
-        lagged_torque = _torque_history[0]
-        _shadow.add_sample(v, -lagged_torque, state['measured'])
 
       # Periodic persistence — save adaptive state to disk every ~50s
       state['save_counter'] += 1
@@ -398,21 +374,21 @@ def on_lat_controller_init(result, lac, CP):
           scale = 1.0
         state['last_scale'] = scale
 
-        # Plant-inversion target torque (fraction of STEER_MAX).
+        # Plant-inversion target torque in angle domain. τ needed to move δ
+        # by δ_err within 500 ms, given aligning-torque physics and first-order
+        # plant lag (0.968 asymptote at +500 ms):
+        #   τ_Nm_steady = T_CAP_SLOPE · v² · δ_err
+        #   τ_Nm_command = τ_Nm_steady / PLANT_500MS_RESPONSE · scale
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
-        # Outside tolerance → torque that would move the front wheel by δ_err
-        # within 500 ms, given plant first-order lag (0.968 asymptote fraction).
-        #   δ(500 ms) = T_frac · plant_gain(v) · L · PLANT_500MS_RESPONSE
-        # Solve for T_frac. If below breakaway friction, push to ±friction so
-        # the rack actually moves; otherwise sub-friction commands sit dead.
+        # Sub-breakaway commands won't move the rack → push to ±FRICTION.
         if abs(delta_err) <= tolerance:
           target_frac = 0.0
           state['action'] = 'hold_zero'
         else:
-          target_frac = delta_err / (state['plant_gain'] * L * PLANT_500MS_RESPONSE) * scale
-          friction = _shadow.friction()
-          if abs(target_frac) < friction:
-            target_frac = friction * (1.0 if delta_err > 0 else -1.0)
+          target_nm = T_CAP_SLOPE * v * v * delta_err / PLANT_500MS_RESPONSE * scale
+          target_frac = target_nm / CCP.STEER_MAX
+          if abs(target_frac) < FRICTION:
+            target_frac = FRICTION * (1.0 if delta_err > 0 else -1.0)
             state['action'] = 'breakaway'
           else:
             state['action'] = 'ramp'
@@ -472,13 +448,11 @@ def on_lat_controller_init(result, lac, CP):
         'step_remaining': float(state['step_remaining']),
         'action': state['action'],
         'scale': float(state['last_scale']),
-        'plant_gain': float(state['plant_gain']),
         'torque': float(state['torque']),
         'output': float(output),
         'vEgo': float(CS.vEgo),
         'active': active,
       }
-      payload.update(_shadow.debug_state())
       state['lat_pub'].send(payload)
     except Exception:
       pass
