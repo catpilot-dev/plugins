@@ -191,8 +191,9 @@ def on_lat_controller_init(result, lac, CP):
   — cancel step_remaining and let plant momentum + applied torque finish.
   Prevents over-commanding on small δ_err where v²-scaled target overshoots.
 
-  Scale factor (per-speed-bin) adapts via iterative learning from
-  commanded-vs-measured δ ratio. Persistent across drives via LatAdaptive.json.
+  No online adaptation: plant behavior is fully described by T_CAP_SLOPE,
+  T_CAP_BASE_NM, FRICTION, and PLANT_500MS_RESPONSE. Tune these offline from
+  route data; there's no scale_by_bin or shadow estimator anymore.
   """
   import math
   from cereal import log
@@ -258,63 +259,12 @@ def on_lat_controller_init(result, lac, CP):
 
   _sm = messaging.SubMaster(['livePose'])
 
-  # Per-speed-bin responsiveness scale factor (adaptive). At each 250 ms decision,
-  # compare desired vs measured δ change over window → ratio tells us how much
-  # of observed motion was commanded (vs disturbance / plant mismatch).
-  # Applied multiplicatively to target (scale > 1 → target bigger → more aggressive).
-  # Bins: 30 km/h to 120 km/h in 5 km/h steps = 18 bins.
-  MIN_VEGO_MS = 30.0 / 3.6
-  BIN_WIDTH_MS = 5.0 / 3.6
-  _SCALE_N = 18
-  _scale_by_bin = [1.0] * _SCALE_N
-  SCALE_MIN, SCALE_MAX = 0.5, 2.0
-  SCALE_EMA_ALPHA = 0.2
-
-  # Persistent adaptive state — survives reboot and plugin updates
-  # (install.sh preserves data/ subdirectory). Only scale_by_bin is persisted;
-  # shadow fit is diagnostic-only (see bmw/shadow_plant.py), live K/b/friction
-  # stay at calibrated seeds.
-  import json
-  import time
-  _ADAPTIVE_PATH = os.path.join(_PLUGIN_DIR, 'data', 'LatAdaptive.json')
-  _SAVE_EVERY_TICKS = 1000  # ~50 seconds at 20 Hz
-  _ADAPTIVE_VERSION = 2     # v2: shadow values dropped (diagnostic-only)
-
-  try:
-    with open(_ADAPTIVE_PATH) as _f:
-      _saved = json.load(_f)
-    if _saved.get('version') == _ADAPTIVE_VERSION:
-      _saved_bins = _saved.get('scale_by_bin', [])
-      if len(_saved_bins) == _SCALE_N:
-        _scale_by_bin = list(_saved_bins)
-  except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
-    pass  # fresh start with defaults
-
-  def _save_adaptive():
-    try:
-      data_dir = os.path.dirname(_ADAPTIVE_PATH)
-      os.makedirs(data_dir, exist_ok=True)
-      tmp = _ADAPTIVE_PATH + '.tmp'
-      with open(tmp, 'w') as f:
-        json.dump({
-          'version': _ADAPTIVE_VERSION,
-          'scale_by_bin': list(_scale_by_bin),
-          'updated_ts': time.time(),
-        }, f)
-      os.replace(tmp, _ADAPTIVE_PATH)  # atomic on same fs
-    except OSError:
-      pass
-
   state = {
     'torque': 0.0,             # current commanded torque fraction (ramps toward target_frac)
     'target_frac': 0.0,        # plant-inversion target set each 250 ms decision
     'step_remaining': 0.0,     # target_frac - torque, drained at CAN rate
-    'prev_desired': 0.0,       # desired curvature at last decision (for adaptive scale)
-    'prev_measured': 0.0,      # measured curvature at last decision (for adaptive scale)
     'tick_count': 0,           # livePose tick counter; decide every ACTION_CADENCE_TICKS
-    'save_counter': 0,         # periodic persistence counter
-    'action': 'init',          # debug: hold_zero / breakaway / ramp
-    'last_scale': 1.0,         # debug: scale factor used in last decision
+    'action': 'init',          # debug: hold_zero / breakaway / ramp / cancel_narrowed
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
     'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
@@ -346,12 +296,6 @@ def on_lat_controller_init(result, lac, CP):
       delta_err = delta_des - delta_meas
       state['delta_err'] = delta_err
 
-      # Periodic persistence — save adaptive state to disk every ~50s
-      state['save_counter'] += 1
-      if state['save_counter'] >= _SAVE_EVERY_TICKS:
-        state['save_counter'] = 0
-        _save_adaptive()
-
       state['tick_count'] += 1
 
       # Mid-cycle abort at 100/150/200 ms: if |δ_err| has narrowed to below
@@ -372,40 +316,18 @@ def on_lat_controller_init(result, lac, CP):
         # δ_tol = 2·M·L / (v·T)²  — scales 1/v², matches natural correction authority.
         tolerance = 2.0 * DRIFT_TOLERANCE_M * L / ((v * DRIFT_EVAL_HORIZON_S) ** 2)
 
-        # Update per-speed-bin responsiveness scale (iterative learning). Use
-        # δ deltas over the 250 ms window; ratio = desired / measured tells us
-        # whether the plant over- or under-responded vs our commanded change.
-        _dw_des = delta_des - math.atan(state['prev_desired']  * L)
-        _dw_meas = delta_meas - math.atan(state['prev_measured'] * L)
-        if abs(_dw_des) > tolerance and abs(_dw_meas) > tolerance:
-          ratio = abs(_dw_des) / abs(_dw_meas)
-          ratio = max(SCALE_MIN, min(SCALE_MAX, ratio))
-          if MIN_VEGO_MS <= v < MIN_VEGO_MS + _SCALE_N * BIN_WIDTH_MS:
-            b_idx = int((v - MIN_VEGO_MS) / BIN_WIDTH_MS)
-            _scale_by_bin[b_idx] = (1 - SCALE_EMA_ALPHA) * _scale_by_bin[b_idx] + SCALE_EMA_ALPHA * ratio
-        state['prev_desired'] = state['desired']
-        state['prev_measured'] = state['measured']
-
-        # Look up scale factor for current speed bin (default 1.0 if outside)
-        if MIN_VEGO_MS <= v < MIN_VEGO_MS + _SCALE_N * BIN_WIDTH_MS:
-          b_idx = int((v - MIN_VEGO_MS) / BIN_WIDTH_MS)
-          scale = _scale_by_bin[b_idx]
-        else:
-          scale = 1.0
-        state['last_scale'] = scale
-
         # Plant-inversion target torque in angle domain. τ needed to move δ
         # by δ_err within 500 ms, given aligning-torque physics and first-order
         # plant lag (0.970 asymptote at +500 ms):
         #   τ_Nm_steady = T_CAP_SLOPE · v² · δ_err
-        #   τ_Nm_command = τ_Nm_steady / PLANT_500MS_RESPONSE · scale
+        #   τ_Nm_command = τ_Nm_steady / PLANT_500MS_RESPONSE
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
         # Sub-breakaway commands won't move the rack → push to ±FRICTION.
         if abs(delta_err) <= tolerance:
           target_frac = 0.0
           state['action'] = 'hold_zero'
         else:
-          target_nm = T_CAP_SLOPE * v * v * delta_err / PLANT_500MS_RESPONSE * scale
+          target_nm = T_CAP_SLOPE * v * v * delta_err / PLANT_500MS_RESPONSE
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
             target_frac = FRICTION * (1.0 if delta_err > 0 else -1.0)
@@ -469,7 +391,6 @@ def on_lat_controller_init(result, lac, CP):
         'target_frac': float(state['target_frac']),
         'step_remaining': float(state['step_remaining']),
         'action': state['action'],
-        'scale': float(state['last_scale']),
         'torque': float(state['torque']),
         'output': float(output),
         'vEgo': float(CS.vEgo),
