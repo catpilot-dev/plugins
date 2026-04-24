@@ -177,7 +177,12 @@ def on_lat_controller_init(result, lac, CP):
     T_peak = δ_err / (plant_gain(v) · L · PLANT_500MS_RESPONSE) · scale[bin]
     plant_gain = K/v² + b (shadow-estimated online)
     If |T_peak| < friction, push to ±friction to break stiction.
-    Clamp to ±T_CAP (1.25 Nm = 0.104 fraction).
+    Clamp to ±T_CAP(v, δ) tracking aligning-torque physics:
+      T_CAP_NM = min(STEER_MAX, T_CAP_BASE + T_CAP_SLOPE · v²·|δ_des|)
+    Linear tire regime (a_y ≤ 3 m/s² per EU/UN-R79): τ_align ∝ v²·δ.
+    BASE covers the hydraulic rack's stiction floor. Hard stop at
+    STEER_MAX (panda limit) preserves lane authority during transient
+    over-envelope events before speedlimitd trims v.
 
   Ramp: step_remaining = T_peak − state['torque'], drained over 25 CAN frames.
 
@@ -204,11 +209,28 @@ def on_lat_controller_init(result, lac, CP):
   # drains into state['torque'] gradually, respecting STEER_DELTA_UP rate limit.
   ACTION_CADENCE_TICKS = 5
   SPREAD_FRAMES = 25
-  # STEP_PER_FRAME sized to the safety cap, not the old MAX_STEP, so step_remaining
-  # can drain at the rate needed to reach T_CAP within one 250 ms decision.
-  T_CAP_NM = 1.25
-  T_CAP_FRAC = T_CAP_NM / CCP.STEER_MAX            # 0.1042 (≈2× old MAX_STEP)
-  STEP_PER_FRAME = T_CAP_FRAC / SPREAD_FRAMES
+  # T_CAP scales with v² · |δ_desired|: linear-tire-regime aligning torque is
+  #     τ_align = (m · L_r / L²) · (t_m + t_p) · v² · δ
+  # i.e. proportional to v² · δ. The hydraulic rack's stiction adds a
+  # speed/angle-independent floor, captured by BASE.
+  #
+  #     T_CAP(v, δ) = T_CAP_BASE_NM + T_CAP_SLOPE · v² · |δ|    (clipped to STEER_MAX)
+  #
+  # The normal operating envelope is a_y ≤ 3 m/s² (EU/UN-R79 LKA guideline)
+  # — speedlimitd's job to enforce. But if speedlimitd is slow to trim v on
+  # a tight corner, we'd rather let T_CAP climb than silently saturate and
+  # drift the car. Hard stop is the panda STEER_MAX cap.
+  #
+  # SLOPE [Nm · s²/(m²·rad)] sized from route 000002a4 segs 8/18: at v=12.8
+  # m/s, δ=0.0304 rad the controller needed ~2.5 Nm vs the old fixed 1.25 Nm,
+  # giving SLOPE = 1.25 / (12.8² · 0.0304) ≈ 0.25.
+  T_CAP_BASE_NM = 1.25
+  T_CAP_SLOPE = 0.25                                # Nm · s² / (m² · rad)
+  # STEP_PER_FRAME stays sized to BASE so per-frame rate (0.00417 frac =
+  # 0.05 Nm/frame) remains well under the STEER_DELTA_UP wire limit (0.1
+  # Nm/frame). Larger targets under tight-corner T_CAP simply drain across
+  # more 250 ms decision cycles — fine since we enter corners gradually.
+  STEP_PER_FRAME = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
 
   # Plant-inversion horizon: we command the torque that would move the front
   # wheel by δ_err within 500 ms. For a first-order plant with τ=100 ms, the
@@ -250,12 +272,14 @@ def on_lat_controller_init(result, lac, CP):
   SCALE_EMA_ALPHA = 0.2
 
   # Persistent adaptive state — survives reboot and plugin updates
-  # (install.sh preserves data/ subdirectory). Saves shadow K/b/friction + scale table.
+  # (install.sh preserves data/ subdirectory). Only scale_by_bin is persisted;
+  # shadow fit is diagnostic-only (see bmw/shadow_plant.py), live K/b/friction
+  # stay at calibrated seeds.
   import json
   import time
   _ADAPTIVE_PATH = os.path.join(_PLUGIN_DIR, 'data', 'LatAdaptive.json')
   _SAVE_EVERY_TICKS = 1000  # ~50 seconds at 20 Hz
-  _ADAPTIVE_VERSION = 1
+  _ADAPTIVE_VERSION = 2     # v2: shadow values dropped (diagnostic-only)
 
   try:
     with open(_ADAPTIVE_PATH) as _f:
@@ -264,10 +288,6 @@ def on_lat_controller_init(result, lac, CP):
       _saved_bins = _saved.get('scale_by_bin', [])
       if len(_saved_bins) == _SCALE_N:
         _scale_by_bin = list(_saved_bins)
-      _shadow.live_k = float(_saved.get('shadow_k', PLANT_GAIN_K))
-      _shadow.live_b = float(_saved.get('shadow_b', PLANT_GAIN_B))
-      _shadow.live_friction = float(_saved.get('shadow_friction', FRICTION_SEED))
-      _shadow.validated = bool(_saved.get('shadow_validated', False))
   except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
     pass  # fresh start with defaults
 
@@ -280,10 +300,6 @@ def on_lat_controller_init(result, lac, CP):
         json.dump({
           'version': _ADAPTIVE_VERSION,
           'scale_by_bin': list(_scale_by_bin),
-          'shadow_k': _shadow.live_k,
-          'shadow_b': _shadow.live_b,
-          'shadow_friction': _shadow.live_friction,
-          'shadow_validated': _shadow.validated,
           'updated_ts': time.time(),
         }, f)
       os.replace(tmp, _ADAPTIVE_PATH)  # atomic on same fs
@@ -301,6 +317,8 @@ def on_lat_controller_init(result, lac, CP):
     'action': 'init',          # debug: hold_zero / breakaway / ramp
     'last_scale': 1.0,         # debug: scale factor used in last decision
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
+    'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
+    'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'plant_gain': 0.0,
@@ -394,13 +412,35 @@ def on_lat_controller_init(result, lac, CP):
             state['action'] = 'breakaway'
           else:
             state['action'] = 'ramp'
-          target_frac = max(-T_CAP_FRAC, min(T_CAP_FRAC, target_frac))
+          # v²·|δ|-scaled cap, clipped at STEER_MAX (panda hard limit).
+          # Normal ops stay within EU 3 m/s² → T_CAP in the 1.25-3.3 Nm
+          # range; transient over-envelope events allowed up to STEER_MAX
+          # so the car doesn't drift while speedlimitd catches up.
+          t_cap_nm = min(CCP.STEER_MAX,
+                         T_CAP_BASE_NM + T_CAP_SLOPE * v * v * abs(delta_des))
+          t_cap_frac = t_cap_nm / CCP.STEER_MAX
+          target_frac = max(-t_cap_frac, min(t_cap_frac, target_frac))
 
         state['target_frac'] = target_frac
-        state['step_remaining'] = target_frac - state['torque']
 
-    # Apply CAN-rate step: fraction of remaining per 100 Hz tick
-    if abs(state['step_remaining']) > 1e-9:
+        # Breakaway sign-flip fast ramp: the normal drain would crawl from
+        # ±friction through zero to ∓friction at STEP_PER_FRAME, sitting in
+        # the stiction zone for ~24 frames and buzzing the actuator. Reset
+        # torque to 0 and ramp to the new target over 5 frames (50 ms).
+        if state['action'] == 'breakaway' and state['torque'] * target_frac < 0.0:
+          state['torque'] = 0.0
+          state['fast_ramp_remaining'] = 5
+          state['fast_ramp_step'] = target_frac / 5.0
+          state['step_remaining'] = 0.0
+        else:
+          state['step_remaining'] = target_frac - state['torque']
+
+    # Apply CAN-rate step: fraction of remaining per 100 Hz tick.
+    # Fast ramp (breakaway sign flip) takes priority for its first 5 frames.
+    if state['fast_ramp_remaining'] > 0:
+      state['torque'] = max(-1.0, min(1.0, state['torque'] + state['fast_ramp_step']))
+      state['fast_ramp_remaining'] -= 1
+    elif abs(state['step_remaining']) > 1e-9:
       step_this_tick = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, state['step_remaining']))
       state['torque'] = max(-1.0, min(1.0, state['torque'] + step_this_tick))
       state['step_remaining'] -= step_this_tick

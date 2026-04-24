@@ -1,4 +1,4 @@
-"""Shadow plant-gain + friction estimator for BMW E9x/E8x.
+"""Shadow plant-gain + friction estimator for BMW E9x/E8x (diagnostic only).
 
 Collects (torque, v, measured_curvature) samples in speed-binned buckets and
 periodically fits the 2-parameter model:
@@ -8,8 +8,13 @@ Friction is estimated from the perpendicular spread of fit residuals
 converted to torque space:
     friction = std(residual / plant_gain(v)) × 1.5
 
-On validation (stability + R² quality + bucket coverage), promotes the fit
-to the live controller, then continues adapting with decay.
+**Diagnostic-only.** The fit is NOT promoted to live_k/live_b/live_friction:
+replay of real route data shows R² ≈ 0.20-0.30 and K sign-flips across refits
+— the linear steady-state model underfits BMW's stiction-dominated hydraulic
+plant on dynamic driving data. Relaxed thresholds would still validate on
+noise (K=1.21 with no SS filter, K=-0.30 with tight SS filter — both garbage).
+Live values stay at the offline-calibrated seed; per-speed-bin scale_by_bin
+in register.py handles online adaptation.
 
 Speed bins: 30 km/h to 120 km/h in 5 km/h steps = 18 bins.
 """
@@ -26,10 +31,8 @@ BUCKET_MAX = 100                   # FIFO samples per bin
 BUCKET_MIN = 30                    # min samples per bin to count as "covered"
 COVERAGE_MIN_BINS = 6              # must have this many covered bins to fit
 REFIT_EVERY = 100                  # new samples between refits
-MIN_R2 = 0.40                      # fit quality threshold
+MIN_R2 = 0.40                      # diagnostic R² threshold for stability flag
 STABLE_REL_DELTA = 0.10            # |K_new − K_last| / |K_last| < this → stable
-STABLE_CYCLES = 3                  # consecutive stable refits before first promotion
-DECAY = 0.3                        # post-promotion: new_live = 0.7·old + 0.3·fit
 MIN_ABS_TORQUE = 0.02              # samples require meaningful torque
 FRICTION_FACTOR = 1.5              # std × this = friction estimate (matches stock torqued)
 # Physical breakaway for BMW hydraulic rack is ~0.5-1.5 Nm (0.04-0.13 torque
@@ -52,7 +55,6 @@ class ShadowPlantEstimator:
     self.shadow_friction = float(friction_init)
     self.shadow_r2 = 0.0
     self.stable_count = 0
-    self.validated = False
     self.sample_count = 0
 
   def add_sample(self, v, torque, measured_curv):
@@ -95,7 +97,8 @@ class ShadowPlantEstimator:
     friction_new = float(np.std(resid_torque) * FRICTION_FACTOR)
     friction_new = max(FRICTION_MIN, min(FRICTION_MAX, friction_new))  # sanity clamp
 
-    # Stability: K change small vs previous shadow fit
+    # Stability: K change small vs previous shadow fit. Stored for diagnostic
+    # logging only — no promotion to live_*.
     k_ref = max(abs(self.shadow_k), 0.1)
     stable = (abs(k_new - self.shadow_k) / k_ref < STABLE_REL_DELTA and
               self.shadow_r2 > MIN_R2)
@@ -103,18 +106,6 @@ class ShadowPlantEstimator:
     self.shadow_k = k_new
     self.shadow_b = b_new
     self.shadow_friction = friction_new
-
-    # Promotion
-    if self.stable_count >= STABLE_CYCLES:
-      if not self.validated:
-        self.live_k = k_new
-        self.live_b = b_new
-        self.live_friction = friction_new
-        self.validated = True
-      else:
-        self.live_k = (1 - DECAY) * self.live_k + DECAY * k_new
-        self.live_b = (1 - DECAY) * self.live_b + DECAY * b_new
-        self.live_friction = (1 - DECAY) * self.live_friction + DECAY * friction_new
 
   def plant_gain(self, v):
     return self.live_k / (v * v) + self.live_b
@@ -128,7 +119,6 @@ class ShadowPlantEstimator:
       'shadow_friction': self.shadow_friction, 'shadow_r2': self.shadow_r2,
       'live_k': self.live_k, 'live_b': self.live_b, 'live_friction': self.live_friction,
       'stable_count': self.stable_count,
-      'validated': int(self.validated),
       'sample_count': self.sample_count,
       'covered_bins': sum(1 for b in self.buckets if len(b) >= BUCKET_MIN),
     }
