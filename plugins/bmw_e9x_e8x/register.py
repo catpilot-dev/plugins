@@ -216,7 +216,7 @@ def on_lat_controller_init(result, lac, CP):
   # giving SLOPE = 1.25 / (12.8² · 0.0304) ≈ 0.25. Residual plant mismatch
   # (derived 1/angle_plant_gain vs observed) is absorbed by scale_by_bin.
   T_CAP_BASE_NM = 1.25
-  T_CAP_SLOPE = 0.25                                # Nm · s² / (m² · rad)
+  T_CAP_SLOPE = 2.0                                 # Nm · s² / (m² · rad)
   # STEP_PER_FRAME stays sized to BASE so per-frame rate (0.00417 frac =
   # 0.05 Nm/frame) remains well under the STEER_DELTA_UP wire limit (0.1
   # Nm/frame). Larger targets under tight-corner T_CAP simply drain across
