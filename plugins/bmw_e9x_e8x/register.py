@@ -217,10 +217,9 @@ def on_lat_controller_init(result, lac, CP):
   #   target_Nm       = T_CAP_SLOPE · v² · |δ_err| / PLANT_500MS_RESPONSE · scale
   #
   # BASE covers the speed- and angle-independent stiction floor.
-  # SLOPE [Nm · s²/(m²·rad)] sized from route 000002a4 segs 8/18: at v=12.8
-  # m/s, δ=0.0304 rad the controller needed ~2.5 Nm vs the old fixed 1.25 Nm,
-  # giving SLOPE = 1.25 / (12.8² · 0.0304) ≈ 0.25. Residual plant mismatch
-  # (derived 1/angle_plant_gain vs observed) is absorbed by scale_by_bin.
+  # SLOPE [Nm · s²/(m²·rad)] initial sizing from route 000002a4 segs 8/18; bumped
+  # to 2.0 after 2a7 (SLOPE=1.0) showed low-v mild turns still under-commanding.
+  # Tune further offline from route data if under/over-response observed.
   T_CAP_BASE_NM = 1.25
   T_CAP_SLOPE = 2.0                                 # Nm · s² / (m² · rad)
   # STEP_PER_FRAME stays sized to BASE so per-frame rate (0.00417 frac =
