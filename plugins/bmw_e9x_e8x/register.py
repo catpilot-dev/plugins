@@ -242,6 +242,10 @@ def on_lat_controller_init(result, lac, CP):
   # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
   #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · M · L / (v·T)²
   # 0.025 m in 0.5 s = 0.05 m/s drift — below driver perception in a 3.5 m lane.
+  # Upstream lane_centering uses a 0.1 m hysteresis band (0.2 m activate, 0.1 m
+  # deactivate) — 4× this tolerance — so layer hand-offs are clean: activation
+  # reliably triggers controller response, deactivation leaves the car inside
+  # our no-action zone. Preserve the ≥ 4× ratio when tuning either layer.
   DRIFT_TOLERANCE_M = 0.025
   DRIFT_EVAL_HORIZON_S = 0.5
 
