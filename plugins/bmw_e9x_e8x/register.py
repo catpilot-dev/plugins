@@ -224,10 +224,12 @@ def on_lat_controller_init(result, lac, CP):
   STEP_PER_FRAME = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
 
   # Plant-inversion horizon: we command the torque that would move the front
-  # wheel by δ_err within 500 ms. For a first-order plant with τ=100 ms, the
-  # output at +500 ms after a ramp-then-hold input is 96.8% of the input peak.
+  # wheel by δ_err within 500 ms. For a first-order plant with τ=100 ms
+  # and a 250 ms ramp → 250 ms hold input, the output at t=500 ms is:
+  #   y(0.25) = 4·[0.15 + 0.1·e^(−2.5)] = 0.633   (end of ramp)
+  #   y(0.50) = 1 + (0.633 − 1)·e^(−2.5) = 0.970   (end of hold)
   # Factor appears in the denominator of T_peak to compensate for this lag.
-  PLANT_500MS_RESPONSE = 0.968
+  PLANT_500MS_RESPONSE = 0.970
 
   # Feedback deadzone: engage only when δ_err would cause ≥DRIFT_TOLERANCE_M
   # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
@@ -376,7 +378,7 @@ def on_lat_controller_init(result, lac, CP):
 
         # Plant-inversion target torque in angle domain. τ needed to move δ
         # by δ_err within 500 ms, given aligning-torque physics and first-order
-        # plant lag (0.968 asymptote at +500 ms):
+        # plant lag (0.970 asymptote at +500 ms):
         #   τ_Nm_steady = T_CAP_SLOPE · v² · δ_err
         #   τ_Nm_command = τ_Nm_steady / PLANT_500MS_RESPONSE · scale
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
