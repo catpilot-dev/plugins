@@ -26,7 +26,14 @@ class LaneCenteringCorrection:
   K_BP = [0.000, 0.002, 0.005, 0.008, 0.012, 0.020]  # Curvature breakpoints (1/m)
   K_V  = [0.150, 0.150, 0.350, 0.400, 0.500, 0.650]   # K for straight matches gentle curves (~2s closure)
 
-  MIN_PROB = 0.5           # Minimum lane detection confidence
+  # Curvature-adaptive confidence threshold. In tight turns the outside lane
+  # line drops out of camera FOV, so requiring ≥ 0.5 confidence gates out
+  # legitimate inside-line tracking. Step down to a relaxed threshold when
+  # turning so we can still use whichever lane is visible as inside reference.
+  #   MIN_PROB(κ) = MIN_PROB_STRAIGHT if |κ| < CURV_TURN_THRESHOLD else MIN_PROB_TURN
+  MIN_PROB_STRAIGHT     = 0.5    # full noise filtering on straights
+  MIN_PROB_TURN         = 0.3    # relaxed when turning (allow inside-only mode)
+  CURV_TURN_THRESHOLD   = 0.01   # |κ| ≥ this (radius ≤ 100 m) → "in a turn"
   MIN_SPEED = 9.0          # m/s - disable at low speed
   # Speed-dependent hysteresis. Offset is sampled at delay_dist = v·MODEL_LAT_ACTION_T
   # ahead of the car, so small angular errors in the model's path prediction
@@ -107,9 +114,15 @@ class LaneCenteringCorrection:
 
     right_prob = model_v2.laneLineProbs[2]
     left_prob = model_v2.laneLineProbs[1]
+    curvature = model_v2.action.desiredCurvature
 
-    # Need at least one lane with good confidence
-    if right_prob < self.MIN_PROB and left_prob < self.MIN_PROB:
+    # Curvature-adaptive minimum confidence: relax in turns where the outside
+    # lane line drops out of FOV. Keep MIN_PROB_STRAIGHT for lane-width learning
+    # so the width estimate isn't polluted by low-confidence detections.
+    min_prob = self.MIN_PROB_STRAIGHT if abs(curvature) < self.CURV_TURN_THRESHOLD else self.MIN_PROB_TURN
+
+    # Need at least one lane with adaptive confidence
+    if right_prob < min_prob and left_prob < min_prob:
       self._reset_lane_tracking()
       return self._smooth_correction(0.0, winding_down=True)
 
@@ -123,8 +136,6 @@ class LaneCenteringCorrection:
         len(model_v2.laneLines[2].y) == 0):
       self._reset_lane_tracking()
       return self._smooth_correction(0.0, winding_down=True)
-
-    curvature = model_v2.action.desiredCurvature
 
     # Read lane positions at modelV2.action_t lookahead (not t=0) so the
     # offset is sampled at the same point in space where desired_curvature
@@ -142,7 +153,7 @@ class LaneCenteringCorrection:
     # When measured width is out of valid range (e.g. > 4.5m due to turn
     # projection distortion), fall back to standard width immediately rather
     # than using a stale smoothed estimate.
-    if right_prob >= self.MIN_PROB and left_prob >= self.MIN_PROB:
+    if right_prob >= self.MIN_PROB_STRAIGHT and left_prob >= self.MIN_PROB_STRAIGHT:
       measured_width = right_y - left_y
       if self.LANE_WIDTH_MIN <= measured_width <= self.LANE_WIDTH_MAX:
         if self.estimated_lane_width is None:
@@ -163,23 +174,38 @@ class LaneCenteringCorrection:
     self.diag['lane_width'] = round(lane_width, 2)
     self.diag['lane_width_learned'] = self.estimated_lane_width is not None
 
-    # Use closest lane line as reference for lane center. The nearer line is
-    # more reliable for detection and matches how a driver references "the
-    # line I'm closest to." If only one is confident enough, use it.
-    right_ok = right_prob >= self.MIN_PROB
-    left_ok  = left_prob  >= self.MIN_PROB
-    if right_ok and left_ok:
-      if abs(right_y) <= abs(left_y):
+    # Lane-center reference selection.
+    # Straights / gentle curves (|κ| < CURV_TURN_THRESHOLD): use the closest
+    # lane line — most reliable detection, matches driver intuition.
+    # Tight turns (|κ| ≥ CURV_TURN_THRESHOLD): explicitly prefer the INSIDE
+    # lane line. Outside lane curves out of FOV; inside stays sharper. Even
+    # if the car has drifted toward the outside (so closest = outside), the
+    # inside is still the more reliable reference.
+    right_ok = right_prob >= min_prob
+    left_ok  = left_prob  >= min_prob
+    if not right_ok and not left_ok:
+      self.active = False
+      return self._smooth_correction(0.0, winding_down=True)
+
+    if abs(curvature) >= self.CURV_TURN_THRESHOLD:
+      # In a turn — pick inside lane (left for left-turn, right for right-turn).
+      inside_left = curvature < 0.0
+      if inside_left and left_ok:
+        lane_center = left_y + half_width
+      elif (not inside_left) and right_ok:
+        lane_center = right_y - half_width
+      elif right_ok:
+        lane_center = right_y - half_width  # outside fallback
+      else:
+        lane_center = left_y + half_width   # outside fallback
+    else:
+      # Straight / gentle curve — closest lane wins (existing behavior).
+      if right_ok and left_ok:
+        lane_center = right_y - half_width if abs(right_y) <= abs(left_y) else left_y + half_width
+      elif right_ok:
         lane_center = right_y - half_width
       else:
         lane_center = left_y + half_width
-    elif right_ok:
-      lane_center = right_y - half_width
-    elif left_ok:
-      lane_center = left_y + half_width
-    else:
-      self.active = False
-      return self._smooth_correction(0.0, winding_down=True)
 
     # Reject sudden lane center jumps
     if self.prev_lane_center is not None:
