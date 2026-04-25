@@ -84,6 +84,15 @@ class LaneCenteringCorrection:
   # the separately-learned liveDelay service.
   MODEL_LAT_ACTION_T = 0.5
 
+  # Reference-frame shift: model uses CAR_ROTATION_RADIUS=0 (rear axle), but
+  # in turns the front swings outside and the rear cuts inside while the CG
+  # follows the path the driver perceives. Sample lane offset at delay_dist
+  # + CG_OFFSET so the measurement approximates CG perspective. On straights
+  # this is a no-op (rear and CG sit on the same line); in turns the shift
+  # captures the geometric outside-swing of the body. CG_OFFSET ≈ rear-axle
+  # to CG distance, ~1.4 m for a typical mid-size sedan.
+  CG_OFFSET = 1.4
+
   def __init__(self):
     self.prev_correction = 0.0
     self.active = False
@@ -137,10 +146,9 @@ class LaneCenteringCorrection:
       self._reset_lane_tracking()
       return self._smooth_correction(0.0, winding_down=True)
 
-    # Read lane positions at modelV2.action_t lookahead (not t=0) so the
-    # offset is sampled at the same point in space where desired_curvature
-    # is evaluated. Keeps our correction intrinsically time-aligned.
-    delay_dist = v_ego * self.MODEL_LAT_ACTION_T
+    # Read lane positions at modelV2.action_t lookahead, shifted by CG_OFFSET
+    # so the offset is measured at CG perspective rather than rear axle.
+    delay_dist = v_ego * self.MODEL_LAT_ACTION_T + self.CG_OFFSET
     X_IDXS = [192.0 * (i / 32) ** 2 for i in range(33)]
     idx = min(range(len(X_IDXS)), key=lambda i: abs(X_IDXS[i] - delay_dist))
     idx = min(idx, len(model_v2.position.y) - 1, len(model_v2.laneLines[1].y) - 1, len(model_v2.laneLines[2].y) - 1)
