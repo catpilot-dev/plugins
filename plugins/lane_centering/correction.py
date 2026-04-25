@@ -159,8 +159,11 @@ class LaneCenteringCorrection:
 
     # Dynamic lane width estimation when both lanes are confident.
     # When measured width is out of valid range (e.g. > 4.5m due to turn
-    # projection distortion), fall back to standard width immediately rather
-    # than using a stale smoothed estimate.
+    # projection distortion or merge ramp pulling the lane lines apart),
+    # fall back to standard width AND flag the measurement as anomalous so
+    # the lane-center selection below knows the raw lane line positions
+    # are unreliable.
+    width_anomalous = False
     if right_prob >= self.MIN_PROB_STRAIGHT and left_prob >= self.MIN_PROB_STRAIGHT:
       measured_width = right_y - left_y
       if self.LANE_WIDTH_MIN <= measured_width <= self.LANE_WIDTH_MAX:
@@ -171,6 +174,7 @@ class LaneCenteringCorrection:
         lane_width = self.estimated_lane_width
       else:
         lane_width = self.LANE_WIDTH_DEFAULT
+        width_anomalous = True
     else:
       lane_width = self.estimated_lane_width if self.estimated_lane_width is not None else self.LANE_WIDTH_DEFAULT
     half_width = lane_width / 2
@@ -183,37 +187,43 @@ class LaneCenteringCorrection:
     self.diag['lane_width_learned'] = self.estimated_lane_width is not None
 
     # Lane-center reference selection.
-    # Straights / gentle curves (|κ| < CURV_TURN_THRESHOLD): use the closest
-    # lane line — most reliable detection, matches driver intuition.
-    # Tight turns (|κ| ≥ CURV_TURN_THRESHOLD): explicitly prefer the INSIDE
-    # lane line. Outside lane curves out of FOV; inside stays sharper. Even
-    # if the car has drifted toward the outside (so closest = outside), the
-    # inside is still the more reliable reference.
-    right_ok = right_prob >= min_prob
-    left_ok  = left_prob  >= min_prob
-    if not right_ok and not left_ok:
-      self.active = False
-      return self._smooth_correction(0.0, winding_down=True)
-
-    if abs(curvature) >= self.CURV_TURN_THRESHOLD:
-      # In a turn — pick inside lane (left for left-turn, right for right-turn).
-      inside_left = curvature < 0.0
-      if inside_left and left_ok:
-        lane_center = left_y + half_width
-      elif (not inside_left) and right_ok:
-        lane_center = right_y - half_width
-      elif right_ok:
-        lane_center = right_y - half_width  # outside fallback
-      else:
-        lane_center = left_y + half_width   # outside fallback
+    # Width-anomaly override: if measured lane width was outside valid range
+    # (likely merge ramp / split / model confusion), the raw lane-line y
+    # positions can't be trusted to define the ego lane. Freeze lane_center
+    # to the last good smoothed value rather than tracking the misleading
+    # lines. The smoothed history rides through the anomaly window without
+    # being pulled by the bad measurements.
+    if width_anomalous and self.smoothed_lane_center is not None:
+      lane_center = self.smoothed_lane_center
     else:
-      # Straight / gentle curve — closest lane wins (existing behavior).
-      if right_ok and left_ok:
-        lane_center = right_y - half_width if abs(right_y) <= abs(left_y) else left_y + half_width
-      elif right_ok:
-        lane_center = right_y - half_width
+      # Straights / gentle curves (|κ| < CURV_TURN_THRESHOLD): use closest lane.
+      # Tight turns (|κ| ≥ CURV_TURN_THRESHOLD): prefer INSIDE lane line —
+      # outside curves out of FOV, inside stays sharper.
+      right_ok = right_prob >= min_prob
+      left_ok  = left_prob  >= min_prob
+      if not right_ok and not left_ok:
+        self.active = False
+        return self._smooth_correction(0.0, winding_down=True)
+
+      if abs(curvature) >= self.CURV_TURN_THRESHOLD:
+        # In a turn — inside lane (left for left-turn, right for right-turn).
+        inside_left = curvature < 0.0
+        if inside_left and left_ok:
+          lane_center = left_y + half_width
+        elif (not inside_left) and right_ok:
+          lane_center = right_y - half_width
+        elif right_ok:
+          lane_center = right_y - half_width  # outside fallback
+        else:
+          lane_center = left_y + half_width   # outside fallback
       else:
-        lane_center = left_y + half_width
+        # Straight / gentle — closest lane wins.
+        if right_ok and left_ok:
+          lane_center = right_y - half_width if abs(right_y) <= abs(left_y) else left_y + half_width
+        elif right_ok:
+          lane_center = right_y - half_width
+        else:
+          lane_center = left_y + half_width
 
     # Reject sudden lane center jumps
     if self.prev_lane_center is not None:
