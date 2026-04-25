@@ -326,16 +326,20 @@ def on_lat_controller_init(result, lac, CP):
 
         # Plant-inversion target torque in angle domain. τ needed to move δ
         # by δ_err within 500 ms, given aligning-torque physics and first-order
-        # plant lag (0.970 asymptote at +500 ms):
-        #   τ_Nm_steady = T_CAP_SLOPE · v² · δ_err
-        #   τ_Nm_command = τ_Nm_steady / PLANT_500MS_RESPONSE
+        # plant lag (0.970 asymptote at +500 ms). Soft deadband: deduct
+        # tolerance from δ_err so commanded torque starts at 0 (not at
+        # SLOPE·v²·tolerance) when crossing the boundary — smooth transition,
+        # no pulse on tolerance crossing.
+        #   effective_err = sign(δ_err) · (|δ_err| − tolerance)
+        #   τ_Nm = T_CAP_SLOPE · v² · effective_err / PLANT_500MS_RESPONSE
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
         # Sub-breakaway commands won't move the rack → push to ±FRICTION.
         if abs(delta_err) <= tolerance:
           target_frac = 0.0
           state['action'] = 'hold_zero'
         else:
-          target_nm = T_CAP_SLOPE * v * v * delta_err / PLANT_500MS_RESPONSE
+          effective_err = delta_err - tolerance * (1.0 if delta_err > 0 else -1.0)
+          target_nm = T_CAP_SLOPE * v * v * effective_err / PLANT_500MS_RESPONSE
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
             target_frac = FRICTION * (1.0 if delta_err > 0 else -1.0)
