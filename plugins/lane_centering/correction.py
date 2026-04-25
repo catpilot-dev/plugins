@@ -189,12 +189,13 @@ class LaneCenteringCorrection:
     # Lane-center reference selection.
     # Width-anomaly override: if measured lane width was outside valid range
     # (likely merge ramp / split / model confusion), the raw lane-line y
-    # positions can't be trusted to define the ego lane. Freeze lane_center
-    # to the last good smoothed value rather than tracking the misleading
-    # lines. The smoothed history rides through the anomaly window without
-    # being pulled by the bad measurements.
-    if width_anomalous and self.smoothed_lane_center is not None:
-      lane_center = self.smoothed_lane_center
+    # positions can't be trusted to define the ego lane.
+    #   With history: freeze lane_center to last good smoothed value.
+    #   Without history: trust the model's path prediction — assume the car
+    #     is on its planned path → lane_center = path_y → offset = 0. Seeds
+    #     smoothed_lane_center for the next frame.
+    if width_anomalous:
+      lane_center = self.smoothed_lane_center if self.smoothed_lane_center is not None else path_y
     else:
       # Straights / gentle curves (|κ| < CURV_TURN_THRESHOLD): use closest lane.
       # Tight turns (|κ| ≥ CURV_TURN_THRESHOLD): prefer INSIDE lane line —
