@@ -202,10 +202,17 @@ def on_lat_controller_init(result, lac, CP):
 
   # Decision cadence & CAN-rate spreading.
   # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
-  # SPREAD_FRAMES = 25 CAN frames × 10 ms = 250 ms ramp window; step_remaining
-  # drains into state['torque'] gradually, respecting STEER_DELTA_UP rate limit.
+  # SPREAD_FRAMES is speed-dependent: linearly interpolated from
+  #   (v=30 kph, spread=10  → 100 ms ramp, agile at low v)
+  #   (v=120 kph, spread=50 → 500 ms ramp, gentle at high v)
+  # Rationale: at high speed the v²·δ-scaled target torque is large for any
+  # given δ_err; spreading it over more CAN frames produces a gentler felt
+  # correction. At low speed the target is naturally small, faster ramp is OK.
   ACTION_CADENCE_TICKS = 5
-  SPREAD_FRAMES = 25
+  SPREAD_FRAMES_MIN = 10                  # at v ≤ 30 kph (8.33 m/s)
+  SPREAD_FRAMES_MAX = 50                  # at v ≥ 120 kph (33.33 m/s)
+  V_FOR_SPREAD_MIN = 30.0 / 3.6           # 8.33 m/s
+  V_FOR_SPREAD_MAX = 120.0 / 3.6          # 33.33 m/s
   # T_CAP_SLOPE is the single plant/aligning-torque characteristic, in the
   # front-wheel-angle (δ) domain. Linear tire regime (a_y ≤ 3 m/s² per
   # EU/UN-R79):
@@ -222,11 +229,12 @@ def on_lat_controller_init(result, lac, CP):
   # Tune further offline from route data if under/over-response observed.
   T_CAP_BASE_NM = 1.25
   T_CAP_SLOPE = 2.0                                 # Nm · s² / (m² · rad)
-  # STEP_PER_FRAME stays sized to BASE so per-frame rate (0.00417 frac =
-  # 0.05 Nm/frame) remains well under the STEER_DELTA_UP wire limit (0.1
-  # Nm/frame). Larger targets under tight-corner T_CAP simply drain across
-  # more 250 ms decision cycles — fine since we enter corners gradually.
-  STEP_PER_FRAME = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
+  # STEP_PER_FRAME is computed per decision from speed-dependent SPREAD_FRAMES:
+  #   step = T_CAP_BASE_NM / STEER_MAX / spread_frames(v)
+  # At v=30 kph (spread=10): 0.0104 frac/frame = 0.125 Nm/frame — exceeds the
+  # wire STEER_DELTA_UP limit (0.1 Nm/frame), so wire clamps to ~0.1 Nm/frame.
+  # At v=120 kph (spread=50): 0.00208 frac/frame = 0.025 Nm/frame — well under
+  # wire limit, internal-paced gentle drain.
 
   # Plant-inversion horizon: we command the torque that would move the front
   # wheel by δ_err within 500 ms. For a first-order plant with τ=100 ms
@@ -271,6 +279,7 @@ def on_lat_controller_init(result, lac, CP):
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
     'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
+    'step_per_frame': T_CAP_BASE_NM / CCP.STEER_MAX / 25,  # per-frame drain rate (set per decision)
     'check_err_0': 0.0,        # δ_err at last decision (for 100/150/200 ms abort check)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
@@ -318,6 +327,12 @@ def on_lat_controller_init(result, lac, CP):
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
         state['tick_count'] = 0
 
+        # Speed-dependent ramp window: linearly interpolate spread frames
+        # between low-speed (agile, spread=10) and high-speed (gentle, spread=50).
+        spread_t = max(0.0, min(1.0, (v - V_FOR_SPREAD_MIN) / (V_FOR_SPREAD_MAX - V_FOR_SPREAD_MIN)))
+        spread_frames = SPREAD_FRAMES_MIN + spread_t * (SPREAD_FRAMES_MAX - SPREAD_FRAMES_MIN)
+        state['step_per_frame'] = T_CAP_BASE_NM / CCP.STEER_MAX / spread_frames
+
         # Speed-adaptive tolerance: 0.025 m lateral drift over 0.5 s horizon.
         # δ_tol = 2·M·L / (v·T)²  — scales 1/v², matches natural correction authority.
         lookahead_m = v * DRIFT_EVAL_HORIZON_S
@@ -360,9 +375,11 @@ def on_lat_controller_init(result, lac, CP):
         state['check_err_0'] = delta_err
 
         # Breakaway sign-flip fast ramp: the normal drain would crawl from
-        # ±friction through zero to ∓friction at STEP_PER_FRAME, sitting in
-        # the stiction zone for ~24 frames and buzzing the actuator. Reset
-        # torque to 0 and ramp to the new target over 5 frames (50 ms).
+        # ±friction through zero to ∓friction at the per-frame step rate,
+        # sitting in the stiction zone for many frames and buzzing the
+        # actuator. Reset torque to 0 and ramp to the new target over 5
+        # frames (50 ms) regardless of speed-dependent SPREAD_FRAMES — the
+        # 5-frame fast ramp is a dedicated stiction-crossing mechanism.
         if state['action'] == 'breakaway' and state['torque'] * target_frac < 0.0:
           state['torque'] = 0.0
           state['fast_ramp_remaining'] = 5
@@ -377,7 +394,8 @@ def on_lat_controller_init(result, lac, CP):
       state['torque'] = max(-1.0, min(1.0, state['torque'] + state['fast_ramp_step']))
       state['fast_ramp_remaining'] -= 1
     elif abs(state['step_remaining']) > 1e-9:
-      step_this_tick = max(-STEP_PER_FRAME, min(STEP_PER_FRAME, state['step_remaining']))
+      step_per_frame = state['step_per_frame']
+      step_this_tick = max(-step_per_frame, min(step_per_frame, state['step_remaining']))
       state['torque'] = max(-1.0, min(1.0, state['torque'] + step_this_tick))
       state['step_remaining'] -= step_this_tick
 
