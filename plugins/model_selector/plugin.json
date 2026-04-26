@@ -9,6 +9,11 @@
       "module": "ui",
       "function": "on_software_settings_extend",
       "priority": 50
+    },
+    "device.health_check": {
+      "module": "ui",
+      "function": "on_health_check",
+      "priority": 50
     }
   }
 }
