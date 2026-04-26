@@ -197,31 +197,32 @@ class LaneCenteringCorrection:
     if width_anomalous:
       lane_center = self.smoothed_lane_center if self.smoothed_lane_center is not None else path_y
     else:
-      # Straights / gentle curves (|κ| < CURV_TURN_THRESHOLD): use closest lane.
-      # Tight turns (|κ| ≥ CURV_TURN_THRESHOLD): prefer INSIDE lane line —
-      # outside curves out of FOV, inside stays sharper.
+      # Confidence-based selection — no closest-lane flip-flop, no explicit
+      # turn/straight branching:
+      #   Both strong (≥ MIN_PROB_STRAIGHT): midpoint = (left + right)/2.
+      #     Stable (no flip when car drifts across the midline) and exact —
+      #     doesn't depend on learned half_width.
+      #   One strong, other weak: use the strong one + estimated half_width.
+      #     In tight turns where outside drops below MIN_PROB_STRAIGHT, this
+      #     naturally yields inside-lane reference (the inside is the strong one).
+      #   Neither strong, at least one OK (curvature-relaxed gate): use higher.
+      right_strong = right_prob >= self.MIN_PROB_STRAIGHT
+      left_strong  = left_prob  >= self.MIN_PROB_STRAIGHT
       right_ok = right_prob >= min_prob
       left_ok  = left_prob  >= min_prob
       if not right_ok and not left_ok:
         self.active = False
         return self._smooth_correction(0.0, winding_down=True)
 
-      if abs(curvature) >= self.CURV_TURN_THRESHOLD:
-        # In a turn — inside lane (left for left-turn, right for right-turn).
-        inside_left = curvature < 0.0
-        if inside_left and left_ok:
-          lane_center = left_y + half_width
-        elif (not inside_left) and right_ok:
-          lane_center = right_y - half_width
-        elif right_ok:
-          lane_center = right_y - half_width  # outside fallback
-        else:
-          lane_center = left_y + half_width   # outside fallback
+      if right_strong and left_strong:
+        lane_center = (left_y + right_y) / 2.0
+      elif left_strong:
+        lane_center = left_y + half_width
+      elif right_strong:
+        lane_center = right_y - half_width
       else:
-        # Straight / gentle — closest lane wins.
-        if right_ok and left_ok:
-          lane_center = right_y - half_width if abs(right_y) <= abs(left_y) else left_y + half_width
-        elif right_ok:
+        # Both weak (only in turns with relaxed gate). Pick higher-confidence.
+        if right_prob >= left_prob:
           lane_center = right_y - half_width
         else:
           lane_center = left_y + half_width
