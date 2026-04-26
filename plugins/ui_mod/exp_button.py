@@ -6,9 +6,7 @@ Replaces stock steering wheel / atomic icons with the vehicle brand emblem.
   - Lane centering active: green ring around the button
 """
 import os
-import sys
 import time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import PLUGINS_REPO_DIR
 import pyray as rl
 from openpilot.common.params import Params
@@ -139,8 +137,8 @@ class ExpButton(Widget):
     # Dark background always
     rl.draw_circle(center_x, center_y, radius, BG_COLOR)
 
-    # Green ring when lane centering active
-    if self._lane_centering_active:
+    # Green ring when lane centering active and openpilot engaged
+    if self._lane_centering_active and ui_state.sm["selfdriveState"].enabled:
       rl.draw_ring(rl.Vector2(center_x, center_y), radius - RING_WIDTH, radius, 0, 360, 36, RING_LANE_CENTERING)
 
     # Experimental mode: color emblem; normal mode: white icon
@@ -154,7 +152,7 @@ class ExpButton(Widget):
       tex = None
 
     if tex:
-      rl.draw_texture(tex, center_x - tex.width // 2, center_y - tex.height // 2, tint)
+      rl.draw_texture_ex(tex, rl.Vector2(center_x - tex.width // 2, center_y - tex.height // 2), 0.0, 1.0, tint)
 
   def _held_or_actual_mode(self):
     now = time.monotonic()

@@ -305,6 +305,52 @@ class TestDriveTracker:
     assert len(data['trace']) == 3
     assert data['trace'][0] == [39.9, 116.4]
 
+  def test_save_preserves_previous_trace_when_no_gps(self, tracker_module):
+    """Drive with no GPS lock keeps previous drive's trace in the saved file."""
+    # Write a previous drive with a GPS trace
+    prev = {
+      'version': 1, 'has_gps': True,
+      'trace': [[39.9, 116.4], [39.91, 116.41]],
+      'start_lat': 39.9, 'start_lng': 116.4,
+      'end_lat': 39.91, 'end_lng': 116.41,
+      'duration_s': 60.0, 'distance_m': 500.0, 'engaged_s': 30.0,
+    }
+    with open(tracker_module._last_drive_file, 'w') as f:
+      json.dump(prev, f)
+
+    # New drive: sufficient length but no GPS
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 50.0
+    t._distance_m = 800.0
+    t._has_gps = False
+    t._trace = []
+    t._save()
+
+    data = json.loads(open(tracker_module._last_drive_file).read())
+    # New drive stats should be saved
+    assert data['duration_s'] == 50.0
+    assert data['distance_m'] == 800.0
+    # GPS trace carried over from previous drive
+    assert data['has_gps'] is True
+    assert len(data['trace']) == 2
+    assert data['start_lat'] == 39.9
+    assert data['end_lat'] == 39.91
+
+  def test_save_no_gps_no_previous_trace(self, tracker_module):
+    """Drive with no GPS and no previous drive: trace stays empty."""
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 50.0
+    t._distance_m = 800.0
+    t._has_gps = False
+    t._trace = []
+    t._save()
+
+    data = json.loads(open(tracker_module._last_drive_file).read())
+    assert data['has_gps'] is False
+    assert data['trace'] == []
+
 
 # ============================================================
 # get_last_drive
