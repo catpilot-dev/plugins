@@ -8,9 +8,19 @@ import importlib
 @pytest.fixture(autouse=True)
 def mock_openpilot(monkeypatch):
   """Mock openpilot + cereal imports."""
+  mock_services = MagicMock()
+  mock_services.SERVICE_LIST = {'modelV2': MagicMock(), 'gpsLocationExternal': MagicMock()}
+  mock_plugin_bus = MagicMock()
+  # PluginSub().drain() must return None to avoid infinite loop in __init__
+  mock_plugin_bus.PluginSub.return_value.drain.return_value = None
   for mod in ['openpilot', 'openpilot.common',
-              'openpilot.common.realtime', 'cereal', 'cereal.messaging']:
+              'openpilot.common.realtime', 'cereal', 'cereal.messaging',
+              'cereal.services',
+              'openpilot.selfdrive', 'openpilot.selfdrive.plugins',
+              'openpilot.selfdrive.plugins.plugin_bus']:
     monkeypatch.setitem(sys.modules, mod, MagicMock())
+  sys.modules['cereal.services'] = mock_services
+  sys.modules['openpilot.selfdrive.plugins.plugin_bus'] = mock_plugin_bus
   sys.modules['openpilot.common.realtime'].Ratekeeper = MagicMock
 
 
@@ -114,13 +124,15 @@ class TestVisionSpeedCap:
 
 class TestSnapToStandardSpeed:
   def test_exact_standard_values(self, sld):
-    for v in [30, 40, 60, 80, 100, 120]:
+    for v in [30, 40, 50, 60, 80, 100, 120]:
       assert sld.snap_to_standard_speed(v) == v
 
   def test_rounds_to_nearest(self, sld):
     assert sld.snap_to_standard_speed(31) == 30
-    assert sld.snap_to_standard_speed(45) == 40
-    assert sld.snap_to_standard_speed(55) == 60
+    assert sld.snap_to_standard_speed(44) == 40
+    assert sld.snap_to_standard_speed(47) == 50
+    assert sld.snap_to_standard_speed(55) == 50
+    assert sld.snap_to_standard_speed(56) == 60
     assert sld.snap_to_standard_speed(75) == 80
     assert sld.snap_to_standard_speed(83) == 80
 
@@ -128,7 +140,7 @@ class TestSnapToStandardSpeed:
     # Values seen from mapd visionCurveSpeed on Shanghai expressways
     assert sld.snap_to_standard_speed(99) == 100
     assert sld.snap_to_standard_speed(105) == 100
-    assert sld.snap_to_standard_speed(47) == 40
+    assert sld.snap_to_standard_speed(46) == 50
 
 
 # ============================================================
@@ -186,18 +198,22 @@ class TestInferSpeedFromRoadType:
 
 class TestSpeedTables:
   def test_load_cn(self, sld):
-    urban, nonurban, fallback = sld.load_speed_table('cn')
+    urban, nonurban, fallback, lane_width_class = sld.load_speed_table('cn')
     assert fallback == 40
     assert urban['motorway']['multi'] == 100
     assert nonurban['motorway']['multi'] == 120
+    # cn has lane_width_class populated; sorted descending by `min`
+    assert len(lane_width_class) >= 2
+    mins = [e['min'] for e in lane_width_class]
+    assert mins == sorted(mins, reverse=True)
 
   def test_load_de(self, sld):
-    urban, nonurban, fallback = sld.load_speed_table('de')
+    urban, nonurban, fallback, _ = sld.load_speed_table('de')
     assert fallback == 50
     assert nonurban['motorway']['multi'] == 130
 
   def test_load_au(self, sld):
-    urban, nonurban, fallback = sld.load_speed_table('au')
+    urban, nonurban, fallback, _ = sld.load_speed_table('au')
     assert fallback == 50
     assert nonurban['motorway']['multi'] == 110
 
@@ -234,7 +250,7 @@ class TestSpeedTables:
       if not fname.endswith('.toml'):
         continue
       country = fname[:-5]
-      urban, nonurban, _ = sld.load_speed_table(country)
+      urban, nonurban, _, _ = sld.load_speed_table(country)
       for table_name, table in [('urban', urban), ('nonurban', nonurban)]:
         for road_type, entry in table.items():
           assert 'multi' in entry, f"{country}/{table_name}/{road_type} missing 'multi'"
@@ -252,6 +268,58 @@ class TestSpeedTables:
 
 
 # ============================================================
+# Lane Width → Road Class Fusion
+# ============================================================
+
+class TestLaneWidthClassification:
+  def test_classify_highway_lane(self, sld):
+    assert sld.classify_by_width(3.75, sld.LANE_WIDTH_CLASS_TABLE) == 'trunk'
+
+  def test_classify_city_arterial(self, sld):
+    assert sld.classify_by_width(3.40, sld.LANE_WIDTH_CLASS_TABLE) == 'primary'
+
+  def test_classify_city_collector(self, sld):
+    assert sld.classify_by_width(3.00, sld.LANE_WIDTH_CLASS_TABLE) == 'secondary'
+
+  def test_classify_narrow_lane(self, sld):
+    assert sld.classify_by_width(2.50, sld.LANE_WIDTH_CLASS_TABLE) == 'residential'
+
+  def test_classify_no_observation(self, sld):
+    assert sld.classify_by_width(0.0, sld.LANE_WIDTH_CLASS_TABLE) == ''
+
+  def test_classify_empty_table(self, sld):
+    assert sld.classify_by_width(3.5, []) == ''
+
+
+class TestLaneWidthFusion:
+  def test_width_promotes_when_osm_unknown(self, sld):
+    # 3-lane urban road with no OSM highway type.
+    # Without width: lane_count votes 'primary' (rank 2) → urban primary = 60 km/h.
+    no_width = sld.infer_speed_from_road_type('', 3, 'city')
+    # With width hint 'trunk' (rank 3, from 3.75 m lanes) → should pick urban trunk = 80.
+    with_width = sld.infer_speed_from_road_type('', 3, 'city', width_class='trunk')
+    assert with_width > no_width
+    assert with_width == sld.SPEED_TABLE_URBAN['trunk']['multi']
+
+  def test_width_does_not_override_known_motorway(self, sld):
+    # OSM already identified the road as motorway (G-ref). Width can't override.
+    speed = sld.infer_speed_from_road_type('motorway', 4, 'freeway', width_class='residential')
+    assert speed == sld.SPEED_TABLE_NONURBAN['motorway']['multi']
+
+  def test_width_ignored_when_lane_class_higher(self, sld):
+    # 5-lane road (lane_class='trunk' urban, rank 3). Width 'primary' (rank 2)
+    # should not demote — highest-rank voter wins.
+    speed = sld.infer_speed_from_road_type('', 5, 'city', width_class='primary')
+    assert speed == sld.SPEED_TABLE_URBAN['trunk']['multi']
+
+  def test_width_breaks_tie_with_osm_tertiary(self, sld):
+    # OSM says 'secondary' (rank 1), lane_count=3 says 'primary' (rank 2),
+    # width says 'secondary' (rank 1). Primary wins — width doesn't demote.
+    speed = sld.infer_speed_from_road_type('secondary', 3, 'city', width_class='secondary')
+    assert speed == sld.SPEED_TABLE_URBAN['primary']['multi']
+
+
+# ============================================================
 # Priority Cascade
 # ============================================================
 
@@ -259,10 +327,9 @@ class TestPriorityCascade:
   def _make_middleware(self, sld):
     """Create a SpeedLimitMiddleware with messaging mocked out."""
     import plugins.speedlimitd.speedlimitd as mod
-    with patch.object(mod.messaging, 'SubMaster'), \
-         patch.object(mod.messaging, 'PubMaster'):
+    with patch.object(mod.messaging, 'SubMaster'):
       mw = mod.SpeedLimitMiddleware()
-    mw.pm = MagicMock()
+    mw._sl_pub = MagicMock()
     return mw
 
   def test_min_of_all_sources(self, sld):
@@ -315,8 +382,8 @@ class TestPriorityCascade:
     assert mw.lane_count_locked is True
     assert mw.lane_count_stable == 3
 
-  def test_lane_count_demotion_requires_5s(self, sld):
-    """Dropping lane count requires 5 s stability (directional hysteresis)."""
+  def test_lane_count_demotion_requires_2s(self, sld):
+    """Dropping lane count requires 2 s stability (directional hysteresis)."""
     import time
     import plugins.speedlimitd.speedlimitd as mod
     with patch.object(mod.messaging, 'SubMaster'), \
@@ -325,18 +392,18 @@ class TestPriorityCascade:
     # Establish stable 3-lane reading
     mw.lane_count_stable = 3
     mw.lane_count_locked = True
-    # Vision now sees 1 lane, stable for 3 s (< 5 s demotion window)
+    # Vision now sees 1 lane, stable for 1 s (< 2 s demotion window)
     mw.lane_count = 1
-    mw.lane_count_stable_since = time.monotonic() - 3.0
+    mw.lane_count_stable_since = time.monotonic() - 1.0
     going_down = mw.lane_count < mw.lane_count_stable
-    stability_window = 5.0 if going_down else 2.0
+    stability_window = 2.0 if going_down else 1.5
     if time.monotonic() - mw.lane_count_stable_since > stability_window:
       mw.lane_count_stable = mw.lane_count
-    # 3 s is not enough to demote
+    # 1 s is not enough to demote
     assert mw.lane_count_stable == 3
 
-  def test_lane_count_demotion_commits_after_5s(self, sld):
-    """Dropping lane count commits after 5 s of stable lower reading."""
+  def test_lane_count_demotion_commits_after_2s(self, sld):
+    """Dropping lane count commits after 2 s of stable lower reading."""
     import time
     import plugins.speedlimitd.speedlimitd as mod
     with patch.object(mod.messaging, 'SubMaster'), \
@@ -344,11 +411,11 @@ class TestPriorityCascade:
       mw = mod.SpeedLimitMiddleware()
     mw.lane_count_stable = 3
     mw.lane_count_locked = True
-    # Vision sees 1 lane for 6 s (> 5 s demotion window)
+    # Vision sees 1 lane for 3 s (> 2 s demotion window)
     mw.lane_count = 1
-    mw.lane_count_stable_since = time.monotonic() - 6.0
+    mw.lane_count_stable_since = time.monotonic() - 3.0
     going_down = mw.lane_count < mw.lane_count_stable
-    stability_window = 5.0 if going_down else 2.0
+    stability_window = 2.0 if going_down else 1.5
     if time.monotonic() - mw.lane_count_stable_since > stability_window:
       mw.lane_count_stable = mw.lane_count
     assert mw.lane_count_stable == 1
@@ -370,35 +437,30 @@ class TestPlannerHook:
 
     import plugins.speedlimitd.planner_hook as mod
     importlib.reload(mod)
+    mod._sl_sub = None
+    mod._sl_data = None
     return mod
+
+  def _set_sl_data(self, hook, data):
+    """Set the speed limit state dict directly on the module."""
+    hook._sl_data = data
 
   def test_no_speed_limit_state(self, hook):
     sm = MagicMock()
-    sm.valid = {}
-    sm.recv_frame = {}
+    hook._sl_data = None
     result = hook.on_v_cruise(30.0, 20.0, sm)
     assert result == 30.0
 
   def test_unconfirmed_returns_original(self, hook):
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = False
-    sls.speedLimit = 60
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': False, 'speedLimit': 60}
     result = hook.on_v_cruise(30.0, 20.0, sm)
     assert result == 30.0
 
   def test_confirmed_limits_v_cruise_highway(self, hook):
     """Limit >= 80 kph uses 10% offset."""
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = True
-    sls.speedLimit = 80  # kph — >= 80, 10% offset
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': True, 'speedLimit': 80}
 
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result < 100.0
@@ -407,12 +469,7 @@ class TestPlannerHook:
   def test_confirmed_limits_v_cruise_low_speed(self, hook):
     """Limit < 80 kph uses 15% offset."""
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = True
-    sls.speedLimit = 40  # kph — < 80, 15% offset
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': True, 'speedLimit': 40}
 
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
@@ -420,39 +477,24 @@ class TestPlannerHook:
   def test_confirmed_limits_v_cruise_mid_speed(self, hook):
     """Limit 60 kph (< 80) uses 15% offset."""
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = True
-    sls.speedLimit = 60  # kph — < 80, 15% offset
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': True, 'speedLimit': 60}
 
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(60 * 1.15 / 3.6, abs=0.1)
 
   def test_confirmed_no_limit_if_already_below(self, hook):
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-    sls = MagicMock()
-    sls.confirmed = True
-    sls.speedLimit = 120  # kph
-    sm.__getitem__ = MagicMock(return_value=sls)
+    hook._sl_data = {'confirmed': True, 'speedLimit': 120}
 
     # v_cruise = 10 m/s (already well below 120 * 1.10 kph limit)
     result = hook.on_v_cruise(10.0, 8.0, sm)
     assert result == 10.0
 
-  def _make_sm(self, speed_limit, confirmed=True, lead_status=False, lead_vLead=0.0):
-    """Helper: build SubMaster mock with speedLimitState and radarState."""
+  def _make_sm(self, hook, speed_limit, confirmed=True, lead_status=False, lead_vLead=0.0):
+    """Helper: set _sl_data and build SubMaster mock with radarState."""
+    hook._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit}
+
     sm = MagicMock()
-    sm.valid = {'speedLimitState': True}
-    sm.recv_frame = {'speedLimitState': 1}
-
-    sls = MagicMock()
-    sls.confirmed = confirmed
-    sls.speedLimit = speed_limit
-
     lead = MagicMock()
     lead.status = lead_status
     lead.vLead = lead_vLead
@@ -461,8 +503,6 @@ class TestPlannerHook:
     radar.leadOne = lead
 
     def getitem(key):
-      if key == 'speedLimitState':
-        return sls
       if key == 'radarState':
         return radar
       return MagicMock()
@@ -472,28 +512,25 @@ class TestPlannerHook:
 
   def test_lead_override_fast_lead_skips_limit(self, hook):
     """Lead >10% above speed limit → skip capping."""
-    # Speed limit 80 kph (highway, 10% offset), lead at 95 kph (19% above → override)
-    sm = self._make_sm(80, confirmed=True, lead_status=True, lead_vLead=95 / 3.6)
+    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=95 / 3.6)
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == 100.0  # original v_cruise, not capped
 
   def test_lead_override_slow_lead_keeps_limit(self, hook):
     """Lead only 5% above speed limit → still cap."""
-    # Speed limit 80 kph, lead at 84 kph (5% above → no override)
-    sm = self._make_sm(80, confirmed=True, lead_status=True, lead_vLead=84 / 3.6)
+    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=84 / 3.6)
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
 
   def test_lead_override_no_lead_keeps_limit(self, hook):
     """No tracked lead → normal capping."""
-    sm = self._make_sm(80, confirmed=True, lead_status=False, lead_vLead=0)
+    sm = self._make_sm(hook, 80, confirmed=True, lead_status=False, lead_vLead=0)
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
 
   def test_lead_override_exactly_at_threshold(self, hook):
     """Lead exactly at 10% threshold → no override (must be strictly above)."""
-    # Speed limit 80 kph, lead at exactly 88 kph (10% above → boundary)
-    sm = self._make_sm(80, confirmed=True, lead_status=True, lead_vLead=88 / 3.6)
+    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=88 / 3.6)
     result = hook.on_v_cruise(100.0, 20.0, sm)
     assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
 
@@ -514,13 +551,12 @@ class TestPluginManifest:
     assert 'planner.v_cruise' in manifest['hooks']
     assert 'ui.render_overlay' in manifest['hooks']
 
-  def test_has_state_subscriptions_hook(self):
+  def test_no_cereal_slot(self):
+    """speedLimitState moved to plugin_bus — no cereal slot needed."""
     import json, os
     manifest_path = os.path.join(os.path.dirname(__file__), '..', 'plugin.json')
     with open(manifest_path) as f:
       manifest = json.load(f)
 
-    assert 'ui.state_subscriptions' in manifest['hooks']
-    hook = manifest['hooks']['ui.state_subscriptions']
-    assert hook['module'] == 'ui_overlay'
-    assert hook['function'] == 'on_state_subscriptions'
+    assert 'cereal' not in manifest or not manifest.get('cereal', {}).get('slots')
+    assert 'services' not in manifest or not manifest.get('services')

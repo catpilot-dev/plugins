@@ -2,14 +2,13 @@
 
 Registered as a ui.render_overlay hook callback. Uses stock UI lib directly:
   - pyray for drawing primitives (circles, text)
-  - gui_app.font() for font access
-  - measure_text_cached() for text measurement
+  - fonts.py shared helper for font access
   - ui_state.sm for speedLimitState data
   - plugin bus for tap-to-confirm toggle
 """
 import pyray as rl
 from openpilot.system.ui.lib.application import gui_app, FontWeight
-from openpilot.system.ui.lib.text_measure import measure_text_cached
+from fonts import get_font, measure
 
 # Layout constants — sign diameter matches MAX block width, centered below it
 SPEED_SIGN_RADIUS_METRIC = 100    # diameter 200 = metric MAX width
@@ -35,48 +34,63 @@ _font_medium = None
 _speed_limit = 0.0
 _speed_limit_source = 2  # roadTypeInference default
 _speed_limit_confirmed = False
-speed_limit_capping = False  # True when confirmed limit is actively capping MAX
-speed_limit_ceiling = 0.0    # Effective ceiling: limit + offset (km/h)
 _tap_hold_until = 0.0  # Hold local confirmed state until this time (monotonic)
 
 
 def _ensure_init():
-  """Lazy init — fonts and imports deferred until first render frame."""
+  """Lazy init — imports deferred until first render frame."""
   global _font_bold, _font_medium, ui_state
   if _font_bold is None:
+    font_bold = get_font(FontWeight.BOLD)
+    if font_bold is None:
+      return  # fonts not ready yet — retry next frame
     from openpilot.selfdrive.ui.ui_state import ui_state as _ui_state
     ui_state = _ui_state
-    _font_bold = gui_app.font(FontWeight.BOLD)
-    _font_medium = gui_app.font(FontWeight.MEDIUM)
+    _font_bold = font_bold
+    _font_medium = get_font(FontWeight.MEDIUM)
+    _ensure_tap_pub()  # create PUB socket early so ZMQ handshake completes before first tap
+
+
+_sl_sub = None
+_sl_data = None
 
 
 def _update_state():
-  """Read speedLimitState from SubMaster (updated each frame by ui_state)."""
-  global _speed_limit, _speed_limit_source, _speed_limit_confirmed, speed_limit_capping, speed_limit_ceiling
+  """Read speedLimitState from plugin bus."""
+  global _speed_limit, _speed_limit_source, _speed_limit_confirmed
+  global _sl_sub, _sl_data
   import time
-  sm = ui_state.sm
-  if sm.recv_frame.get("speedLimitState", 0) > 0:
-    sls = sm['speedLimitState']
-    _speed_limit = sls.speedLimit
-    _speed_limit_source = sls.source.raw if hasattr(sls.source, 'raw') else int(sls.source)
-    # Don't overwrite local confirmed state during tap hold period
+
+  # Recreate sub if socket was recycled (speedlimitd restart deletes + rebinds)
+  import os
+  _sl_socket_path = '/tmp/plugin_bus/speedLimitState'
+  if _sl_sub is not None and not os.path.exists(_sl_socket_path):
+    try:
+      _sl_sub.close()
+    except Exception:
+      pass
+    _sl_sub = None
+
+  if _sl_sub is None and os.path.exists(_sl_socket_path):
+    try:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+      _sl_sub = PluginSub(['speedLimitState'])
+    except Exception:
+      pass
+
+  if _sl_sub is not None:
+    try:
+      msg = _sl_sub.drain('speedLimitState')
+      if msg is not None and isinstance(msg, tuple) and len(msg) == 2:
+        _, _sl_data = msg
+    except Exception:
+      pass
+
+  if _sl_data is not None:
+    _speed_limit = _sl_data.get('speedLimit', 0)
+    _speed_limit_source = _sl_data.get('source', 2)
     if time.monotonic() >= _tap_hold_until:
-      _speed_limit_confirmed = sls.confirmed
-    speed_limit_capping = _speed_limit_confirmed and _speed_limit > 0
-    if speed_limit_capping:
-      # Tiered offset matching planner_hook logic
-      if _speed_limit <= 50:
-        offset_pct = 40
-      elif _speed_limit <= 60:
-        offset_pct = 30
-      else:
-        offset_pct = 10
-      speed_limit_ceiling = _speed_limit * (1 + offset_pct / 100.0)
-    else:
-      speed_limit_ceiling = 0.0
-  else:
-    speed_limit_capping = False
-    speed_limit_ceiling = 0.0
+      _speed_limit_confirmed = _sl_data.get('confirmed', False)
 
 
 def _sign_geometry(content_rect):
@@ -118,7 +132,7 @@ def _draw_speed_limit_sign(content_rect):
   # Speed number (black)
   speed_text = str(round(_speed_limit))
   text_color = rl.Color(0, 0, 0, alpha)
-  text_size = measure_text_cached(_font_bold, speed_text, SPEED_SIGN_FONT_SIZE)
+  text_size = measure(_font_bold, speed_text, SPEED_SIGN_FONT_SIZE)
   rl.draw_text_ex(
     _font_bold,
     speed_text,
@@ -133,9 +147,21 @@ def _draw_speed_limit_sign(content_rect):
 _tap_pub = None
 
 
+def _ensure_tap_pub():
+  """Eagerly create the tap command publisher so ZMQ subscription handshake
+  completes before the user ever taps (avoids slow-joiner message loss)."""
+  global _tap_pub
+  if _tap_pub is None:
+    try:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+      _tap_pub = PluginPub('speedlimit_cmd_ui')
+    except Exception:
+      pass
+
+
 def _handle_tap(content_rect):
   """Check for tap on speed limit sign — toggle confirmed state via plugin bus."""
-  global _speed_limit_confirmed, _tap_hold_until, _tap_pub
+  global _speed_limit_confirmed, _tap_hold_until
   cx, cy, r = _sign_geometry(content_rect)
   for ev in gui_app.mouse_events:
     if not ev.left_released:
@@ -146,43 +172,45 @@ def _handle_tap(content_rect):
       import time
       _speed_limit_confirmed = not _speed_limit_confirmed
       _tap_hold_until = time.monotonic() + 2.0  # hold local state until speedlimitd catches up
-      try:
-        if _tap_pub is None:
-          from openpilot.selfdrive.plugins.plugin_bus import PluginPub
-          _tap_pub = PluginPub('speedlimit_cmd_ui')
-        _tap_pub.send({'action': 'toggle_confirm'})
-      except Exception:
-        pass
+      if _tap_pub is not None:
+        try:
+          _tap_pub.send({'action': 'toggle_confirm'})
+        except Exception:
+          pass
       break
 
 
 def on_state_subscriptions(services):
-  """Hook callback for ui.state_subscriptions.
-
-  Adds speedLimitState to the UI SubMaster so the overlay can read speed limit data.
-  """
-  if 'speedLimitState' not in services:
-    services.append('speedLimitState')
+  """Hook callback for ui.state_subscriptions (no-op, speedLimitState moved to plugin_bus)."""
   return services
 
 
 def on_hud_set_speed_override(default, max_color, set_speed_color, set_speed, is_metric):
   """Hook callback for ui.hud_set_speed_override.
 
-  When speed limit is actively capping cruise, dim the MAX block and show
-  the ceiling speed instead of the user's set speed.
+  MAX block always shows user's set cruise speed. Speed limit info is
+  shown in the speed limit sign overlay instead.
   """
-  if not speed_limit_capping or speed_limit_ceiling <= 0:
-    return default
+  return default
 
-  import pyray as rl
-  KM_TO_MILE = 0.621371
-  ceiling = speed_limit_ceiling if is_metric else speed_limit_ceiling * KM_TO_MILE
-  return {
-    "max_color": rl.Color(max_color.r, max_color.g, max_color.b, 128),
-    "set_speed_color": rl.Color(255, 255, 255, 128),
-    "set_speed_text": str(round(ceiling)),
-  }
+
+def _show_sign_enabled():
+  """Check ShowSpeedLimitSign param (cached, refreshed lazily)."""
+  global _show_sign_cache, _show_sign_check_time
+  import time
+  now = time.monotonic()
+  if not hasattr(_show_sign_enabled, '_cache_until') or now > _show_sign_enabled._cache_until:
+    import os
+    val = None
+    try:
+      param_path = '/data/plugins/speedlimitd/data/ShowSpeedLimitSign'
+      if os.path.isfile(param_path):
+        val = open(param_path).read().strip()
+    except Exception:
+      pass
+    _show_sign_enabled._value = val != '0'
+    _show_sign_enabled._cache_until = now + 2.0  # re-check every 2s
+  return _show_sign_enabled._value
 
 
 def on_render_overlay(default, content_rect):
@@ -190,7 +218,7 @@ def on_render_overlay(default, content_rect):
   _ensure_init()
   _update_state()
 
-  if _speed_limit > 0:
+  if _speed_limit > 0 and _show_sign_enabled():
     _draw_speed_limit_sign(content_rect)
     _handle_tap(content_rect)
 
