@@ -118,8 +118,8 @@ class TestUpdateVersionParam:
 
 class TestPerformUpdate:
   def test_skip_if_already_current(self, manager):
-    with patch.object(manager, 'get_current_version', return_value='v2.1.0'), \
-         patch.object(manager, 'get_latest_version', return_value=('v2.1.0', '')):
+    with patch.object(manager, 'get_current_version', return_value='v2.0.5'), \
+         patch.object(manager, 'get_latest_version', return_value=('v2.0.5', '')):
       result = manager.perform_update()
     assert result is True
 
