@@ -12,9 +12,7 @@ Logic:
 
 The bus_logger plugin captures these messages automatically for debugging.
 """
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import os
 import time
 import urllib.request
 import urllib.error
