@@ -201,18 +201,23 @@ def on_lat_controller_init(result, lac, CP):
   from bmw.values import CarControllerParams as CCP
 
   # Decision cadence & CAN-rate spreading.
-  # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
   # SPREAD_FRAMES is speed-dependent: linearly interpolated from
   #   (v=30 kph, spread=10  → 100 ms ramp, agile at low v)
   #   (v=120 kph, spread=50 → 500 ms ramp, gentle at high v)
-  # Rationale: at high speed the v²·δ-scaled target torque is large for any
-  # given δ_err; spreading it over more CAN frames produces a gentler felt
-  # correction. At low speed the target is naturally small, faster ramp is OK.
-  ACTION_CADENCE_TICKS = 5
+  # ACTION_CADENCE_TICKS scales with SPREAD_FRAMES so each decision's ramp
+  # completes before the next decision fires (CAN at 100 Hz, livePose at
+  # 20 Hz → cadence = spread/5):
+  #   spread=10 (100 ms ramp)  →  2 livePose ticks (100 ms decision)
+  #   spread=25 (250 ms ramp)  →  5 livePose ticks (250 ms decision, current default)
+  #   spread=50 (500 ms ramp)  → 10 livePose ticks (500 ms decision)
+  # Decision frequency tracks ramp duration: more agile at low v (frequent
+  # decisions, short ramps), gentler at high v (rare decisions, long ramps).
+  # cancel_narrowed checks scale with cadence (40/60/80 % of cycle).
   SPREAD_FRAMES_MIN = 10                  # at v ≤ 30 kph (8.33 m/s)
   SPREAD_FRAMES_MAX = 50                  # at v ≥ 120 kph (33.33 m/s)
   V_FOR_SPREAD_MIN = 30.0 / 3.6           # 8.33 m/s
   V_FOR_SPREAD_MAX = 120.0 / 3.6          # 33.33 m/s
+  ACTION_CADENCE_MIN = 2                  # min livePose ticks between decisions (100 ms)
   # T_CAP_SLOPE is the single plant/aligning-torque characteristic, in the
   # front-wheel-angle (δ) domain. Linear tire regime (a_y ≤ 3 m/s² per
   # EU/UN-R79):
@@ -274,7 +279,8 @@ def on_lat_controller_init(result, lac, CP):
     'torque': 0.0,             # current commanded torque fraction (ramps toward target_frac)
     'target_frac': 0.0,        # plant-inversion target set each 250 ms decision
     'step_remaining': 0.0,     # target_frac - torque, drained at CAN rate
-    'tick_count': 0,           # livePose tick counter; decide every ACTION_CADENCE_TICKS
+    'tick_count': 0,           # livePose tick counter; decide every action_cadence_ticks
+    'action_cadence_ticks': 5, # decision interval (set per decision from speed-dep SPREAD)
     'action': 'init',          # debug: hold_zero / breakaway / ramp / cancel_narrowed
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
@@ -319,12 +325,17 @@ def on_lat_controller_init(result, lac, CP):
       # 15/30/47 % at the 100/150/200 ms checkpoints — the 50 % threshold
       # fires when plant responds at or slightly above nominal.
       # Only for 'ramp' action; 'hold_zero'/'breakaway' use other paths.
-      if state['tick_count'] in (2, 3, 4) and state['action'] == 'ramp':
+      cadence = state['action_cadence_ticks']
+      # Cancel checks at ~40/60/80 % of decision cycle (proportional to cadence)
+      cancel_check_ticks = (max(1, int(cadence * 0.4)),
+                            max(1, int(cadence * 0.6)),
+                            max(1, int(cadence * 0.8)))
+      if state['tick_count'] in cancel_check_ticks and state['action'] == 'ramp':
         if abs(delta_err) < 0.5 * abs(state['check_err_0']):
           state['step_remaining'] = 0.0
           state['action'] = 'cancel_narrowed'
 
-      if state['tick_count'] >= ACTION_CADENCE_TICKS:
+      if state['tick_count'] >= cadence:
         state['tick_count'] = 0
 
         # Speed-dependent ramp window: linearly interpolate spread frames
@@ -332,6 +343,8 @@ def on_lat_controller_init(result, lac, CP):
         spread_t = max(0.0, min(1.0, (v - V_FOR_SPREAD_MIN) / (V_FOR_SPREAD_MAX - V_FOR_SPREAD_MIN)))
         spread_frames = SPREAD_FRAMES_MIN + spread_t * (SPREAD_FRAMES_MAX - SPREAD_FRAMES_MIN)
         state['step_per_frame'] = T_CAP_BASE_NM / CCP.STEER_MAX / spread_frames
+        # Decision cadence matches ramp duration: spread CAN frames / 5 livePose ticks per decision
+        state['action_cadence_ticks'] = max(ACTION_CADENCE_MIN, int(round(spread_frames / 5)))
 
         # Speed-adaptive tolerance: 0.025 m lateral drift over 0.5 s horizon.
         # δ_tol = 2·M·L / (v·T)²  — scales 1/v², matches natural correction authority.
