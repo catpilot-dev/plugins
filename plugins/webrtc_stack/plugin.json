@@ -9,6 +9,11 @@
       "module": "factory",
       "function": "provide_session_class",
       "priority": 10
+    },
+    "device.health_check": {
+      "module": "factory",
+      "function": "on_health_check",
+      "priority": 50
     }
   }
 }
