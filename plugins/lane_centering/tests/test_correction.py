@@ -145,7 +145,7 @@ class TestEdgeCases:
     model1 = make_model(curvature=0.005, path_y=0.4, right_y=1.75, left_prob=0.2)
     lcc.update(model1, 15.0)
 
-    # Sudden right-lane jump of 0.75m → lane_center jump > MAX_JUMP (0.3m)
+    # Sudden right-lane jump of 0.75m → lane_center jump > max_jump (~0.33m at v=15)
     model2 = make_model(curvature=0.005, path_y=0.4, right_y=2.5, left_prob=0.2)
     lcc.update(model2, 15.0)
     assert lcc.active is False

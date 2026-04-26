@@ -51,7 +51,17 @@ class LaneCenteringCorrection:
   SMOOTH_TAU = 0.5         # seconds - correction smoothing
   WINDDOWN_TAU = 1.0       # seconds - slower wind-down when exiting turns
   MEASUREMENT_TAU = 0.2    # seconds - lane center measurement smoothing
-  MAX_JUMP = 0.3           # m - max lane center change per frame
+  # Speed-dependent MAX_JUMP for lane_center change rejection. At high speed
+  # perception noise at lookahead is bigger, AND any tracked change implies
+  # higher lateral acceleration if applied — so reject smaller jumps. At low
+  # speed allow bigger jumps since corrections are gentler. Linear between:
+  #   v ≤ 30 kph (8.33 m/s):  0.40 m  (more permissive)
+  #   v ≥ 120 kph (33.33 m/s): 0.15 m  (more conservative)
+  # Matches current fixed 0.30 m near v ≈ 65 kph (typical operating speed).
+  MAX_JUMP_LOW_V  = 0.40   # m at v_low
+  MAX_JUMP_HIGH_V = 0.15   # m at v_high
+  V_FOR_JUMP_LOW  = 30.0 / 3.6   # 8.33 m/s
+  V_FOR_JUMP_HIGH = 120.0 / 3.6  # 33.33 m/s
 
   # Lane width estimation — per China standard (GB 50647):
   #   highway / city expressway ≥60 km/h: 3.75 m
@@ -227,9 +237,12 @@ class LaneCenteringCorrection:
         else:
           lane_center = left_y + half_width
 
-    # Reject sudden lane center jumps
+    # Reject sudden lane center jumps — threshold tighter at high speed where
+    # noise is bigger and tracking would imply higher a_y.
+    t_jump = max(0.0, min(1.0, (v_ego - self.V_FOR_JUMP_LOW) / (self.V_FOR_JUMP_HIGH - self.V_FOR_JUMP_LOW)))
+    max_jump = self.MAX_JUMP_LOW_V + t_jump * (self.MAX_JUMP_HIGH_V - self.MAX_JUMP_LOW_V)
     if self.prev_lane_center is not None:
-      if abs(lane_center - self.prev_lane_center) > self.MAX_JUMP:
+      if abs(lane_center - self.prev_lane_center) > max_jump:
         self.active = False
         self.prev_lane_center = lane_center
         self.smoothed_lane_center = None
