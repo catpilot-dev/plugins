@@ -40,7 +40,18 @@ PYEOF
   echo "[c3_compat] Patched amplifier.py with tici config"
 fi
 
-# 1b. Cache directories: symlink ~/.cache/pip and ~/.cache/tinygrad to /data/
+# 1b. pycapnp: downgrade 2.2.2 → 2.1.0 to fix memory leak on C3
+#     pycapnp 2.2.2 leaks ~6MB/s in Event.new_message() (666k objects/10s).
+#     On C3 with 3.6GB RAM this causes OOM + panda SOM reset in ~60s on-road.
+#     pycapnp 2.1.0 (used by openpilot 0.10.3) does not have this leak.
+if python3 -c "import capnp; exit(0 if capnp.__version__ != '2.1.0' else 1)" 2>/dev/null; then
+  echo "[c3_compat] Downgrading pycapnp to 2.1.0 (memory leak fix)"
+  sudo mount -o remount,rw / 2>/dev/null
+  sudo /usr/local/venv/bin/pip install --quiet pycapnp==2.1.0 2>/dev/null && echo "[c3_compat] pycapnp downgraded to 2.1.0" || echo "[c3_compat] WARNING: pycapnp downgrade failed"
+  sudo mount -o remount,ro / 2>/dev/null
+fi
+
+# 1c. Cache directories: symlink ~/.cache/pip and ~/.cache/tinygrad to /data/
 #     /home is a 100MB overlay that fills up fast. tinygrad cache (model compilation)
 #     and pip cache (venv_sync) need to live on /data/ (16GB+ available).
 CACHE_DIR="/home/comma/.cache"
@@ -78,18 +89,7 @@ STUB
   echo "[c3_compat] Installed msgfmt stub to venv"
 fi
 
-# 2b. AGNOS-specific packages: not in uv.lock, needed by AGNOS system services
-#     kaitaistruct: used by AGNOS system daemons, not declared in openpilot's pyproject.toml
-for pkg in kaitaistruct; do
-  if ! /usr/local/venv/bin/python3 -c "import $pkg" 2>/dev/null; then
-    [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
-    sudo -E /usr/local/venv/bin/pip install --no-cache-dir "$pkg" -q 2>/dev/null || true
-    _venv_patched=1
-    echo "[c3_compat] Installed AGNOS shim: $pkg"
-  fi
-done
-
-# 2d. venv_sync: ensure venv matches deployed branch's uv.lock BEFORE launch.
+# 2b. venv_sync: ensure venv matches deployed branch's uv.lock BEFORE launch.
 #     Compares each package in uv.lock against what's installed in the venv.
 #     Installs anything missing or at wrong version. Fast path: if uv.lock hash
 #     matches cached .venv_synced_hash, skip entirely (<100ms).
@@ -97,7 +97,7 @@ done
 #     the code was deployed (COD update, manual git checkout, AGNOS reflash).
 VENV_SYNC="/data/plugins-runtime/c3_compat/venv_sync.py"
 if [ -f "$VENV_SYNC" ] && [ -f /data/openpilot/uv.lock ]; then
-  /usr/local/venv/bin/python3 "$VENV_SYNC" --runtime-only 2>&1 | while IFS= read -r line; do
+  /usr/local/venv/bin/python3 "$VENV_SYNC" --runtime-only --native-deps 2>&1 | while IFS= read -r line; do
     echo "[c3_compat] $line"
   done
 fi
@@ -105,7 +105,8 @@ fi
 # 2c. DRM raylib: AGNOS 12.8 venv has Wayland raylib, but C3 uses DRM backend
 #     Copy DRM-built raylib from plugin's raylib_drm/ into venv (overwrites Wayland version)
 RAYLIB_DRM="/data/plugins-runtime/c3_compat/raylib_drm"
-if [ -d "$RAYLIB_DRM/raylib" ] && ! /usr/local/venv/bin/python3 -c "import raylib" 2>&1 | grep -q 'DRM\|STATIC'; then
+_raylib_so="$VENV_SITE/raylib/_raylib_cffi.cpython-312-aarch64-linux-gnu.so"
+if [ -d "$RAYLIB_DRM/raylib" ] && ! nm -D "$_raylib_so" 2>/dev/null | grep -q 'gbm_create_device'; then
   [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
   sudo cp -rf "$RAYLIB_DRM/raylib/"* "$VENV_SITE/raylib/"
   _venv_patched=1
@@ -122,15 +123,6 @@ MULTILANG_FILE="$OPENPILOT_DIR/openpilot/system/ui/lib/multilang.py"
 if [ -f "$MULTILANG_FILE" ] && grep -q 'except FileNotFoundError' "$MULTILANG_FILE"; then
   sed -i 's/except FileNotFoundError:/except Exception:/' "$MULTILANG_FILE"
   echo "[c3_compat] Patched multilang.py to handle invalid .mo files"
-fi
-
-# 5a. UI FPS: set tici (C3) to 20 FPS like tizi (C3X)
-#     v0.10.3 dropped C3 from the FPS dict — defaults to 60 FPS, wasting ~15% CPU.
-#     C3's Snapdragon 845 GPU is fine at 20 FPS for the offroad UI.
-APP_FILE="$OPENPILOT_DIR/system/ui/lib/application.py"
-if [ -f "$APP_FILE" ] && grep -q "{'tizi': 20}" "$APP_FILE"; then
-  sed -i "s/{'tizi': 20}/{'tizi': 20, 'tici': 20}/" "$APP_FILE"
-  echo "[c3_compat] Patched UI FPS: tici → 20 FPS (was defaulting to 60)"
 fi
 
 # 5. Display: DRM backend (no Weston compositor)
@@ -160,6 +152,35 @@ WESTONEOF
   sudo systemctl enable weston-ready 2>/dev/null || true
   sudo mount -o remount,ro / 2>/dev/null || true
   echo "[c3_compat] Installed weston-ready stub (eliminates 28s boot delay)"
+fi
+
+# 5b. commaai/dependencies stubs: v0.11.0 SConstruct imports pkg modules
+#     (bzip2, capnproto, eigen, ...) that are only pre-installed on AGNOS 16+.
+#     On AGNOS 12.8 we stub them to return system library paths so scons can parse.
+#     /data/pip_packages is on PYTHONPATH (set in step 6) and persists across reboots.
+if [ ! -f /data/pip_packages/bzip2.py ]; then
+  mkdir -p /data/pip_packages
+  for pkg_spec in \
+    "bzip2:/usr/include:/usr/lib/aarch64-linux-gnu" \
+    "capnproto:/usr/local/include:/usr/local/lib" \
+    "eigen:/usr/include/eigen3:/usr/local/lib" \
+    "ffmpeg:/usr/local/include:/usr/local/lib" \
+    "libjpeg:/usr/include:/usr/lib/aarch64-linux-gnu" \
+    "libyuv:/usr/include:/usr/lib/aarch64-linux-gnu" \
+    "ncurses:/usr/include:/usr/lib/aarch64-linux-gnu" \
+    "zeromq:/usr/include:/usr/lib/aarch64-linux-gnu" \
+    "zstd:/usr/include:/usr/lib/aarch64-linux-gnu"; do
+    name="${pkg_spec%%:*}"
+    rest="${pkg_spec#*:}"
+    inc="${rest%%:*}"
+    lib="${rest#*:}"
+    cat > "/data/pip_packages/${name}.py" << STUBEOF
+# c3_compat: commaai/dependencies stub for AGNOS 12.8
+INCLUDE_DIR = '${inc}'
+LIB_DIR = '${lib}'
+STUBEOF
+  done
+  echo "[c3_compat] Created commaai/dependencies stubs in /data/pip_packages"
 fi
 
 # 6. PATH + PYTHONPATH: make venv tools and packages visible to scons
@@ -217,7 +238,7 @@ fi
 #    C3 has HW_TYPE_DOS (0x06) with STM32F4 MCU
 PANDA_INIT="$OPENPILOT_DIR/panda/python/__init__.py"
 PANDA_CONST="$OPENPILOT_DIR/panda/python/constants.py"
-if [ -f "$PANDA_INIT" ] && ! grep -q 'HW_TYPE_DOS' "$PANDA_INIT"; then
+if [ -f "$PANDA_INIT" ] && ! grep -q "HW_TYPE_DOS = b'" "$PANDA_INIT"; then
   python3 - "$PANDA_INIT" "$PANDA_CONST" << 'PYEOF'
 import sys
 init_path, const_path = sys.argv[1], sys.argv[2]
@@ -254,11 +275,12 @@ F4Config = McuConfig(
 with open(init_path) as f:
     init = f.read()
 
-# Add HW_TYPE_DOS after HW_TYPE_BLACK
-init = init.replace(
-    "HW_TYPE_BLACK = b'\\x03'\n",
-    "HW_TYPE_BLACK = b'\\x03'\n  HW_TYPE_DOS = b'\\x06'  # C3 internal panda (STM32F4)\n"
-)
+# Add HW_TYPE_DOS after HW_TYPE_BODY (HW_TYPE_BLACK removed in panda v0.11.0)
+if "HW_TYPE_DOS = b'" not in init:
+    init = init.replace(
+        "HW_TYPE_BODY = b'\\xb1'\n",
+        "HW_TYPE_BODY = b'\\xb1'\n  HW_TYPE_DOS = b'\\x06'  # C3 internal panda (STM32F4)\n"
+    )
 
 # Add F4 devices list and extend SUPPORTED_DEVICES
 init = init.replace(
@@ -272,11 +294,27 @@ init = init.replace(
     'INTERNAL_DEVICES = (HW_TYPE_TRES, HW_TYPE_CUATRO, HW_TYPE_DOS)'
 )
 
-# Patch get_mcu_type to handle F4
-init = init.replace(
-    '  def get_mcu_type(self) -> McuType:\n    hw_type = self.get_type()\n    if hw_type in Panda.H7_DEVICES:\n      return McuType.H7\n    raise ValueError(f"unknown HW type: {hw_type}")',
-    '  def get_mcu_type(self) -> McuType:\n    hw_type = self.get_type()\n    if hw_type in Panda.H7_DEVICES:\n      return McuType.H7\n    if hw_type in Panda.F4_DEVICES:\n      return McuType.F4\n    raise ValueError(f"unknown HW type: {hw_type}")'
-)
+# Patch or add get_mcu_type to handle F4
+# Upstream v0.11.0 removed get_mcu_type (dropped F4) — add it back if missing
+if 'def get_mcu_type' in init:
+    init = init.replace(
+        '  def get_mcu_type(self) -> McuType:\n    hw_type = self.get_type()\n    if hw_type in Panda.H7_DEVICES:\n      return McuType.H7\n    raise ValueError(f"unknown HW type: {hw_type}")',
+        '  def get_mcu_type(self) -> McuType:\n    hw_type = self.get_type()\n    if hw_type in Panda.H7_DEVICES:\n      return McuType.H7\n    if hw_type in Panda.F4_DEVICES:\n      return McuType.F4\n    raise ValueError(f"unknown HW type: {hw_type}")'
+    )
+else:
+    # Method doesn't exist — inject after SUPPORTED_DEVICES
+    init = init.replace(
+        '  SUPPORTED_DEVICES = H7_DEVICES + F4_DEVICES',
+        '  SUPPORTED_DEVICES = H7_DEVICES + F4_DEVICES\n\n'
+        '  def get_mcu_type(self):\n'
+        '    from panda.python.constants import McuType\n'
+        '    hw_type = self.get_type()\n'
+        '    if hw_type in Panda.H7_DEVICES:\n'
+        '      return McuType.H7\n'
+        '    if hw_type in Panda.F4_DEVICES:\n'
+        '      return McuType.F4\n'
+        '    raise ValueError(f"unknown HW type: {hw_type}")'
+    )
 
 with open(init_path, 'w') as f:
     f.write(init)
@@ -284,11 +322,33 @@ PYEOF
   echo "[c3_compat] Patched panda library with STM32F4 (Dos board) support"
 fi
 
+# 8a. Panda: health() struct padding for F4 panda
+#     F4 firmware v16 sends 58-byte health packets; library v18 expects 59.
+#     Pad with zero bytes so unpack() succeeds (new field defaults to 0).
+if [ -f "$PANDA_INIT" ] && ! grep -q 'c3_compat: F4 firmware may send fewer bytes' "$PANDA_INIT"; then
+  python3 - "$PANDA_INIT" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+old = ('    dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, self.HEALTH_STRUCT.size)\n'
+       '    a = self.HEALTH_STRUCT.unpack(dat)')
+new = ('    dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, self.HEALTH_STRUCT.size)\n'
+       '    # c3_compat: F4 firmware may send fewer bytes (older struct layout), pad to match\n'
+       '    if len(dat) < self.HEALTH_STRUCT.size:\n'
+       '      dat = dat + bytes(self.HEALTH_STRUCT.size - len(dat))\n'
+       '    a = self.HEALTH_STRUCT.unpack(dat)')
+if old in content:
+    content = content.replace(old, new, 1)
+    with open(path, 'w') as f:
+        f.write(content)
+PYEOF
+  echo "[c3_compat] Patched panda health() to pad F4 short packets"
+fi
+
 # 8b. Panda: skip packet version checks for F4 panda
-#     F4 firmware is v16 but the v0.10.3 library expects v17 for health,
-#     v5 for CAN health, etc. The struct layouts are compatible — only the
-#     version counter changed. Without this patch pandad crash-loops calling
-#     health() and eventually hangs the device.
+#     F4 firmware is v16 but the v0.11.0 library expects v18 for health.
+#     Directly inject the final version with get_mcu_type() call + try/except.
 if [ -f "$PANDA_INIT" ] && ! grep -q 'c3_compat.*version' "$PANDA_INIT"; then
   python3 - "$PANDA_INIT" << 'PYEOF'
 import sys
@@ -296,7 +356,6 @@ path = sys.argv[1]
 with open(path) as f:
     content = f.read()
 
-# Patch ensure_version to skip check for F4 devices
 old_ensure = '''def ensure_version(desc, lib_field, panda_field, fn):
   @wraps(fn)
   def wrapper(self, *args, **kwargs):
@@ -310,10 +369,13 @@ old_ensure = '''def ensure_version(desc, lib_field, panda_field, fn):
 new_ensure = '''def ensure_version(desc, lib_field, panda_field, fn):
   @wraps(fn)
   def wrapper(self, *args, **kwargs):
-    # c3_compat: skip version check for F4 panda (firmware v16, library v17)
+    # c3_compat: skip version check for F4 panda (firmware v16, library v18)
     from panda.python.constants import McuType
-    if getattr(self, '_mcu_type', None) == McuType.F4:
-      return fn(self, *args, **kwargs)
+    try:
+      if self.get_mcu_type() == McuType.F4:
+        return fn(self, *args, **kwargs)
+    except Exception:
+      pass
     lib_version = getattr(self, lib_field)
     panda_version = getattr(self, panda_field)
     if lib_version != panda_version:
@@ -359,6 +421,7 @@ new_sig = '''  # c3_compat: skip firmware flashing for F4 panda (BMW plugin hand
   from panda.python.constants import McuType
   if panda.get_mcu_type() == McuType.F4:
     cloudlog.warning("c3_compat: F4 panda detected, skipping firmware flash")
+    panda._mcu_type = McuType.F4  # c3_compat: cache for ensure_version skip
     return panda
   if panda.bootstub or panda_signature != fw_signature:
     cloudlog.info("Panda firmware out of date, update required")
@@ -371,18 +434,18 @@ if old_sig in content:
 # panda.reset(reconnect=True) disconnects USB then tries reconnect() which calls
 # connect(wait=True) — this creates an infinite loop if F4 panda is slow to
 # re-enumerate over USB after a soft reset (0xd8 control transfer).
-old_reset = '''        if first_run:
-          # reset panda to ensure we're in a good state
+old_reset = '''      if first_run:
+        # reset panda to ensure we're in a good state
+        cloudlog.info(f"Resetting panda {panda.get_usb_serial()}")
+        panda.reset(reconnect=True)'''
+new_reset = '''      if first_run:
+        # c3_compat: skip reset for F4 panda (USB reconnect hangs with STM32F4)
+        from panda.python.constants import McuType
+        if panda.get_mcu_type() != McuType.F4:
           cloudlog.info(f"Resetting panda {panda.get_usb_serial()}")
-          panda.reset(reconnect=True)'''
-new_reset = '''        if first_run:
-          # c3_compat: skip reset for F4 panda (USB reconnect hangs with STM32F4)
-          from panda.python.constants import McuType
-          if panda.get_mcu_type() != McuType.F4:
-            cloudlog.info(f"Resetting panda {panda.get_usb_serial()}")
-            panda.reset(reconnect=True)
-          else:
-            cloudlog.info("c3_compat: skipping reset for F4 panda %s", panda.get_usb_serial())'''
+          panda.reset(reconnect=True)
+        else:
+          cloudlog.info("c3_compat: skipping reset for F4 panda %s", panda.get_usb_serial())'''
 if old_reset in content:
     content = content.replace(old_reset, new_reset)
 
@@ -394,7 +457,7 @@ old_launch = '''    first_run = False
 
     # run pandad with all connected serials as arguments
     os.environ['MANAGER_DAEMON'] = 'pandad'
-    process = subprocess.Popen(["./pandad", *panda_serials], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
+    process = subprocess.Popen(["./pandad", panda_serial], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
     process.wait()'''
 new_launch = '''    first_run = False
 
@@ -405,10 +468,10 @@ new_launch = '''    first_run = False
     os.environ['MANAGER_DAEMON'] = 'pandad'
     # c3_compat: skip C++ firmware check for F4 panda
     os.environ["BOARDD_SKIP_FW_CHECK"] = "1"
-    process = subprocess.Popen(["./pandad", *panda_serials], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
+    process = subprocess.Popen(["./pandad", panda_serial], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
     process.wait()
 
-    # c3_compat: crash backoff for F4 panda SPI incompatibility
+    # c3_compat: crash backoff for pandad crashes
     if process.returncode != 0:
       if not hasattr(main, '_crash_count'):
         main._crash_count = 0
@@ -427,7 +490,6 @@ with open(path, 'w') as f:
 PYEOF
   echo "[c3_compat] Patched pandad.py to skip F4 firmware flashing"
 fi
-
 # 10. SPI: disable for C3 (F4 panda) to force native pandad USB-only mode
 #     v0.10.3's native pandad SPI protocol is incompatible with STM32F4.
 #     Without this, native pandad crash-loops on SPI → SIGABRT → Python wrapper
@@ -501,85 +563,39 @@ fi
 #     Stale .pyc files cause patches to be ignored until cache expires.
 find "$OPENPILOT_DIR/panda/python" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
-# 14. Persistent crash diagnostics
-#     AGNOS 12.8 uses volatile journal (/var/log is 128MB tmpfs) — all evidence
-#     is lost on hang/reboot. Capture dmesg + system state to /data/ on each boot
-#     so we can inspect the previous boot's final moments after a crash.
-DIAG_DIR="/data/crash_diag"
-mkdir -p "$DIAG_DIR"
-
-# Rotate previous boot's dmesg before overwriting
-# Keep last 3 boots: dmesg_boot1.log (prev), dmesg_boot2.log, dmesg_boot3.log
-for i in 2 1; do
-  [ -f "$DIAG_DIR/dmesg_boot${i}.log" ] && mv -f "$DIAG_DIR/dmesg_boot${i}.log" "$DIAG_DIR/dmesg_boot$((i+1)).log"
-done
-[ -f "$DIAG_DIR/dmesg_current.log" ] && mv -f "$DIAG_DIR/dmesg_current.log" "$DIAG_DIR/dmesg_boot1.log"
-
-# Save THIS boot's dmesg ring buffer (kernel panics, OOM kills,
-# USB disconnects, watchdog triggers, thermal shutdowns)
-dmesg -T > "$DIAG_DIR/dmesg_current.log" 2>/dev/null || dmesg > "$DIAG_DIR/dmesg_current.log"
-
-# Snapshot system state at boot time (baseline for comparison if hang occurs)
-{
-  echo "=== Boot $(date '+%Y-%m-%d %H:%M:%S') ==="
-  echo "--- uptime ---"
-  uptime
-  echo "--- memory ---"
-  free -m
-  echo "--- panda USB ---"
-  lsusb 2>/dev/null | grep -i 'panda\|1209\|bbaa\|3801' || echo "no panda USB device found"
-  echo "--- thermal ---"
-  cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -10
-  echo "--- processes ---"
-  ps aux --sort=-%mem | head -15
-  echo "--- disk ---"
-  df -h /data
-} > "$DIAG_DIR/boot_state.log" 2>/dev/null
-
-# Background watchdog: periodically save system vitals to catch state before hang
-# Uses setsid to create a new session — survives the exec in continue.sh
-WATCHDOG="/data/plugins-runtime/c3_compat/watchdog.sh"
-if [ -f "$WATCHDOG" ]; then
-  # Kill any stale watchdog from previous boot
-  pkill -f "watchdog.sh" 2>/dev/null || true
-  setsid "$WATCHDOG" &
-  echo "[c3_compat] Crash diagnostics enabled (logs in $DIAG_DIR)"
-fi
-
-# On next boot after a hang, check these files:
-#   /data/crash_diag/dmesg_boot1.log  — previous boot's kernel log
-#   /data/crash_diag/vitals.log       — last system state before hang
-#   /data/crash_diag/boot_state.log   — current boot baseline
-
-# 15. MSGQ: replace fatal asserts in msgq_msg_recv with reader reset
-#     When the ring buffer writer overtakes the reader, corrupted size fields
-#     trigger assert() → SIGABRT. Reset reader to catch up instead of crashing.
-MSGQ_CC="$OPENPILOT_DIR/msgq/msgq.cc"
-if [ -f "$MSGQ_CC" ] && grep -q 'assert((uint64_t)size < q->size)' "$MSGQ_CC"; then
-  python3 - "$MSGQ_CC" << 'PYEOF'
+# 14. Hardwared: guard eSIM prime block against AT command failure
+#     AGNOS 12.8 modem fails AT+CCHO (ISD-R open) with Unknown error.
+#     configure_modem() crashes hardwared which blocks onroad/offroad transitions.
+#     Wrap the get_sim_lpa() call in a try/except so modem init succeeds.
+HW_FILE="$OPENPILOT_DIR/openpilot/system/hardware/tici/hardware.py"
+if [ -f "$HW_FILE" ] && ! grep -q 'c3_compat.*lpa' "$HW_FILE"; then
+  python3 - "$HW_FILE" << 'PYEOF'
 import sys
 path = sys.argv[1]
 with open(path) as f:
     content = f.read()
 
-old_asserts = '''  // crashing is better than passing garbage data to the consumer
-  // the size will have weird value if it was overwritten by data accidentally
-  assert((uint64_t)size < q->size);
-  assert(size > 0);'''
+old = '''    # eSIM prime
+    dest = "/etc/NetworkManager/system-connections/esim.nmconnection"
+    if self.get_sim_lpa().is_comma_profile(sim_id) and not os.path.exists(dest):'''
 
-new_check = '''  // If size is invalid, the writer has overwritten this message's header.
-  // Reset reader to catch up with the writer instead of crashing.
-  if (size <= 0 || (uint64_t)size >= q->size) {
-    msgq_reset_reader(q);
-    goto start;
-  }'''
+new = '''    # eSIM prime
+    dest = "/etc/NetworkManager/system-connections/esim.nmconnection"
+    try:
+      _esim_check = self.get_sim_lpa().is_comma_profile(sim_id)  # c3_compat: AT+CCHO fails on AGNOS 12.8
+    except Exception:
+      _esim_check = False
+    if _esim_check and not os.path.exists(dest):'''
 
-if old_asserts in content:
-    content = content.replace(old_asserts, new_check)
+if old in content:
+    content = content.replace(old, new, 1)
     with open(path, 'w') as f:
         f.write(content)
+    print("OK")
+else:
+    print("SKIP: pattern not found")
 PYEOF
-  echo "[c3_compat] Patched msgq.cc: ring buffer overflow asserts → reader reset"
+  echo "[c3_compat] Patched hardware.py: guarded eSIM prime against AT command failure"
 fi
 
 echo "[c3_compat] Boot patches applied successfully"

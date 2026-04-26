@@ -62,19 +62,36 @@ class TestGetDeviceType:
 
 
 class TestHealthCheck:
-  def test_basic_health_check_no_params(self, compat):
+  def _call(self, compat, acc=None):
+    """Helper: call on_health_check with empty accumulator (SubMaster mocked to fail)."""
+    if acc is None:
+      acc = {}
+    # SubMaster will raise on update — health check falls back to warnings
+    return compat.on_health_check(acc)
+
+  def test_result_nested_under_plugin_key(self, compat):
     with patch.object(compat, 'get_device_type', return_value='tici'), \
          patch.object(compat, 'get_agnos_version', return_value='12.8.1'):
-      result = compat.on_health_check(params=None)
+      result = self._call(compat)
 
-    assert result['plugin'] == 'c3-compat'
-    assert result['agnos_version'] == '12.8.1'
-    assert result['device_type'] == 'tici'
-    assert result['status'] == 'ok'
-    assert result['warnings'] == []
+    assert 'c3-compat' in result
+    entry = result['c3-compat']
+    assert entry['agnos_version'] == '12.8.1'
+    assert entry['device_type'] == 'tici'
+    assert entry['status'] in ('ok', 'warning')  # warning acceptable if pandaStates unavailable
+
+  def test_accumulator_preserved(self, compat):
+    """Other plugins' prior results must be passed through unchanged."""
+    with patch.object(compat, 'get_device_type', return_value='tici'), \
+         patch.object(compat, 'get_agnos_version', return_value='12.8.1'):
+      result = self._call(compat, acc={'other-plugin': {'status': 'ok'}})
+
+    assert 'other-plugin' in result
+    assert result['other-plugin'] == {'status': 'ok'}
+    assert 'c3-compat' in result
 
   def test_unknown_device_still_ok(self, compat):
     with patch.object(compat, 'get_device_type', return_value='unknown'), \
          patch.object(compat, 'get_agnos_version', return_value='unknown'):
-      result = compat.on_health_check(params=None)
-    assert result['status'] == 'ok'
+      result = self._call(compat)
+    assert result['c3-compat']['status'] in ('ok', 'warning')
