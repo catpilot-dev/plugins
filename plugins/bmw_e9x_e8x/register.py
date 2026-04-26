@@ -247,16 +247,13 @@ def on_lat_controller_init(result, lac, CP):
   # Feedback deadzone: engage only when δ_err would cause ≥ drift_tol_m
   # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
   #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · drift_m · L / (v·T)²
-  # Speed-dependent drift_m, same principle as lane_centering threshold:
-  # perception noise projects larger at the lookahead point (v·T) at higher
-  # speeds, so the no-action zone widens with speed.
-  #   drift_m(v) = DRIFT_BASE_M + DRIFT_SLOPE · (v · DRIFT_EVAL_HORIZON_S)
-  # Base 0.025 m keeps low-speed behavior; slope 0.002 m/m gives 2× wider
-  # tolerance at 25 m/s vs the old fixed 0.025 m.
-  # Upstream lane_centering uses hysteresis band ≥ 4× our tolerance for clean
-  # layer hand-off — both layers scale with lookahead, so the ratio is stable.
-  DRIFT_BASE_M = 0.025
-  DRIFT_SLOPE = 0.002    # m per m of lookahead (speed-growth noise floor)
+  # drift_m DECREASES with speed: at low v allow larger drift (comfort,
+  # corrections take longer to be felt); at high v tighten drift (precision,
+  # any error matters more because v² scales the felt impact).
+  # Combined with the 1/v² factor in tolerance, both effects compound:
+  # tolerance shrinks faster with v than the +slope variant did.
+  DRIFT_LOW_V_M  = 0.040  # m at v ≤ 30 kph (8.33 m/s) — permissive
+  DRIFT_HIGH_V_M = 0.020  # m at v ≥ 120 kph (33.33 m/s) — tighter
   DRIFT_EVAL_HORIZON_S = 0.5
 
   # Breakaway torque fraction (rack stiction floor). Sub-friction commands
@@ -280,7 +277,8 @@ def on_lat_controller_init(result, lac, CP):
     'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
     'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
     'step_per_frame': T_CAP_BASE_NM / CCP.STEER_MAX / 25,  # per-frame drain rate (set per decision)
-    'check_err_0': 0.0,        # δ_err at last decision (for 100/150/200 ms abort check)
+    'check_err_0': 0.0,        # δ_err at last decision (for mid-cycle abort check)
+    'check_tolerance': 0.0,    # tolerance at last decision (buffer-based abort threshold)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
   }
@@ -310,17 +308,18 @@ def on_lat_controller_init(result, lac, CP):
 
       state['tick_count'] += 1
 
-      # Mid-cycle abort at 100/150/200 ms: if |δ_err| has narrowed to below
-      # 50 % of the value at decision time, the plant is already closing the
-      # error. Stop ramping and let the already-applied torque + plant
-      # momentum finish the job. Prevents over-correction on small δ_err
-      # where the full ramp would over-respond.
-      # Nominal first-order plant (τ=100 ms, ramp-hold input) closes by
-      # 15/30/47 % at the 100/150/200 ms checkpoints — the 50 % threshold
-      # fires when plant responds at or slightly above nominal.
-      # Only for 'ramp' action; 'hold_zero'/'breakaway' use other paths.
-      if state['tick_count'] in (2, 3, 4) and state['action'] == 'ramp':
-        if abs(delta_err) < 0.5 * abs(state['check_err_0']):
+      # Mid-cycle abort at 100 ms and 200 ms: cancel ramp if δ_err has both
+      # decreased from decision time AND fallen below the more permissive of:
+      #   - 50 % of decision-time error (catches "halved on big errors")
+      #   - 1.2 × decision-time tolerance (catches "near deadband on small errors")
+      # Direction guard (decreased) prevents false cancels on errors that
+      # happen to be momentarily small but growing back into trouble.
+      # Only for 'ramp' action; 'hold_zero'/'breakaway' have other paths.
+      if state['tick_count'] in (2, 4) and state['action'] == 'ramp':
+        cancel_threshold = max(0.5 * abs(state['check_err_0']),
+                               1.2 * state['check_tolerance'])
+        decreased = abs(delta_err) < abs(state['check_err_0'])
+        if decreased and abs(delta_err) < cancel_threshold:
           state['step_remaining'] = 0.0
           state['action'] = 'cancel_narrowed'
 
@@ -336,7 +335,9 @@ def on_lat_controller_init(result, lac, CP):
         # Speed-adaptive tolerance: 0.025 m lateral drift over 0.5 s horizon.
         # δ_tol = 2·M·L / (v·T)²  — scales 1/v², matches natural correction authority.
         lookahead_m = v * DRIFT_EVAL_HORIZON_S
-        drift_m = DRIFT_BASE_M + DRIFT_SLOPE * lookahead_m
+        # drift_m linearly interpolated between low-v (permissive) and high-v (tighter)
+        drift_t = max(0.0, min(1.0, (v - V_FOR_SPREAD_MIN) / (V_FOR_SPREAD_MAX - V_FOR_SPREAD_MIN)))
+        drift_m = DRIFT_LOW_V_M + drift_t * (DRIFT_HIGH_V_M - DRIFT_LOW_V_M)
         tolerance = 2.0 * drift_m * L / (lookahead_m ** 2)
 
         # Plant-inversion target torque in angle domain. τ needed to move δ
@@ -373,6 +374,7 @@ def on_lat_controller_init(result, lac, CP):
         state['target_frac'] = target_frac
         # Record δ_err at decision for 100/150/200 ms mid-cycle abort check.
         state['check_err_0'] = delta_err
+        state['check_tolerance'] = tolerance
 
         # Breakaway sign-flip fast ramp: the normal drain would crawl from
         # ±friction through zero to ∓friction at the per-frame step rate,
