@@ -1,6 +1,3 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import numpy as np
 from config import read_plugin_param
 from openpilot.common.realtime import DT_MDL
@@ -23,25 +20,49 @@ class LaneCenteringCorrection:
     correction = lcc.update(model_v2, v_ego)
   """
 
-  # Curvature-dependent K: sharper turns need stronger correction
-  K_BP = [0.002, 0.005, 0.008, 0.012, 0.020]  # Curvature breakpoints (1/m)
-  K_V = [0.03, 0.35, 0.40, 0.50, 0.65]         # Corresponding K values
+  # Curvature-dependent K: sharper turns need stronger correction. Extended
+  # to curvature=0 (straights) so the correction engages whenever lateral
+  # offset exceeds threshold, not only in curves.
+  K_BP = [0.000, 0.002, 0.005, 0.008, 0.012, 0.020]  # Curvature breakpoints (1/m)
+  K_V  = [0.150, 0.150, 0.350, 0.400, 0.500, 0.650]   # K for straight matches gentle curves (~2s closure)
 
-  MIN_PROB = 0.5           # Minimum lane detection confidence
+  # Curvature-adaptive confidence threshold. In tight turns the outside lane
+  # line drops out of camera FOV, so requiring ≥ 0.5 confidence gates out
+  # legitimate inside-line tracking. Step down to a relaxed threshold when
+  # turning so we can still use whichever lane is visible as inside reference.
+  #   MIN_PROB(κ) = MIN_PROB_STRAIGHT if |κ| < CURV_TURN_THRESHOLD else MIN_PROB_TURN
+  MIN_PROB_STRAIGHT     = 0.5    # full noise filtering on straights
+  MIN_PROB_TURN         = 0.3    # relaxed when turning (allow inside-only mode)
+  CURV_TURN_THRESHOLD   = 0.01   # |κ| ≥ this (radius ≤ 100 m) → "in a turn"
   MIN_SPEED = 9.0          # m/s - disable at low speed
-  MIN_CURVATURE = 0.002    # 1/m (~500m radius) - activate correction
-  EXIT_CURVATURE = 0.001   # 1/m (~1000m radius) - deactivate on straight road
-  OFFSET_THRESHOLD = 0.3   # m - activate when offset exceeds this
-  OFFSET_TOLERANCE = 0.15  # m - deactivate when offset within tolerance
+  # Speed-dependent hysteresis. Offset is sampled at delay_dist = v·MODEL_LAT_ACTION_T
+  # ahead of the car, so small angular errors in the model's path prediction
+  # project geometrically larger at high speed (1° of yaw error → 29 cm offset
+  # at 120 kph). Fixed 0.2 m threshold triggers on noise at highway; relax it
+  # linearly with lookahead distance.
+  #   OFFSET_THRESHOLD(v) = BASE_THRESHOLD + SLOPE · (v · MODEL_LAT_ACTION_T)
+  #   OFFSET_TOLERANCE(v) = OFFSET_THRESHOLD(v) / 2       (keep 2:1 hysteresis)
+  # Sizing preserves urban behavior: at v≈10 m/s → 0.20 m threshold (matches
+  # prior fixed value); at 120 kph → 0.32 m. Hysteresis band (THRESHOLD −
+  # TOLERANCE) stays ≥ 4× the BMW controller's 0.025 m δ-drift tolerance for
+  # clean layer hand-off.
+  OFFSET_BASE_THRESHOLD = 0.15   # m - threshold at v=0
+  OFFSET_THRESHOLD_SLOPE = 0.01  # m per m of lookahead — speed-growth term
   SMOOTH_TAU = 0.5         # seconds - correction smoothing
   WINDDOWN_TAU = 1.0       # seconds - slower wind-down when exiting turns
   MEASUREMENT_TAU = 0.2    # seconds - lane center measurement smoothing
   MAX_JUMP = 0.3           # m - max lane center change per frame
 
-  # Lane width estimation
-  LANE_WIDTH_DEFAULT = 3.5   # m - fallback (standard in China)
-  LANE_WIDTH_MIN = 2.5       # m - minimum valid for estimation
-  LANE_WIDTH_MAX = 4.5       # m - maximum valid for estimation
+  # Lane width estimation — per China standard (GB 50647):
+  #   highway / city expressway ≥60 km/h: 3.75 m
+  #   city general / mixed:               3.25–3.5 m
+  #   intersection:                       2.8–3.5 m
+  #   toll / narrow:                      2.5 m
+  # Accept measurements in [MIN=2.5, MAX=3.75]. Outside this range, fall back
+  # to DEFAULT (3.5, a reasonable middle for mixed city driving).
+  LANE_WIDTH_DEFAULT = 3.5   # m - fallback when measurement out of range
+  LANE_WIDTH_MIN = 2.5       # m - toll / narrow lane lower bound
+  LANE_WIDTH_MAX = 3.75      # m - highway upper bound (China GB standard)
   LANE_WIDTH_SMOOTH_TAU = 2.0  # seconds - width estimation smoothing
 
   # latcontrol_torque kP curve — used to normalize our correction
@@ -55,6 +76,22 @@ class LaneCenteringCorrection:
 
   # Derivative damping — reduce correction when offset is improving
   KD = 0.5  # damping factor on offset rate of change
+
+  # Sample the offset at modelV2's planning horizon (lat_action_t) — this is
+  # where desired_curvature is evaluated, so reading offset at the same
+  # lookahead makes our correction intrinsically consistent with what it
+  # modifies. Fixed 0.5s matches modelV2.action_t; removes dependency on
+  # the separately-learned liveDelay service.
+  MODEL_LAT_ACTION_T = 0.5
+
+  # Reference-frame shift: model uses CAR_ROTATION_RADIUS=0 (rear axle), but
+  # in turns the front swings outside and the rear cuts inside while the CG
+  # follows the path the driver perceives. Sample lane offset at delay_dist
+  # + CG_OFFSET so the measurement approximates CG perspective. On straights
+  # this is a no-op (rear and CG sit on the same line); in turns the shift
+  # captures the geometric outside-swing of the body. CG_OFFSET ≈ rear-axle
+  # to CG distance, ~1.4 m for a typical mid-size sedan.
+  CG_OFFSET = 1.4
 
   def __init__(self):
     self.prev_correction = 0.0
@@ -86,9 +123,15 @@ class LaneCenteringCorrection:
 
     right_prob = model_v2.laneLineProbs[2]
     left_prob = model_v2.laneLineProbs[1]
+    curvature = model_v2.action.desiredCurvature
 
-    # Need at least one lane with good confidence
-    if right_prob < self.MIN_PROB and left_prob < self.MIN_PROB:
+    # Curvature-adaptive minimum confidence: relax in turns where the outside
+    # lane line drops out of FOV. Keep MIN_PROB_STRAIGHT for lane-width learning
+    # so the width estimate isn't polluted by low-confidence detections.
+    min_prob = self.MIN_PROB_STRAIGHT if abs(curvature) < self.CURV_TURN_THRESHOLD else self.MIN_PROB_TURN
+
+    # Need at least one lane with adaptive confidence
+    if right_prob < min_prob and left_prob < min_prob:
       self._reset_lane_tracking()
       return self._smooth_correction(0.0, winding_down=True)
 
@@ -103,16 +146,25 @@ class LaneCenteringCorrection:
       self._reset_lane_tracking()
       return self._smooth_correction(0.0, winding_down=True)
 
-    curvature = model_v2.action.desiredCurvature
-    path_y = model_v2.position.y[0]
-    right_y = model_v2.laneLines[2].y[0]
-    left_y = model_v2.laneLines[1].y[0]
+    # Read lane positions at modelV2.action_t lookahead, shifted by CG_OFFSET
+    # so the offset is measured at CG perspective rather than rear axle.
+    delay_dist = v_ego * self.MODEL_LAT_ACTION_T + self.CG_OFFSET
+    X_IDXS = [192.0 * (i / 32) ** 2 for i in range(33)]
+    idx = min(range(len(X_IDXS)), key=lambda i: abs(X_IDXS[i] - delay_dist))
+    idx = min(idx, len(model_v2.position.y) - 1, len(model_v2.laneLines[1].y) - 1, len(model_v2.laneLines[2].y) - 1)
+
+    path_y = model_v2.position.y[idx]
+    right_y = model_v2.laneLines[2].y[idx]
+    left_y = model_v2.laneLines[1].y[idx]
 
     # Dynamic lane width estimation when both lanes are confident.
     # When measured width is out of valid range (e.g. > 4.5m due to turn
-    # projection distortion), fall back to standard width immediately rather
-    # than using a stale smoothed estimate.
-    if right_prob >= self.MIN_PROB and left_prob >= self.MIN_PROB:
+    # projection distortion or merge ramp pulling the lane lines apart),
+    # fall back to standard width AND flag the measurement as anomalous so
+    # the lane-center selection below knows the raw lane line positions
+    # are unreliable.
+    width_anomalous = False
+    if right_prob >= self.MIN_PROB_STRAIGHT and left_prob >= self.MIN_PROB_STRAIGHT:
       measured_width = right_y - left_y
       if self.LANE_WIDTH_MIN <= measured_width <= self.LANE_WIDTH_MAX:
         if self.estimated_lane_width is None:
@@ -122,18 +174,57 @@ class LaneCenteringCorrection:
         lane_width = self.estimated_lane_width
       else:
         lane_width = self.LANE_WIDTH_DEFAULT
+        width_anomalous = True
     else:
       lane_width = self.estimated_lane_width if self.estimated_lane_width is not None else self.LANE_WIDTH_DEFAULT
     half_width = lane_width / 2
 
-    # Use higher confidence lane to estimate center
-    if right_prob >= left_prob and right_prob >= self.MIN_PROB:
-      lane_center = right_y - half_width
-    elif left_prob >= self.MIN_PROB:
-      lane_center = left_y + half_width
+    # Publish lane width unconditionally — speedlimitd fuses it as road-type
+    # context (3.75 → highway, 3.25 → city general, 2.5 → toll/narrow) so it
+    # must be available whenever we have a measurement, not only when the
+    # correction itself is active.
+    self.diag['lane_width'] = round(lane_width, 2)
+    self.diag['lane_width_learned'] = self.estimated_lane_width is not None
+
+    # Lane-center reference selection.
+    # Width-anomaly override: if measured lane width was outside valid range
+    # (likely merge ramp / split / model confusion), the raw lane-line y
+    # positions can't be trusted to define the ego lane.
+    #   With history: freeze lane_center to last good smoothed value.
+    #   Without history: trust the model's path prediction — assume the car
+    #     is on its planned path → lane_center = path_y → offset = 0. Seeds
+    #     smoothed_lane_center for the next frame.
+    if width_anomalous:
+      lane_center = self.smoothed_lane_center if self.smoothed_lane_center is not None else path_y
     else:
-      self.active = False
-      return self._smooth_correction(0.0, winding_down=True)
+      # Straights / gentle curves (|κ| < CURV_TURN_THRESHOLD): use closest lane.
+      # Tight turns (|κ| ≥ CURV_TURN_THRESHOLD): prefer INSIDE lane line —
+      # outside curves out of FOV, inside stays sharper.
+      right_ok = right_prob >= min_prob
+      left_ok  = left_prob  >= min_prob
+      if not right_ok and not left_ok:
+        self.active = False
+        return self._smooth_correction(0.0, winding_down=True)
+
+      if abs(curvature) >= self.CURV_TURN_THRESHOLD:
+        # In a turn — inside lane (left for left-turn, right for right-turn).
+        inside_left = curvature < 0.0
+        if inside_left and left_ok:
+          lane_center = left_y + half_width
+        elif (not inside_left) and right_ok:
+          lane_center = right_y - half_width
+        elif right_ok:
+          lane_center = right_y - half_width  # outside fallback
+        else:
+          lane_center = left_y + half_width   # outside fallback
+      else:
+        # Straight / gentle — closest lane wins.
+        if right_ok and left_ok:
+          lane_center = right_y - half_width if abs(right_y) <= abs(left_y) else left_y + half_width
+        elif right_ok:
+          lane_center = right_y - half_width
+        else:
+          lane_center = left_y + half_width
 
     # Reject sudden lane center jumps
     if self.prev_lane_center is not None:
@@ -152,12 +243,17 @@ class LaneCenteringCorrection:
 
     offset = path_y - self.smoothed_lane_center
 
-    # Hysteresis logic
+    # Speed-dependent hysteresis — relax at high speed where perception noise
+    # projects larger at the lookahead sample point.
+    offset_threshold = self.OFFSET_BASE_THRESHOLD + self.OFFSET_THRESHOLD_SLOPE * delay_dist
+    offset_tolerance = offset_threshold / 2.0
+
+    # Hysteresis on offset only — runs regardless of curvature.
     if not self.active:
-      if abs(curvature) >= self.MIN_CURVATURE and abs(offset) >= self.OFFSET_THRESHOLD:
+      if abs(offset) >= offset_threshold:
         self.active = True
     else:
-      if abs(curvature) < self.EXIT_CURVATURE and abs(offset) < self.OFFSET_TOLERANCE:
+      if abs(offset) < offset_tolerance:
         self.active = False
 
     if self.active:
@@ -203,7 +299,7 @@ _prev_active = False
 _lcc_pub = None   # publishes lane_centering_state (active + diagnostics)
 
 
-def on_curvature_correction(curvature, model_v2, v_ego, lane_changing):
+def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, **kwargs):
   global _lcc, _enabled, _prev_active, _lcc_pub
 
   # Feature toggle (Driving panel) — independent of plugin lifecycle
@@ -232,5 +328,9 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing):
     cloudlog.warning(f"lane_centering: publish error: {e}")
 
   return curvature + correction
+
+
+def on_health_check(acc, **kwargs):
+  return {**acc, "lane-centering": {"status": "ok"}}
 
 

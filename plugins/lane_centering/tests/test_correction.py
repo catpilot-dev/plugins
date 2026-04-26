@@ -69,11 +69,14 @@ class TestConstants:
       assert LCC.K_V[i] >= LCC.K_V[i - 1]
 
   def test_hysteresis_thresholds(self, LCC):
-    assert LCC.MIN_CURVATURE > LCC.EXIT_CURVATURE
-    assert LCC.OFFSET_THRESHOLD > LCC.OFFSET_TOLERANCE
+    # Activation driven solely by offset (curvature gate removed). Threshold
+    # is speed-dependent but tolerance is always threshold/2 → 2:1 hysteresis.
+    assert LCC.OFFSET_BASE_THRESHOLD > 0
+    assert LCC.OFFSET_THRESHOLD_SLOPE > 0
 
   def test_lane_width_bounds(self, LCC):
-    assert LCC.LANE_WIDTH_MIN < LCC.LANE_WIDTH_DEFAULT < LCC.LANE_WIDTH_MAX
+    # MAX = 3.75m (China highway standard). DEFAULT = 3.5m (city mixed).
+    assert LCC.LANE_WIDTH_MIN < LCC.LANE_WIDTH_DEFAULT <= LCC.LANE_WIDTH_MAX
 
 
 class TestHysteresis:
@@ -88,11 +91,13 @@ class TestHysteresis:
     lcc.update(model, 15.0)
     assert lcc.active is True
 
-  def test_no_activate_low_curvature(self, LCC):
+  def test_activate_on_straight_with_large_offset(self, LCC):
+    # On a straight road (low curvature), lane centering still activates when
+    # offset exceeds threshold — the curvature gate was removed.
     lcc = LCC()
     model = make_model(curvature=0.001, path_y=0.4)
     lcc.update(model, 15.0)
-    assert lcc.active is False
+    assert lcc.active is True
 
   def test_no_activate_small_offset(self, LCC):
     lcc = LCC()
@@ -100,14 +105,14 @@ class TestHysteresis:
     lcc.update(model, 15.0)
     assert lcc.active is False
 
-  def test_deactivate_on_straight(self, LCC):
+  def test_deactivate_on_small_offset(self, LCC):
     lcc = LCC()
     # Activate first
     model = make_model(curvature=0.005, path_y=0.4)
     lcc.update(model, 15.0)
     assert lcc.active is True
-    # Now straighten out with small offset
-    model2 = make_model(curvature=0.0005, path_y=0.05)
+    # Now settle within tolerance — deactivate regardless of curvature
+    model2 = make_model(curvature=0.0005, path_y=0.03)
     lcc.update(model2, 15.0)
     assert lcc.active is False
 
@@ -134,11 +139,14 @@ class TestEdgeCases:
 
   def test_jump_detection_resets(self, LCC):
     lcc = LCC()
-    model1 = make_model(curvature=0.005, path_y=0.4, right_y=1.75)
+    # Force right-lane-only reference so the jump in right_y actually moves
+    # the computed lane center (closest-lane logic would otherwise fall back
+    # to the stable left line).
+    model1 = make_model(curvature=0.005, path_y=0.4, right_y=1.75, left_prob=0.2)
     lcc.update(model1, 15.0)
 
-    # Sudden lane center jump > 0.3m
-    model2 = make_model(curvature=0.005, path_y=0.4, right_y=2.5)
+    # Sudden right-lane jump of 0.75m → lane_center jump > MAX_JUMP (0.3m)
+    model2 = make_model(curvature=0.005, path_y=0.4, right_y=2.5, left_prob=0.2)
     lcc.update(model2, 15.0)
     assert lcc.active is False
 
@@ -149,22 +157,23 @@ class TestLaneWidthEstimation:
     assert lcc.estimated_lane_width is None
 
   def test_width_measured_with_both_lanes(self, LCC):
+    # Measurement of exactly 3.0m (within [MIN=2.5, MAX=3.5]) accepted.
     lcc = LCC()
-    model = make_model(left_y=-2.0, right_y=2.0, left_prob=0.8, right_prob=0.8)
+    model = make_model(left_y=-1.5, right_y=1.5, left_prob=0.8, right_prob=0.8)
     lcc.update(model, 15.0)
     assert lcc.estimated_lane_width is not None
-    assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)
+    assert lcc.estimated_lane_width == pytest.approx(3.0, abs=0.01)
 
   def test_width_fallback_when_too_wide(self, LCC):
     lcc = LCC()
-    # Learn valid width first
-    model = make_model(left_y=-2.0, right_y=2.0, left_prob=0.8, right_prob=0.8)
+    # Learn valid width first (3.0m)
+    model = make_model(left_y=-1.5, right_y=1.5, left_prob=0.8, right_prob=0.8)
     lcc.update(model, 15.0)
-    assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)
-    # Turn distorts apparent width > MAX — lane_width should fall back to default, estimate unchanged
+    assert lcc.estimated_lane_width == pytest.approx(3.0, abs=0.01)
+    # Perspective distortion → apparent width 5m > MAX (3.5m) → fall back, estimate unchanged
     wide = make_model(curvature=0.01, left_y=-2.5, right_y=2.5, left_prob=0.8, right_prob=0.8)
-    result = lcc.update(wide, 15.0)
-    assert lcc.estimated_lane_width == pytest.approx(4.0, abs=0.01)  # estimate unchanged
+    lcc.update(wide, 15.0)
+    assert lcc.estimated_lane_width == pytest.approx(3.0, abs=0.01)
 
   def test_width_rejected_if_too_narrow(self, LCC):
     lcc = LCC()
@@ -174,9 +183,31 @@ class TestLaneWidthEstimation:
 
   def test_width_rejected_if_too_wide(self, LCC):
     lcc = LCC()
-    model = make_model(left_y=-3.0, right_y=3.0)  # 6.0m > MAX (4.5m)
+    model = make_model(left_y=-2.0, right_y=2.0)  # 4.0m > MAX (3.75m)
     lcc.update(model, 15.0)
     assert lcc.estimated_lane_width is None
+
+  def test_lane_width_published_in_diag(self, LCC):
+    # lane_width must be in diag whenever we have lane data, even when
+    # correction is inactive (speedlimitd fuses it as road-type context).
+    lcc = LCC()
+    # Small offset → correction stays inactive. Measured width 3.0m accepted.
+    model = make_model(curvature=0.001, path_y=0.05,
+                       left_y=-1.5, right_y=1.5, left_prob=0.8, right_prob=0.8)
+    lcc.update(model, 15.0)
+    assert lcc.active is False
+    assert 'lane_width' in lcc.diag
+    assert lcc.diag['lane_width'] == pytest.approx(3.0, abs=0.01)
+    assert lcc.diag['lane_width_learned'] is True
+
+  def test_lane_width_fallback_flagged_unlearned(self, LCC):
+    # No prior measurement → uses DEFAULT; lane_width_learned should be False.
+    lcc = LCC()
+    model = make_model(curvature=0.001, path_y=0.05,
+                       left_prob=0.2, right_prob=0.8)  # only right confident
+    lcc.update(model, 15.0)
+    assert lcc.diag.get('lane_width') == pytest.approx(lcc.LANE_WIDTH_DEFAULT, abs=0.01)
+    assert lcc.diag.get('lane_width_learned') is False
 
 
 class TestCorrectionDirection:
