@@ -26,14 +26,17 @@ class LaneCenteringCorrection:
   K_BP = [0.000, 0.002, 0.005, 0.008, 0.012, 0.020]  # Curvature breakpoints (1/m)
   K_V  = [0.150, 0.150, 0.350, 0.400, 0.500, 0.650]   # K for straight matches gentle curves (~2s closure)
 
-  # Curvature-adaptive confidence threshold. In tight turns the outside lane
-  # line drops out of camera FOV, so requiring ≥ 0.5 confidence gates out
-  # legitimate inside-line tracking. Step down to a relaxed threshold when
-  # turning so we can still use whichever lane is visible as inside reference.
-  #   MIN_PROB(κ) = MIN_PROB_STRAIGHT if |κ| < CURV_TURN_THRESHOLD else MIN_PROB_TURN
-  MIN_PROB_STRAIGHT     = 0.5    # full noise filtering on straights
-  MIN_PROB_TURN         = 0.3    # relaxed when turning (allow inside-only mode)
-  CURV_TURN_THRESHOLD   = 0.01   # |κ| ≥ this (radius ≤ 100 m) → "in a turn"
+  # Curvature-adaptive minimum confidence: lane line confidence drops in tight
+  # turns due to perspective distortion at the lookahead point — detections
+  # are at stable positions but model marks them low confidence. Linearly
+  # relax MIN_PROB from straight (full noise filter) to a low floor (tight
+  # turns), so we keep using detected-but-low-confidence lines when the
+  # alternative is bailing entirely (route 2b1 seg 24 case: both probs at
+  # 0.15-0.25 during κ=0.011 apex with positions varying by < 5cm).
+  #   MIN_PROB(κ) = max(MIN_PROB_FLOOR, MIN_PROB_STRAIGHT − SLOPE · |κ|)
+  MIN_PROB_STRAIGHT     = 0.5    # full noise filtering on straights; also "strong" gate for selection
+  MIN_PROB_FLOOR        = 0.15   # minimum confidence even in tightest turns
+  MIN_PROB_CURV_SLOPE   = 30.0   # 1/m → drops 0.5 → 0.15 over κ ∈ [0, 0.012]
   MIN_SPEED = 9.0          # m/s - disable at low speed
   # Speed-dependent hysteresis. Offset is sampled at delay_dist = v·MODEL_LAT_ACTION_T
   # ahead of the car, so small angular errors in the model's path prediction
@@ -135,10 +138,11 @@ class LaneCenteringCorrection:
     left_prob = model_v2.laneLineProbs[1]
     curvature = model_v2.action.desiredCurvature
 
-    # Curvature-adaptive minimum confidence: relax in turns where the outside
-    # lane line drops out of FOV. Keep MIN_PROB_STRAIGHT for lane-width learning
-    # so the width estimate isn't polluted by low-confidence detections.
-    min_prob = self.MIN_PROB_STRAIGHT if abs(curvature) < self.CURV_TURN_THRESHOLD else self.MIN_PROB_TURN
+    # Curvature-adaptive minimum confidence: relax linearly with |κ|. Keep
+    # MIN_PROB_STRAIGHT as the "strong" gate for selection / width learning,
+    # so width estimates aren't polluted by low-confidence detections.
+    min_prob = max(self.MIN_PROB_FLOOR,
+                   self.MIN_PROB_STRAIGHT - self.MIN_PROB_CURV_SLOPE * abs(curvature))
 
     # Need at least one lane with adaptive confidence
     if right_prob < min_prob and left_prob < min_prob:
