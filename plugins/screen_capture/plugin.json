@@ -15,6 +15,11 @@
     "ui.render_overlay": {
       "module": "capture",
       "function": "on_render_overlay"
+    },
+    "device.health_check": {
+      "module": "capture",
+      "function": "on_health_check",
+      "priority": 50
     }
   }
 }

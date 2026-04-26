@@ -6,10 +6,8 @@ Onroad:  saves HUD PNG + sends bookmarkButton (→ userBookmark in rlog).
          COD shows it on the bookmark row for instant HUD frame export.
 """
 import os
-import sys
 import threading
 import time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import MEDIA_DIR
 import pyray as rl
 
@@ -174,3 +172,7 @@ def on_render_overlay(default, content_rect):
     _ensure_init()
     from openpilot.selfdrive.ui.onroad.overlay_zones import register_rect_zone
     register_rect_zone(_tap_rect.x, _tap_rect.y, _tap_rect.width, _tap_rect.height)
+
+
+def on_health_check(acc, **kwargs):
+    return {**acc, "screen_capture": {"status": "ok"}}
