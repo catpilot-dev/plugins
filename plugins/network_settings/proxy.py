@@ -31,3 +31,26 @@ def clear_proxy_env():
   """Remove proxy environment variables."""
   for key in ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
     os.environ.pop(key, None)
+
+
+def _pid_alive(name: str) -> bool:
+  try:
+    pid = int(open(f'/data/plugins-runtime/.pids/{name}.pid').read().strip())
+    os.kill(pid, 0)
+    return True
+  except Exception:
+    return False
+
+
+def on_health_check(acc, **kwargs):
+  alive = _pid_alive("github_pinger")
+  proxy = os.environ.get("ALL_PROXY", "")
+  result = {
+    "status": "ok" if alive else "warning",
+    "process_alive": alive,
+    "proxy_active": bool(proxy),
+    "proxy": proxy or None,
+  }
+  if not alive:
+    result["warnings"] = ["github_pinger process not running"]
+  return {**acc, "network-settings": result}
