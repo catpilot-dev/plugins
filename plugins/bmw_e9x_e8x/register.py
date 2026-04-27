@@ -174,12 +174,15 @@ def on_lat_controller_init(result, lac, CP):
     tolerance = 2 · 0.025 · L / (v² · 0.5²)
 
   Plant-inversion target torque, angle domain (linear tire regime):
-    τ_Nm_target = T_CAP_SLOPE · v² · δ_err / PLANT_500MS_RESPONSE · scale[bin]
-    If |target_frac| < FRICTION, push to ±FRICTION to break stiction.
+    τ_Nm_target = slope_eff · v² · δ_err / PLANT_500MS_RESPONSE
     Clamp to ±T_CAP(v, δ):
-      T_CAP_NM = min(STEER_MAX, T_CAP_BASE + T_CAP_SLOPE · v²·|δ_des|)
-    Same T_CAP_SLOPE drives both target and cap — one plant characteristic
-    (τ_align = T_CAP_SLOPE · v² · δ in linear tire regime, a_y ≤ 3 m/s²).
+      T_CAP_NM = min(STEER_MAX, T_CAP_BASE + slope_eff · v²·|δ_des|)
+    slope_eff is gain-scheduled on |κ_des|:
+      slope_eff = T_CAP_SLOPE_LO + clip01((|κ|−κ_LO)/(κ_HI−κ_LO)) · (HI − LO)
+    Low slope on near-straights → gentle, no plant overshoot / ringing.
+    High slope at tight turns (|κ_des| ≥ KAPPA_TIGHT) → full authority.
+    Same slope_eff drives both target and cap.
+    If |target_frac| < FRICTION, push to ±FRICTION to break stiction.
     BASE is the hydraulic rack's stiction floor. Hard stop at STEER_MAX
     (panda limit) preserves lane authority during transient over-envelope
     events before speedlimitd trims v.
@@ -190,6 +193,10 @@ def on_lat_controller_init(result, lac, CP):
   to < 50 % of its value at decision, the plant is already closing the error
   — cancel step_remaining and let plant momentum + applied torque finish.
   Prevents over-commanding on small δ_err where v²-scaled target overshoots.
+
+  ISO 11270 half-comfort guard (every livePose tick): cancel ramping if
+  |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³.
+  Predicted jerk catches the ringing setup before κ_meas confirms it.
 
   No online adaptation: plant behavior is fully described by T_CAP_SLOPE,
   T_CAP_BASE_NM, FRICTION, and PLANT_500MS_RESPONSE. Tune these offline from
@@ -213,22 +220,24 @@ def on_lat_controller_init(result, lac, CP):
   SPREAD_FRAMES_MAX = 25                  # at v ≥ 120 kph (33.33 m/s) — fills 250 ms cycle
   V_FOR_SPREAD_MIN = 30.0 / 3.6           # 8.33 m/s
   V_FOR_SPREAD_MAX = 120.0 / 3.6          # 33.33 m/s
-  # T_CAP_SLOPE is the single plant/aligning-torque characteristic, in the
-  # front-wheel-angle (δ) domain. Linear tire regime (a_y ≤ 3 m/s² per
-  # EU/UN-R79):
-  #     τ_Nm_hold = T_CAP_SLOPE · v² · δ                 (aligning torque)
-  #     angle_plant_gain(v) = STEER_MAX / (T_CAP_SLOPE · v²)  (δ_ss per τ_frac)
-  #
+  # T_CAP slope gain-schedule (κ_des-adaptive). Linear tire regime:
+  #     τ_Nm_hold = slope_eff · v² · δ                 (aligning torque)
+  #     slope_eff = lerp(LO → HI, (|κ_des|−κ_LO)/(κ_HI−κ_LO))   clamped
   # Used for both authority and target:
-  #   T_CAP(v, δ)     = T_CAP_BASE_NM + T_CAP_SLOPE · v² · |δ_des|      (capped STEER_MAX)
-  #   target_Nm       = T_CAP_SLOPE · v² · |δ_err| / PLANT_500MS_RESPONSE · scale
-  #
+  #   T_CAP(v, δ)  = T_CAP_BASE_NM + slope_eff · v² · |δ_des|   (≤ STEER_MAX)
+  #   target_Nm    = slope_eff · v² · δ_err / PLANT_500MS_RESPONSE
   # BASE covers the speed- and angle-independent stiction floor.
-  # SLOPE [Nm · s²/(m²·rad)] initial sizing from route 000002a4 segs 8/18; bumped
-  # to 2.0 after 2a7 (SLOPE=1.0) showed low-v mild turns still under-commanding.
-  # Tune further offline from route data if under/over-response observed.
+  # Prior fixed SLOPE=2.0 (route 2b8 baseline): seg-14 ringing on small κ_des
+  # (overshoot), seg-6 under-tracking on tight κ_des (insufficient authority).
+  # Curvature schedule resolves both: gentle on near-straights (less ringing
+  # ingredients), full authority on tight turns. v-independent — same SLOPE
+  # multiplier whether κ=0.01 is at parking-lot speed or highway speed.
   T_CAP_BASE_NM = 1.25
-  T_CAP_SLOPE = 2.0                                 # Nm · s² / (m² · rad)
+  T_CAP_SLOPE_LO  = 1.0      # at |κ_des| ≤ KAPPA_STRAIGHT — gentle
+  T_CAP_SLOPE_HI  = 3.0      # at |κ_des| ≥ KAPPA_TIGHT    — full authority
+  KAPPA_STRAIGHT  = 0.001    # m⁻¹ — below this, treat as straight
+  KAPPA_TIGHT     = 0.010    # m⁻¹ — above this, tight turn
+  # Default 2.0 (previous constant) recovered at |κ_des| ≈ 0.0055 (mild curve).
   # STEP_PER_FRAME is computed per decision from speed-dependent SPREAD_FRAMES:
   #   step = T_CAP_BASE_NM / STEER_MAX / spread_frames(v)
   # At v=30 kph (spread=10): 0.0104 frac/frame = 0.125 Nm/frame — exceeds the
@@ -262,6 +271,23 @@ def on_lat_controller_init(result, lac, CP):
   # dedicated stop-and-ramp experiment (not online — see shadow-plant notes).
   FRICTION = 0.05
 
+  # ISO 11270 comfort guard. Half-ISO targets:
+  #   ISO_LATERAL_ACCEL = 3.0 m/s²    →  BMW_LATERAL_ACCEL = 1.5
+  #   ISO_LATERAL_JERK  = 5.0 m/s³    →  BMW_LATERAL_JERK  = 2.5
+  # Cancel step_remaining (and fast_ramp_remaining) when either exceeded.
+  #   |a_y_meas| > BMW_LATERAL_ACCEL — current loading already at limit;
+  #     don't push deeper. Uses κ_meas (measured outcome).
+  #   |jerk_pred| > BMW_LATERAL_JERK — predicted jerk = v²·(κ_des−κ_meas)/τ
+  #     where τ = 0.5 s matches the controller's plant-inversion horizon
+  #     (PLANT_500MS_RESPONSE). Predictive — catches ringing setup ~100 ms
+  #     before it appears in κ_meas. Validated against route 2b8 seg 14:
+  #     at t=848.5s during overshoot, κ_des reversed while κ_meas still on
+  #     the wrong side, jerk_pred = 4.8 m/s³ → would have cancelled the
+  #     counter-torque ramp that produced the 15.7 m/s³ measured jerk.
+  BMW_LATERAL_ACCEL = 1.5
+  BMW_LATERAL_JERK = 2.5
+  JERK_PRED_TAU = 0.5
+
   # Rear-axle bicycle-model wheelbase (m). Used for κ ↔ δ conversion.
   L = float(CP.wheelbase)
 
@@ -281,6 +307,9 @@ def on_lat_controller_init(result, lac, CP):
     'check_tolerance': 0.0,    # tolerance at last decision (buffer-based abort threshold)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
+    'slope_eff': T_CAP_SLOPE_LO,  # debug: effective gain-scheduled T_CAP_SLOPE
+    'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
+    'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -300,11 +329,40 @@ def on_lat_controller_init(result, lac, CP):
       v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
 
+      # κ_des-adaptive aligning-torque slope. Gentle on near-straights (less
+      # overshoot ingredients on small κ_des), full authority on tight turns.
+      #   t = clip((|κ_des| − KAPPA_STRAIGHT) / (KAPPA_TIGHT − KAPPA_STRAIGHT), 0, 1)
+      #   slope_eff = T_CAP_SLOPE_LO + t · (T_CAP_SLOPE_HI − T_CAP_SLOPE_LO)
+      # v-independent — only the path geometry drives authority allocation.
+      kappa_abs = abs(state['desired'])
+      k_t = max(0.0, min(1.0, (kappa_abs - KAPPA_STRAIGHT) / (KAPPA_TIGHT - KAPPA_STRAIGHT)))
+      slope_eff = T_CAP_SLOPE_LO + k_t * (T_CAP_SLOPE_HI - T_CAP_SLOPE_LO)
+      state['slope_eff'] = slope_eff
+
       # Front-wheel-angle error (rear-axle bicycle model).
       delta_des = math.atan(state['desired'] * L)
       delta_meas = math.atan(state['measured'] * L)
       delta_err = delta_des - delta_meas
       state['delta_err'] = delta_err
+
+      # ISO 11270 half-comfort guard. Cancel any ramping if measured a_y
+      # already exceeds the comfort envelope, or if predicted jerk
+      # (v²·κ_err / τ_settling) would. Predicted jerk catches the ringing
+      # setup ~100 ms before κ_meas confirms — gives the controller enough
+      # headroom to break the loop. Both checks fire every livePose tick
+      # (50 ms response), independent of decision cadence.
+      a_y_meas = v * v * state['measured']
+      jerk_pred = v * v * (state['desired'] - state['measured']) / JERK_PRED_TAU
+      state['a_y_meas'] = a_y_meas
+      state['jerk_pred'] = jerk_pred
+      if abs(a_y_meas) > BMW_LATERAL_ACCEL:
+        state['step_remaining'] = 0.0
+        state['fast_ramp_remaining'] = 0
+        state['action'] = 'cancel_accel'
+      elif abs(jerk_pred) > BMW_LATERAL_JERK:
+        state['step_remaining'] = 0.0
+        state['fast_ramp_remaining'] = 0
+        state['action'] = 'cancel_jerk'
 
       state['tick_count'] += 1
 
@@ -355,7 +413,7 @@ def on_lat_controller_init(result, lac, CP):
           state['action'] = 'hold_zero'
         else:
           effective_err = delta_err - tolerance * (1.0 if delta_err > 0 else -1.0)
-          target_nm = T_CAP_SLOPE * v * v * effective_err / PLANT_500MS_RESPONSE
+          target_nm = slope_eff * v * v * effective_err / PLANT_500MS_RESPONSE
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
             target_frac = FRICTION * (1.0 if delta_err > 0 else -1.0)
@@ -363,11 +421,11 @@ def on_lat_controller_init(result, lac, CP):
           else:
             state['action'] = 'ramp'
           # v²·|δ|-scaled cap, clipped at STEER_MAX (panda hard limit).
-          # Normal ops stay within EU 3 m/s² → T_CAP in the 1.25-3.3 Nm
-          # range; transient over-envelope events allowed up to STEER_MAX
-          # so the car doesn't drift while speedlimitd catches up.
+          # Cap also uses the gain-scheduled slope so authority grows with
+          # commanded a_y_des — straights stay near BASE, tight turns can
+          # reach STEER_MAX (transient over-envelope; speedlimitd bleeds v).
           t_cap_nm = min(CCP.STEER_MAX,
-                         T_CAP_BASE_NM + T_CAP_SLOPE * v * v * abs(delta_des))
+                         T_CAP_BASE_NM + slope_eff * v * v * abs(delta_des))
           t_cap_frac = t_cap_nm / CCP.STEER_MAX
           target_frac = max(-t_cap_frac, min(t_cap_frac, target_frac))
 
@@ -427,6 +485,9 @@ def on_lat_controller_init(result, lac, CP):
         'output': float(output),
         'vEgo': float(CS.vEgo),
         'active': active,
+        'slope_eff': float(state['slope_eff']),
+        'a_y_meas': float(state['a_y_meas']),
+        'jerk_pred': float(state['jerk_pred']),
       }
       state['lat_pub'].send(payload)
     except Exception:
