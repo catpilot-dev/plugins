@@ -189,11 +189,6 @@ def on_lat_controller_init(result, lac, CP):
 
   Ramp: step_remaining = T_peak − state['torque'], drained over 25 CAN frames.
 
-  Mid-cycle abort: at 100/150/200 ms post-decision, if |δ_err| has narrowed
-  to < 50 % of its value at decision, the plant is already closing the error
-  — cancel step_remaining and let plant momentum + applied torque finish.
-  Prevents over-commanding on small δ_err where v²-scaled target overshoots.
-
   ISO 11270 half-comfort guard (every livePose tick): cancel ramping if
   |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³.
   Predicted jerk catches the ringing setup before κ_meas confirms it.
@@ -295,13 +290,11 @@ def on_lat_controller_init(result, lac, CP):
     'target_frac': 0.0,        # plant-inversion target set each 250 ms decision
     'step_remaining': 0.0,     # target_frac - torque, drained at CAN rate
     'tick_count': 0,           # livePose tick counter; decide every ACTION_CADENCE_TICKS
-    'action': 'init',          # debug: hold_zero / breakaway / ramp / cancel_narrowed
+    'action': 'init',          # debug: hold_zero / breakaway / ramp / cancel_accel / cancel_jerk
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
     'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
     'step_per_frame': T_CAP_BASE_NM / CCP.STEER_MAX / 25,  # per-frame drain rate (set per decision)
-    'check_err_0': 0.0,        # δ_err at last decision (for mid-cycle abort check)
-    'check_tolerance': 0.0,    # tolerance at last decision (buffer-based abort threshold)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'slope_eff': T_CAP_SLOPE_LO,  # debug: effective gain-scheduled T_CAP_SLOPE
@@ -363,21 +356,6 @@ def on_lat_controller_init(result, lac, CP):
 
       state['tick_count'] += 1
 
-      # Mid-cycle abort at 100 ms and 200 ms: cancel ramp if δ_err has both
-      # decreased from decision time AND fallen below the more permissive of:
-      #   - 50 % of decision-time error (catches "halved on big errors")
-      #   - 1.2 × decision-time tolerance (catches "near deadband on small errors")
-      # Direction guard (decreased) prevents false cancels on errors that
-      # happen to be momentarily small but growing back into trouble.
-      # Only for 'ramp' action; 'hold_zero'/'breakaway' have other paths.
-      if state['tick_count'] in (2, 4) and state['action'] == 'ramp':
-        cancel_threshold = max(0.5 * abs(state['check_err_0']),
-                               1.2 * state['check_tolerance'])
-        decreased = abs(delta_err) < abs(state['check_err_0'])
-        if decreased and abs(delta_err) < cancel_threshold:
-          state['step_remaining'] = 0.0
-          state['action'] = 'cancel_narrowed'
-
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
         state['tick_count'] = 0
 
@@ -426,9 +404,6 @@ def on_lat_controller_init(result, lac, CP):
           target_frac = max(-t_cap_frac, min(t_cap_frac, target_frac))
 
         state['target_frac'] = target_frac
-        # Record δ_err at decision for 100/150/200 ms mid-cycle abort check.
-        state['check_err_0'] = delta_err
-        state['check_tolerance'] = tolerance
 
         # Breakaway sign-flip fast ramp: the normal drain would crawl from
         # ±friction through zero to ∓friction at the per-frame step rate,
