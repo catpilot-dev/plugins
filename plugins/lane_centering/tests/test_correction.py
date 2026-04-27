@@ -27,6 +27,11 @@ def mock_openpilot(monkeypatch):
 
   mods['openpilot.selfdrive.controls.lib.drive_helpers'].smooth_value = _smooth_value
 
+  # Plugin-framework `config` module — provides read_plugin_param
+  config_mock = MagicMock()
+  config_mock.read_plugin_param = MagicMock(return_value='1')
+  mods['config'] = config_mock
+
   for mod_name, mod_mock in mods.items():
     monkeypatch.setitem(sys.modules, mod_name, mod_mock)
 
@@ -48,7 +53,8 @@ def correction_mod(mock_openpilot):
 
 
 def make_model(curvature=0.01, path_y=0.0, left_y=-1.75, right_y=1.75,
-               left_prob=0.8, right_prob=0.8, left_edge=0.5, right_edge=0.5):
+               left_prob=0.8, right_prob=0.8, left_edge=0.5, right_edge=0.5,
+               frame_id=0):
   """Create a mock modelV2 message."""
   m = MagicMock()
   m.laneLineProbs = [left_edge, left_prob, right_prob, right_edge]
@@ -57,6 +63,7 @@ def make_model(curvature=0.01, path_y=0.0, left_y=-1.75, right_y=1.75,
   m.laneLines = [MagicMock(), MagicMock(), MagicMock(), MagicMock()]
   m.laneLines[1].y = [left_y]
   m.laneLines[2].y = [right_y]
+  m.frameId = frame_id
   return m
 
 
@@ -336,3 +343,48 @@ class TestHookCallback:
     correction_mod._enabled = True
     result = correction_mod.on_curvature_correction(0.05, MagicMock(), 15.0, True)
     assert result == 0.05
+
+  def test_recompute_only_on_new_frame(self, correction_mod):
+    """Hook runs at 100 Hz but model_v2 refreshes at 20 Hz — same frameId
+    must reuse the cached correction without rerunning update().
+    """
+    self._reset(correction_mod)
+    correction_mod._enabled = True
+    correction_mod._last_frame_id = None
+    correction_mod._last_correction = 0.0
+
+    model_a = make_model(curvature=0.005, path_y=0.4, frame_id=100)
+    model_b = make_model(curvature=0.005, path_y=0.4, frame_id=100)
+    model_c = make_model(curvature=0.005, path_y=0.4, frame_id=101)
+
+    # First call computes
+    correction_mod.on_curvature_correction(0.05, model_a, 15.0, False)
+    assert correction_mod._last_frame_id == 100
+    cached = correction_mod._last_correction
+
+    # Mutate the LCC instance to detect a recompute
+    correction_mod._lcc.update = MagicMock(return_value=999.0)
+
+    # Same frameId: must NOT call update(), correction unchanged
+    correction_mod.on_curvature_correction(0.05, model_b, 15.0, False)
+    correction_mod._lcc.update.assert_not_called()
+    assert correction_mod._last_correction == cached
+
+    # New frameId: must call update() and refresh cache
+    correction_mod.on_curvature_correction(0.05, model_c, 15.0, False)
+    correction_mod._lcc.update.assert_called_once()
+    assert correction_mod._last_correction == 999.0
+    assert correction_mod._last_frame_id == 101
+
+  def test_lane_change_invalidates_cache(self, correction_mod):
+    """Entering lane-change must invalidate cache so the next non-lane-change
+    frame triggers a fresh compute even if frameId happens to match.
+    """
+    self._reset(correction_mod)
+    correction_mod._enabled = True
+    correction_mod._last_frame_id = 50
+    correction_mod._last_correction = 0.123
+
+    model = make_model(frame_id=50)
+    correction_mod.on_curvature_correction(0.05, model, 15.0, True)
+    assert correction_mod._last_frame_id is None

@@ -84,8 +84,10 @@ class LaneCenteringCorrection:
   KP_VALUES = [250, 120, 65, 30, 11.5, 5.5, 3.5, 2.0, 0.8]
   KP_NOMINAL = 2.0  # normalize to this kP (roughly 15 m/s highway cruising)
 
-  # Rate limiting — max correction change per frame (prevents sudden jumps)
-  MAX_CORRECTION_RATE = 0.0005  # 1/m per frame at 20 Hz
+  # Rate limiting — max correction change per model frame (prevents sudden
+  # jumps). update() is called at modelV2's 20 Hz rate (gated by frameId in
+  # on_curvature_correction), so 0.0005 / 0.05s ≈ 0.01 1/m per second.
+  MAX_CORRECTION_RATE = 0.0005  # 1/m per model frame (20 Hz)
 
   # Derivative damping — reduce correction when offset is improving
   KD = 0.5  # damping factor on offset rate of change
@@ -315,10 +317,12 @@ _lcc = None
 _enabled = None   # None = unread; read once from LaneCenteringEnabled param
 _prev_active = False
 _lcc_pub = None   # publishes lane_centering_state (active + diagnostics)
+_last_frame_id = None    # last model_v2.frameId we computed against
+_last_correction = 0.0   # cached correction; reused on duplicate frames
 
 
 def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, **kwargs):
-  global _lcc, _enabled, _prev_active, _lcc_pub
+  global _lcc, _enabled, _prev_active, _lcc_pub, _last_frame_id, _last_correction
 
   # Feature toggle (Driving panel) — independent of plugin lifecycle
   if _enabled is None:
@@ -330,22 +334,32 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, **kwargs)
   if _lcc is None:
     _lcc = LaneCenteringCorrection()
   if lane_changing:
+    _last_frame_id = None  # force recompute on next frame
     return curvature
-  correction = _lcc.update(model_v2, v_ego)
 
-  # Publish active state and diagnostics to plugin bus
-  try:
-    from openpilot.selfdrive.plugins.plugin_bus import PluginPub
-    if _lcc_pub is None:
-      _lcc_pub = PluginPub('lane_centering_state')
-    msg = {'active': _lcc.active}
-    if _lcc.diag:
-      msg.update(_lcc.diag)
-    _lcc_pub.send(msg)
-  except Exception as e:
-    cloudlog.warning(f"lane_centering: publish error: {e}")
+  # Recompute only on a new model frame (20 Hz). controlsd calls this hook at
+  # 100 Hz, but model_v2 only refreshes when modeld publishes. Smoothing /
+  # rate-limit time constants (SMOOTH_TAU, MAX_CORRECTION_RATE, etc.) are
+  # written assuming 20 Hz cadence — running them at 100 Hz makes them
+  # converge 5× too fast.
+  frame_id = model_v2.frameId
+  if frame_id != _last_frame_id:
+    _last_correction = _lcc.update(model_v2, v_ego)
+    _last_frame_id = frame_id
 
-  return curvature + correction
+    # Publish active state and diagnostics to plugin bus (also at 20 Hz)
+    try:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+      if _lcc_pub is None:
+        _lcc_pub = PluginPub('lane_centering_state')
+      msg = {'active': _lcc.active}
+      if _lcc.diag:
+        msg.update(_lcc.diag)
+      _lcc_pub.send(msg)
+    except Exception as e:
+      cloudlog.warning(f"lane_centering: publish error: {e}")
+
+  return curvature + _last_correction
 
 
 def on_health_check(acc, **kwargs):
