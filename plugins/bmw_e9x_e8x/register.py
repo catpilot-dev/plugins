@@ -174,7 +174,7 @@ def on_lat_controller_init(result, lac, CP):
     tolerance = 2 · 0.025 · L / (v² · 0.5²)
 
   Plant-inversion target torque, angle domain (linear tire regime):
-    τ_Nm_target = slope_eff · v² · δ_err / PLANT_500MS_RESPONSE
+    τ_Nm_target = slope_eff · v² · δ_err
     Clamp to ±T_CAP(v, δ):
       T_CAP_NM = min(STEER_MAX, T_CAP_BASE + slope_eff · v²·|δ_des|)
     slope_eff is gain-scheduled on |κ_des|:
@@ -198,9 +198,9 @@ def on_lat_controller_init(result, lac, CP):
   |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³.
   Predicted jerk catches the ringing setup before κ_meas confirms it.
 
-  No online adaptation: plant behavior is fully described by T_CAP_SLOPE,
-  T_CAP_BASE_NM, FRICTION, and PLANT_500MS_RESPONSE. Tune these offline from
-  route data; there's no scale_by_bin or shadow estimator anymore.
+  No online adaptation: plant behavior is fully described by T_CAP_SLOPE_*,
+  T_CAP_BASE_NM, and FRICTION. Tune these offline from route data; there's
+  no scale_by_bin or shadow estimator anymore.
   """
   import math
   from cereal import log
@@ -225,7 +225,7 @@ def on_lat_controller_init(result, lac, CP):
   #     slope_eff = lerp(LO → HI, (|κ_des|−κ_LO)/(κ_HI−κ_LO))   clamped
   # Used for both authority and target:
   #   T_CAP(v, δ)  = T_CAP_BASE_NM + slope_eff · v² · |δ_des|   (≤ STEER_MAX)
-  #   target_Nm    = slope_eff · v² · δ_err / PLANT_500MS_RESPONSE
+  #   target_Nm    = slope_eff · v² · δ_err
   # BASE covers the speed- and angle-independent stiction floor.
   # Prior fixed SLOPE=2.0 (route 2b8 baseline): seg-14 ringing on small κ_des
   # (overshoot), seg-6 under-tracking on tight κ_des (insufficient authority).
@@ -249,14 +249,6 @@ def on_lat_controller_init(result, lac, CP):
   # wire STEER_DELTA_UP limit (0.1 Nm/frame), so wire clamps to ~0.1 Nm/frame.
   # At v=120 kph (spread=50): 0.00208 frac/frame = 0.025 Nm/frame — well under
   # wire limit, internal-paced gentle drain.
-
-  # Plant-inversion horizon: we command the torque that would move the front
-  # wheel by δ_err within 500 ms. For a first-order plant with τ=100 ms
-  # and a 250 ms ramp → 250 ms hold input, the output at t=500 ms is:
-  #   y(0.25) = 4·[0.15 + 0.1·e^(−2.5)] = 0.633   (end of ramp)
-  #   y(0.50) = 1 + (0.633 − 1)·e^(−2.5) = 0.970   (end of hold)
-  # Factor appears in the denominator of T_peak to compensate for this lag.
-  PLANT_500MS_RESPONSE = 0.970
 
   # Feedback deadzone: engage only when δ_err would cause ≥ drift_tol_m
   # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
@@ -283,8 +275,8 @@ def on_lat_controller_init(result, lac, CP):
   #   |a_y_meas| > BMW_LATERAL_ACCEL — current loading already at limit;
   #     don't push deeper. Uses κ_meas (measured outcome).
   #   |jerk_pred| > BMW_LATERAL_JERK — predicted jerk = v²·(κ_des−κ_meas)/τ
-  #     where τ = 0.5 s matches the controller's plant-inversion horizon
-  #     (PLANT_500MS_RESPONSE). Predictive — catches ringing setup ~100 ms
+  #     where τ = JERK_PRED_TAU = 0.5 s matches the controller's plant
+  #     settling horizon. Predictive — catches ringing setup ~100 ms
   #     before it appears in κ_meas. Validated against route 2b8 seg 14:
   #     at t=848.5s during overshoot, κ_des reversed while κ_meas still on
   #     the wrong side, jerk_pred = 4.8 m/s³ → would have cancelled the
@@ -403,14 +395,13 @@ def on_lat_controller_init(result, lac, CP):
         drift_m = DRIFT_LOW_V_M + drift_t * (DRIFT_HIGH_V_M - DRIFT_LOW_V_M)
         tolerance = 2.0 * drift_m * L / (lookahead_m ** 2)
 
-        # Plant-inversion target torque in angle domain. τ needed to move δ
-        # by δ_err within 500 ms, given aligning-torque physics and first-order
-        # plant lag (0.970 asymptote at +500 ms). Soft deadband: deduct
+        # Plant-inversion target torque in angle domain — the steady-state
+        # aligning torque required to hold δ_err. Soft deadband: deduct
         # tolerance from δ_err so commanded torque starts at 0 (not at
         # SLOPE·v²·tolerance) when crossing the boundary — smooth transition,
         # no pulse on tolerance crossing.
         #   effective_err = sign(δ_err) · (|δ_err| − tolerance)
-        #   τ_Nm = T_CAP_SLOPE · v² · effective_err / PLANT_500MS_RESPONSE
+        #   τ_Nm = slope_eff · v² · effective_err
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
         # Sub-breakaway commands won't move the rack → push to ±FRICTION.
         if abs(delta_err) <= tolerance:
@@ -418,7 +409,7 @@ def on_lat_controller_init(result, lac, CP):
           state['action'] = 'hold_zero'
         else:
           effective_err = delta_err - tolerance * (1.0 if delta_err > 0 else -1.0)
-          target_nm = slope_eff * v * v * effective_err / PLANT_500MS_RESPONSE
+          target_nm = slope_eff * v * v * effective_err
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
             target_frac = FRICTION * (1.0 if delta_err > 0 else -1.0)
