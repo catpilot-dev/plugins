@@ -233,10 +233,15 @@ def on_lat_controller_init(result, lac, CP):
   # ingredients), full authority on tight turns. v-independent — same SLOPE
   # multiplier whether κ=0.01 is at parking-lot speed or highway speed.
   T_CAP_BASE_NM = 1.25
-  T_CAP_SLOPE_LO  = 1.0      # at |κ_des| ≤ KAPPA_STRAIGHT — gentle
-  T_CAP_SLOPE_HI  = 3.0      # at |κ_des| ≥ KAPPA_TIGHT    — full authority
+  T_CAP_SLOPE_LO  = 1.5      # at |κ_des| ≤ KAPPA_STRAIGHT — gentle
+  T_CAP_SLOPE_HI  = 2.5      # at |κ_des| ≥ KAPPA_TIGHT    — full authority
   KAPPA_STRAIGHT  = 0.001    # m⁻¹ — below this, treat as straight
   KAPPA_TIGHT     = 0.010    # m⁻¹ — above this, tight turn
+  # Range narrowed (was 1.0..3.0) after route 2b9 seg 9: HI=3.0 made the
+  # tight-turn entry over-aggressive (τ ramped to 4.9 Nm in 600 ms, plant
+  # overshot, ISO cancel could not undo standing torque → disengagement).
+  # 1.5..2.5 keeps near-straight gentleness vs. seg-14 ringing while never
+  # exceeding the proven 2b8-baseline authority on tight turns.
   # Default 2.0 (previous constant) recovered at |κ_des| ≈ 0.0055 (mild curve).
   # STEP_PER_FRAME is computed per decision from speed-dependent SPREAD_FRAMES:
   #   step = T_CAP_BASE_NM / STEER_MAX / spread_frames(v)
