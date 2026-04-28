@@ -259,30 +259,32 @@ def curvature_speed_cap(model_msg) -> int:
 
 
 def confidence_speed_cap(model_msg, v_ego) -> int:
-  """Cap speed based on model confidence distance.
+  """Cap speed based on curvature visible at the confidence boundary.
 
-  If the model can't see far enough ahead at current speed, cap speed to
-  what the visible distance supports. Also considers curvature at the
-  confidence boundary.
+  The model's reliable vision is ~100 m. At highway speed, BMW DCC's
+  −1 m/s² decel limit cannot bleed enough speed to handle a tight curve
+  emerging from past-vision distance — but only IF a curve is actually
+  there. The previous time-based visibility check (PREVIEW_TIME) capped
+  speed any time vision didn't extend v_ego·PREVIEW_TIME ahead, which
+  triggered on perfectly straight highway and felt over-conservative.
 
-  Moved from look_ahead plugin — runs directly on modelV2 in speedlimitd.
+  Switched to a curvature-gated cap: look at the predicted curvature AT
+  the visibility boundary. If there's curvature there, cap to a speed
+  that handles it (using MAX_LAT_ACCEL_CAP as the comfort target). If
+  the road appears straight at the boundary (κ < threshold), no cap —
+  trust until evidence shows otherwise.
 
-  PREVIEW_TIME sized for "drive at a speed you can decelerate within
-  visible distance" given BMW DCC's −1 m/s² hardware limit and a
-  worst-case tight-curve speed of ~9 m/s (32 kph). Without reliable
-  OSM data in China to anticipate curves past 100m vision, this cap
-  is the only safety net for unseen tight curves at highway speed.
-  Practical effect: speed is capped at ~60 kph whenever visibility is
-  at the typical 100m max, scaling lower in degraded visibility.
-  Below ~60 kph the cap usually doesn't engage (vision matches need).
+  Without reliable OSM data in China this is the only forward-curve
+  safety net at high speed; it accepts a residual risk on roads where
+  a tight curve hides past straight-road visibility (rare in practice).
   """
   CONFIDENCE_THRESHOLD = 0.6
   MIN_DIST = 20.0
   MAX_DIST = 100.0
-  PREVIEW_TIME = 6.0          # seconds of forward visibility needed (was 3.0)
-  MAX_LAT_ACCEL_CAP = 1.5     # m/s² for speed cap
-  MIN_CAP_SPEED = 20.0        # km/h
-  MAX_CAP_SPEED = 120.0       # km/h
+  BOUNDARY_CURV_THRESHOLD = 0.004   # 1/m (radius ≥ 250 m). Below ≈ straight at boundary.
+  MAX_LAT_ACCEL_CAP = 1.5    # m/s² target for cap (same as curvature_speed_cap)
+  MIN_CAP_SPEED = 30.0       # km/h floor
+  MAX_CAP_SPEED = 100.0      # km/h — above this, treat as no constraint
 
   if v_ego < 5.0:
     return 0
@@ -302,14 +304,8 @@ def confidence_speed_cap(model_msg, v_ego) -> int:
   except (AttributeError, IndexError):
     pass
 
-  needed_dist = min(v_ego * PREVIEW_TIME, MAX_DIST)
-  if conf_dist >= needed_dist:
-    return 0
-
-  # Visibility-based cap
-  vis_safe_kph = (conf_dist / PREVIEW_TIME) * 3.6
-
   # Curvature at confidence boundary
+  boundary_curv = 0.0
   try:
     pos = model_msg.position
     px, py = list(pos.x), list(pos.y)
@@ -325,18 +321,19 @@ def confidence_speed_cap(model_msg, v_ego) -> int:
           dydx = dy / dx
           d2ydx2 = d2y / ((dx/2) * dx)
           boundary_curv = abs(d2ydx2) / (1 + dydx**2)**1.5
-          if boundary_curv > 0.001:
-            curv_safe_kph = ((MAX_LAT_ACCEL_CAP / boundary_curv) ** 0.5) * 3.6
-            vis_safe_kph = min(vis_safe_kph, curv_safe_kph)
   except (AttributeError, IndexError):
     pass
 
-  if vis_safe_kph >= MAX_CAP_SPEED:
+  # No cap if road appears straight at the boundary
+  if boundary_curv < BOUNDARY_CURV_THRESHOLD:
     return 0
-  if vis_safe_kph < MIN_CAP_SPEED:
-    vis_safe_kph = MIN_CAP_SPEED
 
-  return int(vis_safe_kph)
+  # Cap based on boundary curvature
+  safe_speed_kph = ((MAX_LAT_ACCEL_CAP / boundary_curv) ** 0.5) * 3.6
+
+  if safe_speed_kph >= MAX_CAP_SPEED:
+    return 0
+  return int(max(MIN_CAP_SPEED, safe_speed_kph))
 
 
 def vision_speed_cap(model_msg) -> int:
