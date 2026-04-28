@@ -265,7 +265,7 @@ def on_lat_controller_init(result, lac, CP):
   # don't move the hydraulic rack, so the controller pushes target to ±friction
   # to break stiction. Initial estimate from memory; tune if needed via a
   # dedicated stop-and-ramp experiment (not online — see shadow-plant notes).
-  FRICTION = 0.05
+  FRICTION = 0.1
 
   # ISO 11270 comfort guard. Half-ISO targets:
   #   ISO_LATERAL_ACCEL = 3.0 m/s²    →  BMW_LATERAL_ACCEL = 1.5
