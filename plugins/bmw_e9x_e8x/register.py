@@ -294,7 +294,7 @@ def on_lat_controller_init(result, lac, CP):
     'target_frac': 0.0,        # plant-inversion target set each 250 ms decision
     'step_remaining': 0.0,     # target_frac - torque, drained at CAN rate
     'tick_count': 0,           # livePose tick counter; decide every ACTION_CADENCE_TICKS
-    'action': 'init',          # debug: hold_zero / breakaway / ramp / cancel_accel / cancel_jerk
+    'action': 'init',          # debug: hold_zero / brake_zero / breakaway / ramp / cancel_accel / cancel_jerk
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
     'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
@@ -403,9 +403,21 @@ def on_lat_controller_init(result, lac, CP):
         #   τ_Nm = slope_eff · v² · effective_err
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
         # Sub-breakaway commands won't move the rack → push to ±FRICTION.
+        prev_action = state['action']
         if abs(delta_err) <= tolerance:
-          target_frac = 0.0
-          state['action'] = 'hold_zero'
+          # Brake-to-hold: if we just exited a ramp into deadzone with τ
+          # still loading toward δ_err, plant has momentum that would
+          # cross zero. Set target to FRICTION-level reverse torque to
+          # actively decelerate (BMW rack is sticky; small reverse torque
+          # is enough to halt residual motion). One-shot per ramp →
+          # deadzone transition: next decision sees prev_action='brake_zero'
+          # and falls through to hold_zero (target=0) so τ relaxes.
+          if prev_action == 'ramp' and state['torque'] * delta_err > 0:
+            target_frac = -FRICTION if delta_err > 0 else FRICTION
+            state['action'] = 'brake_zero'
+          else:
+            target_frac = 0.0
+            state['action'] = 'hold_zero'
         else:
           effective_err = delta_err - tolerance * (1.0 if delta_err > 0 else -1.0)
           target_nm = slope_eff * v * v * effective_err
