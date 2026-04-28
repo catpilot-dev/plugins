@@ -695,14 +695,24 @@ class SpeedLimitMiddleware:
         self._displayed_speed_limit = _step_speed_limit(self._displayed_speed_limit, target)
         self._last_step_time = now
 
-    # Safety caps override — clamp displayed limit immediately (bypass gradual transition)
-    safety_capped = False
+    # Safety caps override — clamp displayed limit immediately (bypass gradual
+    # transition) so a tightening curve cap takes effect without lag.
     for cap in (self.curvature_cap, self.lookahead_cap):
       if cap >= MIN_SPEED_LIMIT:
         cap_snapped = snap_to_standard_speed(cap)
         if cap_snapped < self._displayed_speed_limit:
           self._displayed_speed_limit = cap_snapped
-          safety_capped = True
+
+    # safetyCapped: True whenever a curve cap is the active (lowest) source
+    # OR is at/below the displayed limit (i.e., the limit IS being constrained
+    # by a safety cap, regardless of gradual-transition state). planner_hook
+    # uses this to skip the +15% comfort offset on curve approaches — applying
+    # the offset to a curve-derived speed defeats the purpose of the cap.
+    safety_capped = source in (4, 5) or any(
+      snap_to_standard_speed(c) <= self._displayed_speed_limit
+      for c in (self.curvature_cap, self.lookahead_cap)
+      if c >= MIN_SPEED_LIMIT
+    )
 
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
