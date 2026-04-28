@@ -206,13 +206,14 @@ def curvature_speed_cap(model_msg) -> int:
   """Cap speed based on predicted path curvature lookahead.
 
   Uses the model's predicted orientation rate (yaw rate) and velocity
-  over the next ~8 seconds to estimate upcoming curvature. The horizon
-  is sized for the BMW DCC's hardware-limited −1 m/s² deceleration:
-  bleeding 8 m/s of speed (e.g., 17 m/s → 9 m/s for a tight curve)
-  takes 8 seconds, so the cap must fire that far in advance to be
-  actionable. Far-horizon model predictions are noisier but safety
-  caps prefer false positives (slight unnecessary slowdown) over
-  false negatives (curve overshoot at hardware decel limit).
+  over a horizon bounded by both time (8.8s ceiling, T_IDXS[30]) AND
+  distance (~100m, the model's reliable vision range). Beyond 100m the
+  model extrapolates 'straight ahead' from current heading and any κ
+  prediction is noise — we'd rather miss a curve than chase a phantom.
+  Adaptive horizon means: at city speed (40 kph) we use the full 8.8s
+  window; at highway speed (>72 kph) the 100m distance limit kicks in
+  and the time horizon shrinks. For curves at high speed beyond 100m,
+  OSM map data is the right path (not model-based prediction).
 
   Returns speed cap in km/h, or 0 if no constraint.
   """
@@ -222,19 +223,20 @@ def curvature_speed_cap(model_msg) -> int:
   try:
     yaw_rates = list(model_msg.orientationRate.z)
     velocities = list(model_msg.velocity.x)
+    positions_x = list(model_msg.position.x)
   except Exception:
     return 0
 
-  if len(yaw_rates) < 10 or len(velocities) < 10:
+  if len(yaw_rates) < 10 or len(velocities) < 10 or len(positions_x) < 10:
     return 0
 
-  # Look 1-8.8 seconds ahead (T_IDXS spans 0-10s quadratically, T_IDXS[i] = 10*(i/32)^2):
-  #   i=10  → T~1.0s   i=22  → T~4.7s   i=30  → T~8.8s
-  # 5-second window was insufficient: at 17 m/s with a 32 kph curve apex,
-  # the cap arrived only 1-2s before the curve, leaving the −1 m/s² limit
-  # unable to bleed v in time. 8.8 seconds covers the worst case.
+  # T_IDXS = 10 * (i/32)^2:  i=10 → 1.0s   i=22 → 4.7s   i=30 → 8.8s
+  # Vision-bounded horizon: stop iterating once predicted x exceeds VISION_M.
+  VISION_M = 100.0
   max_curvature = 0.0
-  for i in range(5, min(31, len(yaw_rates))):
+  for i in range(5, min(31, len(yaw_rates), len(positions_x))):
+    if positions_x[i] > VISION_M:
+      break  # past reliable vision — model extrapolates, predictions are noise
     v = max(velocities[i], 5.0)  # floor at 5 m/s to avoid division issues
     curvature = abs(yaw_rates[i]) / v
     max_curvature = max(max_curvature, curvature)
