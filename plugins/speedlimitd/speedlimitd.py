@@ -206,8 +206,13 @@ def curvature_speed_cap(model_msg) -> int:
   """Cap speed based on predicted path curvature lookahead.
 
   Uses the model's predicted orientation rate (yaw rate) and velocity
-  over the next ~5 seconds to estimate upcoming curvature. Maps maximum
-  curvature to a safe speed using lateral acceleration limit of 2.0 m/s².
+  over the next ~8 seconds to estimate upcoming curvature. The horizon
+  is sized for the BMW DCC's hardware-limited −1 m/s² deceleration:
+  bleeding 8 m/s of speed (e.g., 17 m/s → 9 m/s for a tight curve)
+  takes 8 seconds, so the cap must fire that far in advance to be
+  actionable. Far-horizon model predictions are noisier but safety
+  caps prefer false positives (slight unnecessary slowdown) over
+  false negatives (curve overshoot at hardware decel limit).
 
   Returns speed cap in km/h, or 0 if no constraint.
   """
@@ -223,10 +228,13 @@ def curvature_speed_cap(model_msg) -> int:
   if len(yaw_rates) < 10 or len(velocities) < 10:
     return 0
 
-  # Look 1-5 seconds ahead (indices ~5-22 in T_IDXS, which spans 0-10s quadratically)
-  # T_IDXS[i] = 10 * (i/32)^2, so T~1s is i≈10, T~5s is i≈22
+  # Look 1-8.8 seconds ahead (T_IDXS spans 0-10s quadratically, T_IDXS[i] = 10*(i/32)^2):
+  #   i=10  → T~1.0s   i=22  → T~4.7s   i=30  → T~8.8s
+  # 5-second window was insufficient: at 17 m/s with a 32 kph curve apex,
+  # the cap arrived only 1-2s before the curve, leaving the −1 m/s² limit
+  # unable to bleed v in time. 8.8 seconds covers the worst case.
   max_curvature = 0.0
-  for i in range(5, min(23, len(yaw_rates))):
+  for i in range(5, min(31, len(yaw_rates))):
     v = max(velocities[i], 5.0)  # floor at 5 m/s to avoid division issues
     curvature = abs(yaw_rates[i]) / v
     max_curvature = max(max_curvature, curvature)
