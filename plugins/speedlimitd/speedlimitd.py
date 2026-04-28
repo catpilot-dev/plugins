@@ -203,19 +203,23 @@ def infer_lane_count(model_msg) -> int:
 
 
 def curvature_speed_cap(model_msg) -> int:
-  """Cap speed based on predicted path curvature lookahead.
+  """Cap speed based on max predicted path curvature within reliable vision.
 
-  Uses the model's predicted orientation rate (yaw rate) and velocity
-  over a horizon bounded by both time (8.8s ceiling, T_IDXS[30]) AND
-  distance (~100m, the model's reliable vision range). Beyond 100m the
-  model extrapolates 'straight ahead' from current heading and any κ
-  prediction is noise — we'd rather miss a curve than chase a phantom.
-  Adaptive horizon means: at city speed (40 kph) we use the full 8.8s
-  window; at highway speed (>72 kph) the 100m distance limit kicks in
-  and the time horizon shrinks. For curves at high speed beyond 100m,
-  OSM map data is the right path (not model-based prediction).
+  Looks at the model's predicted yaw rate and velocity over a horizon
+  bounded by:
+    - time:     T_IDXS index 30 (≈ 8.8 s, model's prediction limit)
+    - distance: model's confidence boundary (yStd-based, capped at 100 m)
+  Whichever bound is tighter wins. Beyond the confidence boundary the
+  model extrapolates 'straight ahead' and predictions are noise.
 
-  Returns speed cap in km/h, or 0 if no constraint.
+  Computes max κ within that range and maps to a comfort-limited safe
+  speed (MAX_LAT_ACCEL = 1.5 m/s², below the EU/UN-R79 3 m/s² envelope).
+
+  Replaced two separate functions (curvature_speed_cap looking at +5s
+  yaw rate and confidence_speed_cap sampling boundary κ) — both were
+  computing the same physical quantity (path curvature within vision).
+
+  Returns speed cap in km/h, or 0 if no meaningful constraint.
   """
   if not hasattr(model_msg, 'orientationRate') or not hasattr(model_msg, 'velocity'):
     return 0
@@ -224,19 +228,29 @@ def curvature_speed_cap(model_msg) -> int:
     yaw_rates = list(model_msg.orientationRate.z)
     velocities = list(model_msg.velocity.x)
     positions_x = list(model_msg.position.x)
+    yStd = list(model_msg.position.yStd)
   except Exception:
     return 0
 
   if len(yaw_rates) < 10 or len(velocities) < 10 or len(positions_x) < 10:
     return 0
 
+  # Confidence-based vision distance, capped at 100 m
+  CONFIDENCE_THRESHOLD = 0.6
+  MAX_VISION = 100.0
+  conf_dist = MAX_VISION
+  for i in range(min(len(positions_x), len(yStd)) - 1, -1, -1):
+    conf = 1.0 / (1.0 + yStd[i])
+    if conf > CONFIDENCE_THRESHOLD:
+      conf_dist = min(MAX_VISION, positions_x[i])
+      break
+
   # T_IDXS = 10 * (i/32)^2:  i=10 → 1.0s   i=22 → 4.7s   i=30 → 8.8s
-  # Vision-bounded horizon: stop iterating once predicted x exceeds VISION_M.
-  VISION_M = 100.0
+  # Iterate within both time AND distance bounds.
   max_curvature = 0.0
   for i in range(5, min(31, len(yaw_rates), len(positions_x))):
-    if positions_x[i] > VISION_M:
-      break  # past reliable vision — model extrapolates, predictions are noise
+    if positions_x[i] > conf_dist:
+      break  # past confident vision — extrapolation noise
     v = max(velocities[i], 5.0)  # floor at 5 m/s to avoid division issues
     curvature = abs(yaw_rates[i]) / v
     max_curvature = max(max_curvature, curvature)
@@ -244,96 +258,16 @@ def curvature_speed_cap(model_msg) -> int:
   if max_curvature < 0.003:  # negligible curvature (~330m radius)
     return 0
 
-  # v = sqrt(a_lat_max / curvature)
-  # Use 1.5 m/s² (not the physical limit of ~3-4 m/s²) because the model
-  # underestimates apex curvature when looking ahead from the approach.
-  # 1.5 compensates for this, producing 60 km/h caps ~3s earlier.
+  # v = sqrt(a_lat_max / curvature). Use 1.5 m/s² (below the 3 m/s² EU
+  # envelope) to give the BMW DCC's −1 m/s² decel limit time to bleed
+  # speed before the curve.
   MAX_LAT_ACCEL = 1.5
-  safe_speed_ms = (MAX_LAT_ACCEL / max_curvature) ** 0.5
-  safe_speed_kph = safe_speed_ms * 3.6
+  safe_speed_kph = ((MAX_LAT_ACCEL / max_curvature) ** 0.5) * 3.6
 
   if safe_speed_kph >= 100:
     return 0  # no meaningful constraint
 
   return snap_to_standard_speed(int(safe_speed_kph))
-
-
-def confidence_speed_cap(model_msg, v_ego) -> int:
-  """Cap speed based on curvature visible at the confidence boundary.
-
-  The model's reliable vision is ~100 m. At highway speed, BMW DCC's
-  −1 m/s² decel limit cannot bleed enough speed to handle a tight curve
-  emerging from past-vision distance — but only IF a curve is actually
-  there. The previous time-based visibility check (PREVIEW_TIME) capped
-  speed any time vision didn't extend v_ego·PREVIEW_TIME ahead, which
-  triggered on perfectly straight highway and felt over-conservative.
-
-  Switched to a curvature-gated cap: look at the predicted curvature AT
-  the visibility boundary. If there's curvature there, cap to a speed
-  that handles it (using MAX_LAT_ACCEL_CAP as the comfort target). If
-  the road appears straight at the boundary (κ < threshold), no cap —
-  trust until evidence shows otherwise.
-
-  Without reliable OSM data in China this is the only forward-curve
-  safety net at high speed; it accepts a residual risk on roads where
-  a tight curve hides past straight-road visibility (rare in practice).
-  """
-  CONFIDENCE_THRESHOLD = 0.6
-  MIN_DIST = 20.0
-  MAX_DIST = 100.0
-  BOUNDARY_CURV_THRESHOLD = 0.004   # 1/m (radius ≥ 250 m). Below ≈ straight at boundary.
-  MAX_LAT_ACCEL_CAP = 1.5    # m/s² target for cap (same as curvature_speed_cap)
-  MIN_CAP_SPEED = 30.0       # km/h floor
-  MAX_CAP_SPEED = 100.0      # km/h — above this, treat as no constraint
-
-  if v_ego < 5.0:
-    return 0
-
-  # Find confidence distance — farthest point where yStd confidence > threshold
-  conf_dist = MIN_DIST
-  try:
-    pos = model_msg.position
-    x = list(pos.x)
-    yStd = list(pos.yStd)
-    if len(x) >= 5 and len(yStd) >= 5:
-      for i in range(len(x) - 1, -1, -1):
-        conf = 1.0 / (1.0 + yStd[i])
-        if conf > CONFIDENCE_THRESHOLD:
-          conf_dist = max(MIN_DIST, min(MAX_DIST, x[i]))
-          break
-  except (AttributeError, IndexError):
-    pass
-
-  # Curvature at confidence boundary
-  boundary_curv = 0.0
-  try:
-    pos = model_msg.position
-    px, py = list(pos.x), list(pos.y)
-    if len(px) >= 5 and len(py) >= 5:
-      import numpy as np
-      pxa, pya = np.array(px), np.array(py)
-      idx = np.searchsorted(pxa, conf_dist)
-      if 2 <= idx < len(pxa) - 1:
-        dx = pxa[idx+1] - pxa[idx-1]
-        dy = pya[idx+1] - pya[idx-1]
-        d2y = pya[idx+1] - 2*pya[idx] + pya[idx-1]
-        if abs(dx) >= 0.1:
-          dydx = dy / dx
-          d2ydx2 = d2y / ((dx/2) * dx)
-          boundary_curv = abs(d2ydx2) / (1 + dydx**2)**1.5
-  except (AttributeError, IndexError):
-    pass
-
-  # No cap if road appears straight at the boundary
-  if boundary_curv < BOUNDARY_CURV_THRESHOLD:
-    return 0
-
-  # Cap based on boundary curvature
-  safe_speed_kph = ((MAX_LAT_ACCEL_CAP / boundary_curv) ** 0.5) * 3.6
-
-  if safe_speed_kph >= MAX_CAP_SPEED:
-    return 0
-  return int(max(MIN_CAP_SPEED, safe_speed_kph))
 
 
 def vision_speed_cap(model_msg) -> int:
@@ -502,9 +436,6 @@ class SpeedLimitMiddleware:
     self.lane_width: float = 0.0       # smoothed m, 0 = no observation yet
     self.lane_width_class: str = ''    # road-type hint from lane_width_class table
 
-    self.lookahead_cap: int = 0
-    self._lookahead_cap_hold_until: float = 0.0
-
     # YOLO detection state (placeholder for future integration)
     self.yolo_speed: int = 0
     self.yolo_last_seen: float = 0.0
@@ -622,21 +553,6 @@ class SpeedLimitMiddleware:
         # Hold expired — allow cap to relax
         self.curvature_cap = raw_curv_cap
 
-    # --- Confidence-based speed cap (moved from look_ahead plugin) ---
-    if self.sm.updated['modelV2']:
-      try:
-        v_ego = max(list(model.velocity.x)[0], 0.0) if hasattr(model, 'velocity') else 0.0
-      except (IndexError, AttributeError):
-        v_ego = 0.0
-      raw_la_cap = confidence_speed_cap(model, v_ego)
-      if raw_la_cap > 0 and (raw_la_cap < self.lookahead_cap or self.lookahead_cap == 0):
-        self.lookahead_cap = raw_la_cap
-        self._lookahead_cap_hold_until = now + 3.0
-      elif now < self._lookahead_cap_hold_until:
-        pass  # Hold current cap
-      else:
-        self.lookahead_cap = raw_la_cap
-
     # --- Lane width observation from lane_centering plugin ---
     # Smoothed (EMA) across 5 Hz drain so a single noisy frame can't swing
     # the road-class vote. lane_width_learned=False → fall back to default
@@ -691,8 +607,6 @@ class SpeedLimitMiddleware:
       candidates.append((float(yolo_speed), 1, 0.8))    # yoloDetection
     if self.curvature_cap >= MIN_SPEED_LIMIT:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
-    if self.lookahead_cap >= MIN_SPEED_LIMIT:
-      candidates.append((float(self.lookahead_cap), 5, 0.7))  # lookaheadConfidence
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # roadTypeInference
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
@@ -711,23 +625,20 @@ class SpeedLimitMiddleware:
         self._displayed_speed_limit = _step_speed_limit(self._displayed_speed_limit, target)
         self._last_step_time = now
 
-    # Safety caps override — clamp displayed limit immediately (bypass gradual
+    # Safety cap override — clamp displayed limit immediately (bypass gradual
     # transition) so a tightening curve cap takes effect without lag.
-    for cap in (self.curvature_cap, self.lookahead_cap):
-      if cap >= MIN_SPEED_LIMIT:
-        cap_snapped = snap_to_standard_speed(cap)
-        if cap_snapped < self._displayed_speed_limit:
-          self._displayed_speed_limit = cap_snapped
+    if self.curvature_cap >= MIN_SPEED_LIMIT:
+      cap_snapped = snap_to_standard_speed(self.curvature_cap)
+      if cap_snapped < self._displayed_speed_limit:
+        self._displayed_speed_limit = cap_snapped
 
-    # safetyCapped: True whenever a curve cap is the active (lowest) source
+    # safetyCapped: True whenever the curve cap is the active (lowest) source
     # OR is at/below the displayed limit (i.e., the limit IS being constrained
     # by a safety cap, regardless of gradual-transition state). planner_hook
-    # uses this to skip the +15% comfort offset on curve approaches — applying
-    # the offset to a curve-derived speed defeats the purpose of the cap.
-    safety_capped = source in (4, 5) or any(
-      snap_to_standard_speed(c) <= self._displayed_speed_limit
-      for c in (self.curvature_cap, self.lookahead_cap)
-      if c >= MIN_SPEED_LIMIT
+    # uses this to skip the +15% comfort offset on curve approaches.
+    safety_capped = source == 4 or (
+      self.curvature_cap >= MIN_SPEED_LIMIT
+      and snap_to_standard_speed(self.curvature_cap) <= self._displayed_speed_limit
     )
 
     # --- Confirmation management ---
@@ -768,7 +679,6 @@ class SpeedLimitMiddleware:
       'laneWidth': round(self.lane_width, 2),
       'laneWidthClass': self.lane_width_class,
       'curvatureCap': self.curvature_cap,
-      'lookaheadCap': self.lookahead_cap,
       'safetyCapped': safety_capped,
     })
 
