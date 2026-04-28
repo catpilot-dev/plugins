@@ -190,12 +190,12 @@ def on_lat_controller_init(result, lac, CP):
   Ramp: step_remaining = T_peak − state['torque'], drained over 25 CAN frames.
 
   ISO 11270 half-comfort guard (every livePose tick): cancel ramping if
-  |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³.
-  Predicted jerk catches the ringing setup before κ_meas confirms it. When
-  τ is still loading the wheel deeper into the over-envelope direction,
-  redirect the ramp toward −FRICTION·sign(κ_meas) so the rack can unwind
-  via tire aligning forces (BMW hydraulic rack won't self-center under
-  standing torque).
+  |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³,
+  AND only when plant has actually overshot ((κ_des−κ_meas)·κ_meas < 0).
+  Under-tracking (plant lagging in a hard curve) is left to the controller
+  to chase. When cancel fires, redirect the ramp toward −FRICTION·sign(κ_meas)
+  so the BMW hydraulic rack can unwind via tire aligning forces (won't
+  self-center under standing torque).
 
   No online adaptation: plant behavior is fully described by T_CAP_SLOPE_*,
   T_CAP_BASE_NM, and FRICTION. Tune these offline from route data; there's
@@ -339,41 +339,40 @@ def on_lat_controller_init(result, lac, CP):
       delta_err = delta_des - delta_meas
       state['delta_err'] = delta_err
 
-      # ISO 11270 half-comfort guard. Cancel ramping if measured a_y already
-      # exceeds the comfort envelope, or if predicted jerk (v²·κ_err / τ)
-      # would. Predicted jerk catches the ringing setup ~100 ms before
-      # κ_meas confirms. Checks fire every livePose tick (50 ms), independent
-      # of decision cadence.
+      # ISO 11270 half-comfort guard, gated on plant overshoot. Fires only
+      # when (κ_des − κ_meas)·κ_meas < 0 — i.e., plant has turned more than
+      # the planner asked for (or to the wrong side of zero). During
+      # legitimate under-tracking (plant lagging κ_des in a hard curve),
+      # the guard stays silent so the controller can keep tracking. Route
+      # 2ba seg 22 evidence: a_y_meas crept above 1.5 during chassis catch-
+      # up while still under-tracking (κ_meas < κ_des); the un-gated guard
+      # zeroed step_remaining, the controller couldn't apply torque, and
+      # the car drifted 1.29 m outside the lane.
       #
-      # Reverse-breakaway unwind: the BMW hydraulic rack has high stiction
-      # and won't self-center under standing torque. When cancel fires AND
-      # the current torque is still loading the wheel into the over-envelope
-      # direction (sign(τ) == sign(κ_meas)), redirect the ramp toward
-      # −FRICTION·sign(κ_meas). That small counter-direction torque unloads
-      # the standing command and breaks stiction so tire aligning forces
-      # can unwind the rack toward center. Without this, cancel only halts
-      # the ramp — the loaded torque keeps holding the wheel turned (route
-      # 2b9 seg 9: τ held at −4.4 Nm for 1+ second after cancel fired).
+      # Reverse-breakaway unwind: when overshoot is real, drain τ toward
+      # −FRICTION·sign(κ_meas). The BMW hydraulic rack has high stiction
+      # and won't self-center under standing torque; that small counter-
+      # direction torque (~0.6 Nm) breaks stiction so tire aligning forces
+      # can return the wheel toward center. FRICTION-level (not full
+      # counter-correction) prevents the cancel from creating the seg-14
+      # ringing pattern in reverse.
       a_y_meas = v * v * state['measured']
       jerk_pred = v * v * (state['desired'] - state['measured']) / JERK_PRED_TAU
       state['a_y_meas'] = a_y_meas
       state['jerk_pred'] = jerk_pred
+      overshooting = (state['desired'] - state['measured']) * state['measured'] < 0
       cancel_reason = None
-      if abs(a_y_meas) > BMW_LATERAL_ACCEL:
-        cancel_reason = 'cancel_accel'
-      elif abs(jerk_pred) > BMW_LATERAL_JERK:
-        cancel_reason = 'cancel_jerk'
+      if overshooting:
+        if abs(a_y_meas) > BMW_LATERAL_ACCEL:
+          cancel_reason = 'cancel_accel'
+        elif abs(jerk_pred) > BMW_LATERAL_JERK:
+          cancel_reason = 'cancel_jerk'
       if cancel_reason:
         state['fast_ramp_remaining'] = 0
-        if abs(state['measured']) > 0.0005 and state['torque'] * state['measured'] > 0:
-          # Wheel turned + torque loading it deeper → unwind via FRICTION-level
-          # counter-direction breakaway. Drains through the existing ramp.
-          unwind_target = -FRICTION if state['measured'] > 0 else FRICTION
-          state['target_frac'] = unwind_target
-          state['step_remaining'] = unwind_target - state['torque']
-        else:
-          # Already counter-correcting or wheel near center — just halt ramp.
-          state['step_remaining'] = 0.0
+        # overshooting=True implies κ_meas != 0; unwind toward opposite sign.
+        unwind_target = -FRICTION if state['measured'] > 0 else FRICTION
+        state['target_frac'] = unwind_target
+        state['step_remaining'] = unwind_target - state['torque']
         state['action'] = cancel_reason
 
       state['tick_count'] += 1
