@@ -266,11 +266,20 @@ def confidence_speed_cap(model_msg, v_ego) -> int:
   confidence boundary.
 
   Moved from look_ahead plugin — runs directly on modelV2 in speedlimitd.
+
+  PREVIEW_TIME sized for "drive at a speed you can decelerate within
+  visible distance" given BMW DCC's −1 m/s² hardware limit and a
+  worst-case tight-curve speed of ~9 m/s (32 kph). Without reliable
+  OSM data in China to anticipate curves past 100m vision, this cap
+  is the only safety net for unseen tight curves at highway speed.
+  Practical effect: speed is capped at ~60 kph whenever visibility is
+  at the typical 100m max, scaling lower in degraded visibility.
+  Below ~60 kph the cap usually doesn't engage (vision matches need).
   """
   CONFIDENCE_THRESHOLD = 0.6
   MIN_DIST = 20.0
   MAX_DIST = 100.0
-  PREVIEW_TIME = 3.0          # seconds of forward visibility needed
+  PREVIEW_TIME = 6.0          # seconds of forward visibility needed (was 3.0)
   MAX_LAT_ACCEL_CAP = 1.5     # m/s² for speed cap
   MIN_CAP_SPEED = 20.0        # km/h
   MAX_CAP_SPEED = 120.0       # km/h
