@@ -208,17 +208,13 @@ def on_lat_controller_init(result, lac, CP):
 
   # Decision cadence & CAN-rate spreading.
   # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
-  # SPREAD_FRAMES is speed-dependent (linearly interpolated):
-  #   v=30 kph (8.33 m/s):  spread=10 → 100 ms ramp (agile, sub-cycle)
-  #   v=120 kph (33.3 m/s): spread=25 → 250 ms ramp (fills the decision cycle)
-  # Capping SPREAD_FRAMES_MAX at 25 keeps ramps within the 250 ms decision
-  # window — each cycle's ramp completes before the next decision fires.
-  # Higher v gets gentler ramps without de-syncing from cadence.
+  # SPREAD_FRAMES = 25 uniformly: each ramp drains over 250 ms = exactly
+  # one decision cycle, regardless of speed. Speed-dependent SPREAD removed
+  # — the curvature-scheduled slope_eff already adapts authority by κ_des,
+  # and a uniform ramp window simplifies tuning without a measurable feel
+  # change on previous routes.
   ACTION_CADENCE_TICKS = 5
-  SPREAD_FRAMES_MIN = 10                  # at v ≤ 30 kph (8.33 m/s)
-  SPREAD_FRAMES_MAX = 25                  # at v ≥ 120 kph (33.33 m/s) — fills 250 ms cycle
-  V_FOR_SPREAD_MIN = 30.0 / 3.6           # 8.33 m/s
-  V_FOR_SPREAD_MAX = 120.0 / 3.6          # 33.33 m/s
+  SPREAD_FRAMES = 25                       # 250 ms ramp = one decision cycle
   # T_CAP slope gain-schedule (κ_des-adaptive). Linear tire regime:
   #     τ_Nm_hold = slope_eff · v² · δ                 (aligning torque)
   #     slope_eff = lerp(LO → HI, (|κ_des|−κ_LO)/(κ_HI−κ_LO))   clamped
@@ -242,12 +238,10 @@ def on_lat_controller_init(result, lac, CP):
   # 1.5..2.5 keeps near-straight gentleness vs. seg-14 ringing while never
   # exceeding the proven 2b8-baseline authority on tight turns.
   # Default 2.0 (previous constant) recovered at |κ_des| ≈ 0.0055 (mild curve).
-  # STEP_PER_FRAME is computed per decision from speed-dependent SPREAD_FRAMES:
-  #   step = T_CAP_BASE_NM / STEER_MAX / spread_frames(v)
-  # At v=30 kph (spread=10): 0.0104 frac/frame = 0.125 Nm/frame — exceeds the
-  # wire STEER_DELTA_UP limit (0.1 Nm/frame), so wire clamps to ~0.1 Nm/frame.
-  # At v=120 kph (spread=50): 0.00208 frac/frame = 0.025 Nm/frame — well under
-  # wire limit, internal-paced gentle drain.
+  # STEP_PER_FRAME = T_CAP_BASE_NM / STEER_MAX / SPREAD_FRAMES = 0.00417
+  # frac/frame = 0.05 Nm/frame at the BASE level. Drains a full T_CAP_BASE
+  # in 250 ms (one decision cycle). Well under the wire STEER_DELTA_UP
+  # limit (0.1 Nm/frame), so internal pacing dominates.
 
   # Feedback deadzone: engage only when δ_err would cause ≥ drift_tol_m
   # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
@@ -257,8 +251,10 @@ def on_lat_controller_init(result, lac, CP):
   # any error matters more because v² scales the felt impact).
   # Combined with the 1/v² factor in tolerance, both effects compound:
   # tolerance shrinks faster with v than the +slope variant did.
-  DRIFT_LOW_V_M  = 0.040  # m at v ≤ 30 kph (8.33 m/s) — permissive
-  DRIFT_HIGH_V_M = 0.020  # m at v ≥ 120 kph (33.33 m/s) — tighter
+  DRIFT_LOW_V_M  = 0.040  # m at v ≤ V_FOR_DRIFT_MIN — permissive
+  DRIFT_HIGH_V_M = 0.020  # m at v ≥ V_FOR_DRIFT_MAX — tighter
+  V_FOR_DRIFT_MIN = 30.0 / 3.6     # 8.33 m/s
+  V_FOR_DRIFT_MAX = 120.0 / 3.6    # 33.33 m/s
   DRIFT_EVAL_HORIZON_S = 0.5
 
   # Breakaway torque fraction (rack stiction floor). Sub-friction commands
@@ -298,7 +294,7 @@ def on_lat_controller_init(result, lac, CP):
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
     'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
-    'step_per_frame': T_CAP_BASE_NM / CCP.STEER_MAX / 25,  # per-frame drain rate (set per decision)
+    'step_per_frame': T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES,  # per-frame drain rate
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'slope_eff': T_CAP_SLOPE_LO,  # debug: effective gain-scheduled T_CAP_SLOPE
@@ -380,17 +376,14 @@ def on_lat_controller_init(result, lac, CP):
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
         state['tick_count'] = 0
 
-        # Speed-dependent ramp window: linearly interpolate spread frames
-        # between low-speed (agile, spread=10) and high-speed (gentle, spread=50).
-        spread_t = max(0.0, min(1.0, (v - V_FOR_SPREAD_MIN) / (V_FOR_SPREAD_MAX - V_FOR_SPREAD_MIN)))
-        spread_frames = SPREAD_FRAMES_MIN + spread_t * (SPREAD_FRAMES_MAX - SPREAD_FRAMES_MIN)
-        state['step_per_frame'] = T_CAP_BASE_NM / CCP.STEER_MAX / spread_frames
+        # Uniform ramp window — drain step_remaining over one decision cycle.
+        state['step_per_frame'] = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
 
         # Speed-adaptive tolerance: 0.025 m lateral drift over 0.5 s horizon.
         # δ_tol = 2·M·L / (v·T)²  — scales 1/v², matches natural correction authority.
         lookahead_m = v * DRIFT_EVAL_HORIZON_S
         # drift_m linearly interpolated between low-v (permissive) and high-v (tighter)
-        drift_t = max(0.0, min(1.0, (v - V_FOR_SPREAD_MIN) / (V_FOR_SPREAD_MAX - V_FOR_SPREAD_MIN)))
+        drift_t = max(0.0, min(1.0, (v - V_FOR_DRIFT_MIN) / (V_FOR_DRIFT_MAX - V_FOR_DRIFT_MIN)))
         drift_m = DRIFT_LOW_V_M + drift_t * (DRIFT_HIGH_V_M - DRIFT_LOW_V_M)
         tolerance = 2.0 * drift_m * L / (lookahead_m ** 2)
 
