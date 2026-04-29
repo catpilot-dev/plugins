@@ -377,12 +377,8 @@ def on_lat_controller_init(result, lac, CP):
         tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
 
         # Plant-inversion target torque in angle domain — the steady-state
-        # aligning torque required to hold δ_err. Soft deadband: deduct
-        # tolerance from δ_err so commanded torque starts at 0 (not at
-        # SLOPE·v²·tolerance) when crossing the boundary — smooth transition,
-        # no pulse on tolerance crossing.
-        #   effective_err = sign(δ_err) · (|δ_err| − tolerance)
-        #   τ_Nm = slope_eff · v² · effective_err
+        # aligning torque required to hold δ_err.
+        #   τ_Nm = slope_eff · v² · δ_err
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
         # Sub-breakaway commands won't move the rack → push to ±FRICTION.
         prev_action = state['action']
@@ -401,8 +397,7 @@ def on_lat_controller_init(result, lac, CP):
             target_frac = 0.0
             state['action'] = 'hold_zero'
         else:
-          effective_err = delta_err - tolerance * (1.0 if delta_err > 0 else -1.0)
-          target_nm = slope_eff * v * v * effective_err
+          target_nm = slope_eff * v * v * delta_err
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
             target_frac = FRICTION * (1.0 if delta_err > 0 else -1.0)
