@@ -243,18 +243,13 @@ def on_lat_controller_init(result, lac, CP):
   # in 250 ms (one decision cycle). Well under the wire STEER_DELTA_UP
   # limit (0.1 Nm/frame), so internal pacing dominates.
 
-  # Feedback deadzone: engage only when δ_err would cause ≥ drift_tol_m
+  # Feedback deadzone: engage only when δ_err would cause ≥ DRIFT_M
   # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
-  #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · drift_m · L / (v·T)²
-  # drift_m DECREASES with speed: at low v allow larger drift (comfort,
-  # corrections take longer to be felt); at high v tighten drift (precision,
-  # any error matters more because v² scales the felt impact).
-  # Combined with the 1/v² factor in tolerance, both effects compound:
-  # tolerance shrinks faster with v than the +slope variant did.
-  DRIFT_LOW_V_M  = 0.040  # m at v ≤ V_FOR_DRIFT_MIN — permissive
-  DRIFT_HIGH_V_M = 0.020  # m at v ≥ V_FOR_DRIFT_MAX — tighter
-  V_FOR_DRIFT_MIN = 30.0 / 3.6     # 8.33 m/s
-  V_FOR_DRIFT_MAX = 120.0 / 3.6    # 33.33 m/s
+  #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · DRIFT_M · L / (v·T)²
+  # The 1/v² factor in tolerance already gives natural speed adaptation
+  # (tighter at high v); the prior speed-adaptive drift_m interpolation
+  # added a second-order tweak that wasn't measurably useful.
+  DRIFT_M = 0.025          # m of allowed drift over DRIFT_EVAL_HORIZON_S
   DRIFT_EVAL_HORIZON_S = 0.5
 
   # Breakaway torque fraction (rack stiction floor). Sub-friction commands
@@ -266,7 +261,7 @@ def on_lat_controller_init(result, lac, CP):
   # ISO 11270 comfort guard. Half-ISO targets:
   #   ISO_LATERAL_ACCEL = 3.0 m/s²    →  BMW_LATERAL_ACCEL = 1.5
   #   ISO_LATERAL_JERK  = 5.0 m/s³    →  BMW_LATERAL_JERK  = 2.5
-  # Cancel step_remaining (and fast_ramp_remaining) when either exceeded.
+  # Cancel step_remaining when either exceeded, redirect toward FRICTION-
   #   |a_y_meas| > BMW_LATERAL_ACCEL — current loading already at limit;
   #     don't push deeper. Uses κ_meas (measured outcome).
   #   |jerk_pred| > BMW_LATERAL_JERK — predicted jerk = v²·(κ_des−κ_meas)/τ
@@ -292,8 +287,6 @@ def on_lat_controller_init(result, lac, CP):
     'tick_count': 0,           # livePose tick counter; decide every ACTION_CADENCE_TICKS
     'action': 'init',          # debug: hold_zero / brake_zero / breakaway / ramp / cancel_accel / cancel_jerk
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
-    'fast_ramp_remaining': 0,  # CAN frames left in breakaway sign-flip fast ramp
-    'fast_ramp_step': 0.0,     # per-frame step during fast ramp (target_frac / 5)
     'step_per_frame': T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES,  # per-frame drain rate
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
@@ -364,7 +357,6 @@ def on_lat_controller_init(result, lac, CP):
         elif abs(jerk_pred) > BMW_LATERAL_JERK:
           cancel_reason = 'cancel_jerk'
       if cancel_reason:
-        state['fast_ramp_remaining'] = 0
         # overshooting=True implies κ_meas != 0; unwind toward opposite sign.
         unwind_target = -FRICTION if state['measured'] > 0 else FRICTION
         state['target_frac'] = unwind_target
@@ -379,13 +371,10 @@ def on_lat_controller_init(result, lac, CP):
         # Uniform ramp window — drain step_remaining over one decision cycle.
         state['step_per_frame'] = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
 
-        # Speed-adaptive tolerance: 0.025 m lateral drift over 0.5 s horizon.
-        # δ_tol = 2·M·L / (v·T)²  — scales 1/v², matches natural correction authority.
+        # Speed-scaled tolerance: 0.025 m drift over 0.5 s horizon, 1/v² scaling.
+        # δ_tol = 2 · DRIFT_M · L / (v·T)²  — natural authority match.
         lookahead_m = v * DRIFT_EVAL_HORIZON_S
-        # drift_m linearly interpolated between low-v (permissive) and high-v (tighter)
-        drift_t = max(0.0, min(1.0, (v - V_FOR_DRIFT_MIN) / (V_FOR_DRIFT_MAX - V_FOR_DRIFT_MIN)))
-        drift_m = DRIFT_LOW_V_M + drift_t * (DRIFT_HIGH_V_M - DRIFT_LOW_V_M)
-        tolerance = 2.0 * drift_m * L / (lookahead_m ** 2)
+        tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
 
         # Plant-inversion target torque in angle domain — the steady-state
         # aligning torque required to hold δ_err. Soft deadband: deduct
@@ -430,27 +419,10 @@ def on_lat_controller_init(result, lac, CP):
           target_frac = max(-t_cap_frac, min(t_cap_frac, target_frac))
 
         state['target_frac'] = target_frac
-
-        # Breakaway sign-flip fast ramp: the normal drain would crawl from
-        # ±friction through zero to ∓friction at the per-frame step rate,
-        # sitting in the stiction zone for many frames and buzzing the
-        # actuator. Reset torque to 0 and ramp to the new target over 5
-        # frames (50 ms) regardless of speed-dependent SPREAD_FRAMES — the
-        # 5-frame fast ramp is a dedicated stiction-crossing mechanism.
-        if state['action'] == 'breakaway' and state['torque'] * target_frac < 0.0:
-          state['torque'] = 0.0
-          state['fast_ramp_remaining'] = 5
-          state['fast_ramp_step'] = target_frac / 5.0
-          state['step_remaining'] = 0.0
-        else:
-          state['step_remaining'] = target_frac - state['torque']
+        state['step_remaining'] = target_frac - state['torque']
 
     # Apply CAN-rate step: fraction of remaining per 100 Hz tick.
-    # Fast ramp (breakaway sign flip) takes priority for its first 5 frames.
-    if state['fast_ramp_remaining'] > 0:
-      state['torque'] = max(-1.0, min(1.0, state['torque'] + state['fast_ramp_step']))
-      state['fast_ramp_remaining'] -= 1
-    elif abs(state['step_remaining']) > 1e-9:
+    if abs(state['step_remaining']) > 1e-9:
       step_per_frame = state['step_per_frame']
       step_this_tick = max(-step_per_frame, min(step_per_frame, state['step_remaining']))
       state['torque'] = max(-1.0, min(1.0, state['torque'] + step_this_tick))
