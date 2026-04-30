@@ -102,12 +102,8 @@ def on_cruise_initialized(result, v_cruise_helper, CS):
   for BMW because engagement is a state transition (not a resume button press).
   This restores the user's last-adjusted ceiling within the same onroad session.
   """
-  try:
-    with open(os.path.join(_PLUGIN_DIR, 'data', 'CruiseCeilingMemory')) as f:
-      if f.read().strip() == '0':
-        return result
-  except (FileNotFoundError, OSError):
-    pass  # default: enabled
+  if _read_param('CruiseCeilingMemory') == '0':
+    return result
 
   if 30 <= v_cruise_helper.v_cruise_kph_last <= 145:
     v_cruise_helper.v_cruise_kph = v_cruise_helper.v_cruise_kph_last
@@ -202,9 +198,11 @@ def on_lat_controller_init(result, lac, CP):
   no scale_by_bin or shadow estimator anymore.
   """
   import math
+  import numpy as np
   from cereal import log
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
+  from opendbc.car.lateral import ISO_LATERAL_ACCEL, ISO_LATERAL_JERK
 
   # Decision cadence & CAN-rate spreading.
   # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
@@ -242,6 +240,7 @@ def on_lat_controller_init(result, lac, CP):
   # frac/frame = 0.05 Nm/frame at the BASE level. Drains a full T_CAP_BASE
   # in 250 ms (one decision cycle). Well under the wire STEER_DELTA_UP
   # limit (0.1 Nm/frame), so internal pacing dominates.
+  STEP_PER_FRAME = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
 
   # Feedback deadzone: engage only when δ_err would cause ≥ DRIFT_M
   # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
@@ -271,8 +270,8 @@ def on_lat_controller_init(result, lac, CP):
   #     at t=848.5s during overshoot, κ_des reversed while κ_meas still on
   #     the wrong side, jerk_pred = 4.8 m/s³ → would have cancelled the
   #     counter-torque ramp that produced the 15.7 m/s³ measured jerk.
-  BMW_LATERAL_ACCEL = 1.5
-  BMW_LATERAL_JERK = 2.5
+  BMW_LATERAL_ACCEL = ISO_LATERAL_ACCEL / 2
+  BMW_LATERAL_JERK = ISO_LATERAL_JERK / 2
   JERK_PRED_TAU = 0.5
 
   # Rear-axle bicycle-model wheelbase (m). Used for κ ↔ δ conversion.
@@ -287,7 +286,6 @@ def on_lat_controller_init(result, lac, CP):
     'tick_count': 0,           # livePose tick counter; decide every ACTION_CADENCE_TICKS
     'action': 'init',          # debug: hold_zero / brake_zero / breakaway / ramp / cancel_accel / cancel_jerk
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
-    'step_per_frame': T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES,  # per-frame drain rate
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'slope_eff': T_CAP_SLOPE_LO,  # debug: effective gain-scheduled T_CAP_SLOPE
@@ -301,6 +299,7 @@ def on_lat_controller_init(result, lac, CP):
 
     _sm.update(0)
     lp = _sm['livePose']
+    livepose_updated = _sm.updated['livePose']
 
     state['desired'] = float(desired_curvature)
 
@@ -308,18 +307,16 @@ def on_lat_controller_init(result, lac, CP):
     # decision only every ACTION_CADENCE_TICKS (250 ms) — gives plant time to
     # respond to previous correction (2.5τ → ~92% response).
     # CAN tick (100 Hz): drain step_remaining toward T_peak_frac target.
-    if _sm.updated['livePose']:
+    if livepose_updated:
       v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
 
       # κ_des-adaptive aligning-torque slope. Gentle on near-straights (less
       # overshoot ingredients on small κ_des), full authority on tight turns.
-      #   t = clip((|κ_des| − KAPPA_STRAIGHT) / (KAPPA_TIGHT − KAPPA_STRAIGHT), 0, 1)
-      #   slope_eff = T_CAP_SLOPE_LO + t · (T_CAP_SLOPE_HI − T_CAP_SLOPE_LO)
       # v-independent — only the path geometry drives authority allocation.
       kappa_abs = abs(state['desired'])
-      k_t = max(0.0, min(1.0, (kappa_abs - KAPPA_STRAIGHT) / (KAPPA_TIGHT - KAPPA_STRAIGHT)))
-      slope_eff = T_CAP_SLOPE_LO + k_t * (T_CAP_SLOPE_HI - T_CAP_SLOPE_LO)
+      slope_eff = float(np.interp(kappa_abs, [KAPPA_STRAIGHT, KAPPA_TIGHT],
+                                  [T_CAP_SLOPE_LO, T_CAP_SLOPE_HI]))
       state['slope_eff'] = slope_eff
 
       # Front-wheel-angle error (rear-axle bicycle model).
@@ -358,18 +355,18 @@ def on_lat_controller_init(result, lac, CP):
           cancel_reason = 'cancel_jerk'
       if cancel_reason:
         # overshooting=True implies κ_meas != 0; unwind toward opposite sign.
-        unwind_target = -FRICTION if state['measured'] > 0 else FRICTION
+        # Cancel preempts the cadence decision this tick — reset window so
+        # the next plant-inversion decision is one full cycle after the unwind.
+        unwind_target = -math.copysign(FRICTION, state['measured'])
         state['target_frac'] = unwind_target
         state['step_remaining'] = unwind_target - state['torque']
         state['action'] = cancel_reason
-
-      state['tick_count'] += 1
+        state['tick_count'] = 0
+      else:
+        state['tick_count'] += 1
 
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
         state['tick_count'] = 0
-
-        # Uniform ramp window — drain step_remaining over one decision cycle.
-        state['step_per_frame'] = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
 
         # Speed-scaled tolerance: 0.025 m drift over 0.5 s horizon, 1/v² scaling.
         # δ_tol = 2 · DRIFT_M · L / (v·T)²  — natural authority match.
@@ -391,7 +388,7 @@ def on_lat_controller_init(result, lac, CP):
           # deadzone transition: next decision sees prev_action='brake_zero'
           # and falls through to hold_zero (target=0) so τ relaxes.
           if prev_action == 'ramp' and state['torque'] * delta_err > 0:
-            target_frac = -FRICTION if delta_err > 0 else FRICTION
+            target_frac = -math.copysign(FRICTION, delta_err)
             state['action'] = 'brake_zero'
           else:
             target_frac = 0.0
@@ -400,7 +397,7 @@ def on_lat_controller_init(result, lac, CP):
           target_nm = slope_eff * v * v * delta_err
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
-            target_frac = FRICTION * (1.0 if delta_err > 0 else -1.0)
+            target_frac = math.copysign(FRICTION, delta_err)
             state['action'] = 'breakaway'
           else:
             state['action'] = 'ramp'
@@ -411,20 +408,19 @@ def on_lat_controller_init(result, lac, CP):
           t_cap_nm = min(CCP.STEER_MAX,
                          T_CAP_BASE_NM + slope_eff * v * v * abs(delta_des))
           t_cap_frac = t_cap_nm / CCP.STEER_MAX
-          target_frac = max(-t_cap_frac, min(t_cap_frac, target_frac))
+          target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
 
         state['target_frac'] = target_frac
         state['step_remaining'] = target_frac - state['torque']
 
     # Apply CAN-rate step: fraction of remaining per 100 Hz tick.
     if abs(state['step_remaining']) > 1e-9:
-      step_per_frame = state['step_per_frame']
-      step_this_tick = max(-step_per_frame, min(step_per_frame, state['step_remaining']))
-      state['torque'] = max(-1.0, min(1.0, state['torque'] + step_this_tick))
+      step_this_tick = float(np.clip(state['step_remaining'], -STEP_PER_FRAME, STEP_PER_FRAME))
+      state['torque'] = float(np.clip(state['torque'] + step_this_tick, -1.0, 1.0))
       state['step_remaining'] -= step_this_tick
 
     err = state['desired'] - state['measured']  # for logging only
-    output = 0.0 if not active else max(-1.0, min(1.0, state['torque']))
+    output = 0.0 if not active else float(np.clip(state['torque'], -1.0, 1.0))
 
     pid_log.actualLateralAccel = float(state['measured'])
     pid_log.desiredLateralAccel = float(state['desired'])
@@ -433,29 +429,33 @@ def on_lat_controller_init(result, lac, CP):
     pid_log.output = float(output)
     pid_log.saturated = bool(abs(output) > 0.99)
 
-    try:
-      if state['lat_pub'] is None:
-        from openpilot.selfdrive.plugins.plugin_bus import PluginPub
-        state['lat_pub'] = PluginPub('bmw_lat_control')
-      payload = {
-        'desired': float(state['desired']),
-        'measured': float(state['measured']),
-        'err': float(err),
-        'delta_err': float(state['delta_err']),
-        'target_frac': float(state['target_frac']),
-        'step_remaining': float(state['step_remaining']),
-        'action': state['action'],
-        'torque': float(state['torque']),
-        'output': float(output),
-        'vEgo': float(CS.vEgo),
-        'active': active,
-        'slope_eff': float(state['slope_eff']),
-        'a_y_meas': float(state['a_y_meas']),
-        'jerk_pred': float(state['jerk_pred']),
-      }
-      state['lat_pub'].send(payload)
-    except Exception:
-      pass
+    # Telemetry: publish at livePose rate (20 Hz). Most fields only change on
+    # livePose ticks; per-CAN-tick publish would burn ~1300 dict-key inserts/sec
+    # for the same observable signal.
+    if livepose_updated:
+      try:
+        if state['lat_pub'] is None:
+          from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+          state['lat_pub'] = PluginPub('bmw_lat_control')
+        payload = {
+          'desired': float(state['desired']),
+          'measured': float(state['measured']),
+          'err': float(err),
+          'delta_err': float(state['delta_err']),
+          'target_frac': float(state['target_frac']),
+          'step_remaining': float(state['step_remaining']),
+          'action': state['action'],
+          'torque': float(state['torque']),
+          'output': float(output),
+          'vEgo': float(CS.vEgo),
+          'active': active,
+          'slope_eff': float(state['slope_eff']),
+          'a_y_meas': float(state['a_y_meas']),
+          'jerk_pred': float(state['jerk_pred']),
+        }
+        state['lat_pub'].send(payload)
+      except Exception:
+        pass
 
     return -output, 0.0, pid_log
 
