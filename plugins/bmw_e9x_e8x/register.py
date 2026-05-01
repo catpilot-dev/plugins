@@ -166,8 +166,8 @@ def on_lat_controller_init(result, lac, CP):
     δ_meas = atan(κ_meas · L)        κ_meas = yawRate / v_ego
     δ_err  = δ_des − δ_meas
 
-  Tolerance (physical 0.025 m drift over 0.5 s, speed-adaptive, scales 1/v²):
-    tolerance = 2 · 0.025 · L / (v² · 0.5²)
+  Tolerance (physical 0.05 m drift over 0.5 s, speed-adaptive, scales 1/v²):
+    tolerance = 2 · 0.05 · L / (v² · 0.5²)
 
   Plant-inversion target torque, angle domain (linear tire regime):
     τ_Nm_target = slope_eff · v² · δ_err
@@ -248,7 +248,7 @@ def on_lat_controller_init(result, lac, CP):
   # The 1/v² factor in tolerance already gives natural speed adaptation
   # (tighter at high v); the prior speed-adaptive drift_m interpolation
   # added a second-order tweak that wasn't measurably useful.
-  DRIFT_M = 0.025          # m of allowed drift over DRIFT_EVAL_HORIZON_S
+  DRIFT_M = 0.05           # m of allowed drift over DRIFT_EVAL_HORIZON_S
   DRIFT_EVAL_HORIZON_S = 0.5
 
   # Breakaway torque fraction (rack stiction floor). Sub-friction commands
@@ -368,7 +368,7 @@ def on_lat_controller_init(result, lac, CP):
       if state['tick_count'] >= ACTION_CADENCE_TICKS:
         state['tick_count'] = 0
 
-        # Speed-scaled tolerance: 0.025 m drift over 0.5 s horizon, 1/v² scaling.
+        # Speed-scaled tolerance: DRIFT_M drift over 0.5 s horizon, 1/v² scaling.
         # δ_tol = 2 · DRIFT_M · L / (v·T)²  — natural authority match.
         lookahead_m = v * DRIFT_EVAL_HORIZON_S
         tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
