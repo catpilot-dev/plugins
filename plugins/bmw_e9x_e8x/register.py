@@ -275,7 +275,7 @@ def on_lat_controller_init(result, lac, CP):
     'target_frac': 0.0,        # plant-inversion target set each 250 ms decision
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / SPREAD_FRAMES
     'ramp_frames': 0,          # CAN frames left in current ramp
-    'tick_count': 0,           # livePose tick counter; decide every ACTION_CADENCE_TICKS
+    'tick_count': ACTION_CADENCE_TICKS,  # primed so first livePose tick fires cadence immediately (no 250 ms engagement gap)
     'action': 'init',          # debug: hold_zero / brake_zero / breakaway / ramp / cancel_accel / cancel_jerk
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'lat_pub': None,
@@ -342,10 +342,17 @@ def on_lat_controller_init(result, lac, CP):
         # overshooting=True implies κ_meas != 0; unwind toward opposite sign.
         # Cancel preempts the cadence decision this tick — reset window so
         # the next plant-inversion decision is one full cycle after the unwind.
+        # Only re-arm the ramp if the unwind target changed (first cancel, or
+        # κ_meas flipped sign). If we're already ramping toward this same
+        # unwind target, leave it alone — re-arming on every continuous-
+        # overshoot tick would restart the 500 ms window from current torque
+        # each time, producing exponential decay (slower unwind the harder
+        # the plant fights, the opposite of what a safety guard should do).
         unwind_target = -math.copysign(FRICTION, state['measured'])
-        state['target_frac'] = unwind_target
-        state['ramp_step'] = (unwind_target - state['torque']) / SPREAD_FRAMES
-        state['ramp_frames'] = SPREAD_FRAMES
+        if state['target_frac'] != unwind_target:
+          state['target_frac'] = unwind_target
+          state['ramp_step'] = (unwind_target - state['torque']) / SPREAD_FRAMES
+          state['ramp_frames'] = SPREAD_FRAMES
         state['action'] = cancel_reason
         state['tick_count'] = 0
       else:
