@@ -179,7 +179,7 @@ def on_lat_controller_init(result, lac, CP):
     (panda limit) preserves lane authority during transient over-envelope
     events before speedlimitd trims v.
 
-  Ramp: step_remaining = T_peak − state['torque'], drained over 25 CAN frames.
+  Ramp: step_remaining = T_peak − state['torque'], drained over 50 CAN frames.
 
   ISO 11270 half-comfort guard (every livePose tick): cancel ramping if
   |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³,
@@ -202,10 +202,16 @@ def on_lat_controller_init(result, lac, CP):
 
   # Decision cadence & CAN-rate spreading.
   # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
-  # SPREAD_FRAMES = 25 uniformly: each ramp drains over 250 ms = exactly
-  # one decision cycle, regardless of speed.
+  # SPREAD_FRAMES = 50 → 500 ms ramp = 2× the decision cadence. Each ramp
+  # spans two decision cycles, so step_remaining is half-drained when the
+  # next decision overwrites it. Trades controller bandwidth for smoother
+  # torque trajectory — hydraulic rack with stiction prefers slow inputs.
+  # ISO cancel inherits the same drain rate, so a fully-loaded ramp
+  # (~3 Nm) takes ~1.4 s to unwind to FRICTION level instead of 0.7 s.
+  # That's accepted: FRICTION-level torque isn't dangerous, just slower
+  # to relax, and the gentler feel during normal operation is the goal.
   ACTION_CADENCE_TICKS = 5
-  SPREAD_FRAMES = 25                       # 250 ms ramp
+  SPREAD_FRAMES = 50                       # 500 ms ramp (2× cadence)
   # T_CAP_SLOPE: aligning-torque gain (κ-independent). Linear tire regime:
   #     τ_Nm_hold = T_CAP_SLOPE · v² · δ                (aligning torque)
   # Drives both authority cap and target torque:
@@ -219,9 +225,9 @@ def on_lat_controller_init(result, lac, CP):
   # breakaway (smooth low-error band), so the schedule is no longer needed.
   T_CAP_BASE_NM = 1.25
   T_CAP_SLOPE = 2.0
-  # STEP_PER_FRAME = T_CAP_BASE_NM / STEER_MAX / SPREAD_FRAMES = 0.00417
-  # frac/frame = 0.05 Nm/frame at the BASE level. Drains a full T_CAP_BASE
-  # in 250 ms (one decision cycle). Well under the wire STEER_DELTA_UP
+  # STEP_PER_FRAME = T_CAP_BASE_NM / STEER_MAX / SPREAD_FRAMES = 0.00208
+  # frac/frame = 0.025 Nm/frame at the BASE level. Drains a full T_CAP_BASE
+  # in 500 ms (two decision cycles). Well under the wire STEER_DELTA_UP
   # limit (0.1 Nm/frame), so internal pacing dominates.
   STEP_PER_FRAME = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
 
