@@ -227,7 +227,7 @@ def on_lat_controller_init(result, lac, CP):
   # and seg-6 under-tracking on tight κ_des — both cases are now handled by
   # the soft-deadband (continuous response near zero) and the FRICTION
   # breakaway (smooth low-error band), so the schedule is no longer needed.
-  T_CAP_BASE_NM = 1.25
+  T_CAP_BASE_NM = 2.0
   T_CAP_SLOPE = 2.0
   # Model action horizon — the time over which the model expects desired
   # curvature to be achieved (= lat_action_t). Used both for the feedback
