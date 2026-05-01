@@ -292,13 +292,12 @@ def on_lat_controller_init(result, lac, CP):
     lp = _sm['livePose']
     livepose_updated = _sm.updated['livePose']
 
-    state['desired'] = float(desired_curvature)
-
-    # livePose tick (20 Hz): update measured every tick; plant-inversion
-    # decision only every ACTION_CADENCE_TICKS (250 ms) — gives plant time to
-    # respond to previous correction (2.5τ → ~92% response).
+    # livePose tick (20 Hz): update measured + desired every tick; plant-
+    # inversion decision only every ACTION_CADENCE_TICKS (250 ms) — gives
+    # plant time to respond to previous correction (2.5τ → ~92% response).
     # CAN tick (100 Hz): apply ramp_step toward target_frac.
     if livepose_updated:
+      state['desired'] = float(desired_curvature)
       # 8.5 m/s = ~30 kph, BMW DCC minimum engagement speed. Below this the
       # controller is never active, so the floor only protects κ_meas from
       # div-by-near-zero during disengaged crawl.
