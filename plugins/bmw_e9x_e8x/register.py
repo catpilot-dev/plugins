@@ -225,14 +225,18 @@ def on_lat_controller_init(result, lac, CP):
   # limit (0.1 Nm/frame), so internal pacing dominates.
   STEP_PER_FRAME = T_CAP_BASE_NM / CCP.STEER_MAX / SPREAD_FRAMES
 
+  # Model action horizon — the time over which the model expects desired
+  # curvature to be achieved (= lat_action_t). Used both for the feedback
+  # deadzone (drift integration window) and for predicted jerk (ISO guard).
+  MODEL_ACTION_T = 0.5
+
   # Feedback deadzone: engage only when δ_err would cause ≥ DRIFT_M
-  # lateral drift within DRIFT_EVAL_HORIZON_S (= model's lat_action_t).
+  # lateral drift within MODEL_ACTION_T.
   #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · DRIFT_M · L / (v·T)²
   # The 1/v² factor in tolerance already gives natural speed adaptation
   # (tighter at high v); the prior speed-adaptive drift_m interpolation
   # added a second-order tweak that wasn't measurably useful.
-  DRIFT_M = 0.05           # m of allowed drift over DRIFT_EVAL_HORIZON_S
-  DRIFT_EVAL_HORIZON_S = 0.5
+  DRIFT_M = 0.05           # m of allowed drift over MODEL_ACTION_T
 
   # Breakaway torque fraction (rack stiction floor). Sub-friction commands
   # don't move the hydraulic rack, so the controller pushes target to ±friction
@@ -246,16 +250,16 @@ def on_lat_controller_init(result, lac, CP):
   # Cancel step_remaining when either exceeded, redirect toward FRICTION-
   #   |a_y_meas| > BMW_LATERAL_ACCEL — current loading already at limit;
   #     don't push deeper. Uses κ_meas (measured outcome).
-  #   |jerk_pred| > BMW_LATERAL_JERK — predicted jerk = v²·(κ_des−κ_meas)/τ
-  #     where τ = JERK_PRED_TAU = 0.5 s matches the controller's plant
-  #     settling horizon. Predictive — catches ringing setup ~100 ms
-  #     before it appears in κ_meas. Validated against route 2b8 seg 14:
-  #     at t=848.5s during overshoot, κ_des reversed while κ_meas still on
-  #     the wrong side, jerk_pred = 4.8 m/s³ → would have cancelled the
-  #     counter-torque ramp that produced the 15.7 m/s³ measured jerk.
+  #   |jerk_pred| > BMW_LATERAL_JERK — predicted jerk = v²·(κ_des−κ_meas)/T
+  #     using MODEL_ACTION_T as the prediction horizon (matches the
+  #     controller's plant settling). Predictive — catches ringing setup
+  #     ~100 ms before it appears in κ_meas. Validated against route 2b8
+  #     seg 14: at t=848.5s during overshoot, κ_des reversed while κ_meas
+  #     still on the wrong side, jerk_pred = 4.8 m/s³ → would have
+  #     cancelled the counter-torque ramp that produced the 15.7 m/s³
+  #     measured jerk.
   BMW_LATERAL_ACCEL = ISO_LATERAL_ACCEL / 2
   BMW_LATERAL_JERK = ISO_LATERAL_JERK / 2
-  JERK_PRED_TAU = 0.5
 
   # Rear-axle bicycle-model wheelbase (m). Used for κ ↔ δ conversion.
   L = float(CP.wheelbase)
@@ -317,7 +321,7 @@ def on_lat_controller_init(result, lac, CP):
       # counter-correction) prevents the cancel from creating the seg-14
       # ringing pattern in reverse.
       a_y_meas = v * v * state['measured']
-      jerk_pred = v * v * (state['desired'] - state['measured']) / JERK_PRED_TAU
+      jerk_pred = v * v * (state['desired'] - state['measured']) / MODEL_ACTION_T
       state['a_y_meas'] = a_y_meas
       state['jerk_pred'] = jerk_pred
       overshooting = (state['desired'] - state['measured']) * state['measured'] < 0
@@ -344,7 +348,7 @@ def on_lat_controller_init(result, lac, CP):
 
         # Speed-scaled tolerance: DRIFT_M drift over 0.5 s horizon, 1/v² scaling.
         # δ_tol = 2 · DRIFT_M · L / (v·T)²  — natural authority match.
-        lookahead_m = v * DRIFT_EVAL_HORIZON_S
+        lookahead_m = v * MODEL_ACTION_T
         tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
 
         # Plant-inversion target torque in angle domain — the steady-state
