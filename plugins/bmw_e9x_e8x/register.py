@@ -170,7 +170,7 @@ def on_lat_controller_init(result, lac, CP):
     tolerance = 2 · 0.05 · L / (v² · 0.5²)
 
   Plant-inversion target torque, angle domain (linear tire regime):
-    τ_Nm_target = slope_eff · v² · δ_err
+    τ_Nm_target = slope_eff · v² · (δ_err − tolerance·sign(δ_err))
     Clamp to ±T_CAP(v, δ):
       T_CAP_NM = min(STEER_MAX, T_CAP_BASE + slope_eff · v²·|δ_des|)
     slope_eff is gain-scheduled on |κ_des|:
@@ -374,8 +374,12 @@ def on_lat_controller_init(result, lac, CP):
         tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
 
         # Plant-inversion target torque in angle domain — the steady-state
-        # aligning torque required to hold δ_err.
-        #   τ_Nm = slope_eff · v² · δ_err
+        # aligning torque required to hold δ_err. Soft-deadband subtracts
+        # the tolerance from |δ_err| so τ_Nm starts at 0 when crossing the
+        # boundary instead of stepping to slope_eff·v²·tolerance (= 1.66 Nm
+        # at 120 kph with current tunables — the dominant boundary step
+        # since FRICTION dropped to 0.025 and DRIFT_M doubled to 0.05).
+        #   τ_Nm = slope_eff · v² · (δ_err − tolerance·sign(δ_err))
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
         # Sub-breakaway commands won't move the rack → push to ±FRICTION.
         prev_action = state['action']
@@ -394,7 +398,8 @@ def on_lat_controller_init(result, lac, CP):
             target_frac = 0.0
             state['action'] = 'hold_zero'
         else:
-          target_nm = slope_eff * v * v * delta_err
+          effective_err = delta_err - math.copysign(tolerance, delta_err)
+          target_nm = slope_eff * v * v * effective_err
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
             target_frac = math.copysign(FRICTION, delta_err)
