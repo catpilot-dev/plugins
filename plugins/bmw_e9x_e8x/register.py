@@ -170,14 +170,10 @@ def on_lat_controller_init(result, lac, CP):
     tolerance = 2 · 0.05 · L / (v² · 0.5²)
 
   Plant-inversion target torque, angle domain (linear tire regime):
-    τ_Nm_target = slope_eff · v² · (δ_err − tolerance·sign(δ_err))
+    τ_Nm_target = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
     Clamp to ±T_CAP(v, δ):
-      T_CAP_NM = min(STEER_MAX, T_CAP_BASE + slope_eff · v²·|δ_des|)
-    slope_eff is gain-scheduled on |κ_des|:
-      slope_eff = T_CAP_SLOPE_LO + clip01((|κ|−κ_LO)/(κ_HI−κ_LO)) · (HI − LO)
-    Low slope on near-straights → gentle, no plant overshoot / ringing.
-    High slope at tight turns (|κ_des| ≥ KAPPA_TIGHT) → full authority.
-    Same slope_eff drives both target and cap.
+      T_CAP_NM = min(STEER_MAX, T_CAP_BASE + T_CAP_SLOPE · v²·|δ_des|)
+    Same slope drives both target and cap.
     If |target_frac| < FRICTION, push to ±FRICTION to break stiction.
     BASE is the hydraulic rack's stiction floor. Hard stop at STEER_MAX
     (panda limit) preserves lane authority during transient over-envelope
@@ -193,7 +189,7 @@ def on_lat_controller_init(result, lac, CP):
   so the BMW hydraulic rack can unwind via tire aligning forces (won't
   self-center under standing torque).
 
-  No online adaptation: plant behavior is fully described by T_CAP_SLOPE_*,
+  No online adaptation: plant behavior is fully described by T_CAP_SLOPE,
   T_CAP_BASE_NM, and FRICTION. Tune these offline from route data; there's
   no scale_by_bin or shadow estimator anymore.
   """
@@ -207,35 +203,22 @@ def on_lat_controller_init(result, lac, CP):
   # Decision cadence & CAN-rate spreading.
   # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
   # SPREAD_FRAMES = 25 uniformly: each ramp drains over 250 ms = exactly
-  # one decision cycle, regardless of speed. Speed-dependent SPREAD removed
-  # — the curvature-scheduled slope_eff already adapts authority by κ_des,
-  # and a uniform ramp window simplifies tuning without a measurable feel
-  # change on previous routes.
+  # one decision cycle, regardless of speed.
   ACTION_CADENCE_TICKS = 5
   SPREAD_FRAMES = 25                       # 250 ms ramp
-  # T_CAP slope gain-schedule (κ_des-adaptive). Linear tire regime:
-  #     τ_Nm_hold = slope_eff · v² · δ                 (aligning torque)
-  #     slope_eff = lerp(LO → HI, (|κ_des|−κ_LO)/(κ_HI−κ_LO))   clamped
-  # Used for both authority and target:
-  #   T_CAP(v, δ)  = T_CAP_BASE_NM + slope_eff · v² · |δ_des|   (≤ STEER_MAX)
-  #   target_Nm    = slope_eff · v² · δ_err
+  # T_CAP_SLOPE: aligning-torque gain (κ-independent). Linear tire regime:
+  #     τ_Nm_hold = T_CAP_SLOPE · v² · δ                (aligning torque)
+  # Drives both authority cap and target torque:
+  #   T_CAP(v, δ)  = T_CAP_BASE_NM + T_CAP_SLOPE · v² · |δ_des|   (≤ STEER_MAX)
+  #   target_Nm    = T_CAP_SLOPE · v² · effective_err
   # BASE covers the speed- and angle-independent stiction floor.
-  # Prior fixed SLOPE=2.0 (route 2b8 baseline): seg-14 ringing on small κ_des
-  # (overshoot), seg-6 under-tracking on tight κ_des (insufficient authority).
-  # Curvature schedule resolves both: gentle on near-straights (less ringing
-  # ingredients), full authority on tight turns. v-independent — same SLOPE
-  # multiplier whether κ=0.01 is at parking-lot speed or highway speed.
+  # 2.0 = midpoint of the prior κ-schedule (1.5..2.5). Route 2b8 baseline
+  # value; the κ-schedule was added to address seg-14 ringing on small κ_des
+  # and seg-6 under-tracking on tight κ_des — both cases are now handled by
+  # the soft-deadband (continuous response near zero) and the FRICTION
+  # breakaway (smooth low-error band), so the schedule is no longer needed.
   T_CAP_BASE_NM = 1.25
-  T_CAP_SLOPE_LO  = 1.5      # at |κ_des| ≤ KAPPA_STRAIGHT — gentle
-  T_CAP_SLOPE_HI  = 2.5      # at |κ_des| ≥ KAPPA_TIGHT    — full authority
-  KAPPA_STRAIGHT  = 0.001    # m⁻¹ — below this, treat as straight
-  KAPPA_TIGHT     = 0.010    # m⁻¹ — above this, tight turn
-  # Range narrowed (was 1.0..3.0) after route 2b9 seg 9: HI=3.0 made the
-  # tight-turn entry over-aggressive (τ ramped to 4.9 Nm in 600 ms, plant
-  # overshot, ISO cancel could not undo standing torque → disengagement).
-  # 1.5..2.5 keeps near-straight gentleness vs. seg-14 ringing while never
-  # exceeding the proven 2b8-baseline authority on tight turns.
-  # Default 2.0 (previous constant) recovered at |κ_des| ≈ 0.0055 (mild curve).
+  T_CAP_SLOPE = 2.0
   # STEP_PER_FRAME = T_CAP_BASE_NM / STEER_MAX / SPREAD_FRAMES = 0.00417
   # frac/frame = 0.05 Nm/frame at the BASE level. Drains a full T_CAP_BASE
   # in 250 ms (one decision cycle). Well under the wire STEER_DELTA_UP
@@ -288,7 +271,6 @@ def on_lat_controller_init(result, lac, CP):
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad)
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
-    'slope_eff': T_CAP_SLOPE_LO,  # debug: effective gain-scheduled T_CAP_SLOPE
     'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
     'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
   }
@@ -310,14 +292,6 @@ def on_lat_controller_init(result, lac, CP):
     if livepose_updated:
       v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
-
-      # κ_des-adaptive aligning-torque slope. Gentle on near-straights (less
-      # overshoot ingredients on small κ_des), full authority on tight turns.
-      # v-independent — only the path geometry drives authority allocation.
-      kappa_abs = abs(state['desired'])
-      slope_eff = float(np.interp(kappa_abs, [KAPPA_STRAIGHT, KAPPA_TIGHT],
-                                  [T_CAP_SLOPE_LO, T_CAP_SLOPE_HI]))
-      state['slope_eff'] = slope_eff
 
       # Front-wheel-angle error (rear-axle bicycle model).
       delta_des = math.atan(state['desired'] * L)
@@ -376,10 +350,10 @@ def on_lat_controller_init(result, lac, CP):
         # Plant-inversion target torque in angle domain — the steady-state
         # aligning torque required to hold δ_err. Soft-deadband subtracts
         # the tolerance from |δ_err| so τ_Nm starts at 0 when crossing the
-        # boundary instead of stepping to slope_eff·v²·tolerance (= 1.66 Nm
+        # boundary instead of stepping to T_CAP_SLOPE·v²·tolerance (= 2.21 Nm
         # at 120 kph with current tunables — the dominant boundary step
         # since FRICTION dropped to 0.025 and DRIFT_M doubled to 0.05).
-        #   τ_Nm = slope_eff · v² · (δ_err − tolerance·sign(δ_err))
+        #   τ_Nm = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
         # Sub-breakaway commands won't move the rack → push to ±FRICTION.
         prev_action = state['action']
@@ -399,7 +373,7 @@ def on_lat_controller_init(result, lac, CP):
             state['action'] = 'hold_zero'
         else:
           effective_err = delta_err - math.copysign(tolerance, delta_err)
-          target_nm = slope_eff * v * v * effective_err
+          target_nm = T_CAP_SLOPE * v * v * effective_err
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
             target_frac = math.copysign(FRICTION, delta_err)
@@ -407,11 +381,11 @@ def on_lat_controller_init(result, lac, CP):
           else:
             state['action'] = 'ramp'
           # v²·|δ|-scaled cap, clipped at STEER_MAX (panda hard limit).
-          # Cap also uses the gain-scheduled slope so authority grows with
-          # commanded a_y_des — straights stay near BASE, tight turns can
-          # reach STEER_MAX (transient over-envelope; speedlimitd bleeds v).
+          # Authority grows with commanded a_y_des — straights stay near BASE,
+          # tight turns can reach STEER_MAX (transient over-envelope; speedlimitd
+          # bleeds v).
           t_cap_nm = min(CCP.STEER_MAX,
-                         T_CAP_BASE_NM + slope_eff * v * v * abs(delta_des))
+                         T_CAP_BASE_NM + T_CAP_SLOPE * v * v * abs(delta_des))
           t_cap_frac = t_cap_nm / CCP.STEER_MAX
           target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
 
@@ -454,7 +428,6 @@ def on_lat_controller_init(result, lac, CP):
           'output': float(output),
           'vEgo': float(CS.vEgo),
           'active': active,
-          'slope_eff': float(state['slope_eff']),
           'a_y_meas': float(state['a_y_meas']),
           'jerk_pred': float(state['jerk_pred']),
         }
