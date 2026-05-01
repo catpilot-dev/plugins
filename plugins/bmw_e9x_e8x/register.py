@@ -294,7 +294,10 @@ def on_lat_controller_init(result, lac, CP):
     # respond to previous correction (2.5τ → ~92% response).
     # CAN tick (100 Hz): drain step_remaining toward T_peak_frac target.
     if livepose_updated:
-      v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 5.0)
+      # 8.5 m/s = ~30 kph, BMW DCC minimum engagement speed. Below this the
+      # controller is never active, so the floor only protects κ_meas from
+      # div-by-near-zero during disengaged crawl.
+      v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 8.5)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
 
       # Front-wheel-angle error (rear-axle bicycle model).
