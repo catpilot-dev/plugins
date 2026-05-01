@@ -38,19 +38,16 @@ class LaneCenteringCorrection:
   MIN_PROB_FLOOR        = 0.15   # minimum confidence even in tightest turns
   MIN_PROB_CURV_SLOPE   = 30.0   # 1/m → drops 0.5 → 0.15 over κ ∈ [0, 0.012]
   MIN_SPEED = 9.0          # m/s - disable at low speed
-  # Speed-dependent hysteresis. Offset is sampled at delay_dist = v·MODEL_LAT_ACTION_T
-  # ahead of the car, so small angular errors in the model's path prediction
-  # project geometrically larger at high speed (1° of yaw error → 29 cm offset
-  # at 120 kph). Fixed 0.2 m threshold triggers on noise at highway; relax it
-  # linearly with lookahead distance.
-  #   OFFSET_THRESHOLD(v) = BASE_THRESHOLD + SLOPE · (v · MODEL_LAT_ACTION_T)
-  #   OFFSET_TOLERANCE(v) = OFFSET_THRESHOLD(v) / 2       (keep 2:1 hysteresis)
-  # Sizing preserves urban behavior: at v≈10 m/s → 0.20 m threshold (matches
-  # prior fixed value); at 120 kph → 0.32 m. Hysteresis band (THRESHOLD −
-  # TOLERANCE) stays ≥ 4× the BMW controller's 0.025 m δ-drift tolerance for
-  # clean layer hand-off.
-  OFFSET_BASE_THRESHOLD = 0.15   # m - threshold at v=0
-  OFFSET_THRESHOLD_SLOPE = 0.01  # m per m of lookahead — speed-growth term
+  # Curvature-adaptive hysteresis. Tight turns produce larger lookahead-point
+  # offsets from geometric outside-swing (CG cuts inside the rear-axle path)
+  # and from perception uncertainty (lane lines dim in turns — see
+  # MIN_PROB_CURV_SLOPE). Straights stay tight to catch real drift; curves
+  # relax to avoid fighting geometry. Linearly interpolated on |κ|:
+  #   |κ| ≤ 0.001 (straight)   → threshold = 0.20 m
+  #   |κ| ≥ 0.010 (tight)      → threshold = 0.30 m
+  #   tolerance = threshold / 2     (2:1 hysteresis)
+  OFFSET_THRESHOLD_KAPPA = [0.001, 0.010]
+  OFFSET_THRESHOLD_M     = [0.20,  0.30]
   SMOOTH_TAU = 0.5         # seconds - correction smoothing
   WINDDOWN_TAU = 1.0       # seconds - slower wind-down when exiting turns
   MEASUREMENT_TAU = 0.2    # seconds - lane center measurement smoothing
@@ -263,9 +260,9 @@ class LaneCenteringCorrection:
 
     offset = path_y - self.smoothed_lane_center
 
-    # Speed-dependent hysteresis — relax at high speed where perception noise
-    # projects larger at the lookahead sample point.
-    offset_threshold = self.OFFSET_BASE_THRESHOLD + self.OFFSET_THRESHOLD_SLOPE * delay_dist
+    # Curvature-adaptive hysteresis — relax in turns (geometric outside-swing
+    # + perception noise on dim lane lines) and tighten on straights.
+    offset_threshold = float(np.interp(abs(curvature), self.OFFSET_THRESHOLD_KAPPA, self.OFFSET_THRESHOLD_M))
     offset_tolerance = offset_threshold / 2.0
 
     # Hysteresis on offset only — runs regardless of curvature.

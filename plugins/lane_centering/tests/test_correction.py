@@ -76,10 +76,12 @@ class TestConstants:
       assert LCC.K_V[i] >= LCC.K_V[i - 1]
 
   def test_hysteresis_thresholds(self, LCC):
-    # Activation driven solely by offset (curvature gate removed). Threshold
-    # is speed-dependent but tolerance is always threshold/2 → 2:1 hysteresis.
-    assert LCC.OFFSET_BASE_THRESHOLD > 0
-    assert LCC.OFFSET_THRESHOLD_SLOPE > 0
+    # Activation driven solely by offset. Threshold is curvature-adaptive
+    # (interpolated on |κ|), tolerance is always threshold/2 → 2:1 hysteresis.
+    assert len(LCC.OFFSET_THRESHOLD_KAPPA) == len(LCC.OFFSET_THRESHOLD_M)
+    assert LCC.OFFSET_THRESHOLD_KAPPA == sorted(LCC.OFFSET_THRESHOLD_KAPPA)
+    assert all(t > 0 for t in LCC.OFFSET_THRESHOLD_M)
+    assert LCC.OFFSET_THRESHOLD_M == sorted(LCC.OFFSET_THRESHOLD_M)
 
   def test_lane_width_bounds(self, LCC):
     # MAX = 3.75m (China highway standard). DEFAULT = 3.5m (city mixed).
