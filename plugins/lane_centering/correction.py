@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from config import read_plugin_param
 from openpilot.common.realtime import DT_MDL
@@ -94,7 +95,7 @@ class LaneCenteringCorrection:
   # lookahead makes our correction intrinsically consistent with what it
   # modifies. Fixed 0.5s matches modelV2.action_t; removes dependency on
   # the separately-learned liveDelay service.
-  MODEL_LAT_ACTION_T = 0.5
+  MODEL_ACTION_T = 0.5
 
   # Reference-frame shift: model uses CAR_ROTATION_RADIUS=0 (rear axle), but
   # in turns the front swings outside and the rear cuts inside while the CG
@@ -161,7 +162,7 @@ class LaneCenteringCorrection:
 
     # Read lane positions at modelV2.action_t lookahead, shifted by CG_OFFSET
     # so the offset is measured at CG perspective rather than rear axle.
-    delay_dist = v_ego * self.MODEL_LAT_ACTION_T + self.CG_OFFSET
+    delay_dist = v_ego * self.MODEL_ACTION_T + self.CG_OFFSET
     X_IDXS = [192.0 * (i / 32) ** 2 for i in range(33)]
     idx = min(range(len(X_IDXS)), key=lambda i: abs(X_IDXS[i] - delay_dist))
     idx = min(idx, len(model_v2.position.y) - 1, len(model_v2.laneLines[1].y) - 1, len(model_v2.laneLines[2].y) - 1)
@@ -276,6 +277,13 @@ class LaneCenteringCorrection:
     if self.active:
       k = float(np.interp(abs(curvature), self.K_BP, self.K_V))
 
+      # Soft deadband — subtract the disengage tolerance so correction smoothly
+      # approaches 0 as |offset| shrinks toward the disengagement boundary.
+      # Mirrors the BMW lat controller's effective_err = δ_err − tolerance·sign
+      # (commit 5b5ba08). While active, |offset| ≥ offset_tolerance so the
+      # subtraction preserves the sign of offset.
+      effective_offset = offset - math.copysign(offset_tolerance, offset)
+
       # Derivative damping: offset rate of change (m/frame)
       d_offset = offset - self.prev_offset
       # If offset is shrinking (d_offset has opposite sign to offset), damp the correction
@@ -285,7 +293,7 @@ class LaneCenteringCorrection:
       kp_at_speed = float(np.interp(v_ego, self.KP_SPEEDS, self.KP_VALUES))
       kp_scale = self.KP_NOMINAL / max(kp_at_speed, 0.1)
 
-      raw_correction = -k * offset * damping * kp_scale / (v_ego ** 2)
+      raw_correction = -k * effective_offset * damping * kp_scale / (v_ego ** 2)
 
       # Rate limiting: clamp correction change per frame
       prev = self.prev_correction
@@ -294,6 +302,7 @@ class LaneCenteringCorrection:
       self.prev_offset = offset
       self.diag = {
         'offset': round(offset, 3),
+        'effective_offset': round(effective_offset, 3),
         'd_offset': round(d_offset, 4),
         'damping': round(damping, 3),
         'kp_scale': round(kp_scale, 3),
