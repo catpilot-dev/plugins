@@ -212,7 +212,7 @@ def on_lat_controller_init(result, lac, CP):
   # and a uniform ramp window simplifies tuning without a measurable feel
   # change on previous routes.
   ACTION_CADENCE_TICKS = 5
-  SPREAD_FRAMES = 50                       # 500 ms ramp = one decision cycle
+  SPREAD_FRAMES = 25                       # 250 ms ramp
   # T_CAP slope gain-schedule (κ_des-adaptive). Linear tire regime:
   #     τ_Nm_hold = slope_eff · v² · δ                 (aligning torque)
   #     slope_eff = lerp(LO → HI, (|κ_des|−κ_LO)/(κ_HI−κ_LO))   clamped
