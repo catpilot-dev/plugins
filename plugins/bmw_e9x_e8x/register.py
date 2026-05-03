@@ -416,13 +416,13 @@ def on_lat_controller_init(result, lac, CP):
             target_frac = 0.0
             state['action'] = 'hold_zero'
         else:
-          # Curvature-scaled slope: 1.0 on straights (|κ_des| ≤ 0.001) rising
-          # linearly to 2.5 on tight curves (|κ_des| ≥ 0.01). Applies to both
-          # target torque and the authority cap so they stay coupled.
-          slope = T_CAP_SLOPE_BASE * float(np.interp(abs(state['desired']),
-                                                     T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP))
+          # Curvature scale: 1.0 on straights (|κ_des| ≤ 0.001) rising linearly
+          # to 2.5 on tight curves (|κ_des| ≥ 0.01). Inlined into both target
+          # and cap formulas so the κ_des-dependence is visible at the math.
+          kappa_scale = float(np.interp(abs(state['desired']),
+                                        T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP))
           effective_err = delta_err - math.copysign(tolerance, delta_err)
-          target_nm = slope * v * v * effective_err
+          target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * effective_err
           target_frac = target_nm / CCP.STEER_MAX
           if abs(target_frac) < FRICTION:
             target_frac = math.copysign(FRICTION, delta_err)
@@ -434,7 +434,7 @@ def on_lat_controller_init(result, lac, CP):
           # tight turns can reach STEER_MAX (transient over-envelope; speedlimitd
           # bleeds v).
           t_cap_nm = min(CCP.STEER_MAX,
-                         T_CAP_BASE_NM + slope * v * v * abs(delta_des))
+                         T_CAP_BASE_NM + T_CAP_SLOPE_BASE * kappa_scale * v * v * abs(delta_des))
           t_cap_frac = t_cap_nm / CCP.STEER_MAX
           target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
 
