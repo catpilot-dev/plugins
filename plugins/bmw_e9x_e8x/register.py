@@ -179,8 +179,9 @@ def on_lat_controller_init(result, lac, CP):
     (panda limit) preserves lane authority during transient over-envelope
     events before speedlimitd trims v.
 
-  Ramp: ramp_step = (T_peak − state['torque']) / SPREAD_FRAMES, applied
-  per CAN frame for SPREAD_FRAMES (25) frames; panda enforces wire-rate.
+  Ramp: ramp_step = (T_peak − state['torque']) / spread_frames, applied
+  per CAN frame for spread_frames (5..25, speed-dependent); panda enforces
+  wire-rate.
 
   ISO 11270 half-comfort guard (every livePose tick): cancel ramping if
   |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³,
@@ -208,32 +209,38 @@ def on_lat_controller_init(result, lac, CP):
 
   # Decision cadence & CAN-rate spreading.
   # ACTION_CADENCE_TICKS = 5 livePose ticks × 50 ms = 250 ms decision period.
-  # SPREAD_FRAMES = 25 → 250 ms ramp matches the cadence. Each ramp completes
-  # before the next decision lands; no overlapping ramps. Cadence sets
-  # target_frac and ramp_step = (target − torque) / SPREAD_FRAMES; CAN ticks
-  # apply ramp_step until SPREAD_FRAMES have fired.
+  # spread_frames is speed-dependent: 5 frames (50 ms) at 30 kph rising
+  # linearly to 25 frames (250 ms) at 120 kph. Rationale: at low speed the
+  # plant responds quickly and a snappy ramp tracks tightly; at highway,
+  # comfort and stiction dominate, so a slower ramp avoids jerk and gives
+  # cancel/tolerance guards more headroom inside one cadence.
+  #
+  # Cadence sets target_frac and ramp_step = (target − torque) / spread_frames;
+  # CAN ticks apply ramp_step until spread_frames have fired. Speed changes
+  # between cadences are absorbed at the next cadence (in-flight ramp keeps
+  # its current ramp_step).
   #
   # No internal rate cap — panda enforces wire-rate (STEER_DELTA_UP =
-  # 0.1 Nm/frame). For typical deltas (≤ 2.5 Nm), ramp_step ≤ 0.1 Nm/frame
-  # and demand tracks rack reality. For large transients, panda clips and
-  # state['torque'] briefly leads the rack — accepted; cancel logic still
-  # produces correct intent.
+  # 0.1 Nm/frame). For typical deltas, ramp_step ≤ 0.1 Nm/frame and demand
+  # tracks rack reality. For large transients, panda clips and state['torque']
+  # briefly leads the rack — accepted; cancel logic still produces correct intent.
   ACTION_CADENCE_TICKS = 5
-  SPREAD_FRAMES = 25                       # 250 ms ramp (matches cadence)
+  SPREAD_FRAMES_V = [8.33, 33.33]          # 30 kph, 120 kph
+  SPREAD_FRAMES_BP = [5, 25]               # 50 ms, 250 ms ramp
   # T_CAP_SLOPE: aligning-torque gain (κ-independent). Linear tire regime:
   #     τ_Nm_hold = T_CAP_SLOPE · v² · δ                (aligning torque)
   # Drives both authority cap and target torque:
   #   T_CAP(v, δ)  = T_CAP_BASE_NM + T_CAP_SLOPE · v² · |δ_des|   (≤ STEER_MAX)
   #   target_Nm    = T_CAP_SLOPE · v² · effective_err
   # BASE covers the speed- and angle-independent stiction floor.
-  # 2.5 = upper end of the prior κ-schedule (1.5..2.5). The κ-schedule was
-  # added to address seg-14 ringing on small κ_des and seg-6 under-tracking
-  # on tight κ_des — both cases are now handled by the soft-deadband
-  # (continuous response near zero), the FRICTION breakaway (smooth low-
-  # error band), and the per-tick tolerance-cancel (drains torque the
-  # moment the goal is reached), so the schedule is no longer needed.
+  # T_CAP_SLOPE = 1.0: lower-than-prior-schedule gain, paired with the
+  # speed-dependent ramp horizon. Edge cases that used to need a κ-schedule
+  # (seg-14 ringing on small κ_des, seg-6 under-tracking on tight κ_des) are
+  # now handled by the soft-deadband (continuous response near zero), the
+  # FRICTION breakaway (smooth low-error band), and the per-tick tolerance-
+  # cancel (drains torque the moment the goal is reached).
   T_CAP_BASE_NM = 2.0
-  T_CAP_SLOPE = 2.5
+  T_CAP_SLOPE = 1.0
   # Model action horizon — the time over which the model expects desired
   # curvature to be achieved (= lat_action_t). Used both for the feedback
   # deadzone (drift integration window) and for predicted jerk (ISO guard).
@@ -278,7 +285,7 @@ def on_lat_controller_init(result, lac, CP):
   state = {
     'torque': 0.0,             # current commanded torque fraction (advances by ramp_step each CAN tick)
     'target_frac': 0.0,        # plant-inversion target set each 250 ms decision
-    'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / SPREAD_FRAMES
+    'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS,  # primed so first livePose tick fires cadence immediately (no 250 ms engagement gap)
     'action': 'init',          # debug: hold_zero / brake_zero / breakaway / ramp / cancel_accel / cancel_jerk
@@ -321,6 +328,9 @@ def on_lat_controller_init(result, lac, CP):
       lookahead_m = v * MODEL_ACTION_T
       tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
 
+      # Speed-dependent ramp horizon: snappy at low speed, gentle at highway.
+      spread_frames = int(round(np.interp(v, SPREAD_FRAMES_V, SPREAD_FRAMES_BP)))
+
       # ISO 11270 half-comfort guard, gated on plant overshoot. Fires only
       # when (κ_des − κ_meas)·κ_meas < 0 — i.e., plant has turned more than
       # the planner asked for (or to the wrong side of zero). During
@@ -362,8 +372,8 @@ def on_lat_controller_init(result, lac, CP):
         unwind_target = -math.copysign(FRICTION, state['measured'])
         if state['target_frac'] != unwind_target:
           state['target_frac'] = unwind_target
-          state['ramp_step'] = (unwind_target - state['torque']) / SPREAD_FRAMES
-          state['ramp_frames'] = SPREAD_FRAMES
+          state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
+          state['ramp_frames'] = spread_frames
         state['action'] = cancel_reason
         state['tick_count'] = 0
       elif abs(delta_err) <= tolerance and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION:
@@ -378,8 +388,8 @@ def on_lat_controller_init(result, lac, CP):
           unwind_target = 0.0
         if state['target_frac'] != unwind_target:
           state['target_frac'] = unwind_target
-          state['ramp_step'] = (unwind_target - state['torque']) / SPREAD_FRAMES
-          state['ramp_frames'] = SPREAD_FRAMES
+          state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
+          state['ramp_frames'] = spread_frames
         state['action'] = 'cancel_tol'
         state['tick_count'] = 0
       else:
@@ -391,7 +401,7 @@ def on_lat_controller_init(result, lac, CP):
         # Plant-inversion target torque in angle domain — the steady-state
         # aligning torque required to hold δ_err. Soft-deadband subtracts
         # the tolerance from |δ_err| so τ_Nm starts at 0 when crossing the
-        # boundary instead of stepping to T_CAP_SLOPE·v²·tolerance (~2.7 Nm
+        # boundary instead of stepping to T_CAP_SLOPE·v²·tolerance (~1.1 Nm
         # at 120 kph) — without it, the boundary crossing would dominate
         # the torque profile and feel like a discrete step.
         #   τ_Nm = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
@@ -431,8 +441,8 @@ def on_lat_controller_init(result, lac, CP):
           target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
 
         state['target_frac'] = target_frac
-        state['ramp_step'] = (target_frac - state['torque']) / SPREAD_FRAMES
-        state['ramp_frames'] = SPREAD_FRAMES
+        state['ramp_step'] = (target_frac - state['torque']) / spread_frames
+        state['ramp_frames'] = spread_frames
 
     # Apply per-frame ramp step. Panda enforces wire-rate (STEER_DELTA_UP)
     # downstream; large ramp_step (Δ > 5 Nm spread over 50 frames) gets
