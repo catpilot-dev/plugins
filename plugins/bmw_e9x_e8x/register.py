@@ -227,7 +227,7 @@ def on_lat_controller_init(result, lac, CP):
   #   target_Nm    = T_CAP_SLOPE · v² · effective_err
   # BASE covers the speed- and angle-independent stiction floor.
   # T_CAP_SLOPE_BASE = 1.0: gentle baseline gain on straights. A curvature-
-  # dependent scale T_CAP_SCALE(|κ_des|) bumps it up to 2.5× on tight curves
+  # dependent scale T_CAP_SCALE(|κ_des|) bumps it up to 3.0× on tight curves
   # (linear interp 0.001..0.01 1/m). Rationale: small κ_des needs gentle gain
   # to avoid ringing on near-straight sections (seg-14 evidence); tight κ_des
   # needs enough authority to chase the planner without lag (seg-6 evidence).
@@ -236,7 +236,7 @@ def on_lat_controller_init(result, lac, CP):
   T_CAP_BASE_NM = 2.0
   T_CAP_SLOPE_BASE = 1.0
   T_CAP_SCALE_KAPPA = [0.001, 0.01]        # |κ_des| breakpoints (1/m)
-  T_CAP_SCALE_BP    = [1.0, 2.5]           # scale factor on T_CAP_SLOPE_BASE
+  T_CAP_SCALE_BP    = [1.0, 3.0]           # scale factor on T_CAP_SLOPE_BASE
   # Model action horizon — the time over which the model expects desired
   # curvature to be achieved (= lat_action_t). Used both for the feedback
   # deadzone (drift integration window) and for predicted jerk (ISO guard).
@@ -417,7 +417,7 @@ def on_lat_controller_init(result, lac, CP):
             state['action'] = 'hold_zero'
         else:
           # Curvature scale: 1.0 on straights (|κ_des| ≤ 0.001) rising linearly
-          # to 2.5 on tight curves (|κ_des| ≥ 0.01). Inlined into both target
+          # to 3.0 on tight curves (|κ_des| ≥ 0.01). Inlined into both target
           # and cap formulas so the κ_des-dependence is visible at the math.
           kappa_scale = float(np.interp(abs(state['desired']),
                                         T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP))
