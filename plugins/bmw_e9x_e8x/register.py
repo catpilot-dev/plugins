@@ -369,7 +369,7 @@ def on_lat_controller_init(result, lac, CP):
           state['ramp_frames'] = SPREAD_FRAMES
         state['action'] = cancel_reason
         state['tick_count'] = 0
-      elif abs(delta_err) <= tolerance and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION:
+      elif abs(delta_err) <= 1.2*tolerance and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION:
         # Tolerance-cancel: error fell into the success band while a push
         # ramp is still in flight. Without this, the ramp keeps driving
         # torque toward a stale target until the next 250 ms cadence. If
