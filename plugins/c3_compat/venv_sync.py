@@ -39,7 +39,6 @@ except ImportError:
 
 log = logging.getLogger("venv_sync")
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import OPENPILOT_DIR, plugin_data_dir
 
 # --- Paths ---
@@ -52,6 +51,20 @@ HASH_CACHE = str(plugin_data_dir("c3_compat").parent / ".venv_synced_hash")
 # --- C3 target platform ---
 TARGET_PYTHON = "cp312"
 TARGET_ARCH = "aarch64"
+
+# --- Packages pinned by boot_patch.sh — do not override ---
+# pycapnp: 2.2.2 has 6MB/s memory leak in Event.new_message() on C3;
+#          boot_patch.sh downgrades to 2.1.0 before venv_sync runs.
+SKIP_PACKAGES = {"pycapnp"}
+
+# --- commaai/dependencies packages (not in uv.lock — git-sourced native libs) ---
+# These wrap pre-built native libraries and provide INCLUDE_DIR/LIB_DIR for scons.
+COMMAAI_DEPS_REPO = "https://github.com/commaai/dependencies.git@releases"
+COMMAAI_DEPS = [
+    "bzip2", "capnproto", "eigen", "ffmpeg",
+    "libjpeg", "libyuv", "ncurses", "zeromq", "zstd",
+]
+NATIVE_DEPS_CACHE = str(plugin_data_dir("c3_compat").parent / ".native_deps_installed")
 
 
 def sha256_of(text: str) -> str:
@@ -396,8 +409,8 @@ def find_actions(packages: dict[str, PackageInfo]) -> list[PackageAction]:
     Returns list of packages that need to be installed or upgraded.
     Only considers packages that have compatible wheels for C3.
     """
-    # Filter to packages with installable wheels
-    installable = {n: p for n, p in packages.items() if p.wheel_url}
+    # Filter to packages with installable wheels, excluding boot_patch-pinned packages
+    installable = {n: p for n, p in packages.items() if p.wheel_url and n not in SKIP_PACKAGES}
     if not installable:
         return []
 
@@ -550,6 +563,107 @@ def ensure_venv(check_only: bool = False, dry_run: bool = False,
     return {"synced": synced, "hash": lock_hash[:12], **result}
 
 
+def ensure_native_deps(dry_run: bool = False) -> dict:
+    """Install commaai/dependencies packages if missing from the venv.
+
+    These are not in uv.lock (they're git-sourced and bundle pre-built native
+    libraries needed by scons). Checks a cache file to skip on normal boots.
+
+    Returns: {installed: [...], failed: [...], skipped: bool}
+    """
+    # Fast path: if all were installed last time, check the cache
+    try:
+        with open(NATIVE_DEPS_CACHE) as f:
+            cached = f.read().strip().split()
+        if set(cached) >= set(COMMAAI_DEPS):
+            log.debug("native deps already installed (cached)")
+            return {"installed": [], "failed": [], "skipped": True}
+    except FileNotFoundError:
+        pass
+
+    # Check which packages are actually missing (fast importlib check)
+    import importlib
+    missing = []
+    for name in COMMAAI_DEPS:
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            missing.append(name)
+
+    if not missing:
+        log.info("native deps: all %d packages present", len(COMMAAI_DEPS))
+        _write_native_deps_cache(COMMAAI_DEPS)
+        return {"installed": [], "failed": [], "skipped": True}
+
+    log.info("native deps: %d missing: %s", len(missing), missing)
+    if dry_run:
+        return {"installed": missing, "failed": [], "skipped": False, "dry_run": True}
+
+    installed = []
+    failed = []
+
+    # Remount rw — venv is root-owned on read-only root filesystem
+    subprocess.run(["sudo", "mount", "-o", "remount,rw", "/"],
+                   capture_output=True, timeout=10)
+
+    # Use /data/tmp as TMPDIR — ffmpeg static libs are ~100MB,
+    # far exceeding the 150MB /tmp tmpfs. Other packages are small.
+    pip_tmpdir = "/data/tmp/pip_native"
+    os.makedirs(pip_tmpdir, exist_ok=True)
+    pip_env = {**os.environ, "TMPDIR": pip_tmpdir, "GIT_SSL_NO_VERIFY": "1"}
+
+    # Install in one pip call (pip clones the repo once, builds all subdirs)
+    specs = [f"git+{COMMAAI_DEPS_REPO}#subdirectory={name}" for name in missing]
+    log.info("Installing: %s", ", ".join(missing))
+    try:
+        result = subprocess.run(
+            ["sudo", "-E", VENV_PIP, "install", "--no-build-isolation"] + specs,
+            capture_output=True, text=True, timeout=600, env=pip_env,
+        )
+        if result.returncode == 0:
+            installed.extend(missing)
+            log.info("native deps: installed %s", installed)
+        else:
+            # Batch failed — try each individually so one bad package doesn't block others
+            log.warning("Batch install failed, retrying individually")
+            for name in missing:
+                spec = f"git+{COMMAAI_DEPS_REPO}#subdirectory={name}"
+                r = subprocess.run(
+                    ["sudo", "-E", VENV_PIP, "install", "--no-build-isolation", spec],
+                    capture_output=True, text=True, timeout=300, env=pip_env,
+                )
+                if r.returncode == 0:
+                    installed.append(name)
+                else:
+                    err = (r.stderr or r.stdout).strip()[-200:]
+                    failed.append({"name": name, "error": err})
+                    log.error("native deps: failed to install %s: %s", name, err)
+    except subprocess.TimeoutExpired:
+        failed.append({"name": "all", "error": "timeout"})
+        log.error("native deps: install timed out")
+    except Exception as e:
+        failed.append({"name": "all", "error": str(e)})
+        log.error("native deps: install error: %s", e)
+    finally:
+        subprocess.run(["sudo", "rm", "-rf", pip_tmpdir], capture_output=True, timeout=10)
+        subprocess.run(["sudo", "mount", "-o", "remount,ro", "/"],
+                       capture_output=True, timeout=10)
+
+    if installed:
+        _write_native_deps_cache(installed)
+
+    return {"installed": installed, "failed": failed, "skipped": False}
+
+
+def _write_native_deps_cache(names: list):
+    try:
+        os.makedirs(os.path.dirname(NATIVE_DEPS_CACHE), exist_ok=True)
+        with open(NATIVE_DEPS_CACHE, "w") as f:
+            f.write("\n".join(names))
+    except OSError as e:
+        log.warning("Could not write native deps cache: %s", e)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Ensure C3 venv matches deployed branch's uv.lock")
@@ -563,6 +677,8 @@ def main():
                         help="Output result as JSON")
     parser.add_argument("--runtime-only", action="store_true",
                         help="Only sync runtime deps (skip dev/testing/docs)")
+    parser.add_argument("--native-deps", action="store_true",
+                        help="Also install commaai/dependencies packages (not in uv.lock)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose logging")
     args = parser.parse_args()
@@ -571,6 +687,18 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="[venv_sync] %(message)s",
     )
+
+    # Install commaai/dependencies packages (scons native libs) if requested
+    if args.native_deps:
+        nd = ensure_native_deps(dry_run=args.dry_run)
+        if not nd["skipped"]:
+            if nd.get("dry_run"):
+                print(f"[dry-run] Would install native deps: {nd['installed']}")
+            else:
+                for name in nd.get("installed", []):
+                    print(f"  installed native dep: {name}")
+                for pkg in nd.get("failed", []):
+                    print(f"  FAILED native dep: {pkg['name']}: {pkg['error']}")
 
     result = ensure_venv(
         check_only=args.check_only,
