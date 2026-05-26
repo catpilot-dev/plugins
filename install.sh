@@ -269,11 +269,13 @@ overlay_opendbc
 install_plugins
 overlay_cereal
 
-# Copy shared config module to plugins-runtime root so all plugins can import it
-if [[ -f "$SCRIPT_DIR/plugins/config.py" ]] && ! $DRY_RUN; then
-  cp "$SCRIPT_DIR/plugins/config.py" "$PLUGINS_DEST/config.py"
-  log "Installed shared config.py to $PLUGINS_DEST/"
-fi
+# Copy shared modules to plugins-runtime root so all plugins can import them
+for shared_mod in config.py fonts.py; do
+  if [[ -f "$SCRIPT_DIR/plugins/$shared_mod" ]] && ! $DRY_RUN; then
+    cp "$SCRIPT_DIR/plugins/$shared_mod" "$PLUGINS_DEST/$shared_mod"
+    log "Installed shared $shared_mod to $PLUGINS_DEST/"
+  fi
+done
 
 # --- Restore stock files for removed overlays ---
 restore_removed_overlays() {
@@ -337,9 +339,11 @@ fi
 if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
   touch "$PLUGINS_DEST/c3_compat/.enforced"
 fi
-if [[ -d "$PLUGINS_DEST/mapd" ]]; then
-  touch "$PLUGINS_DEST/mapd/.enforced"
-fi
+# mapd v2.0.6 uses slotless carState subscription (gomsgq) which causes
+# msgq ring buffer corruption on C3's USB panda. Not enforced until fixed.
+# if [[ -d "$PLUGINS_DEST/mapd" ]]; then
+#   touch "$PLUGINS_DEST/mapd/.enforced"
+# fi
 
 if $DRY_RUN; then
   log "Dry run complete. Re-run without --dry-run to apply."
