@@ -8,10 +8,8 @@ import math
 import os
 import subprocess
 import shutil
-import sys
 import time
 from pathlib import Path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import PLUGINS_RUNTIME_DIR
 from model_swapper import ModelSwapper, ModelType
@@ -112,17 +110,19 @@ def on_software_settings_extend(default, layout):
   class ModelActionDialog(Widget):
     """3-button dialog: [Delete] (red) | [Cancel] | [Activate] (blue)."""
 
-    def __init__(self, model_name, is_active=False):
+    def __init__(self, model_name, is_active=False, callback=None):
       super().__init__()
-      self._result = ACTION_NONE
+      self._callback = callback
       self._label = Label(model_name, 70, FontWeight.BOLD, text_color=rl.Color(201, 201, 201, 255))
-      self._delete_btn = Button('Delete', lambda: self._set_result(ACTION_DELETE), button_style=ButtonStyle.DANGER)
-      self._cancel_btn = Button('Cancel', lambda: self._set_result(ACTION_CANCEL))
-      self._activate_btn = Button('Activate', lambda: self._set_result(ACTION_ACTIVATE), button_style=ButtonStyle.PRIMARY)
+      self._delete_btn = Button('Delete', lambda: self._done(ACTION_DELETE), button_style=ButtonStyle.DANGER)
+      self._cancel_btn = Button('Cancel', lambda: self._done(ACTION_CANCEL))
+      self._activate_btn = Button('Activate', lambda: self._done(ACTION_ACTIVATE), button_style=ButtonStyle.PRIMARY)
       self._activate_btn.set_enabled(not is_active)
 
-    def _set_result(self, result):
-      self._result = result
+    def _done(self, result):
+      gui_app.pop_widget()
+      if self._callback:
+        self._callback(result)
 
     def _render(self, rect):
       margin = 200
@@ -143,8 +143,6 @@ def on_software_settings_extend(default, layout):
       self._delete_btn.render(rl.Rectangle(content.x, btn_y, btn_w, btn_h))
       self._cancel_btn.render(rl.Rectangle(content.x + btn_w + btn_spacing, btn_y, btn_w, btn_h))
       self._activate_btn.render(rl.Rectangle(content.x + 2 * (btn_w + btn_spacing), btn_y, btn_w, btn_h))
-
-      return self._result
 
   class ModelSelectorUI:
     """Manages model selector widgets and background processes."""
@@ -213,6 +211,7 @@ def on_software_settings_extend(default, layout):
           break
 
       dlg = MultiOptionDialog(MODEL_TYPE_LABELS[model_type], options, current=current)
+      # callback wired below after on_select is defined (on_select references dlg.selection)
 
       def on_select(result):
         if result != DialogResult.CONFIRM:
@@ -220,14 +219,12 @@ def on_software_settings_extend(default, layout):
         for i, m in enumerate(models):
           if options[i] == dlg.selection:
             is_active = m['id'] == active_id
-            action_dlg = ModelActionDialog(_display_label(m), is_active=is_active)
 
             def on_action(r, mt=model_type, mid=m['id'], prev=active_id):
               if r == ACTION_DELETE:
                 if mid == prev:
-                  gui_app.set_modal_overlay(
-                    ConfirmDialog('Cannot delete the active model.', 'OK', cancel_text=''),
-                    callback=lambda _: None)
+                  gui_app.push_widget(ConfirmDialog('Cannot delete the active model.', 'OK', cancel_text='',
+                                                    callback=lambda _: None))
                   return
                 _delete_model(mt, mid)
                 self._model_cache[mt] = _list_models(mt)
@@ -235,16 +232,13 @@ def on_software_settings_extend(default, layout):
                 try:
                   _swap_model(mt, mid)
                 except Exception:
-                  gui_app.set_modal_overlay(
-                    ConfirmDialog('Model swap failed.', 'OK', cancel_text=''),
-                    callback=lambda _: None)
+                  gui_app.push_widget(ConfirmDialog('Model swap failed.', 'OK', cancel_text='',
+                                                    callback=lambda _: None))
                   return
 
                 _, new_name = _read_active(mt)
                 if mt in self._model_btns:
                   self._model_btns[mt].action_item.set_value(new_name)
-
-                reboot_dlg = ConfirmDialog('Model swapped. Reboot to activate.', 'Reboot', cancel_text='Cancel')
 
                 def on_reboot(r2, mt2=mt, prev2=prev):
                   if r2 == DialogResult.CONFIRM:
@@ -258,12 +252,15 @@ def on_software_settings_extend(default, layout):
                     except Exception:
                       pass
 
-                gui_app.set_modal_overlay(reboot_dlg, callback=on_reboot)
+                gui_app.push_widget(ConfirmDialog('Model swapped. Reboot to activate.', 'Reboot',
+                                                  cancel_text='Cancel', callback=on_reboot))
 
-            gui_app.set_modal_overlay(action_dlg, callback=on_action)
+            action_dlg = ModelActionDialog(_display_label(m), is_active=is_active, callback=on_action)
+            gui_app.push_widget(action_dlg)
             return
 
-      gui_app.set_modal_overlay(dlg, callback=on_select)
+      dlg._callback = on_select
+      gui_app.push_widget(dlg)
 
     def _on_check_new_models(self):
       script = _find_script('model_download.py')
@@ -314,7 +311,6 @@ def on_software_settings_extend(default, layout):
       self._set_status(f'{total} available')
 
       options = [f"{m['prefix']}: {_display_label(m)}" for m in new_models]
-      dlg = MultiOptionDialog('New Models', options, current='')
 
       def on_result(result):
         if result != DialogResult.CONFIRM:
@@ -324,7 +320,8 @@ def on_software_settings_extend(default, layout):
             self._start_download(m['type'], m['id'])
             return
 
-      gui_app.set_modal_overlay(dlg, callback=on_result)
+      dlg = MultiOptionDialog('New Models', options, current='', callback=on_result)
+      gui_app.push_widget(dlg)
 
     def _start_download(self, model_type, model_id):
       script = _find_script('model_download.py')
@@ -361,3 +358,22 @@ def on_software_settings_extend(default, layout):
   layout._plugin_items.extend(manager.items)
   layout._plugin_updaters.append(manager.update)
   layout._plugin_show_cbs.append(manager.show)
+
+
+def on_health_check(acc, **kwargs):
+  # Proactively cache compiled pkl files for the active models.
+  # device.health_check runs every 5s; cache_compiled_pkl is idempotent
+  # (only copies files not already in cache), so repeated calls are safe.
+  # This ensures pkl files are saved to /data/models/ as soon as tinygrad
+  # compiles them, so switching back to a model skips recompilation.
+  for model_type_key, swapper in _SWAPPERS.items():
+    try:
+      active_id = swapper.get_active_model()
+      if active_id and active_id != 'unknown':
+        count = swapper.cache_compiled_pkl(active_id)
+        if count > 0:
+          from openpilot.common.swaglog import cloudlog
+          cloudlog.info(f"model_selector: cached {count} pkl files for {model_type_key}/{active_id}")
+    except Exception:
+      pass
+  return {**acc, "model_selector": {"status": "ok"}}

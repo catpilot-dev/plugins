@@ -1,0 +1,17 @@
+{
+  "id": "ui_recorder",
+  "name": "UI Recorder",
+  "version": "1.0.0",
+  "type": "hook",
+  "hooks": {
+    "ui.post_end_drawing": {
+      "module": "recorder",
+      "function": "on_post_end_drawing"
+    },
+    "device.health_check": {
+      "module": "recorder",
+      "function": "on_health_check",
+      "priority": 50
+    }
+  }
+}

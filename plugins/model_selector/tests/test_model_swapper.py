@@ -46,14 +46,15 @@ class TestModelConfigs:
     assert len(cfg['onnx_files']) == 1
     assert cfg['active_file'] == 'active_dm_model'
 
-  def test_pkl_files_match_onnx(self, ModelSwapper, ModelType):
-    """Each ONNX file should have a corresponding tinygrad PKL."""
+  def test_pkl_patterns_match_onnx(self, ModelSwapper, ModelType):
+    """Each ONNX file should have a corresponding tinygrad PKL pattern."""
     for mt in ModelType:
       cfg = ModelSwapper.MODEL_CONFIGS[mt]
       for onnx in cfg['onnx_files']:
         base = onnx.replace('.onnx', '')
-        pkl_name = f"{base}_tinygrad.pkl"
-        assert pkl_name in cfg['pkl_files'], f"Missing PKL for {onnx}"
+        stem = f"{base}_tinygrad.pkl"
+        assert stem in cfg['required_pkl_stems'], f"Missing required PKL stem for {onnx}"
+        assert cfg['pkl_patterns'] == ['*pkl*'], "pkl_patterns should be ['*pkl*']"
 
 
 class TestListModels:
@@ -64,7 +65,8 @@ class TestListModels:
       swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
       swapper.models_dir = tmp_path / 'models' / 'driving'
       swapper.onnx_files = swapper.config['onnx_files']
-      swapper.pkl_files = swapper.config['pkl_files']
+      swapper.pkl_patterns = swapper.config['pkl_patterns']
+      swapper.required_pkl_stems = swapper.config['required_pkl_stems']
       models = swapper.list_models()
     assert models == []
 
@@ -85,7 +87,8 @@ class TestListModels:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_files = swapper.config['pkl_files']
+    swapper.pkl_patterns = swapper.config['pkl_patterns']
+    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
 
     models = swapper.list_models()
     assert len(models) == 1
@@ -105,7 +108,8 @@ class TestListModels:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_files = swapper.config['pkl_files']
+    swapper.pkl_patterns = swapper.config['pkl_patterns']
+    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
 
     models = swapper.list_models()
     assert len(models) == 0
@@ -123,7 +127,8 @@ class TestListModels:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_files = swapper.config['pkl_files']
+    swapper.pkl_patterns = swapper.config['pkl_patterns']
+    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
 
     models = swapper.list_models()
     dates = [m['date'] for m in models]
@@ -140,7 +145,8 @@ class TestResolveModelId:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_files = swapper.config['pkl_files']
+    swapper.pkl_patterns = swapper.config['pkl_patterns']
+    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
 
     assert swapper.resolve_model_id('my_model') == 'my_model'
 
@@ -153,7 +159,8 @@ class TestResolveModelId:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_files = swapper.config['pkl_files']
+    swapper.pkl_patterns = swapper.config['pkl_patterns']
+    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
 
     assert swapper.resolve_model_id('nonexistent') == 'nonexistent'
 
@@ -169,7 +176,8 @@ class TestSwapModelValidation:
     swapper.models_dir = models_dir
     swapper.active_model_file = models_dir.parent / 'active_driving_model'
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_files = swapper.config['pkl_files']
+    swapper.pkl_patterns = swapper.config['pkl_patterns']
+    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
 
     with pytest.raises(ValueError, match="not found"):
       swapper.swap_model('nonexistent')
@@ -187,7 +195,8 @@ class TestSwapModelValidation:
     swapper.models_dir = models_dir
     swapper.active_model_file = models_dir.parent / 'active_driving_model'
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_files = swapper.config['pkl_files']
+    swapper.pkl_patterns = swapper.config['pkl_patterns']
+    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
 
     with patch.object(swapper, 'get_active_model', return_value='unknown'), \
          pytest.raises(ValueError, match="missing required ONNX"):
