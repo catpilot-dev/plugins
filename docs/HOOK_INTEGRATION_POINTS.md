@@ -15,7 +15,7 @@
 
 | Hook | File | Plugin | Signature |
 |------|------|--------|-----------|
-| `controls.curvature_correction` | `selfdrive/controls/controlsd.py` | lane_centering | `(curvature, model_v2, v_ego, lane_changing) → curvature` |
+| `controls.curvature_correction` | `selfdrive/controls/controlsd.py` | (available) | `(curvature, model_v2, v_ego, lane_changing) → curvature` |
 | `controls.post_actuators` | `selfdrive/controls/controlsd.py` | (available) | `(None, actuators, CS, long_plan) → None` (void) |
 | `car.cruise_initialized` | `selfdrive/car/card.py` | (available) | `(None, v_cruise_helper, CS_prev) → None` (void) |
 | `car.register_interfaces` | `opendbc_repo/opendbc/car/car_helpers.py` | bmw_e9x_e8x | `(interfaces, platforms) → (interfaces, platforms)` |
@@ -43,7 +43,7 @@
 | Hook | File | Plugin | Signature |
 |------|------|--------|-----------|
 | `selfdrived.alert_registry` | `selfdrive/selfdrived/selfdrived.py` | (available) | `({}) → {EventName: Alert}` (one-shot at init) |
-| `selfdrived.events` | `selfdrive/selfdrived/selfdrived.py` | phone_display | `([], CS, sm) → [EventName]` (100Hz) |
+| `selfdrived.events` | `selfdrive/selfdrived/selfdrived.py` | (available) | `([], CS, sm) → [EventName]` (100Hz) |
 
 `selfdrived.alert_registry` is called once at selfdrived startup. Plugins return a dict of `{EventName: Alert}` entries that are merged into the alert registry.
 
@@ -87,8 +87,8 @@
 
 | Hook | File | Plugin | Signature |
 |------|------|--------|-----------|
-| `ui.connectivity_check` | `selfdrive/ui/layouts/sidebar.py` | network_settings | `(False) → bool` |
-| `ui.network_settings_extend` | `selfdrive/ui/layouts/settings/settings.py` | network_settings | `(None, net_ui) → None` (void) |
+| `ui.connectivity_check` | `selfdrive/ui/layouts/sidebar.py` | (available) | `(False) → bool` |
+| `ui.network_settings_extend` | `selfdrive/ui/layouts/settings/settings.py` | (available) | `(None, net_ui) → None` (void) |
 | `ui.settings_extend` | `selfdrive/ui/layouts/settings/settings.py` | ui_mod | `(None, settings_layout) → None` (void) |
 | `ui.software_settings_extend` | `selfdrive/ui/layouts/settings/software.py` | model_selector | `(None, software_layout) → None` (void) |
 
@@ -98,14 +98,14 @@
 
 | Hook | File | Plugin | Signature |
 |------|------|--------|-----------|
-| `webrtc.session_factory` | `system/webrtc/webrtcd.py` | webrtc_stack | `(StreamSession) → SessionClass` (one-shot at init) |
-| `webrtc.app_routes` | `system/webrtc/webrtcd.py` | phone_display | `([], aiohttp_app) → [RouteTableDef]` |
-| `webrtc.session_started` | `system/webrtc/webrtcd.py` | phone_display | `(None, identifier) → None` (void) |
-| `webrtc.session_ended` | `system/webrtc/webrtcd.py` | phone_display | `(None, identifier) → None` (void) |
+| `webrtc.session_factory` | `system/webrtc/webrtcd.py` | (available) | `(StreamSession) → SessionClass` (one-shot at init) |
+| `webrtc.app_routes` | `system/webrtc/webrtcd.py` | (available) | `([], aiohttp_app) → [RouteTableDef]` |
+| `webrtc.session_started` | `system/webrtc/webrtcd.py` | (available) | `(None, identifier) → None` (void) |
+| `webrtc.session_ended` | `system/webrtc/webrtcd.py` | (available) | `(None, identifier) → None` (void) |
 
-`webrtc.session_factory` is called once at webrtcd startup. It receives the default `StreamSession` class and must return a class with the same constructor signature `(sdp, cameras, incoming_services, outgoing_services, debug_mode)` and public interface (`get_answer()`, `get_messaging_channel()`, `start()`, `stop()`). The `webrtc_stack` plugin uses this to substitute a portable aiortc-native session implementation that carries no teleoprtc dependency.
+`webrtc.session_factory` is called once at webrtcd startup. It receives the default `StreamSession` class and must return a class with the same constructor signature `(sdp, cameras, incoming_services, outgoing_services, debug_mode)` and public interface (`get_answer()`, `get_messaging_channel()`, `start()`, `stop()`).
 
-`webrtc.app_routes` is called once at webrtcd startup to register additional aiohttp routes. The phone_display plugin uses it to add WebRTC signaling and HUD data endpoints.
+`webrtc.app_routes` is called once at webrtcd startup to register additional aiohttp routes.
 
 ---
 

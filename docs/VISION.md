@@ -134,16 +134,14 @@ lines of unmaintainable diff.
 
 ## Status
 
-Proven with 10 plugins on Comma 3 (AGNOS 12.8) and Orange Pi 5 Plus (RK3588):
+Proven on Comma 3 (AGNOS 12.8) and Orange Pi 5 Plus (RK3588):
 - bmw_e9x_e8x (car interface + safety + DCC control)
 - c3_compat (AGNOS 12.8 compat: Raylib UI, venv_sync, boot patches, watchdog)
-- lane_centering (curvature correction)
 - mapd (OSM data)
 - speedlimitd (speed limit fusion)
 - model_selector (runtime model swapping)
-- network_settings (proxy, static IP, github connectivity)
-- phone_display (phone-as-display: WebRTC camera + HUD, engagement watchdog)
-- trafficd (YOLO traffic sign detection via RKNN NPU)
+- bus_logger (plugin bus capture for logging)
+- screen_capture (tap-to-capture screenshots)
 - ui_mod (custom UI panels: Driving, Vehicle, Plugins, drive stats, route map)
 
 Validated:
