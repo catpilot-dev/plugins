@@ -276,15 +276,15 @@ def on_lat_controller_init(result, lac, CP):
   # The 1/v² factor gives natural speed adaptation (tighter at high v).
   # 2026-05-20: a constant-angle reformulation (TOL_DEG_CONST = 0.35°) was
   # tried and reverted — the wide highway-speed deadzone allowed sustained
-  # δ_err inside the band to accumulate into 1.3–1.7 m lateral drift when
-  # lane_centering was off (route 31b seg 8/15). The 1/v² scaling is what
-  # keeps the κ-controller actively tracking at highway speed when it's the
-  # sole loop closing against drift.
+  # δ_err inside the band to accumulate into 1.3–1.7 m lateral drift
+  # (route 31b seg 8/15) when no position-feedback layer was running. The
+  # 1/v² scaling is what keeps the κ-controller actively tracking at highway
+  # speed when it's the sole loop closing against drift.
   DRIFT_M = 0.02           # m of allowed drift over model_action_t
 
   # κ-gated box filter on delta_err. Bare-model κ_des on near-straight
-  # (lane_centering off) produces high-rate sign-flips that propagate into
-  # delta_err. Each delta_err sign-flip across the tolerance band triggers
+  # produces high-rate sign-flips that propagate into delta_err. Each
+  # delta_err sign-flip across the tolerance band triggers
   # a cancel_tol / brake_zero cycle with a counter-direction FRICTION pulse
   # — the actual felt swaying isn't κ_des amplitude, it's the rate of
   # those unwind pulses.
@@ -302,8 +302,8 @@ def on_lat_controller_init(result, lac, CP):
   #
   # Gate on |raw κ_des| < KD_GATE: filter active only in the near-straight
   # wobble regime. Real curves bypass (no filter lag during curve entry).
-  # Lane changes (modelV2.meta.laneChangeState != off) also bypass
-  # (canonical signal stock controlsd uses to gate lane_centering).
+  # Lane changes (modelV2.meta.laneChangeState != off) also bypass — that's
+  # the canonical openpilot signal for "model is reframing the trajectory".
   # de_filter_window subscribes to action_cadence_ticks for single-knob
   # coupling: at SAD=0.4 → cadence=6 → window=6 (300 ms box, 150 ms group
   # delay).
@@ -455,13 +455,14 @@ def on_lat_controller_init(result, lac, CP):
       # Speed-scaled tolerance: DRIFT_M drift over model_action_t, 1/v² scaling.
       # Restored 2026-05-20 after route 31b seg 8/15 showed the constant-angle
       # 0.35° deadzone (commit 715114d, now reverted) allowed 1.3–1.7 m lateral
-      # drift at 85 kph when lane_centering is off: δ_err of 0.2–0.35° sat
-      # inside the 0.35° band for seconds while stiction held the rack at zero,
-      # and the car coasted ~half a lane out of position with 98% torque=0.
-      # The kinematic 1/v² formula keeps the deadzone tight at highway speed
-      # (~0.05° at 85 kph) where the κ-controller is the only loop closing
-      # against drift in the lane_centering-off configuration. Re-evaluate the
-      # constant-angle reformulation only with lane_centering active.
+      # drift at 85 kph with no position-feedback layer running: δ_err of
+      # 0.2–0.35° sat inside the 0.35° band for seconds while stiction held
+      # the rack at zero, and the car coasted ~half a lane out of position
+      # with 98% torque=0. The kinematic 1/v² formula keeps the deadzone tight
+      # at highway speed (~0.05° at 85 kph) so the κ-controller stays active
+      # against drift. The constant-angle reformulation is only viable on top
+      # of an external position-feedback loop, which the public build has
+      # none of.
       lookahead_m = v * model_action_t
       tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
 

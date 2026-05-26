@@ -80,9 +80,7 @@ liveDelay.lateralDelay             (= 0.6 s; permanently pinned for BMW —
 modelV2.action.desiredCurvature   (raw model output, ~20 Hz)
         │
         ▼  hooks.run('controls.curvature_correction', ...)
-        │  — look_ahead (priority 40, passthrough)
-        │  — lane_centering (priority 50, +correction)
-        │     but lane_centering is currently OFF by user choice (vision noise)
+        │     (passthrough — no curvature corrections registered in the public build)
         ▼
 clip_curvature() in drive_helpers.py
         │  — rate-limited to MAX_LATERAL_JERK = 5.0 m/s³ (ISO)
@@ -139,7 +137,7 @@ return -state['torque']  (BMW carcontroller flips sign convention)
 
 ## 4. The κ-gated box filter on delta_err
 
-**Purpose**: suppress high-rate sign-flips in `delta_err` caused by vision-only κ_des wobble on near-straight (lane_centering disabled). Each sign-flip across the tolerance band triggers `cancel_tol` / `brake_zero` with a counter-direction FRICTION pulse — those are the felt "swaying" pulses.
+**Purpose**: suppress high-rate sign-flips in `delta_err` caused by vision-only κ_des wobble on near-straight (no position-feedback layer running). Each sign-flip across the tolerance band triggers `cancel_tol` / `brake_zero` with a counter-direction FRICTION pulse — those are the felt "swaying" pulses.
 
 **Target choice**: filter applied to `delta_err`, **not** to raw κ_des. Keeps `state['desired']` raw so:
 - Reference is always fresh — no held bias → no drift accumulation
@@ -183,7 +181,7 @@ tolerance   = 2.0 * DRIFT_M * L / (lookahead_m**2) # rad, 1/v² scaling
 
 **Physical meaning**: tolerance is the front-wheel-angle error that produces ≤ `DRIFT_M` of lateral position drift over `model_action_t` of forward travel. At 85 kph: tolerance ≈ 0.027°. At 30 kph: tolerance ≈ 0.36°.
 
-**Why 1/v² and not constant-angle**: a constant 0.35° deadzone was tried (commit 715114d) and reverted (d43fb19) after route 31b seg 8/15 showed the controller silent for 98% of samples while `δ_err` sat inside the wide band, producing 1.3–1.7 m lateral drift at 85 kph with `lane_centering` off. The 1/v² formula tightens the deadzone exactly where it matters (high speed) and is the only safe choice without a position-feedback layer.
+**Why 1/v² and not constant-angle**: a constant 0.35° deadzone was tried (commit 715114d) and reverted (d43fb19) after route 31b seg 8/15 showed the controller silent for 98% of samples while `δ_err` sat inside the wide band, producing 1.3–1.7 m lateral drift at 85 kph with no position-feedback layer running. The 1/v² formula tightens the deadzone exactly where it matters (high speed) and is the only safe choice without a position-feedback layer.
 
 **Used in three places** in the cadence decision:
 - `if abs(delta_err) ≤ 1.2 · tolerance` → cancel_tol band (drain ramp toward FRICTION-level brake or 0)
@@ -279,8 +277,8 @@ Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 
 ## 10. Constraints baked into the design
 
-- **Vision-only stack**: catpilot has no HD-map, lidar, radar fusion, or IMU-fusion for κ. All correction must come from `modelV2` outputs. Don't propose external-sensor escape hatches for vision-noise problems. See `feedback_vision_only_stack.md` in user memory.
-- **lane_centering disabled by user choice**: its correction is derived from `modelV2.laneLines` which shares the same vision noise source as `modelV2.action.desiredCurvature` — it doesn't fix κ_des wobble on straights, it translates κ-domain wobble into position-domain wobble. The controller must handle vision noise downstream without position feedback.
+- **Vision-only stack**: catpilot has no HD-map, lidar, radar fusion, or IMU-fusion for κ. All correction must come from `modelV2` outputs. Don't propose external-sensor escape hatches for vision-noise problems.
+- **No position-feedback layer**: there is no lane-offset correction registered on `controls.curvature_correction` in the public build, and adding one based on `modelV2.laneLines` would not fix κ_des wobble on straights (laneLines share the same vision noise source as `desiredCurvature`). The controller must handle vision noise downstream without position feedback.
 - **lagd never converges for BMW**: `liveDelay.lateralDelay` is permanently pinned at `SAD + 0.2` because lagd correlates on latcontrol_torque telemetry our controller doesn't produce. `SAD` is the effective knob — not a hint to be overridden.
 - **BMW hydraulic rack**: stiction holds δ at zero torque, no self-centering. The plant-inversion controller is designed around this. **Don't add a FF term on κ_des** (correct for EPS, wrong here).
 
@@ -292,7 +290,7 @@ These were tried, deployed, and reverted. Each appears here so future maintainer
 
 | experiment | result | file:line | reverted by |
 |---|---|---|---|
-| Constant-angle deadzone (`TOL_DEG_CONST = 0.35°`) | Allowed 1.3–1.7 m drift at 85 kph with lane_centering off; controller silent 98% of samples (route 31b seg 8/15). Wide angular deadzone is unsafe without a position-feedback layer. | commit 715114d | d43fb19 |
+| Constant-angle deadzone (`TOL_DEG_CONST = 0.35°`) | Allowed 1.3–1.7 m drift at 85 kph with no position-feedback layer running; controller silent 98% of samples (route 31b seg 8/15). Wide angular deadzone is unsafe without a position-feedback layer. | commit 715114d | d43fb19 |
 | Stiction-gated steering-angle FF (linear in \|steer\|, 20°/0.10 Nm·deg⁻¹) | Over-pushed in route 31d seg 8 right turn: 50% over-rotation, 6.22 Nm torque, sustained cancel_jerk oscillation. SAT physics aren't linear in steering angle alone — needs multi-regime (v×κ grid) calibration, not single-route fit. | commit 2c67a97 | e81f1c0 |
 | Hysteresis-on-κ_des (`KD_HYST_GAP = 0.003`, `KD_GATE = 0.006`) | 95% sign-flip reduction in offline check, but route 322 had 32% time `\|offset\|>0.5 m` and 44-second frozen-κ_des stretches — controller faithfully tracked a held biased reference → drift. Structural failure of holding the reference without a position-feedback layer. | commit daef207 | 96945fc (replaced with box-on-delta_err) |
 | Suggesting external sensor fusion (HD map, radar, lidar, IMU) for vision noise | Out of project scope by design — see [vision-only constraint](§10). | (recurring; do not propose) |
@@ -350,22 +348,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 
 ---
 
-## 14. Related memory files (in user's `~/.claude/.../memory/`)
-
-- `project_lat_horizon_single_knob.md` — single-knob timing design
-- `project_kappa_box_filter.md` — wobble filter evolution (box-on-κ → hysteresis → box-on-delta_err)
-- `project_constant_angle_deadzone.md` — failed constant-angle deadzone experiment
-- `project_steer_angle_ff.md` — failed steering-angle feedforward experiment
-- `feedback_bmw_steering.md` — BMW E90 has hydraulic, NOT Servotronic
-- `feedback_bmw_steering_stiction.md` — rack holds angle at zero torque; no self-centering
-- `feedback_bmw_kappa_scale.md` — kappa_scale as multiplicative gain, NOT FF
-- `feedback_vision_only_stack.md` — no HD-map/lidar/radar fixes for vision-noise problems
-- `feedback_lane_centering_vision_noise.md` — lane_centering shares the same vision noise source as κ_des; not a fix for κ_des wobble
-- `feedback_controller_layering.md` — position feedback stays in lane_centering, not the κ-tracking controller
-
----
-
-## 15. Quick verification recipe
+## 14. Quick verification recipe
 
 To check that a deployed change behaves as expected:
 

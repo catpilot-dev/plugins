@@ -73,7 +73,7 @@ class CarState(CarStateBase):
     cp_F = can_parsers[Bus.body]
     cp_aux = can_parsers[Bus.alt]
 
-    # Update offset from look_ahead plugin bus (published at 1 Hz)
+    # Update offset from any registered steer_angle_offset publisher (1 Hz)
     self._update_steer_angle_offset()
 
     ret = structs.CarState()
@@ -259,7 +259,7 @@ class CarState(CarStateBase):
       return 0.0
 
   def _update_steer_angle_offset(self):
-    """Update offset from look_ahead plugin bus (steer_angle_offset topic)."""
+    """Update offset from any registered publisher on the steer_angle_offset topic."""
     try:
       import os
       socket_path = '/tmp/plugin_bus/steer_angle_offset'

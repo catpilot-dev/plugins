@@ -34,14 +34,12 @@ plugins/
   plugins/
     config.py             # Shared path config; deployed to /data/plugins-runtime/config.py
     bmw_e9x_e8x/          # BMW E8x/E9x car interface (hook-based registration)
+    bus_logger/           # Plugin bus capture for logging
     c3_compat/            # Comma 3 AGNOS compatibility (boot patches, venv_sync)
-    lane_centering/       # Curvature correction hook
     mapd/                 # OSM map data process
     model_selector/       # Runtime driving model swapping
-    network_settings/     # Proxy + static IP + github connectivity
-    phone_display/        # Phone-as-display: WebRTC video + HUD, watchdog
+    screen_capture/       # Tap-to-capture screenshots
     speedlimitd/          # Speed limit fusion (process + hook)
-    trafficd/             # YOLO traffic sign detection (NPU)
     ui_mod/               # Custom UI panels: Driving, Vehicle, Plugins, drive stats
   docs/                   # This documentation
 ```
@@ -65,14 +63,12 @@ Web app for device management. Served on port 8082 (redirected from port 80 via 
 /data/plugins-runtime/      # Deployed plugin runtime (written by install.sh)
   config.py                 # Shared path config — importable by all plugins
   bmw_e9x_e8x/
+  bus_logger/
   c3_compat/
-  lane_centering/
   mapd/
   model_selector/
-  network_settings/
-  phone_display/
+  screen_capture/
   speedlimitd/
-  trafficd/
   ui_mod/
     data/                   # Plugin-specific param storage (plugin_data_dir())
 
@@ -116,10 +112,10 @@ Plugin params are **NOT** in `params_keys.h`. Using `Params().get()` for unknown
 from config import read_plugin_param, write_plugin_param
 
 # Read: returns '' if not set
-value = read_plugin_param("phone_display", "CatEyePhoneRequired")
+value = read_plugin_param("speedlimitd", "SpeedLimitConfirmed")
 
 # Write
-write_plugin_param("phone_display", "CatEyePhoneRequired", "1")
+write_plugin_param("speedlimitd", "SpeedLimitConfirmed", "1")
 ```
 
 Files are stored at `/data/plugins-runtime/<id>/data/<key>`.
@@ -190,23 +186,6 @@ openpilot manager
 
 ---
 
-## Plugin: phone_display
-
-Enables phone-as-display for headless devices (RK3588, future C3 headless).
-
-**Hooks registered**:
-- `selfdrived.events` — publishes `EventName.catEyePhoneRequired` when phone not connected and required
-- `webrtc.app_routes` — registers WebRTC signaling + HUD data endpoints in webrtcd
-- `webrtc.session_started` / `webrtc.session_ended` — watchdog lifecycle management
-
-**Param**: `CatEyePhoneRequired` (in plugin data dir, not params_keys.h)
-- `0` = phone optional (no blocking alert)
-- `1` = phone required (blocks engagement when disconnected)
-
-**COD routing**: `_PLUGIN_TOGGLE_PARAMS` in `handlers/params.py` routes `CatEyePhoneRequired` reads/writes through `read_plugin_param`/`write_plugin_param` instead of openpilot Params.
-
----
-
 ## Plugin: c3_compat
 
 Comma 3 hardware compatibility for AGNOS 12.8. Device filter: `tici`.
@@ -261,5 +240,5 @@ print('Hook system OK')
 \""
 
 # Check plugin logs
-ssh comma@c3 "cat /tmp/plugin_logs/phone_display.log"
+ssh comma@c3 "cat /tmp/plugin_logs/speedlimitd.log"
 ```

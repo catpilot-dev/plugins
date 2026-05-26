@@ -8,11 +8,9 @@ Plugin packages for [catpilot](https://github.com/catpilot-dev/catpilot). Integr
 |--------|------|-------------|
 | `bmw_e9x_e8x` | car | BMW E82/E90 car interface — VIN detection, cruise, lane change, torque learning |
 | `c3_compat` | hybrid | Comma 3 compatibility (AGNOS 12.8, STM32F4 panda, DRM display, MSGQ fix) |
-| `lane_centering` | hook | Lane centering curvature correction with kP/kD tuning |
 | `mapd` | process | OSM map daemon for speed limits, curves, and road context |
 | `model_selector` | hook | Download and swap driving models from Software panel |
 | `speedlimitd` | hybrid | Conditional speed control — road type inference, vision cap, per-country speed tables |
-| `network_settings` | hook | Per-SSID proxy and static IPv4 configuration |
 | `bus_logger` | process | Capture plugin bus messages to cereal for logging |
 | `ui_mod` | hook | Settings panels (Driving, Vehicle, Plugins), home screen (drive stats, route map, emblem) |
 | `screen_capture` | hook | Tap-to-capture screenshots with camera icon overlay |
@@ -29,10 +27,8 @@ plugins/
 │   ├── bmw_e9x_e8x/
 │   ├── bus_logger/
 │   ├── c3_compat/
-│   ├── lane_centering/
 │   ├── mapd/
 │   ├── model_selector/
-│   ├── network_settings/
 │   ├── screen_capture/
 │   ├── speedlimitd/
 │   └── ui_mod/
