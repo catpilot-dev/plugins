@@ -10,9 +10,7 @@ Samples on deviceState updates (~2Hz) — matching qlog resolution exactly.
 import json
 import math
 import os
-import sys
 import time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import PLUGINS_RUNTIME_DIR
 
 LAST_DRIVE_FILE = os.path.join(PLUGINS_RUNTIME_DIR, '.last_drive.json')
@@ -30,6 +28,7 @@ class DriveTracker:
     self._distance_m = 0.0
     self._duration_s = 0.0
     self._engaged_s = 0.0
+    self._engaged_m = 0.0
     self._start_time = 0.0
     self._start_lat = 0.0
     self._start_lng = 0.0
@@ -53,6 +52,7 @@ class DriveTracker:
     self._distance_m = 0.0
     self._duration_s = 0.0
     self._engaged_s = 0.0
+    self._engaged_m = 0.0
     self._start_time = time.time()
     self._start_lat = 0.0
     self._start_lng = 0.0
@@ -81,6 +81,7 @@ class DriveTracker:
 
     if sm['selfdriveState'].enabled:
       self._engaged_s += dt
+      self._engaged_m += v_ego * dt
 
     # GPS: capture start once, continuously update end, accumulate trace
     if sm.updated.get('gpsLocationExternal', False):
@@ -111,18 +112,34 @@ class DriveTracker:
     if self._duration_s < 5.0 or self._distance_m < 100.0:
       return
 
+    # Preserve the previous drive's GPS trace if this drive had no GPS lock.
+    trace = self._trace
+    has_gps = self._has_gps
+    start_lat, start_lng = self._start_lat, self._start_lng
+    end_lat, end_lng = self._end_lat, self._end_lng
+    if not has_gps:
+      prev = get_last_drive()
+      if prev and prev.get('has_gps') and prev.get('trace'):
+        trace = prev['trace']
+        has_gps = prev['has_gps']
+        start_lat = prev.get('start_lat', 0.0)
+        start_lng = prev.get('start_lng', 0.0)
+        end_lat = prev.get('end_lat', 0.0)
+        end_lng = prev.get('end_lng', 0.0)
+
     data = {
       'version': 1,
       'start_time': self._start_time,
       'duration_s': round(self._duration_s, 1),
       'distance_m': round(self._distance_m, 1),
       'engaged_s': round(self._engaged_s, 1),
-      'start_lat': self._start_lat,
-      'start_lng': self._start_lng,
-      'end_lat': self._end_lat,
-      'end_lng': self._end_lng,
-      'has_gps': self._has_gps,
-      'trace': self._trace,
+      'engaged_m': round(self._engaged_m, 1),
+      'start_lat': start_lat,
+      'start_lng': start_lng,
+      'end_lat': end_lat,
+      'end_lng': end_lng,
+      'has_gps': has_gps,
+      'trace': trace,
     }
 
     try:
@@ -142,6 +159,7 @@ class DriveTracker:
       'distance_m': self._distance_m,
       'duration_s': self._duration_s,
       'engaged_s': self._engaged_s,
+      'engaged_m': self._engaged_m,
     }
 
 

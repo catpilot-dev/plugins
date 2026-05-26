@@ -2,10 +2,8 @@
 
 import json
 import os
-import sys
 import threading
 import urllib.request
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import PLUGINS_REPO_DIR
 
 import pyray as rl
@@ -16,7 +14,7 @@ from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.widgets import Widget
 
-COD_BASE = "http://localhost:8082"
+COD_BASE = "http://localhost"
 EMBLEMS_DIR = os.path.join(PLUGINS_REPO_DIR, 'logos', 'emblems')
 EMBLEM_SIZE = 180
 
@@ -65,6 +63,9 @@ class DriveStatsWidget(Widget):
   def refresh(self):
     self._is_metric = Params().get_bool("IsMetric")
     self._maybe_reload()
+    # Retry stats fetch if it hasn't succeeded yet (e.g. COD not ready at startup)
+    if self._stats is None and not self._fetching:
+      self._fetch_stats()
 
   def _maybe_reload(self):
     """Reload last drive and stats only when the data file changes (offroad transition)."""
@@ -194,20 +195,24 @@ class DriveStatsWidget(Widget):
 
     data = self._stats.get(stats_key, {})
     routes = data.get("routes", 0)
-    distance_mi = data.get("distance", 0)
+    distance_m = data.get("distance_m", 0)
     minutes = data.get("minutes", 0)
+    engaged_m = data.get("engaged_m", 0)
+    total_m_eng = data.get("total_m_with_engagement", 0)
     if self._is_metric:
-      distance = distance_mi * 1.60934
+      distance = distance_m / 1000
       dist_unit = tr("km")
     else:
-      distance = distance_mi
+      distance = distance_m / 1609.344
       dist_unit = tr("mi")
 
     hours = minutes / 60
+    eng_pct = f"{engaged_m / total_m_eng * 100:.0f}%" if total_m_eng > 0 else "—"
     stats_row = [
-      (str(routes), tr("Drives")),
       (f"{distance:.0f}", dist_unit),
       (f"{hours:.0f}", tr("Hours")),
+      (str(routes), tr("Drives")),
+      (eng_pct, tr("Engaged")),
     ]
 
     self._draw_stat_cols(x, y, w, stats_row, font_bold, font_normal)
@@ -221,6 +226,7 @@ class DriveStatsWidget(Widget):
     d = self._last_drive
     distance_m = d.get('distance_m', 0)
     duration_s = d.get('duration_s', 0)
+    engaged_m = d.get('engaged_m')  # None on pre-distance .last_drive.json
     engaged_s = d.get('engaged_s', 0)
 
     if self._is_metric:
@@ -238,7 +244,14 @@ class DriveStatsWidget(Widget):
       dur_text = f"{dur_min:.0f}"
       dur_unit = tr("Min")
 
-    pct_text = f"{min(engaged_s / duration_s, 1.0) * 100:.0f}%" if duration_s > 0 else "—"
+    # Distance-based engagement %. Fall back to time-based for pre-distance
+    # .last_drive.json files (one drive of staleness across the upgrade).
+    if engaged_m is not None and distance_m > 0:
+      pct_text = f"{min(engaged_m / distance_m, 1.0) * 100:.0f}%"
+    elif duration_s > 0:
+      pct_text = f"{min(engaged_s / duration_s, 1.0) * 100:.0f}%"
+    else:
+      pct_text = "—"
 
     stats_row = [
       (f"{dist_val:.1f}", dist_unit),

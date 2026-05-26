@@ -9,11 +9,8 @@ rect completely — no black borders.
 import math
 import os
 import random
-import sys
 import threading
 import urllib.request
-import socket
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import PLUGINS_RUNTIME_DIR
 
@@ -191,7 +188,7 @@ class RouteMapRenderer:
 
     # URL overlay at bottom (no background — dark tiles provide contrast)
     bar_rect = rl.Rectangle(rect.x, rect.y + rect.height - URL_BAR_HEIGHT, rect.width, URL_BAR_HEIGHT)
-    url_text = f"View route details at {self._get_device_ip()}:8082"
+    url_text = "Check route details at catpilot.local"
     font = gui_app.font(FontWeight.NORMAL)
     text_size = measure_text_cached(font, url_text, URL_FONT_SIZE)
     tx = bar_rect.x + (bar_rect.width - text_size.x) / 2
@@ -203,16 +200,6 @@ class RouteMapRenderer:
     # Rounded border on top to mask square corners
     rl.draw_rectangle_rounded_lines_ex(rect, CORNER_ROUNDNESS, CORNER_SEGMENTS, CORNER_BORDER, BG_COLOR)
 
-  @staticmethod
-  def _get_device_ip():
-    try:
-      s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-      s.connect(("8.8.8.8", 80))
-      ip = s.getsockname()[0]
-      s.close()
-      return ip
-    except Exception:
-      return "<device_ip>"
 
   def _to_screen(self, point, ox, oy):
     x, y = _lat_lng_to_tile_xy(point[0], point[1], self._zoom)
