@@ -206,7 +206,7 @@ class TestPlatformConfig:
     assert p.STEER_MAX == 12
     assert p.STEER_STEP == 1
     assert p.STEER_DELTA_UP == 0.1
-    assert p.STEER_DELTA_DOWN == 1.0
+    assert p.STEER_DELTA_DOWN == 0.1
 
   def test_bmw_flags(self, mock_opendbc):
     from bmw.values import BmwFlags
@@ -250,10 +250,10 @@ class TestResumeButton:
       return 'resume'
 
   def test_short_press_disengaged_emits_resume(self):
-    assert self._classify_release(cruise_state_enabled=False, hold_frames=5) == 'resume'
+    assert self._classify_release(cruise_state_enabled=False, hold_frames=1) == 'resume'
 
   def test_short_press_engaged_toggles_speed_limit(self):
-    assert self._classify_release(cruise_state_enabled=True, hold_frames=5) == 'speed_limit_toggle'
+    assert self._classify_release(cruise_state_enabled=True, hold_frames=1) == 'speed_limit_toggle'
 
   def test_long_press_emits_gap_adjust(self):
     from bmw.carstate import RESUME_LONG_PRESS_FRAMES

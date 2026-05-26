@@ -102,7 +102,7 @@ static bool bmw_tx_hook(const CANPacket_t *msg) {
       {96, 64, 32},       // CAN units: 12Nm, 8Nm, 4Nm (full torque up to 54kph)
     },
     .max_rate_up = 2,                               // <= 0.125Nm/10ms
-    .max_rate_down = (1.0f / CAN_ACTUATOR_TQ_FAC),  // < 1Nm/10ms
+    .max_rate_down = (0.2f / CAN_ACTUATOR_TQ_FAC),   // <= 0.2Nm/10ms (smooth release to reduce oscillation)
     .max_rt_delta = (25.0f / CAN_ACTUATOR_TQ_FAC),  // 25Nm/250ms
     .max_torque_error = (1.0f / CAN_ACTUATOR_TQ_FAC),  // 1Nm
     .type = TorqueMotorLimited,

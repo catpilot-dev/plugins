@@ -8,10 +8,8 @@ import cereal.messaging as messaging
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
-# Resume button hold duration threshold (in frames at 100Hz = 10ms per frame)
-# 0.5 seconds = 50 frames, but counter increments 49 times (reset to 0 on first press, then 49 increments)
-# So threshold is 49 to detect 50 frames (0.5 seconds) of button press
-# This makes personality cycling more practical (easier to hold for 0.5s than 1s)
+# Resume button hold duration thresholds (in frames at 100Hz = 10ms per frame)
+# Long press threshold: 500ms (49 frames) — triggers gap adjust / personality cycle
 RESUME_LONG_PRESS_FRAMES = 49
 
 
@@ -50,8 +48,11 @@ class CarState(CarStateBase):
     self.prev_cruise_stalk_resume = self.cruise_stalk_resume
     self.prev_cruise_stalk_cancel = self.cruise_stalk_cancel
     self.prev_cruise_enabled = False  # Track previous openpilot cruise state for resume button logic
-    self.resume_button_hold_frames = 0  # Track how many frames resume button has been held (v4 duration-based logic)
+    self.resume_button_hold_frames = 0
+    self.resume_press_engaged = False  # Was cruise engaged when resume button was first pressed?
     self.steer_fault_counter = 0  # Debounce: consecutive frames with raw fault bits set
+    self.steer_angle_offset = self._load_steer_angle_offset()
+    self._offset_sub = None
 
     self.right_blinker_pressed = False
     self.left_blinker_pressed = False
@@ -61,13 +62,19 @@ class CarState(CarStateBase):
     self.cruise_state_enabled = False
     self.dtc_mode = False
 
-    # Subscribe to radarState, liveDelay, speedLimitState
-    self.sm = messaging.SubMaster(['radarState', 'liveDelay', 'speedLimitState'])
+    # Subscribe to radarState, liveDelay
+    self.sm = messaging.SubMaster(['radarState', 'liveDelay'])
+    from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+    self._sl_sub = PluginSub(['speedLimitState'])
+    self._sl_data = None
 
   def update(self, can_parsers) -> structs.CarState:
     cp_PT = can_parsers[Bus.pt]
     cp_F = can_parsers[Bus.body]
     cp_aux = can_parsers[Bus.alt]
+
+    # Update offset from look_ahead plugin bus (published at 1 Hz)
+    self._update_steer_angle_offset()
 
     ret = structs.CarState()
 
@@ -121,12 +128,12 @@ class CarState(CarStateBase):
 
     cruise_control_stal_msg = cp_PT.vl["CruiseControlStalk"]
     if self.CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
-      ret.steeringAngleDeg = cp_F.vl['SteeringWheelAngle_DSC']['SteeringPosition']
+      ret.steeringAngleDeg = cp_F.vl['SteeringWheelAngle_DSC']['SteeringPosition'] - self.steer_angle_offset
       ret.cruiseState.speed = cp_PT.vl["DynamicCruiseControlStatus"]['CruiseControlSetpointSpeed'] * (CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS)
       ret.cruiseState.enabled = cp_PT.vl["DynamicCruiseControlStatus"]['CruiseActive'] != 0
       cruise_control_stal_msg = cp_F.vl["CruiseControlStalk"]
     elif self.CP.flags & BmwFlags.NORMAL_CRUISE_CONTROL:
-      ret.steeringAngleDeg = cp_PT.vl['SteeringWheelAngle']['SteeringPosition']
+      ret.steeringAngleDeg = cp_PT.vl['SteeringWheelAngle']['SteeringPosition'] - self.steer_angle_offset
       ret.cruiseState.speed = cp_PT.vl["CruiseControlStatus"]['CruiseControlSetpointSpeed'] * (CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS)
       ret.cruiseState.enabled = cp_PT.vl["CruiseControlStatus"]['CruiseControlActiveFlag'] != 0
     ret.cruiseState.speedCluster = ret.cruiseState.speed + CruiseSettings.CLUSTER_OFFSET * CV.KPH_TO_MS
@@ -191,7 +198,9 @@ class CarState(CarStateBase):
 
     if self.cruise_stalk_resume:
       if not self.prev_cruise_stalk_resume:
+        # Rising edge: capture whether cruise was already engaged at press time
         self.resume_button_hold_frames = 0
+        self.resume_press_engaged = self.cruise_state_enabled
       else:
         self.resume_button_hold_frames += 1
 
@@ -205,10 +214,11 @@ class CarState(CarStateBase):
           pressed=False,
           type=ButtonType.gapAdjustCruise
         ))
-      elif self.cruise_state_enabled:
+      elif self.resume_press_engaged:
         # Short press while engaged: toggle speed limit confirm
-        self.sm.update(0)
-        sl = self.sm['speedLimitState'].speedLimit if self.sm.recv_frame.get('speedLimitState', 0) > 0 else 0.0
+        msg = self._sl_sub.drain('speedLimitState')
+        if msg is not None:
+          _, self._sl_data = msg
         toggle_speed_limit_confirm()
       else:
         resume_button_events.append(structs.CarState.ButtonEvent(
@@ -237,6 +247,45 @@ class CarState(CarStateBase):
     if self.cruise_state_enabled and not self.out.cruiseState.enabled:
       return True
     return False
+
+  @staticmethod
+  def _load_steer_angle_offset():
+    """Load persisted offset from plugin data dir. Falls back to 0."""
+    try:
+      from config import read_plugin_param
+      val = read_plugin_param('bmw_e9x_e8x', 'SteerAngleOffset')
+      return float(val) if val else 0.0
+    except (ValueError, Exception):
+      return 0.0
+
+  def _update_steer_angle_offset(self):
+    """Update offset from look_ahead plugin bus (steer_angle_offset topic)."""
+    try:
+      import os
+      socket_path = '/tmp/plugin_bus/steer_angle_offset'
+      if self._offset_sub is not None and not os.path.exists(socket_path):
+        try:
+          self._offset_sub.close()
+        except Exception:
+          pass
+        self._offset_sub = None
+      if self._offset_sub is None and os.path.exists(socket_path):
+        from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+        self._offset_sub = PluginSub(['steer_angle_offset'])
+      if self._offset_sub is not None:
+        msg = self._offset_sub.drain('steer_angle_offset')
+        if msg is not None:
+          _, data = msg
+          new_offset = float(data.get('offset', self.steer_angle_offset))
+          if new_offset != self.steer_angle_offset:
+            self.steer_angle_offset = new_offset
+            try:
+              from config import write_plugin_param
+              write_plugin_param('bmw_e9x_e8x', 'SteerAngleOffset', '%.4f' % new_offset)
+            except Exception:
+              pass
+    except Exception:
+      pass
 
   @staticmethod
   def get_can_parsers(CP):
