@@ -158,6 +158,52 @@ def on_vehicle_settings(items, CP):
   return items
 
 
+# ============================================================
+# Self-calibrating hold-bias (tight-turn oscillation fix).
+# Plain-Python, stateless, module-level so they are unit-testable.
+# Spec: docs/superpowers/specs/2026-07-02-bmw-self-calibrating-hold-bias-design.md
+# ============================================================
+
+def hold_gate(steer_deg, kappa_des, angle_on, angle_full, kappa_on, kappa_full):
+  """Regime gate g in [0,1]: 1 only when BOTH |steer| and |kappa_des| are well
+  past their thresholds. Soft blend; decides WHERE the bias applies, not how much."""
+  if angle_full <= angle_on or kappa_full <= kappa_on:
+    return 0.0
+  ga = (abs(steer_deg) - angle_on) / (angle_full - angle_on)
+  gk = (abs(kappa_des) - kappa_on) / (kappa_full - kappa_on)
+  ga = 0.0 if ga < 0.0 else (1.0 if ga > 1.0 else ga)
+  gk = 0.0 if gk < 0.0 else (1.0 if gk > 1.0 else gk)
+  return ga * gk
+
+
+def hold_learn_flags(g, action, steering_pressed, overshooting, saturated):
+  """Decide whether to integrate (learn_ok) or leak the bias to zero (release).
+  Learn only while actively holding/tracking on-target, in-regime, not saturated,
+  not overshooting, and the driver is not steering. Release (leak) out-of-regime
+  or under driver override. Overshoot/saturation freeze WITHOUT releasing."""
+  learn_ok = (g > 0.0) and (action in ('hold_zero', 'ramp')) \
+      and (not steering_pressed) and (not overshooting) and (not saturated)
+  release = (g <= 0.0) or bool(steering_pressed)
+  return learn_ok, release
+
+
+def hold_bias_step(prev_b, g, delta_err, learn_ok, release, ki, b_max, leak):
+  """One livePose-tick update of the hold-bias integral. Release leaks toward 0;
+  else integrate delta_err (self-limiting: over-push reverses delta_err and backs
+  the integral down); else hold. Clamped to +/- b_max."""
+  if release:
+    return prev_b + leak * (0.0 - prev_b)
+  if learn_ok:
+    b = prev_b + ki * g * delta_err
+    return -b_max if b < -b_max else (b_max if b > b_max else b)
+  return prev_b
+
+
+def hold_applied(base_frac, g, b):
+  """Torque actually applied by the bias, ridden under the P-term target."""
+  return base_frac + g * b
+
+
 def on_lat_controller_init(result, lac, CP):
   """Plant-inversion at 500 ms horizon in front-wheel-angle space.
 
@@ -326,6 +372,20 @@ def on_lat_controller_init(result, lac, CP):
   # dedicated stop-and-ramp experiment (not online — see shadow-plant notes).
   FRICTION = 0.05
 
+  # --- Self-calibrating hold-bias (route 00000380 seg 6 oscillation fix) ---
+  # Slow gated anti-windup integral that supplies the steady self-aligning
+  # torque in tight turns (where SAT exceeds rack stiction and hold_zero fails).
+  # Magnitude is self-calibrated (integrates measured delta_err) so it cannot
+  # over-push. See spec 2026-07-02. All values tunable on-car.
+  HOLD_ANGLE_ON_DEG   = 20.0     # |steeringAngleDeg| where the gate opens
+  HOLD_ANGLE_FULL_DEG = 35.0     # full-strength angle
+  HOLD_KAPPA_ON       = 0.006    # |kappa_des| where the gate opens (1/m)
+  HOLD_KAPPA_FULL     = 0.012    # full-strength curvature
+  HOLD_KI             = 0.8      # integral gain on delta_err (rad^-1 per livePose tick)
+  HOLD_B_MAX          = 0.20     # clamp on |hold_bias| (torque frac, ~2.4 Nm)
+  HOLD_LEAK           = 0.10     # per-tick leak toward 0 out-of-regime / driver-pressed
+  HOLD_SAT_FRAC       = 0.99     # freeze integration when |torque| >= this (anti-windup)
+
   # ISO 11270 comfort guard, κ-dependent. At small κ (near-straight), tighter
   # half-ISO; ramps up to full ISO at tight curves (where larger accel/jerk
   # are part of normal driving).
@@ -377,6 +437,8 @@ def on_lat_controller_init(result, lac, CP):
     'de_buffer': [],            # rolling window of recent delta_err for box filter
     'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
     'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
+    'hold_bias': 0.0,             # self-calibrating hold-bias (torque frac, same frame as 'torque')
+    'gate': 0.0,                  # debug: hold-bias regime gate g in [0,1]
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -418,6 +480,13 @@ def on_lat_controller_init(result, lac, CP):
       # of the prior κ_des-hysteresis attempt) and downstream magnitude-
       # sensitive logic sees the true model intent.
       state['desired'] = float(desired_curvature)
+
+      # Hold-bias regime gate: 1 only when steering angle AND curvature are both
+      # significant (the regime where SAT overcomes stiction and hold_zero fails).
+      g_hold = hold_gate(CS.steeringAngleDeg, state['desired'],
+                         HOLD_ANGLE_ON_DEG, HOLD_ANGLE_FULL_DEG,
+                         HOLD_KAPPA_ON, HOLD_KAPPA_FULL)
+      state['gate'] = g_hold
 
       # 8.5 m/s = ~30 kph, BMW DCC minimum engagement speed. Below this the
       # controller is never active, so the floor only protects κ_meas from
@@ -559,7 +628,7 @@ def on_lat_controller_init(result, lac, CP):
             target_frac = -math.copysign(FRICTION, delta_err)
             state['action'] = 'brake_zero'
           else:
-            target_frac = 0.0
+            target_frac = hold_applied(0.0, g_hold, state['hold_bias'])
             state['action'] = 'hold_zero'
         else:
           # Curvature scale: 1.0 on straights (|κ_des| ≤ 0.001) rising linearly
@@ -586,11 +655,23 @@ def on_lat_controller_init(result, lac, CP):
           t_cap_nm = min(CCP.STEER_MAX,
                          T_CAP_BASE_NM + T_CAP_SLOPE_BASE * kappa_scale * v * v * abs(delta_des))
           t_cap_frac = t_cap_nm / CCP.STEER_MAX
+          if state['action'] == 'ramp':
+            target_frac = hold_applied(target_frac, g_hold, state['hold_bias'])
           target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
 
         state['target_frac'] = target_frac
         state['ramp_step'] = (target_frac - state['torque']) / spread_frames
         state['ramp_frames'] = spread_frames
+
+      # Self-calibrating hold-bias integral (every livePose tick). Learn the
+      # steady holding torque from delta_err while on-target in-regime; leak out
+      # of regime or under driver override. Runs after the decision so
+      # state['action'] reflects this tick.
+      saturated = abs(state['torque']) >= HOLD_SAT_FRAC
+      learn_ok, release = hold_learn_flags(g_hold, state['action'],
+                                           bool(CS.steeringPressed), overshooting, saturated)
+      state['hold_bias'] = hold_bias_step(state['hold_bias'], g_hold, state['delta_err'],
+                                          learn_ok, release, HOLD_KI, HOLD_B_MAX, HOLD_LEAK)
 
     # Apply per-frame ramp step. Panda enforces wire-rate (STEER_DELTA_UP)
     # downstream; large ramp_step (Δ > 5 Nm spread over 50 frames) gets
@@ -634,6 +715,8 @@ def on_lat_controller_init(result, lac, CP):
           'active': active,
           'a_y_meas': float(state['a_y_meas']),
           'jerk_pred': float(state['jerk_pred']),
+          'hold_bias': float(state['hold_bias']),
+          'gate': float(state['gate']),
         }
         state['lat_pub'].send(payload)
       except Exception:
