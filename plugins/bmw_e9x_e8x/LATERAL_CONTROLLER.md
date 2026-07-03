@@ -201,19 +201,25 @@ state['delta_err_raw'] = delta_err_raw    # both published in telemetry
 ## 5. The kinematic deadzone
 
 ```python
-DRIFT_M = 0.02                                     # m of allowed drift over model_action_t
+DRIFT_M_KAPPA = [0.004, 0.02]   # |κ_des| breakpoints (1/m)      (2026-07-03)
+DRIFT_M_BP    = [0.02, 0.10]    # m of allowed drift over model_action_t
+drift_m     = np.interp(abs(κ_des), DRIFT_M_KAPPA, DRIFT_M_BP)
 lookahead_m = v * model_action_t
-tolerance   = 2.0 * DRIFT_M * L / (lookahead_m**2) # rad, 1/v² scaling
+tolerance   = 2.0 * drift_m * L / (lookahead_m**2) # rad, 1/v² scaling
 ```
 
-**Physical meaning**: tolerance is the front-wheel-angle error that produces ≤ `DRIFT_M` of lateral position drift over `model_action_t` of forward travel. At 85 kph: tolerance ≈ 0.027°. At 30 kph: tolerance ≈ 0.36°.
+**Physical meaning**: tolerance is the front-wheel-angle error that produces ≤ `drift_m` of lateral position drift over `model_action_t` of forward travel. Near-straight at 85 kph: tolerance ≈ 0.027°. Near-straight at 30 kph: ≈ 0.36°. Tight turn (κ=0.02) at 34 kph: ≈ 0.85°.
+
+**Why κ-dependent drift_m (2026-07-03)**: in route-384 tight turns the fixed 0.02 m band (~0.17° at 9.4 m/s) was ~3σ smaller than the δ_err vision noise (0.008–0.012 rad) — the controller never rested in the deadzone and chased noise. At 0.10 m the band (~0.85°) is ~1.5σ: `hold_curve` becomes the resting state and P fires on real excursions only. Near-straight keeps 0.02 m (the κ ramp starts at 0.004, above the ±0.003 wobble band), and at highway speed the 1/v² term dominates regardless (κ=0.007 @ 20 m/s → ~0.09°) — so this does not re-create the route-31b failure below.
 
 **Why 1/v² and not constant-angle**: a constant 0.35° deadzone was tried (commit 715114d) and reverted (d43fb19) after route 31b seg 8/15 showed the controller silent for 98% of samples while `δ_err` sat inside the wide band, producing 1.3–1.7 m lateral drift at 85 kph with no position-feedback layer running. The 1/v² formula tightens the deadzone exactly where it matters (high speed) and is the only safe choice without a position-feedback layer.
 
 **Used in three places** in the cadence decision:
-- `if abs(delta_err) ≤ 1.2 · tolerance` → cancel_tol band (drain ramp toward FRICTION-level brake or 0)
-- `if abs(delta_err) ≤ tolerance` → hold_zero / brake_zero
+- `if abs(delta_err) ≤ 1.2 · tolerance` → cancel_tol band (drain to hold_f·torque)
+- `if abs(delta_err) ≤ tolerance` → hold_zero / hold_curve
 - `effective_err = delta_err - copysign(tolerance, delta_err)` → soft-deadband in target_nm formula
+
+Telemetry publishes the live `tolerance` (and `hold_f`) for band-occupancy forensics.
 
 ---
 

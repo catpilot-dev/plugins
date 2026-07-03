@@ -179,8 +179,10 @@ def on_lat_controller_init(result, lac, CP):
     δ_meas = atan(κ_meas · L)        κ_meas = yawRate / v_ego
     δ_err  = δ_des − δ_meas
 
-  Tolerance (physical 0.05 m drift over 0.5 s, speed-adaptive, scales 1/v²):
-    tolerance = 2 · 0.05 · L / (v² · 0.5²)
+  Tolerance (physical drift_m over model_action_t, speed-adaptive 1/v²;
+  drift_m is κ_des-dependent since 2026-07-03 — 0.02 m near-straight up to
+  0.10 m at tight-turn κ=0.02, see DRIFT_M_BP):
+    tolerance = 2 · drift_m · L / (v · model_action_t)²
 
   Plant-inversion target torque, angle domain (linear tire regime):
     τ_Nm_target = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
@@ -272,7 +274,7 @@ def on_lat_controller_init(result, lac, CP):
   # (= liveDelay.lateralDelay + LAT_SMOOTH_SECONDS) and matched to where
   # modeld samples κ_des: lat_action_t = lat_delay + DT_MDL (modeld.py:391).
   # Used by jerk_pred (the ISO-jerk overshoot guard) and by the kinematic
-  # deadzone formula (DRIFT_M block below) — same horizon for both.
+  # deadzone formula (DRIFT_M_BP block below) — same horizon for both.
   #
   # For BMW: lagd never converges (it correlates on latcontrol_torque
   # telemetry that our front-wheel-angle plant-inversion controller doesn't
@@ -283,9 +285,9 @@ def on_lat_controller_init(result, lac, CP):
   DT_MDL = 0.05                                  # openpilot model dt (common/realtime.py)
   MODEL_ACTION_T_FALLBACK = 0.55                 # used only if lat_delay arrives as 0/None
 
-  # Feedback deadzone: engage only when δ_err would cause ≥ DRIFT_M
+  # Feedback deadzone: engage only when δ_err would cause ≥ drift_m
   # lateral drift within model_action_t (per-tick horizon).
-  #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · DRIFT_M · L / (v·T)²
+  #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · drift_m · L / (v·T)²
   # The 1/v² factor gives natural speed adaptation (tighter at high v).
   # 2026-05-20: a constant-angle reformulation (TOL_DEG_CONST = 0.35°) was
   # tried and reverted — the wide highway-speed deadzone allowed sustained
@@ -293,7 +295,19 @@ def on_lat_controller_init(result, lac, CP):
   # (route 31b seg 8/15) when no position-feedback layer was running. The
   # 1/v² scaling is what keeps the κ-controller actively tracking at highway
   # speed when it's the sole loop closing against drift.
-  DRIFT_M = 0.02           # m of allowed drift over model_action_t
+  #
+  # 2026-07-03: drift_m is κ_des-dependent — 0.02 m near-straight rising to
+  # 0.10 m at route-384-tight κ (0.02 1/m). In tight turns the old 0.02 m
+  # band (~0.17° front-wheel at 9.4 m/s) was ~3σ SMALLER than the δ_err
+  # vision noise (0.008–0.012 rad), so the controller never rested in the
+  # deadzone and chased noise. At 0.10 m the band (~0.85°) is ~1.5σ:
+  # hold_curve becomes the resting state, P fires on real excursions only.
+  # This does NOT re-create the route-31b failure: near-straight keeps
+  # 0.02 m (the κ ramp starts above the ±0.003 wobble band), and at highway
+  # speed the 1/v² term dominates anyway (κ=0.007 @ 20 m/s → ~0.09° even
+  # with the widened drift_m).
+  DRIFT_M_KAPPA = [0.004, 0.02]   # |κ_des| breakpoints (1/m)
+  DRIFT_M_BP    = [0.02, 0.10]    # m of allowed drift over model_action_t
 
   # κ-gated box filter on delta_err. Bare-model κ_des on near-straight
   # produces high-rate sign-flips that propagate into delta_err. Each
@@ -404,6 +418,7 @@ def on_lat_controller_init(result, lac, CP):
     'de_buffer': [],            # rolling window of recent delta_err for box filter
     'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
     'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
+    'tolerance': 0.0,             # debug: current deadzone half-width (rad), κ- and v-dependent
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -491,19 +506,23 @@ def on_lat_controller_init(result, lac, CP):
       state['delta_err'] = delta_err
       state['delta_err_raw'] = delta_err_raw
 
-      # Speed-scaled tolerance: DRIFT_M drift over model_action_t, 1/v² scaling.
+      # Speed-scaled tolerance: κ-dependent drift_m over model_action_t,
+      # 1/v² scaling (see DRIFT_M_BP block above for both the route-31b
+      # constant-angle lesson and the 2026-07-03 κ-widening rationale).
       # Restored 2026-05-20 after route 31b seg 8/15 showed the constant-angle
       # 0.35° deadzone (commit 715114d, now reverted) allowed 1.3–1.7 m lateral
       # drift at 85 kph with no position-feedback layer running: δ_err of
       # 0.2–0.35° sat inside the 0.35° band for seconds while stiction held
       # the rack at zero, and the car coasted ~half a lane out of position
       # with 98% torque=0. The kinematic 1/v² formula keeps the deadzone tight
-      # at highway speed (~0.05° at 85 kph) so the κ-controller stays active
-      # against drift. The constant-angle reformulation is only viable on top
-      # of an external position-feedback loop, which the public build has
-      # none of.
+      # at highway speed (~0.05° at 85 kph near-straight) so the κ-controller
+      # stays active against drift. The constant-angle reformulation is only
+      # viable on top of an external position-feedback loop, which the public
+      # build has none of.
+      drift_m = float(np.interp(abs(state['desired']), DRIFT_M_KAPPA, DRIFT_M_BP))
       lookahead_m = v * model_action_t
-      tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
+      tolerance = 2.0 * drift_m * L / (lookahead_m ** 2)
+      state['tolerance'] = tolerance
 
       # ISO 11270 half-comfort guard, gated on plant overshoot. Fires only
       # when (κ_des − κ_meas)·κ_meas < 0 — i.e., plant has turned more than
@@ -672,6 +691,7 @@ def on_lat_controller_init(result, lac, CP):
           'a_y_meas': float(state['a_y_meas']),
           'jerk_pred': float(state['jerk_pred']),
           'hold_f': float(np.interp(abs(state['desired']), HOLD_KAPPA_BP, [0.0, 1.0])),
+          'tolerance': float(state['tolerance']),
         }
         state['lat_pub'].send(payload)
       except Exception:
