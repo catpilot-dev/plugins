@@ -181,10 +181,11 @@ def on_lat_controller_init(result, lac, CP):
     Clamp to ±T_CAP(v, δ):
       T_CAP_NM = min(STEER_MAX, T_CAP_BASE + T_CAP_SLOPE · v²·|δ_des|)
     Same slope drives both target and cap.
-    If |target_frac| < FRICTION, push to ±FRICTION to break stiction.
-    BASE is the hydraulic rack's stiction floor. Hard stop at STEER_MAX
-    (panda limit) preserves lane authority during transient over-envelope
-    events before speedlimitd trims v.
+    Sub-friction targets are commanded as-is (they don't move the rack —
+    a deliberate soft actuation deadband; stiction special-casing removed
+    2026-07-03). BASE is the hydraulic rack's stiction floor. Hard stop at
+    STEER_MAX (panda limit) preserves lane authority during transient
+    over-envelope events before speedlimitd trims v.
 
   Ramp: ramp_step = (T_peak − state['torque']) / spread_frames, applied
   per CAN frame for spread_frames frames; panda enforces wire-rate.
@@ -194,14 +195,20 @@ def on_lat_controller_init(result, lac, CP):
   |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³,
   AND only when plant has actually overshot ((κ_des−κ_meas)·κ_meas < 0).
   Under-tracking (plant lagging in a hard curve) is left to the controller
-  to chase. When cancel fires, redirect the ramp toward −FRICTION·sign(κ_meas)
-  so the BMW hydraulic rack can unwind via tire aligning forces (won't
-  self-center under standing torque).
+  to chase. When cancel fires, drain the ramp to 0 — with torque relaxed,
+  tire aligning forces unwind the wheel (at guard-firing angles aligning
+  torque exceeds rack stiction; route 380/384 evidence).
 
   Tolerance-cancel (every livePose tick): if |δ_err| drops into the success
-  band mid-ramp, redirect torque to 0 (or −FRICTION·sign(δ_err) if plant
-  has momentum past the goal). Without this, the in-flight ramp keeps
+  band mid-ramp, drain torque to 0. Without this, the in-flight ramp keeps
   pushing toward a stale target until the next 250 ms cadence notices.
+
+  2026-07-03 simplification: all stiction special-casing removed (breakaway
+  ±FRICTION amplification, brake_zero reverse pulse, cancel reverse-FRICTION
+  pulses). Route 384 telemetry showed ~40% of in-turn decisions were friction
+  pulses — torque reversals that churned rather than corrected. The straight-
+  line wobble those mechanisms targeted is modelV2 vision noise, handled by
+  the κ-gated delta_err box filter instead.
 
   No online adaptation: plant behavior is fully described by T_CAP_SLOPE,
   T_CAP_BASE_NM, and FRICTION. Tune these offline from route data; there's
@@ -249,8 +256,8 @@ def on_lat_controller_init(result, lac, CP):
   # (linear interp 0.001..0.01 1/m). Rationale: small κ_des needs gentle gain
   # to avoid ringing on near-straight sections (seg-14 evidence); tight κ_des
   # needs enough authority to chase the planner without lag (seg-6 evidence).
-  # The soft-deadband, FRICTION breakaway, and per-tick tolerance-cancel
-  # handle the boundary smoothness.
+  # The soft-deadband and per-tick tolerance-cancel handle the boundary
+  # smoothness.
   T_CAP_BASE_NM = 2.0
   T_CAP_SLOPE_BASE = 1.0
   T_CAP_SCALE_KAPPA = [0.001, 0.01, 0.02]        # |κ_des| breakpoints (1/m)
@@ -285,7 +292,8 @@ def on_lat_controller_init(result, lac, CP):
   # κ-gated box filter on delta_err. Bare-model κ_des on near-straight
   # produces high-rate sign-flips that propagate into delta_err. Each
   # delta_err sign-flip across the tolerance band triggers
-  # a cancel_tol / brake_zero cycle with a counter-direction FRICTION pulse
+  # a cancel_tol cycle (and, before the 2026-07-03 stiction-logic removal,
+  # a counter-direction FRICTION pulse)
   # — the actual felt swaying isn't κ_des amplitude, it's the rate of
   # those unwind pulses.
   #
@@ -320,10 +328,12 @@ def on_lat_controller_init(result, lac, CP):
   # to real-correction capability.
   KD_GATE = 0.002                           # |raw κ_des| at which delta_err filter bypasses
 
-  # Breakaway torque fraction (rack stiction floor). Sub-friction commands
-  # don't move the hydraulic rack, so the controller pushes target to ±friction
-  # to break stiction. Initial estimate from memory; tune if needed via a
-  # dedicated stop-and-ramp experiment (not online — see shadow-plant notes).
+  # Rack breakaway torque fraction (stiction floor). 2026-07-03: no longer
+  # used to amplify sub-friction commands or emit reverse pulses (stiction
+  # special-casing removed — the pulses were churn, not correction; the
+  # straight-line wobble they targeted is modelV2 vision noise, handled by
+  # the delta_err box filter). Retained only as the tolerance-cancel guard:
+  # ramps below this can't move the rack, so there is nothing to cancel.
   FRICTION = 0.05
 
   # ISO 11270 comfort guard, κ-dependent. At small κ (near-straight), tighter
@@ -331,7 +341,7 @@ def on_lat_controller_init(result, lac, CP):
   # are part of normal driving).
   #   ISO_LATERAL_ACCEL = 3.0 m/s²    →  BMW_LATERAL_ACCEL [1.5..3.0]
   #   ISO_LATERAL_JERK  = 5.0 m/s³    →  BMW_LATERAL_JERK  [1.5..5.0]
-  # Cancel the ramp when either exceeded, redirect toward FRICTION-level
+  # Cancel the ramp when either exceeded, drain torque to 0
   #   |a_y_meas| > BMW_LATERAL_ACCEL — current loading already at limit;
   #     don't push deeper. Uses κ_meas (measured outcome).
   #   |jerk_pred| > BMW_LATERAL_JERK — predicted jerk = v²·(κ_des−κ_meas)/T
@@ -369,7 +379,7 @@ def on_lat_controller_init(result, lac, CP):
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
-    'action': 'init',          # debug: hold_zero / brake_zero / breakaway / ramp / cancel_accel / cancel_jerk
+    'action': 'init',          # debug: hold_zero / ramp / cancel_tol / cancel_accel / cancel_jerk
     'delta_err': 0.0,          # debug: filtered front-wheel-angle error (rad), what controller acts on
     'delta_err_raw': 0.0,      # debug: pre-filter delta_err (rad)
     'lat_pub': None,
@@ -433,7 +443,7 @@ def on_lat_controller_init(result, lac, CP):
       # κ-gated box filter on delta_err (see KD_GATE block above).
       # Smooths the controller's view of the error signal so wobble-induced
       # delta_err sign-flips don't repeatedly cross the tolerance band and
-      # trigger cancel_tol / brake_zero unwind pulses. Filter bypassed when:
+      # trigger cancel_tol churn. Filter bypassed when:
       #   - |κ_des| ≥ KD_GATE: real curve, controller needs the raw error
       #   - lane change active: prevents filter lag across the mid-lane-
       #     change κ_des zero-crossing (route 31d seg 7 evidence)
@@ -476,13 +486,12 @@ def on_lat_controller_init(result, lac, CP):
       # zeroed step_remaining, the controller couldn't apply torque, and
       # the car drifted 1.29 m outside the lane.
       #
-      # Reverse-breakaway unwind: when overshoot is real, drain τ toward
-      # −FRICTION·sign(κ_meas). The BMW hydraulic rack has high stiction
-      # and won't self-center under standing torque; that small counter-
-      # direction torque (~0.6 Nm) breaks stiction so tire aligning forces
-      # can return the wheel toward center. FRICTION-level (not full
-      # counter-correction) prevents the cancel from creating the seg-14
-      # ringing pattern in reverse.
+      # When overshoot is real, drain τ toward 0 (reverse-FRICTION unwind
+      # pulse removed 2026-07-03): with torque relaxed, tire aligning forces
+      # return the wheel — at the angles where these guards fire, aligning
+      # torque exceeds rack stiction (route 380/384 evidence). No active
+      # counter-push, so the cancel can't create the seg-14 ringing pattern
+      # in reverse.
       a_y_meas = v * v * state['measured']
       jerk_pred = v * v * (state['desired'] - state['measured']) / model_action_t
       state['a_y_meas'] = a_y_meas
@@ -499,16 +508,16 @@ def on_lat_controller_init(result, lac, CP):
         elif abs(jerk_pred) > BMW_LATERAL_JERK:
           cancel_reason = 'cancel_jerk'
       if cancel_reason:
-        # overshooting=True implies κ_meas != 0; unwind toward opposite sign.
         # Cancel preempts the cadence decision this tick — reset window so
-        # the next plant-inversion decision is one full cycle after the unwind.
-        # Only re-arm the ramp if the unwind target changed (first cancel, or
-        # κ_meas flipped sign). If we're already ramping toward this same
-        # unwind target, leave it alone — re-arming on every continuous-
-        # overshoot tick would restart the 250 ms window from current torque
-        # each time, producing exponential decay (slower unwind the harder
-        # the plant fights, the opposite of what a safety guard should do).
-        unwind_target = -math.copysign(FRICTION, state['measured'])
+        # the next plant-inversion decision is one full cycle after the drain.
+        # Drain to 0 (reverse-FRICTION unwind pulse removed 2026-07-03 with
+        # the rest of the stiction special-casing): torque relaxes and tire
+        # aligning forces return the wheel — at the angles where the
+        # overshoot guards fire, aligning torque exceeds rack stiction
+        # (route 380/384 evidence). Only re-arm the ramp if the target
+        # changed, so continuous overshoot doesn't restart the drain window
+        # every tick (exponential-decay bug guarded against as before).
+        unwind_target = 0.0
         if state['target_frac'] != unwind_target:
           state['target_frac'] = unwind_target
           state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
@@ -518,13 +527,13 @@ def on_lat_controller_init(result, lac, CP):
       elif abs(delta_err) <= 1.2*tolerance and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION:
         # Tolerance-cancel: error fell into the success band while a push
         # ramp is still in flight. Without this, the ramp keeps driving
-        # torque toward a stale target until the next 250 ms cadence. If
-        # plant has momentum in the error direction, brake with reverse
-        # FRICTION; otherwise drain to 0. Idempotent like the ISO cancel.
-        if state['torque'] * delta_err > 0:
-          unwind_target = -math.copysign(FRICTION, delta_err)
-        else:
-          unwind_target = 0.0
+        # torque toward a stale target until the next 250 ms cadence.
+        # Drain to 0 (momentum-brake reverse-FRICTION pulse removed
+        # 2026-07-03) — residual entry motion is left to rack friction.
+        # Idempotent like the ISO cancel. The abs(target) > FRICTION guard
+        # keeps this from re-cancelling its own drain and ignores
+        # sub-friction ramps that can't move the rack anyway.
+        unwind_target = 0.0
         if state['target_frac'] != unwind_target:
           state['target_frac'] = unwind_target
           state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
@@ -545,22 +554,12 @@ def on_lat_controller_init(result, lac, CP):
         # the torque profile and feel like a discrete step.
         #   τ_Nm = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
-        # Sub-breakaway commands won't move the rack → push to ±FRICTION.
-        prev_action = state['action']
         if abs(delta_err) <= tolerance:
-          # Brake-to-hold: if we just exited a ramp into deadzone with τ
-          # still loading toward δ_err, plant has momentum that would
-          # cross zero. Set target to FRICTION-level reverse torque to
-          # actively decelerate (BMW rack is sticky; small reverse torque
-          # is enough to halt residual motion). One-shot per ramp →
-          # deadzone transition: next decision sees prev_action='brake_zero'
-          # and falls through to hold_zero (target=0) so τ relaxes.
-          if prev_action == 'ramp' and state['torque'] * delta_err > 0:
-            target_frac = -math.copysign(FRICTION, delta_err)
-            state['action'] = 'brake_zero'
-          else:
-            target_frac = 0.0
-            state['action'] = 'hold_zero'
+          # Hold at zero: torque relaxes and stiction keeps the wheel where
+          # it is. (brake_zero one-shot reverse pulse removed 2026-07-03 —
+          # residual deadzone-entry momentum is left to rack friction.)
+          target_frac = 0.0
+          state['action'] = 'hold_zero'
         else:
           # Curvature scale: 1.0 on straights (|κ_des| ≤ 0.001) rising linearly
           # to 2.5 at |κ_des| = 0.01 to 3.0 on tight curves (|κ_des| ≥ 0.02).
@@ -574,11 +573,12 @@ def on_lat_controller_init(result, lac, CP):
           effective_err = delta_err - math.copysign(tolerance, delta_err)
           target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * effective_err
           target_frac = target_nm / CCP.STEER_MAX
-          if abs(target_frac) < FRICTION:
-            target_frac = math.copysign(FRICTION, delta_err)
-            state['action'] = 'breakaway'
-          else:
-            state['action'] = 'ramp'
+          # Sub-friction targets are commanded as-is (breakaway ±FRICTION
+          # amplification removed 2026-07-03): commands below the rack's
+          # breakaway torque don't move the wheel — an intentional soft
+          # actuation deadband; the wheel moves once the P-term grows past
+          # friction naturally.
+          state['action'] = 'ramp'
           # v²·|δ|-scaled cap, clipped at STEER_MAX (panda hard limit).
           # Authority grows with commanded a_y_des — straights stay near BASE,
           # tight turns can reach STEER_MAX (transient over-envelope; speedlimitd

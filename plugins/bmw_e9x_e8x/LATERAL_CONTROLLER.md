@@ -2,6 +2,20 @@
 
 This document is the canonical reference for the lateral controller registered by `register.py::on_lat_controller_init` (hook: `controls.lat_controller_init`). It describes **what** the controller does, **why** it's shaped this way for the BMW hydraulic rack, **how** the single-knob timing design propagates, and **what was tried and rejected**. Future maintainers should be able to retune without re-litigating the failed experiments.
 
+> **2026-07-03 — stiction special-casing removed.** All FRICTION-based command
+> shaping is gone: the `breakaway` ±FRICTION amplification, the `brake_zero`
+> one-shot reverse pulse, and the reverse-FRICTION pulses in `cancel_tol` and
+> the ISO cancels (all drains now go to 0). Route 384 telemetry showed ~40% of
+> in-turn decisions were friction pulses — ±0.6 Nm torque reversals that
+> churned rather than corrected. The straight-line wobble those mechanisms
+> were built to manage is modelV2 vision noise, mitigated by the κ-gated
+> delta_err box filter (§4) instead. Sub-friction targets are now commanded
+> as-is (soft actuation deadband); cancels relax to 0 and rely on tire
+> aligning torque to unwind (at guard-firing angles it exceeds rack stiction —
+> route 380/384 evidence). Sections below describing `breakaway`/`brake_zero`
+> or reverse-FRICTION drains are historical where they conflict with this note.
+> `FRICTION` remains only as the tolerance-cancel guard threshold.
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -238,13 +252,13 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | state | when entered |
 |---|---|
 | `init` | controller construction |
-| `hold_zero` | `|delta_err| ≤ tolerance`, no recent ramp momentum |
-| `brake_zero` | one-shot: just exited a ramp into deadzone with torque still loading toward δ_err. Sets target to −FRICTION·sign(δ_err) to brake residual plant motion |
-| `breakaway` | `|target_frac| < FRICTION` — push to ±FRICTION to overcome rack stiction |
-| `ramp` | active plant-inversion push toward `target_nm` |
-| `cancel_tol` | error fell into 1.2× tolerance band mid-ramp; drain target toward 0 or reverse-FRICTION |
-| `cancel_accel` | overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` |
-| `cancel_jerk` | overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` |
+| `hold_zero` | `|delta_err| ≤ tolerance` — target 0, stiction holds |
+| `ramp` | active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
+| `cancel_tol` | error fell into 1.2× tolerance band mid-ramp; drain target to 0 |
+| `cancel_accel` | overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` — drain to 0 |
+| `cancel_jerk` | overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` — drain to 0 |
+
+Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`.
 
 ---
 
