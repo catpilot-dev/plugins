@@ -49,11 +49,12 @@ def tracker_module(tmp_path, monkeypatch, mock_openpilot):
 
 class MockSM(dict):
   def __init__(self, v_ego=0.0, enabled=False, gps_updated=False, gps_lat=0.0, gps_lng=0.0, gps_flags=0,
-               device_state_updated=True):
+               device_state_updated=True, gps_ts_ms=0):
     super().__init__({
       'carState': SimpleNamespace(vEgo=v_ego),
       'selfdriveState': SimpleNamespace(enabled=enabled),
-      'gpsLocationExternal': SimpleNamespace(flags=gps_flags, latitude=gps_lat, longitude=gps_lng),
+      'gpsLocationExternal': SimpleNamespace(flags=gps_flags, latitude=gps_lat, longitude=gps_lng,
+                                              unixTimestampMillis=gps_ts_ms),
     })
     self.updated = {'gpsLocationExternal': gps_updated, 'deviceState': device_state_updated}
 
@@ -149,6 +150,41 @@ class TestDriveTracker:
 
     assert t._start_lat == 39.9  # unchanged
     assert t._end_lat == 40.0    # updated
+
+  def test_gps_time_captured_on_first_fix(self, tracker_module):
+    t = tracker_module.DriveTracker()
+    t._reset()
+
+    sm = make_sm(v_ego=10.0, gps_updated=True, gps_lat=39.9, gps_lng=116.4, gps_flags=1,
+                  gps_ts_ms=1_000_000_000)
+    ready_tick(t)
+    t.tick(sm)
+
+    assert t._gps_time == pytest.approx(1_000_000.0)
+
+  def test_gps_time_first_fix_not_overwritten(self, tracker_module):
+    t = tracker_module.DriveTracker()
+    t._reset()
+
+    # First fix
+    sm = make_sm(v_ego=10.0, gps_updated=True, gps_lat=39.9, gps_lng=116.4, gps_flags=1,
+                  gps_ts_ms=1_000_000_000)
+    ready_tick(t)
+    t.tick(sm)
+
+    # Second fix, different timestamp — must not overwrite the first
+    sm = make_sm(v_ego=10.0, gps_updated=True, gps_lat=40.0, gps_lng=116.5, gps_flags=1,
+                  gps_ts_ms=2_000_000_000)
+    ready_tick(t)
+    t.tick(sm)
+
+    assert t._gps_time == pytest.approx(1_000_000.0)
+
+  def test_gps_time_unset_without_fix(self, tracker_module):
+    t = tracker_module.DriveTracker()
+    t._reset()
+
+    assert t._gps_time == 0.0
 
   def test_gps_no_fix_ignored(self, tracker_module):
     t = tracker_module.DriveTracker()
@@ -343,6 +379,33 @@ class TestDriveTracker:
     assert data['start_lat'] == 39.9
     assert data['end_lat'] == 39.91
 
+  def test_save_includes_gps_time_when_captured(self, tracker_module, monkeypatch):
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 60.0
+    t._distance_m = 1000.0
+    t._gps_time = 1_000_000.123
+
+    posted = {}
+    monkeypatch.setattr(t, '_post_stats', lambda data: posted.update(data))
+
+    t._save()
+
+    assert posted['gps_time'] == pytest.approx(1_000_000.123)
+
+  def test_save_gps_time_none_when_no_fix(self, tracker_module, monkeypatch):
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 60.0
+    t._distance_m = 1000.0
+
+    posted = {}
+    monkeypatch.setattr(t, '_post_stats', lambda data: posted.update(data))
+
+    t._save()
+
+    assert posted['gps_time'] is None
+
   def test_save_no_gps_no_previous_trace(self, tracker_module):
     """Drive with no GPS and no previous drive: trace stays empty."""
     t = tracker_module.DriveTracker()
@@ -466,6 +529,48 @@ class TestPostStats:
     assert req.get_header('Content-type') == 'application/json'
     body = json.loads(req.data.decode())
     assert body == data
+
+  def test_payload_includes_gps_time_when_present(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / '00000385--6e363981a3--8').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    mock_urlopen = MagicMock()
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', mock_urlopen)
+
+    t = mod.DriveTracker()
+    data = {'distance_m': 1000.0, 'duration_s': 60.0, 'engaged_m': 900.0, 'engaged_s': 55.0,
+            'gps_time': 1_000_000.0}
+    t._post_stats(data)
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data.decode())
+    assert body['gps_time'] == 1_000_000.0
+
+  def test_payload_omits_gps_time_when_absent(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / '00000385--6e363981a3--8').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    mock_urlopen = MagicMock()
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', mock_urlopen)
+
+    t = mod.DriveTracker()
+    data = {'distance_m': 1000.0, 'duration_s': 60.0, 'engaged_m': 900.0, 'engaged_s': 55.0,
+            'gps_time': None}
+    t._post_stats(data)
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data.decode())
+    assert 'gps_time' not in body
 
   def test_noop_when_no_route_id(self, tracker_module, tmp_path, monkeypatch):
     mod = tracker_module

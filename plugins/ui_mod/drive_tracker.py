@@ -64,6 +64,7 @@ class DriveTracker:
     self._end_lng = 0.0
     self._has_gps = False
     self._trace = []  # [[lat, lng], ...]
+    self._gps_time = 0.0  # unix seconds of first GPS fix, 0 if none
 
     # Register for onroad/offroad transitions
     from openpilot.selfdrive.ui.ui_state import ui_state
@@ -88,6 +89,7 @@ class DriveTracker:
     self._end_lng = 0.0
     self._has_gps = False
     self._trace = []
+    self._gps_time = 0.0
     self._last_tick = time.monotonic()
     self._active = True
 
@@ -116,6 +118,10 @@ class DriveTracker:
       gps = sm['gpsLocationExternal']
       if getattr(gps, 'flags', 0) & 1:
         lat, lng = gps.latitude, gps.longitude
+        if not self._gps_time:
+          ts_ms = getattr(gps, 'unixTimestampMillis', 0)
+          if ts_ms:
+            self._gps_time = ts_ms / 1000.0
         if not self._has_gps:
           self._start_lat = lat
           self._start_lng = lng
@@ -168,6 +174,7 @@ class DriveTracker:
       'end_lng': end_lng,
       'has_gps': has_gps,
       'trace': trace,
+      'gps_time': round(self._gps_time, 3) if self._gps_time else None,
     }
 
     try:
@@ -200,6 +207,9 @@ class DriveTracker:
         'engaged_m': data['engaged_m'],
         'engaged_s': data['engaged_s'],
       }
+      gt = data.get('gps_time')
+      if gt:
+        payload['gps_time'] = gt
 
       def _send():
         try:
