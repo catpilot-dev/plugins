@@ -46,7 +46,7 @@
       "priority": 50
     },
     "controls.lat_controller_init": {
-      "module": "register",
+      "module": "bmw.latcontroller",
       "function": "on_lat_controller_init",
       "priority": 50
     },

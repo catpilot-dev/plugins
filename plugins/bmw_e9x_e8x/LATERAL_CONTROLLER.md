@@ -1,6 +1,6 @@
 # BMW E9x/E8x Lateral Controller — Design & Tuning Reference
 
-This document is the canonical reference for the lateral controller registered by `register.py::on_lat_controller_init` (hook: `controls.lat_controller_init`). It describes **what** the controller does, **why** it's shaped this way for the BMW hydraulic rack, **how** the single-knob timing design propagates, and **what was tried and rejected**. Future maintainers should be able to retune without re-litigating the failed experiments.
+This document is the canonical reference for the lateral controller registered by `bmw/latcontroller.py::on_lat_controller_init` (hook: `controls.lat_controller_init`). It describes **what** the controller does, **why** it's shaped this way for the BMW hydraulic rack, **how** the single-knob timing design propagates, and **what was tried and rejected**. Future maintainers should be able to retune without re-litigating the failed experiments.
 
 > **2026-07-03 — stiction special-casing removed.** All FRICTION-based command
 > shaping is gone: the `breakaway` ±FRICTION amplification, the `brake_zero`
@@ -74,7 +74,7 @@ liveDelay.lateralDelay             (= 0.6 s; permanently pinned for BMW —
                                     (LAT_SMOOTH_SECONDS = 0.0 on catpilot)
                 │
                 ▼  passed to LaC.update(..., lat_delay)
-        register.py update() per livePose tick:
+        bmw/latcontroller.py update() per livePose tick:
                 model_action_t = lat_delay + DT_MDL = 0.65 s   ≡ modeld's lat_action_t
                 half_horizon   = model_action_t / 2 = 0.325 s
                 action_cadence_ticks = round(half_horizon / DT_LIVEPOSE)  = 6  (300 ms)
@@ -117,7 +117,7 @@ clip_curvature() in drive_helpers.py
 self.LaC.update(active, CS, VM, params, steer_limited_by_safety,
                 desired_curvature, curvature_limited, lat_delay)
         ▼
-=== register.py update() ===
+=== bmw/latcontroller.py update() ===
 state['desired'] = float(desired_curvature)   # raw, NO filter on κ_des itself
 v               = float(lp.velocityDevice.x), floored at 8.5 m/s
 state['measured'] = float(lp.angularVelocityDevice.z) / v
@@ -365,7 +365,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 
 ---
 
-## 13. Code map (`register.py`)
+## 13. Code map (`bmw/latcontroller.py`)
 
 | section | line range (approx) | content |
 |---|---:|---|
@@ -376,7 +376,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | κ-filter block | inside update | δ_err box filter with κ-gate + LC-disable |
 | Tolerance | inside update | Kinematic 1/v² deadzone |
 | ISO guards | inside update | Overshoot-gated cancel_jerk / cancel_accel |
-| Cadence decision | inside update | hold_zero / brake_zero / breakaway / ramp / target_nm formula |
+| Cadence decision | inside update | hold_zero / hold_curve / ramp / target_nm formula |
 | Ramp application | inside update | Per-CAN-tick torque ramp |
 | Telemetry publish | inside update | `bmw_lat_control` topic via plugin_bus |
 

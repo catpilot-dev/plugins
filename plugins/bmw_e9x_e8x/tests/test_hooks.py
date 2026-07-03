@@ -78,6 +78,30 @@ class TestRegisterInterfaces:
 
 
 # ============================================================
+# Lateral controller module (split out of register.py 2026-07-03)
+# ============================================================
+
+class TestLateralControllerModule:
+  def test_module_exposes_hook(self, mock_deps):
+    """bmw/latcontroller.py loads the way the registry loads it (file-level, and exposes the hook target
+    canonical name) and exposes the hook plugin.json points at."""
+    import importlib.util
+    path = os.path.join(_PLUGIN_DIR, 'bmw', 'latcontroller.py')
+    spec = importlib.util.spec_from_file_location('plugins.bmw_e9x_e8x.bmw.latcontroller', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert callable(mod.on_lat_controller_init)
+
+  def test_plugin_json_points_at_module(self):
+    import json
+    with open(os.path.join(_PLUGIN_DIR, 'plugin.json')) as f:
+      hooks = json.load(f)['hooks']
+    lat = hooks['controls.lat_controller_init']
+    assert lat['module'] == 'bmw.latcontroller'
+    assert lat['function'] == 'on_lat_controller_init'
+
+
+# ============================================================
 # Cruise Ceiling Memory
 # ============================================================
 
