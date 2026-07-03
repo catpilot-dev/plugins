@@ -376,3 +376,154 @@ class TestGetLastDrive:
     with open(tracker_module._last_drive_file, 'w') as f:
       f.write('garbage{{{')
     assert tracker_module.get_last_drive() is None
+
+
+# ============================================================
+# _resolve_route_id / _post_stats (COD drive-stats POST)
+# ============================================================
+
+class TestResolveRouteId:
+  def test_strips_segment_suffix_of_newest_dir(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    names = ['00000385--6e363981a3--6', '00000385--6e363981a3--7', '00000385--6e363981a3--8']
+    for i, name in enumerate(names):
+      p = root / name
+      p.mkdir()
+      # force strictly increasing mtimes so the last one created is unambiguously newest
+      mtime = time.time() + i
+      os.utime(p, (mtime, mtime))
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    assert mod._resolve_route_id() == '00000385--6e363981a3'
+
+  def test_none_when_empty(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    assert mod._resolve_route_id() is None
+
+  def test_none_when_root_missing(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    missing = tmp_path / 'does_not_exist'
+    monkeypatch.setattr(mod, '_log_root', lambda: str(missing))
+
+    assert mod._resolve_route_id() is None
+
+  def test_falls_back_to_dir_name_without_segment_suffix(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / 'not_a_route_dir').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    assert mod._resolve_route_id() == 'not_a_route_dir'
+
+
+class FakeThread:
+  """Records construction args and runs target synchronously on start()."""
+  instances = []
+
+  def __init__(self, target=None, daemon=None):
+    self.target = target
+    self.daemon = daemon
+    FakeThread.instances.append(self)
+
+  def start(self):
+    self.started = True
+    self.target()
+
+
+class TestPostStats:
+  def test_posts_expected_url_and_payload(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / '00000385--6e363981a3--8').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    mock_urlopen = MagicMock()
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', mock_urlopen)
+
+    t = mod.DriveTracker()
+    data = {'distance_m': 1000.0, 'duration_s': 60.0, 'engaged_m': 900.0, 'engaged_s': 55.0}
+    t._post_stats(data)
+
+    assert len(FakeThread.instances) == 1
+    th = FakeThread.instances[0]
+    assert th.daemon is True
+    assert getattr(th, 'started', False) is True
+
+    assert mock_urlopen.called
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == 'http://localhost/v1/route/00000385--6e363981a3/drive_stats'
+    assert req.get_method() == 'POST'
+    assert req.get_header('Content-type') == 'application/json'
+    body = json.loads(req.data.decode())
+    assert body == data
+
+  def test_noop_when_no_route_id(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()  # empty -> no route id
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+
+    t = mod.DriveTracker()
+    t._post_stats({'distance_m': 1.0, 'duration_s': 1.0, 'engaged_m': 1.0, 'engaged_s': 1.0})
+
+    assert FakeThread.instances == []
+
+  def test_swallows_network_errors(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / '00000385--6e363981a3--8').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', MagicMock(side_effect=OSError('boom')))
+
+    t = mod.DriveTracker()
+    # Must not raise even though the network call fails inside the (synchronously-run) thread target.
+    t._post_stats({'distance_m': 1.0, 'duration_s': 1.0, 'engaged_m': 1.0, 'engaged_s': 1.0})
+
+
+class TestSavePostsStats:
+  def test_save_calls_post_stats_with_summary_fields(self, tracker_module, monkeypatch):
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 60.0
+    t._distance_m = 1000.0
+    t._engaged_s = 50.0
+    t._engaged_m = 900.0
+
+    posted = {}
+    monkeypatch.setattr(t, '_post_stats', lambda data: posted.update(data))
+
+    t._save()
+
+    assert posted['distance_m'] == 1000.0
+    assert posted['duration_s'] == 60.0
+    assert posted['engaged_s'] == 50.0
+    assert posted['engaged_m'] == 900.0
+
+  def test_save_skips_post_stats_for_short_drive(self, tracker_module, monkeypatch):
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 3.0  # below MIN threshold -> _save returns early
+
+    called = []
+    monkeypatch.setattr(t, '_post_stats', lambda data: called.append(data))
+
+    t._save()
+
+    assert called == []

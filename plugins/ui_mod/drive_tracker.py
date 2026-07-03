@@ -10,11 +10,42 @@ Samples on deviceState updates (~2Hz) — matching qlog resolution exactly.
 import json
 import math
 import os
+import re
+import threading
 import time
+import urllib.request
 from config import PLUGINS_RUNTIME_DIR
 
 LAST_DRIVE_FILE = os.path.join(PLUGINS_RUNTIME_DIR, '.last_drive.json')
 MIN_TRACE_DIST_M = 50  # minimum distance between trace points
+
+COD_BASE = "http://localhost"
+_SEG_RE = re.compile(r"^(.*)--\d+$")
+
+
+def _log_root() -> str:
+  """Realdata root — indirection kept for tests."""
+  from openpilot.system.hardware.hw import Paths
+  return Paths.log_root()
+
+
+def _resolve_route_id():
+  """local_id of the most recently written route (newest realdata dir with
+  the --<segment> suffix stripped). None if realdata is empty/unreadable.
+  """
+  try:
+    root = _log_root()
+    entries = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+  except Exception:
+    # Best-effort: any failure to resolve (missing/unreadable realdata dir,
+    # openpilot not importable in this environment, etc.) must not block
+    # .last_drive.json from being written.
+    return None
+  if not entries:
+    return None
+  newest = max(entries, key=lambda d: os.path.getmtime(os.path.join(root, d)))
+  m = _SEG_RE.match(newest)
+  return m.group(1) if m else newest
 
 
 class DriveTracker:
@@ -149,6 +180,34 @@ class DriveTracker:
       os.replace(tmp, LAST_DRIVE_FILE)
     except OSError:
       pass
+
+    self._post_stats(data)
+
+  def _post_stats(self, data):
+    """Best-effort POST of brief drive stats to COD. Non-fatal on failure —
+    .last_drive.json is already written and the next offroad transition re-POSTs.
+    """
+    route_id = _resolve_route_id()
+    if not route_id:
+      return
+    payload = {
+      'distance_m': data['distance_m'],
+      'duration_s': data['duration_s'],
+      'engaged_m': data['engaged_m'],
+      'engaged_s': data['engaged_s'],
+    }
+
+    def _send():
+      try:
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+          f"{COD_BASE}/v1/route/{route_id}/drive_stats",
+          data=body, headers={'Content-Type': 'application/json'}, method='POST')
+        urllib.request.urlopen(req, timeout=10).close()
+      except Exception:
+        pass
+
+    threading.Thread(target=_send, daemon=True).start()
 
   @property
   def summary(self):
