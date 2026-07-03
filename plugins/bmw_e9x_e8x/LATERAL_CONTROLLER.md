@@ -28,6 +28,29 @@ This document is the canonical reference for the lateral controller registered b
 > reverted hold-bias integral). The tolerance-cancel drain targets the same
 > `hold_f·torque` ("stop the ramp, keep what you have" in curves); ISO
 > overshoot cancels still drain to 0.
+>
+> **2026-07-03 (route 385 seg 27 review batch).** Four fixes/mechanisms after
+> the first on-car data of the new stack still oscillated in a hairpin:
+> 1. **Held torque is sign-guarded** — never hold torque opposing the
+>    commanded curve (`held·δ_des ≥ 0`); seg 27 showed 400 ms counter-curve
+>    holds during overshoot recovery (63 vs 38 deg/s subsequent rate bursts).
+> 2. **Held torque is magnitude-capped** at the deadzone-edge P value
+>    (`hold_cap = T_CAP_SLOPE·kappa_scale·v²·tolerance`): anything above what
+>    P commands while "almost on-target" is arrival momentum, not holding
+>    torque (seg 27 latched 0.588 vs steady SAT ≈ 0.15 → cancel_accel dump →
+>    deep unwind).
+> 3. **`cancel_tol` gated to `action == 'ramp'`** — it fired on hold ramps
+>    every in-band tick, stretching cadence 300→550 ms and flooding telemetry
+>    with phantom `cancel_tol` (~10 of 11 in-curve ticks).
+> 4. **Per-decision step cap `STEP_MAX = 0.10`** — human-style gradual
+>    steering: move ≤1.2 Nm toward the P target per 300 ms decision, let the
+>    plant respond, re-measure, step again. Design rule: **never apply
+>    excessive steering torque abruptly.** Seg 27 had single decisions
+>    swinging Δ0.69 frac (8.3 Nm) → 150 deg/s wheel bursts. Max slew now
+>    ~4 Nm/s; full authority builds in ~1.5 s (accepted — speedlimitd slows
+>    for curves, ISO guards still cancel instantly).
+> Telemetry gains `hold_cap`; `kappa_scale` is computed per tick (shared by
+> the P-term and the hold cap).
 
 ---
 
@@ -274,7 +297,7 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | `hold_zero` | `|delta_err| ≤ tolerance`, straight (`hold_f = 0`) — target 0, stiction holds |
 | `hold_curve` | `|delta_err| ≤ tolerance`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
 | `ramp` | active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
-| `cancel_tol` | error fell into 1.2× tolerance band mid-ramp; drain to `hold_f·torque` (0 on straights) |
+| `cancel_tol` | error fell into 1.2× tolerance band mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights) |
 | `cancel_accel` | overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` — drain to 0 |
 | `cancel_jerk` | overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` — drain to 0 |
 

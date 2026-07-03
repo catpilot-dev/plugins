@@ -228,6 +228,17 @@ def on_lat_controller_init(result, lac, CP):
   # lets the wheel unwind (route 380/384 0.6 Hz limit cycle).
   HOLD_KAPPA_BP = [0.004, 0.010]
 
+  # Per-decision torque step cap (2026-07-03, route 385 seg 27 review).
+  # Human-style gradual steering: each cadence decision moves the target at
+  # most STEP_MAX from the current torque, the plant responds (~2.5τ per
+  # cadence), the next decision re-measures and steps again. Design rule:
+  # never apply excessive steering torque abruptly. 0.10 frac = 1.2 Nm per
+  # 300 ms ≈ 4 Nm/s max slew (panda wire limit is 10 Nm/s). Full authority
+  # builds in ~1.5 s instead of 0.3 s — accepted: speedlimitd slows for
+  # curves and the ISO guards still cancel overshoot instantly. First knob
+  # to revisit if curve entries ever feel late.
+  STEP_MAX = 0.10
+
   # Rack breakaway torque fraction (stiction floor). 2026-07-03: no longer
   # used to amplify sub-friction commands or emit reverse pulses (stiction
   # special-casing removed — the pulses were churn, not correction; the
@@ -288,6 +299,8 @@ def on_lat_controller_init(result, lac, CP):
     'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
     'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
     'tolerance': 0.0,             # debug: current deadzone half-width (rad), κ- and v-dependent
+    'hold_f': 0.0,                # debug: curvature hold factor [0,1]
+    'hold_cap': 0.0,              # debug: cap on held torque (deadzone-edge P value, frac)
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -341,6 +354,7 @@ def on_lat_controller_init(result, lac, CP):
       # and re-derives from state['torque'] every decision — no learning
       # state, no ratchet (the hold-bias integral failure mode).
       hold_f = float(np.interp(abs(state['desired']), HOLD_KAPPA_BP, [0.0, 1.0]))
+      state['hold_f'] = hold_f
 
       # 8.5 m/s = ~30 kph, BMW DCC minimum engagement speed. Below this the
       # controller is never active, so the floor only protects κ_meas from
@@ -393,6 +407,30 @@ def on_lat_controller_init(result, lac, CP):
       tolerance = 2.0 * drift_m * L / (lookahead_m ** 2)
       state['tolerance'] = tolerance
 
+      # Curvature scale for the P-term and caps (computed per tick since the
+      # hold cap below needs it too; keyed on raw |κ_des|, see T_CAP_SCALE
+      # constants block). 2026-05-22 (route 326): near-straight scale 1.5 → 1.0.
+      kappa_scale = float(np.interp(abs(state['desired']),
+                                    T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP))
+
+      # Held torque for the deadzone / tolerance-cancel (route 385 seg 27
+      # review, 2026-07-03). "Keep what you have" needs two qualifiers:
+      #   - sign-guard: never hold torque opposing the commanded curve — on a
+      #     rack with no self-centering that actively drives the wrong way
+      #     (seg 27: 400 ms counter-curve holds during overshoot recovery,
+      #     63 vs 38 deg/s subsequent rate bursts).
+      #   - magnitude cap at the deadzone-edge P value (effective_err =
+      #     tolerance): anything above what P would command while "almost
+      #     on-target" is arrival momentum, not holding torque (seg 27
+      #     latched 0.588 where steady SAT ≈ 0.15 → cancel_accel dump →
+      #     deep unwind cycle).
+      hold_cap = (T_CAP_SLOPE_BASE * kappa_scale * v * v * tolerance) / CCP.STEER_MAX
+      state['hold_cap'] = hold_cap
+      held = hold_f * state['torque']
+      if held * delta_des < 0.0:
+        held = 0.0
+      held_target = float(np.clip(held, -hold_cap, hold_cap))
+
       # ISO 11270 half-comfort guard, gated on plant overshoot. Fires only
       # when (κ_des − κ_meas)·κ_meas < 0 — i.e., plant has turned more than
       # the planner asked for (or to the wrong side of zero). During
@@ -441,19 +479,21 @@ def on_lat_controller_init(result, lac, CP):
           state['ramp_frames'] = spread_frames
         state['action'] = cancel_reason
         state['tick_count'] = 0
-      elif abs(delta_err) <= 1.2*tolerance and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION:
-        # Tolerance-cancel: error fell into the success band while a push
+      elif (state['action'] == 'ramp' and abs(delta_err) <= 1.2*tolerance
+            and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION):
+        # Tolerance-cancel: error fell into the success band while a PUSH
         # ramp is still in flight. Without this, the ramp keeps driving
         # torque toward a stale target until the next 250 ms cadence.
-        # Drain to the curvature-dependent hold (0 on straights; ≈current
-        # torque in curves — "stop the ramp, keep what you have", so the
-        # cancel doesn't unwind the wheel and restart the push cycle).
-        # Reverse-FRICTION momentum brake removed 2026-07-03. At hold_f=1
-        # the target equals current torque → ramp_step ≈ 0, naturally
-        # idempotent; at hold_f=0 the fixed 0 target is idempotent via the
-        # != guard. The abs(target) > FRICTION guard keeps this from
-        # re-cancelling its own sub-friction drain.
-        unwind_target = hold_f * state['torque']
+        # Gated on action=='ramp' (route 385 review, 2026-07-03): hold
+        # ramps also set ramp_frames, and un-gated this branch fired on
+        # them every in-band tick — pinning tick_count (cadence stretched
+        # 300→550 ms) and flooding telemetry with phantom cancel_tol
+        # (~10 of 11 in-curve ticks), corrupting the cancel_* field-health
+        # metric. Gating also removes the float-equality re-arm fragility
+        # in the blend region. Drain to the sign-guarded, capped hold
+        # (0 on straights; ≈steady SAT in curves — "stop the ramp, keep
+        # what you have" without keeping arrival momentum).
+        unwind_target = held_target
         if state['target_frac'] != unwind_target:
           state['target_frac'] = unwind_target
           state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
@@ -483,18 +523,13 @@ def on_lat_controller_init(result, lac, CP):
           # decision: bounded by the P-term's own command, no ratchet.
           # (brake_zero one-shot reverse pulse removed 2026-07-03 —
           # residual deadzone-entry momentum is left to rack friction.)
-          target_frac = hold_f * state['torque']
-          state['action'] = 'hold_curve' if hold_f > 0.0 else 'hold_zero'
+          # held_target is sign-guarded (never counter-curve) and capped at
+          # the deadzone-edge P value — see the hold_cap block above.
+          target_frac = held_target
+          state['action'] = 'hold_curve' if held_target != 0.0 else 'hold_zero'
         else:
-          # Curvature scale: 1.0 on straights (|κ_des| ≤ 0.001) rising linearly
-          # to 2.5 at |κ_des| = 0.01 to 3.0 on tight curves (|κ_des| ≥ 0.02).
-          # Inlined into both target and cap formulas so the κ_des-dependence
-          # is visible at the math. 2026-05-22 (route 326): reduced near-
-          # straight scale 1.5 → 1.0 (matches T_CAP_SLOPE_BASE) to suppress
-          # over-correction the user felt at the small-κ regime; "feels much
-          # better" verbatim on route 326 with the change in place.
-          kappa_scale = float(np.interp(abs(state['desired']),
-                                        T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP))
+          # kappa_scale computed per tick above (shared with hold_cap):
+          # 1.0 on straights rising to 3.0 at |κ_des| ≥ 0.02.
           effective_err = delta_err - math.copysign(tolerance, delta_err)
           target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * effective_err
           target_frac = target_nm / CCP.STEER_MAX
@@ -512,6 +547,17 @@ def on_lat_controller_init(result, lac, CP):
                          T_CAP_BASE_NM + T_CAP_SLOPE_BASE * kappa_scale * v * v * abs(delta_des))
           t_cap_frac = t_cap_nm / CCP.STEER_MAX
           target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
+          # Per-decision step cap (route 385 seg 27 review, 2026-07-03):
+          # human-style gradual steering — move at most STEP_MAX toward the
+          # P target per decision, let the plant respond one cadence, then
+          # re-measure and step again. Never apply excessive torque
+          # abruptly: seg 27 showed single decisions swinging Δ0.69 frac
+          # (8.3 Nm) which drove 150 deg/s wheel bursts and the
+          # over-latch → cancel_accel dump → deep-unwind cycle. Max slew
+          # is now ~0.33 frac/s (~4 Nm/s); ISO guards still cancel
+          # overshoot instantly, speedlimitd handles curve-entry speed.
+          step = float(np.clip(target_frac - state['torque'], -STEP_MAX, STEP_MAX))
+          target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
 
         state['target_frac'] = target_frac
         state['ramp_step'] = (target_frac - state['torque']) / spread_frames
@@ -559,7 +605,8 @@ def on_lat_controller_init(result, lac, CP):
           'active': active,
           'a_y_meas': float(state['a_y_meas']),
           'jerk_pred': float(state['jerk_pred']),
-          'hold_f': float(np.interp(abs(state['desired']), HOLD_KAPPA_BP, [0.0, 1.0])),
+          'hold_f': float(state['hold_f']),
+          'hold_cap': float(state['hold_cap']),
           'tolerance': float(state['tolerance']),
         }
         state['lat_pub'].send(payload)
