@@ -162,8 +162,14 @@ def on_lat_controller_init(result, lac, CP):
   """Plant-inversion at 500 ms horizon in front-wheel-angle space.
 
   BMW E90 hydraulic rack has high breakaway friction and no alignment-torque
-  self-centering — the wheel holds its angle at zero torque. So:
-    - Inside tolerance: drive torque → 0 and let stiction hold. No chatter.
+  self-centering — the wheel holds its angle at zero torque *near center*.
+  In curves, self-aligning torque exceeds rack stiction above ~40° wheel
+  (route 380/384), so on-target there requires standing torque. So:
+    - Inside tolerance, straight (|κ_des| < HOLD_KAPPA_BP[0]): drive torque
+      → 0 and let stiction hold. No chatter.
+    - Inside tolerance, curve: hold hold_f·torque — the torque that achieved
+      on-target ≈ the self-aligning torque. Re-derived each decision from
+      state['torque']; bounded by the P-term's own command, no ratchet.
     - Outside tolerance: compute the torque that would move the front wheel by
       δ_err over 500 ms (plant-inversion accounting for first-order lag), ramp
       to it over one 250 ms decision.
@@ -328,6 +334,17 @@ def on_lat_controller_init(result, lac, CP):
   # to real-correction capability.
   KD_GATE = 0.002                           # |raw κ_des| at which delta_err filter bypasses
 
+  # Curvature-dependent hold (2026-07-03): inside the tolerance band the
+  # target is hold_f·torque instead of 0, hold_f = interp(|κ_des|, BP, [0,1]).
+  # Below BP[0] (straights; above the ±0.003 modelV2 wobble amplitude) the
+  # target is 0 as before. Between BP[0] and BP[1] the partial factor gives
+  # a geometric relax (each decision multiplies held torque by hold_f);
+  # at/above BP[1] the torque that achieved on-target is held outright.
+  # Rationale: in a curve, on-target is reached WITH torque applied — that
+  # torque ≈ SAT, and above ~40° wheel SAT beats rack stiction, so target-0
+  # lets the wheel unwind (route 380/384 0.6 Hz limit cycle).
+  HOLD_KAPPA_BP = [0.004, 0.010]
+
   # Rack breakaway torque fraction (stiction floor). 2026-07-03: no longer
   # used to amplify sub-friction commands or emit reverse pulses (stiction
   # special-casing removed — the pulses were churn, not correction; the
@@ -379,7 +396,7 @@ def on_lat_controller_init(result, lac, CP):
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
-    'action': 'init',          # debug: hold_zero / ramp / cancel_tol / cancel_accel / cancel_jerk
+    'action': 'init',          # debug: hold_zero / hold_curve / ramp / cancel_tol / cancel_accel / cancel_jerk
     'delta_err': 0.0,          # debug: filtered front-wheel-angle error (rad), what controller acts on
     'delta_err_raw': 0.0,      # debug: pre-filter delta_err (rad)
     'lat_pub': None,
@@ -428,6 +445,18 @@ def on_lat_controller_init(result, lac, CP):
       # of the prior κ_des-hysteresis attempt) and downstream magnitude-
       # sensitive logic sees the true model intent.
       state['desired'] = float(desired_curvature)
+
+      # Curvature-dependent hold factor (2026-07-03). In a curve, "on-target"
+      # is achieved WITH torque applied — that standing torque ≈ the self-
+      # aligning torque, which above ~40° wheel exceeds rack stiction
+      # (route 380/384: hold-at-zero let the wheel unwind → 0.6 Hz limit
+      # cycle). hold_f scales the deadzone / tolerance-cancel target:
+      # 0 on straights (pure stiction-hold, below-BP includes the ±0.003
+      # modelV2 wobble band), 1 in real curves (keep what got us on-target).
+      # The held value is bounded by what the P-term was already commanding
+      # and re-derives from state['torque'] every decision — no learning
+      # state, no ratchet (the hold-bias integral failure mode).
+      hold_f = float(np.interp(abs(state['desired']), HOLD_KAPPA_BP, [0.0, 1.0]))
 
       # 8.5 m/s = ~30 kph, BMW DCC minimum engagement speed. Below this the
       # controller is never active, so the floor only protects κ_meas from
@@ -528,12 +557,15 @@ def on_lat_controller_init(result, lac, CP):
         # Tolerance-cancel: error fell into the success band while a push
         # ramp is still in flight. Without this, the ramp keeps driving
         # torque toward a stale target until the next 250 ms cadence.
-        # Drain to 0 (momentum-brake reverse-FRICTION pulse removed
-        # 2026-07-03) — residual entry motion is left to rack friction.
-        # Idempotent like the ISO cancel. The abs(target) > FRICTION guard
-        # keeps this from re-cancelling its own drain and ignores
-        # sub-friction ramps that can't move the rack anyway.
-        unwind_target = 0.0
+        # Drain to the curvature-dependent hold (0 on straights; ≈current
+        # torque in curves — "stop the ramp, keep what you have", so the
+        # cancel doesn't unwind the wheel and restart the push cycle).
+        # Reverse-FRICTION momentum brake removed 2026-07-03. At hold_f=1
+        # the target equals current torque → ramp_step ≈ 0, naturally
+        # idempotent; at hold_f=0 the fixed 0 target is idempotent via the
+        # != guard. The abs(target) > FRICTION guard keeps this from
+        # re-cancelling its own sub-friction drain.
+        unwind_target = hold_f * state['torque']
         if state['target_frac'] != unwind_target:
           state['target_frac'] = unwind_target
           state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
@@ -555,11 +587,16 @@ def on_lat_controller_init(result, lac, CP):
         #   τ_Nm = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
         if abs(delta_err) <= tolerance:
-          # Hold at zero: torque relaxes and stiction keeps the wheel where
-          # it is. (brake_zero one-shot reverse pulse removed 2026-07-03 —
+          # On-target. Straights (hold_f=0): drain to 0, stiction holds.
+          # Curves (hold_f→1): keep the torque that achieved on-target —
+          # it approximates the self-aligning torque, which beats stiction
+          # at curve angles; target-0 here was the 0.6 Hz limit cycle's
+          # driver (route 380/384). Re-derived from state['torque'] each
+          # decision: bounded by the P-term's own command, no ratchet.
+          # (brake_zero one-shot reverse pulse removed 2026-07-03 —
           # residual deadzone-entry momentum is left to rack friction.)
-          target_frac = 0.0
-          state['action'] = 'hold_zero'
+          target_frac = hold_f * state['torque']
+          state['action'] = 'hold_curve' if hold_f > 0.0 else 'hold_zero'
         else:
           # Curvature scale: 1.0 on straights (|κ_des| ≤ 0.001) rising linearly
           # to 2.5 at |κ_des| = 0.01 to 3.0 on tight curves (|κ_des| ≥ 0.02).
@@ -634,6 +671,7 @@ def on_lat_controller_init(result, lac, CP):
           'active': active,
           'a_y_meas': float(state['a_y_meas']),
           'jerk_pred': float(state['jerk_pred']),
+          'hold_f': float(np.interp(abs(state['desired']), HOLD_KAPPA_BP, [0.0, 1.0])),
         }
         state['lat_pub'].send(payload)
       except Exception:

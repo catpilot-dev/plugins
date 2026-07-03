@@ -15,6 +15,19 @@ This document is the canonical reference for the lateral controller registered b
 > route 380/384 evidence). Sections below describing `breakaway`/`brake_zero`
 > or reverse-FRICTION drains are historical where they conflict with this note.
 > `FRICTION` remains only as the tolerance-cancel guard threshold.
+>
+> **Same date — curvature-dependent hold.** Inside the tolerance band the
+> target is `hold_f·torque` instead of 0, with
+> `hold_f = interp(|κ_des|, HOLD_KAPPA_BP=[0.004, 0.010], [0, 1])`. In a curve
+> the torque that achieved on-target ≈ the self-aligning torque (which beats
+> rack stiction above ~40° wheel — target-0 there was the driver of the
+> route 380/384 0.6 Hz limit cycle). Straights (|κ_des| < 0.004, above the
+> ±0.003 modelV2 wobble band) keep the pure stiction-hold. The held value
+> re-derives from `state['torque']` each decision — bounded by the P-term's
+> own command, no learning state, no ratchet (the failure mode of the
+> reverted hold-bias integral). The tolerance-cancel drain targets the same
+> `hold_f·torque` ("stop the ramp, keep what you have" in curves); ISO
+> overshoot cancels still drain to 0.
 
 ---
 
@@ -252,13 +265,14 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | state | when entered |
 |---|---|
 | `init` | controller construction |
-| `hold_zero` | `|delta_err| ≤ tolerance` — target 0, stiction holds |
+| `hold_zero` | `|delta_err| ≤ tolerance`, straight (`hold_f = 0`) — target 0, stiction holds |
+| `hold_curve` | `|delta_err| ≤ tolerance`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
 | `ramp` | active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
-| `cancel_tol` | error fell into 1.2× tolerance band mid-ramp; drain target to 0 |
+| `cancel_tol` | error fell into 1.2× tolerance band mid-ramp; drain to `hold_f·torque` (0 on straights) |
 | `cancel_accel` | overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` — drain to 0 |
 | `cancel_jerk` | overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` — drain to 0 |
 
-Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`.
+Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`. Added: `hold_curve`. Telemetry gains `hold_f`.
 
 ---
 
