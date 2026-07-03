@@ -36,10 +36,7 @@ def _resolve_route_id():
   try:
     root = _log_root()
     entries = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
-  except Exception:
-    # Best-effort: any failure to resolve (missing/unreadable realdata dir,
-    # openpilot not importable in this environment, etc.) must not block
-    # .last_drive.json from being written.
+  except OSError:
     return None
   if not entries:
     return None
@@ -186,28 +183,37 @@ class DriveTracker:
   def _post_stats(self, data):
     """Best-effort POST of brief drive stats to COD. Non-fatal on failure —
     .last_drive.json is already written and the next offroad transition re-POSTs.
+
+    This method is the best-effort boundary: the entire synchronous attempt
+    (route resolution, payload construction, thread spawn) is guarded so that
+    NOTHING — a non-OSError from _log_root (e.g. ImportError), a missing key in
+    data, etc. — can propagate out of _save. The daemon thread guards the
+    network call separately.
     """
-    route_id = _resolve_route_id()
-    if not route_id:
-      return
-    payload = {
-      'distance_m': data['distance_m'],
-      'duration_s': data['duration_s'],
-      'engaged_m': data['engaged_m'],
-      'engaged_s': data['engaged_s'],
-    }
+    try:
+      route_id = _resolve_route_id()
+      if not route_id:
+        return
+      payload = {
+        'distance_m': data['distance_m'],
+        'duration_s': data['duration_s'],
+        'engaged_m': data['engaged_m'],
+        'engaged_s': data['engaged_s'],
+      }
 
-    def _send():
-      try:
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-          f"{COD_BASE}/v1/route/{route_id}/drive_stats",
-          data=body, headers={'Content-Type': 'application/json'}, method='POST')
-        urllib.request.urlopen(req, timeout=10).close()
-      except Exception:
-        pass
+      def _send():
+        try:
+          body = json.dumps(payload).encode()
+          req = urllib.request.Request(
+            f"{COD_BASE}/v1/route/{route_id}/drive_stats",
+            data=body, headers={'Content-Type': 'application/json'}, method='POST')
+          urllib.request.urlopen(req, timeout=10).close()
+        except Exception:
+          pass
 
-    threading.Thread(target=_send, daemon=True).start()
+      threading.Thread(target=_send, daemon=True).start()
+    except Exception:
+      pass
 
   @property
   def summary(self):

@@ -496,6 +496,33 @@ class TestPostStats:
     # Must not raise even though the network call fails inside the (synchronously-run) thread target.
     t._post_stats({'distance_m': 1.0, 'duration_s': 1.0, 'engaged_m': 1.0, 'engaged_s': 1.0})
 
+  def test_swallows_non_oserror_from_log_root(self, tracker_module, monkeypatch):
+    """The best-effort boundary lives in _post_stats: a non-OSError raised by
+    _log_root (e.g. ImportError when openpilot isn't importable) must NOT
+    propagate out and must NOT attempt a POST. _resolve_route_id only catches
+    OSError, so this proves _post_stats' own guard is what swallows it.
+    """
+    mod = tracker_module
+
+    def boom():
+      raise ImportError('openpilot not available')
+    monkeypatch.setattr(mod, '_log_root', boom)
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    mock_urlopen = MagicMock()
+    mock_request = MagicMock()
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', mock_urlopen)
+    monkeypatch.setattr(mod.urllib.request, 'Request', mock_request)
+
+    t = mod.DriveTracker()
+    # Must not raise despite the non-OSError from _log_root.
+    t._post_stats({'distance_m': 1.0, 'duration_s': 1.0, 'engaged_m': 1.0, 'engaged_s': 1.0})
+
+    assert FakeThread.instances == []
+    assert not mock_urlopen.called
+    assert not mock_request.called
+
 
 class TestSavePostsStats:
   def test_save_calls_post_stats_with_summary_fields(self, tracker_module, monkeypatch):
