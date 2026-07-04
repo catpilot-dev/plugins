@@ -51,6 +51,26 @@ This document is the canonical reference for the lateral controller registered b
 >    for curves, ISO guards still cancel instantly).
 > Telemetry gains `hold_cap`; `kappa_scale` is computed per tick (shared by
 > the P-term and the hold cap).
+>
+> **2026-07-04 (route 38b follow-up).** Straights on the new stack: "almost
+> perfect" (user verdict). Two changes from the mild-turn wobble analysis
+> (segs 10/11 — small 1.6–2.3° p2p wobble in a mild highway left):
+> 1. **delta_err filter is BLENDED, not gated**: `w_raw = interp(|κ_des|,
+>    KD_BLEND_BP=[0.002, 0.004], [0,1])`, `delta_err = w_raw·raw +
+>    (1−w_raw)·filtered`. The old hard KD_GATE=0.002 sat exactly on
+>    mild-turn κ, flickering on/off at ~0.5 Hz and passing raw vision noise
+>    half the time. Straights unchanged (fully filtered), real curves
+>    unchanged (fully raw), lane changes still bypass.
+> 2. **κ-dependent DRIFT_M REVERTED to fixed 0.02 m**: the widening logic
+>    was wrong — in large curvature the lane margin shrinks and position
+>    error matters MORE; allowed drift must not grow with κ. (Route 38b
+>    also showed the widening was a bystander in the mild-turn wobble:
+>    factor 1.1× there.) Noise-chasing in tight turns is handled by
+>    hold_curve + STEP_MAX instead. The **hold cap is decoupled** onto its
+>    own fixed reference (`HOLD_CAP_DRIFT_M = 0.10`) so it keeps the
+>    field-verified seg-27 scale — deriving it from the now-tight tolerance
+>    would have shrunk it below measured steady SAT and broken hold_curve.
+> Telemetry gains `de_w` (blend weight).
 
 ---
 
@@ -224,12 +244,17 @@ state['delta_err_raw'] = delta_err_raw    # both published in telemetry
 ## 5. The kinematic deadzone
 
 ```python
-DRIFT_M_KAPPA = [0.004, 0.02]   # |κ_des| breakpoints (1/m)      (2026-07-03)
-DRIFT_M_BP    = [0.02, 0.10]    # m of allowed drift over model_action_t
-drift_m     = np.interp(abs(κ_des), DRIFT_M_KAPPA, DRIFT_M_BP)
+DRIFT_M     = 0.02              # m of allowed drift over model_action_t (fixed)
 lookahead_m = v * model_action_t
-tolerance   = 2.0 * drift_m * L / (lookahead_m**2) # rad, 1/v² scaling
+tolerance   = 2.0 * DRIFT_M * L / (lookahead_m**2) # rad, 1/v² scaling
 ```
+
+**2026-07-04: the 2026-07-03 κ-dependent widening (0.02→0.10 m) was REVERTED.**
+Allowed drift must not grow with curvature — lane margin shrinks in tight turns
+and position error matters more there, not less. The tight-turn noise-chasing
+the widening tried to solve is handled by `hold_curve` (resting torque) +
+`STEP_MAX` (bounded chase). The hold cap now uses its own fixed reference
+(`HOLD_CAP_DRIFT_M = 0.10`), decoupled from this deadzone.
 
 **Physical meaning**: tolerance is the front-wheel-angle error that produces ≤ `drift_m` of lateral position drift over `model_action_t` of forward travel. Near-straight at 85 kph: tolerance ≈ 0.027°. Near-straight at 30 kph: ≈ 0.36°. Tight turn (κ=0.02) at 34 kph: ≈ 0.85°.
 
