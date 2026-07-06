@@ -210,9 +210,10 @@ def on_lat_controller_init(result, lac, CP):
   # boundary flicker. The 2026-05-22 concern (filtering delays real small
   # corrections) is softened by STEP_MAX bounding correction aggressiveness
   # anyway. Lane changes still fully bypass (buffer cleared).
-  # de_filter_window subscribes to action_cadence_ticks for single-knob
-  # coupling: at SAD=0.4 → cadence=6 → window=6 (300 ms box, 150 ms group
-  # delay).
+  # de_filter_window = 2·action_cadence_ticks for single-knob coupling:
+  # at SAD=0.4 → cadence=6 → window=12 (600 ms box, 300 ms group delay).
+  # Lengthened from 1× on 2026-07-06 (route 393 segs 17-22 replay: −31%
+  # sign-flips, −26% band crossings, +0.01 s mean onset lag).
   KD_BLEND_BP = [0.002, 0.004]              # |raw κ_des| blend: below→filtered, above→raw
 
   # Curvature-dependent hold (2026-07-03): inside the tolerance band the
@@ -377,7 +378,13 @@ def on_lat_controller_init(result, lac, CP):
       # raw in real curves, proportional in between; no boundary flicker.
       # Lane changes bypass entirely (buffer cleared): canonical signal for
       # "model is reframing the trajectory" (route 31d seg 7 evidence).
-      # Filter window = action_cadence_ticks (cadence-coupled, single-knob).
+      # Filter window = 2·action_cadence_ticks (2026-07-06, route 393 segs
+      # 17-22 offline window replay over 334 s of straights: W=12 cuts
+      # sign-flips a further 31% and band crossings 26% vs W=6, for
+      # +0.01 s mean / +0.15 s max correction-onset lag over 81 genuine
+      # excursions; W=16 adds nothing — the residual is sub-Hz modelV2
+      # wander beyond any causal box). Still cadence-coupled (single-knob):
+      # 12 ticks = 600 ms box at SAD=0.4.
       # state['delta_err'] holds the BLENDED value (used downstream).
       # Telemetry publishes raw, blended, and the blend weight.
       lane_change_active = (_sm['modelV2'].meta.laneChangeState != log.LaneChangeState.off)
@@ -387,7 +394,7 @@ def on_lat_controller_init(result, lac, CP):
         delta_err = delta_err_raw
       else:
         state['de_buffer'].append(delta_err_raw)
-        if len(state['de_buffer']) > action_cadence_ticks:
+        if len(state['de_buffer']) > 2 * action_cadence_ticks:
           state['de_buffer'].pop(0)
         filtered = sum(state['de_buffer']) / len(state['de_buffer'])
         w_raw = float(np.interp(abs(state['desired']), KD_BLEND_BP, [0.0, 1.0]))

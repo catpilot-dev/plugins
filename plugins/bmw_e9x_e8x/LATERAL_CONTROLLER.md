@@ -83,6 +83,14 @@ This document is the canonical reference for the lateral controller registered b
 > letting SAT unwind the wheel mid-correction. Opposite-sign P (overshoot
 > correction) is untouched — torque still reduces the moment the error
 > flips sides.
+>
+> **Same date — filter window 6 → 12 ticks (2·cadence).** Offline replay of
+> W ∈ {6,10,12,16} over 334 s of route-393 straights (segs 17–22): the
+> current W=6 blend already cuts sign-flips 62% and band crossings 60% vs
+> raw; W=12 takes a further −31% / −26% at +0.01 s mean (+0.15 s max)
+> correction-onset lag; W=16 adds nothing. The residual error amplitude is
+> sub-Hz modelV2 wander — beyond any causal box filter (vision-only floor).
+> Window stays cadence-coupled (single-knob): 2×cadence = 600 ms at SAD=0.4.
 
 ---
 
