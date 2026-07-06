@@ -71,6 +71,18 @@ This document is the canonical reference for the lateral controller registered b
 >    field-verified seg-27 scale — deriving it from the now-tight tolerance
 >    would have shrunk it below measured steady SAT and broken hold_curve.
 > Telemetry gains `de_w` (blend weight).
+>
+> **2026-07-06 (route 393 segs 7/8 — hold verified working).** Wheel quality
+> in tight curves: rate std 7.5–13.4 deg/s, residual p2p ~14° (vs 18–37 /
+> 29–54° pre-redesign); held torque 0.06–0.08 mean ≈ measured SAT; hold_cap
+> binds ≤5%. One structural improvement from the data — **hold-floor**: a
+> same-direction ramp push never commands less than the held torque
+> ("keep holding while adding trim — don't ease off while still
+> understeering"). 15–31% of in-curve ramp ticks had been commanding
+> sub-friction targets that DROPPED torque below the holding level,
+> letting SAT unwind the wheel mid-correction. Opposite-sign P (overshoot
+> correction) is untouched — torque still reduces the moment the error
+> flips sides.
 
 ---
 

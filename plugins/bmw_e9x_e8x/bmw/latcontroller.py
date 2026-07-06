@@ -562,6 +562,20 @@ def on_lat_controller_init(result, lac, CP):
                          T_CAP_BASE_NM + T_CAP_SLOPE_BASE * kappa_scale * v * v * abs(delta_des))
           t_cap_frac = t_cap_nm / CCP.STEER_MAX
           target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
+          # Hold-floor (route 393 segs 7/8, 2026-07-06): a same-direction
+          # push never commands LESS than the held torque — "keep holding
+          # while adding trim; don't ease off while still understeering."
+          # Route 393 showed 15–31% of in-curve ramp ticks commanded
+          # sub-friction targets: with the wheel held at e.g. 0.08 and the
+          # error drifting just outside the band, P computed ~0.04 and the
+          # ramp DROPPED torque below the holding level — SAT unwound the
+          # wheel and accelerated the very error being corrected. The floor
+          # applies only when P and the (sign-guarded, capped) hold point
+          # the same way; opposite-sign P (overshoot correction) is
+          # untouched, so torque reduction still happens the moment the
+          # error flips sides. Bounded by hold_cap, STEP_MAX, and t_cap.
+          if target_frac * held_target > 0.0:
+            target_frac = math.copysign(max(abs(target_frac), abs(held_target)), target_frac)
           # Per-decision step cap (route 385 seg 27 review, 2026-07-03):
           # human-style gradual steering — move at most STEP_MAX toward the
           # P target per decision, let the plant respond one cadence, then
