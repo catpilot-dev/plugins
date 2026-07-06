@@ -20,6 +20,9 @@ struct Way {
   oneWay @11 :Bool;
   maxSpeedForward @12 :Float64;
   maxSpeedBackward @13 :Float64;
+  # OSM highway=* classification (e.g. "tertiary"). Only present in
+  # self-generated offline_hw tiles; reads as "" on pfeifer tiles.
+  highwayType @14 :Text;
 }
 
 struct Offline {

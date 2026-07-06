@@ -19,6 +19,9 @@ from config import MEDIA_DIR
 log = logging.getLogger("osm_query")
 
 TILE_DIR = os.path.join(MEDIA_DIR, "0/osm/offline")
+# Self-generated tiles with highwayType — preferred over pfeifer tiles when
+# present. Kept in a separate dir so mapd tile re-downloads never clobber them.
+HW_TILE_DIR = os.path.join(MEDIA_DIR, "0/osm/offline_hw")
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osm_reader.capnp")
 TILE_SIZE = 0.25  # degrees per tile
 MAX_WAY_DISTANCE = 50.0  # meters — ignore ways farther than this
@@ -43,8 +46,8 @@ def _is_expressway_ref(ref: str) -> bool:
   return False
 
 
-def _tile_path(lat: float, lon: float) -> str:
-  """Get tile file path for a GPS coordinate."""
+def _tile_relpath(lat: float, lon: float) -> str:
+  """Relative tile path (lat_dir/lon_dir/fname) for a GPS coordinate."""
   min_lat = math.floor(lat / TILE_SIZE) * TILE_SIZE
   min_lon = math.floor(lon / TILE_SIZE) * TILE_SIZE
   max_lat = min_lat + TILE_SIZE
@@ -54,7 +57,17 @@ def _tile_path(lat: float, lon: float) -> str:
   lon_dir = str(int(math.floor(lon / 2) * 2))
 
   fname = f"{min_lat:.6f}_{min_lon:.6f}_{max_lat:.6f}_{max_lon:.6f}"
-  return os.path.join(TILE_DIR, lat_dir, lon_dir, fname)
+  return os.path.join(lat_dir, lon_dir, fname)
+
+
+def _tile_path(lat: float, lon: float) -> str:
+  """Get pfeifer tile file path for a GPS coordinate."""
+  return os.path.join(TILE_DIR, _tile_relpath(lat, lon))
+
+
+def _hw_tile_path(lat: float, lon: float) -> str:
+  """Get self-generated (highwayType) tile file path for a GPS coordinate."""
+  return os.path.join(HW_TILE_DIR, _tile_relpath(lat, lon))
 
 
 def _point_to_segment_distance(px, py, ax, ay, bx, by):
@@ -89,6 +102,7 @@ def _parse_tile(schema, path):
       nodes,
       way.ref or '', way.name or '',
       way.maxSpeed, way.maxSpeedForward, way.lanes,
+      way.highwayType or '',
     ))
   return ways
 
@@ -150,7 +164,10 @@ class OsmTileReader:
     if self.schema is None:
       return None
 
-    path = _tile_path(lat, lon)
+    # Prefer the self-generated tile (has highwayType) when it exists
+    path = _hw_tile_path(lat, lon)
+    if not os.path.exists(path):
+      path = _tile_path(lat, lon)
     ways = self._get_tile(path)
     if ways is None:
       return None
@@ -159,7 +176,7 @@ class OsmTileReader:
     best_way = None
 
     for way in ways:
-      min_lat, max_lat, min_lon, max_lon, nodes, ref, name, max_speed, max_speed_fwd, lanes = way
+      min_lat, max_lat, min_lon, max_lon, nodes = way[:5]
 
       # Quick bounding box check
       if lat < min_lat - 0.001 or lat > max_lat + 0.001:
@@ -183,7 +200,7 @@ class OsmTileReader:
     if best_way is None:
       return None
 
-    _, _, _, _, _, ref, name, speed, speed_fwd, lanes = best_way
+    _, _, _, _, _, ref, name, speed, speed_fwd, lanes, highway_type = best_way
     if speed <= 0:
       speed = speed_fwd
 
@@ -198,5 +215,6 @@ class OsmTileReader:
       'lanes': lanes,
       'roadContext': 0 if is_freeway else 1,  # 0=freeway, 1=city
       'roadName': name,
+      'highwayType': highway_type,
       'distance': best_dist,
     }

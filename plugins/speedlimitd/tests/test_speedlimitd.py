@@ -1,8 +1,15 @@
 """Tests for speedlimitd daemon — lane inference, speed tables, priority cascade, confirmation."""
+import os
 import pytest
 from unittest.mock import MagicMock, patch
 import sys
 import importlib
+
+# osm_query does `from config import MEDIA_DIR` — on device the plugins dir is
+# on sys.path; replicate that here.
+_PLUGINS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _PLUGINS_DIR not in sys.path:
+  sys.path.insert(0, _PLUGINS_DIR)
 
 
 @pytest.fixture(autouse=True)
@@ -317,6 +324,97 @@ class TestLaneWidthFusion:
     # width says 'secondary' (rank 1). Primary wins — width doesn't demote.
     speed = sld.infer_speed_from_road_type('secondary', 3, 'city', width_class='secondary')
     assert speed == sld.SPEED_TABLE_URBAN['primary']['multi']
+
+
+# ============================================================
+# OSM highwayType — trusted classification vote
+# ============================================================
+
+class TestOsmHighwayTypeVote:
+  def test_osm_tertiary_overrides_inflated_lane_vote(self, sld):
+    # Route 38d 白城路 regression: two-way 1+1 road, vision overcounts to
+    # 4 lanes (counts oncoming lane + edge boost) → trunk → 80 km/h.
+    # OSM highway=tertiary is the trusted classification → urban tertiary = 40.
+    without_osm = sld.infer_speed_from_road_type('', 4, 'city')
+    with_osm = sld.infer_speed_from_road_type('', 4, 'city', osm_type='tertiary')
+    assert without_osm == sld.SPEED_TABLE_URBAN['trunk']['multi']  # the bug: 80
+    assert with_osm == sld.SPEED_TABLE_URBAN['tertiary']['multi']  # 40
+
+  def test_osm_motorway_without_ref_demotes_to_trunk(self, sld):
+    # Elevated urban expressways without G/S refs (中环路-style) are trunk-grade
+    # (80), not motorway-grade (100), even if OSM tags them motorway.
+    speed = sld.infer_speed_from_road_type('', 4, 'city', osm_type='motorway')
+    assert speed == sld.SPEED_TABLE_URBAN['trunk']['multi']
+
+  def test_expressway_ref_beats_osm_type(self, sld):
+    # G/S ref classification stays highest priority — a matched parallel
+    # side-road's OSM type must not demote a ref'd expressway.
+    speed = sld.infer_speed_from_road_type('motorway', 4, 'freeway', osm_type='tertiary')
+    assert speed == sld.SPEED_TABLE_NONURBAN['motorway']['multi']
+
+  def test_narrow_road_shortcut_beats_osm_type(self, sld):
+    # Vision confidently seeing ≤2 lanes still wins (link/ramp safety net).
+    assert sld.infer_speed_from_road_type('', 2, 'city', osm_type='trunk') == 40
+    assert sld.infer_speed_from_road_type('', 1, 'city', osm_type='trunk') == 30
+
+  def test_osm_urban_only_type_forces_city_context(self, sld):
+    # tertiary can't be a freeway — context demotes to city → urban table.
+    speed = sld.infer_speed_from_road_type('', 4, 'freeway', osm_type='tertiary')
+    assert speed == sld.SPEED_TABLE_URBAN['tertiary']['multi']
+
+  def test_unknown_osm_type_falls_back(self, sld):
+    # OSM types with no table entry (e.g. 'track') → default fallback.
+    assert sld.infer_speed_from_road_type('', 3, 'city', osm_type='track') == sld.DEFAULT_FALLBACK_SPEED
+
+  def test_osm_link_type_uses_link_entry(self, sld):
+    # _link classifications map to their table entries (ramps → 40).
+    speed = sld.infer_speed_from_road_type('', 3, 'city', osm_type='trunk_link')
+    assert speed == sld.SPEED_TABLE_URBAN['trunk_link']['multi']
+
+
+class TestOsmResultIngest:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _result(self, **kw):
+    base = {'wayRef': '', 'wayName': '', 'speedLimit': 0.0, 'lanes': 0,
+            'roadContext': 1, 'roadName': '', 'highwayType': '', 'distance': 5.0}
+    base.update(kw)
+    return base
+
+  def test_refless_named_way_accepted(self, sld):
+    # Ways without a G/S ref (all residential/tertiary streets) must no longer
+    # be discarded — name and highwayType are ingested.
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='白城路', highwayType='tertiary'))
+    assert mw.last_road_name == '白城路'
+    assert mw.last_osm_hwtype == 'tertiary'
+
+  def test_unnamed_typed_way_accepted(self, sld):
+    # Unnamed service/residential ways still carry a classification.
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(highwayType='service'))
+    assert mw.last_osm_hwtype == 'service'
+
+  def test_no_match_clears_osm_state(self, sld):
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='白城路', highwayType='tertiary'))
+    mw._ingest_osm_result(None)
+    assert mw.last_road_name == ''
+    assert mw.last_osm_hwtype == ''
+
+  def test_ref_way_still_sets_highway_type(self, sld):
+    # Existing G-ref behavior is preserved through the ingest path.
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(wayRef='G2', roadName='京沪高速',
+                                       roadContext=0, highwayType='motorway'))
+    assert mw.last_highway_type == 'motorway'
+    assert mw.last_road_context == 'freeway'
+    assert mw.last_osm_hwtype == 'motorway'
 
 
 # ============================================================

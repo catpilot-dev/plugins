@@ -303,7 +303,7 @@ def vision_speed_cap(model_msg) -> int:
 
 
 def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context: str,
-                               width_class: str = '') -> int:
+                               width_class: str = '', osm_type: str = '') -> int:
   """Look up fallback speed from road context + highway type + lane count + width.
 
   For narrow roads (≤2 lanes), vision cannot distinguish a through road from
@@ -315,6 +315,12 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
 
   width_class is a road-type hint derived from observed lane_width (via the
   lane_width_class table in the country TOML); '' if unavailable.
+
+  osm_type is the OSM highway=* classification from offline_hw tiles ('' if
+  unavailable). Unlike OSM maxspeed (sparse/stale in China), the highway
+  classification is structural and reliably mapped, so when present it is
+  trusted over the vision-inferred class votes. Vision keeps two safety nets:
+  the narrow-road shortcut above, and the ≤2-lane vision cap in update().
   """
   # Narrow roads: use lane count directly, skip table lookup
   if lane_count <= 1:
@@ -325,7 +331,8 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
   # Secondary and below are almost never nonurban high-speed roads (especially
   # in China). Override mapd's roadContext to urban when highway type is low.
   URBAN_ONLY_TYPES = {'secondary', 'tertiary', 'residential', 'unclassified', 'living_street', 'service'}
-  if road_context == 'freeway' and highway_type in URBAN_ONLY_TYPES:
+  osm_demotes_context = osm_type in URBAN_ONLY_TYPES and highway_type not in ('motorway', 'trunk')
+  if road_context == 'freeway' and (highway_type in URBAN_ONLY_TYPES or osm_demotes_context):
     road_context = 'city'
 
   if road_context == 'freeway':
@@ -349,6 +356,10 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
   EXPRESSWAY_REFS = {'motorway', 'trunk'}
   if highway_type in EXPRESSWAY_REFS:
     effective_type = highway_type
+  elif osm_type:
+    # Trusted OSM classification. 'motorway' without a G/S ref is an urban
+    # elevated expressway (中环路-style) — trunk-grade (80), not 100/120.
+    effective_type = 'trunk' if osm_type == 'motorway' else osm_type
   else:
     rank = {'motorway': 4, 'trunk': 3, 'primary': 2, 'secondary': 1, 'tertiary': 0, 'residential': -1}
     hw_rank = rank.get(highway_type, -2)
@@ -392,6 +403,7 @@ class SpeedLimitMiddleware:
     self.last_road_id: str = ''        # roadName or wayRef — stable road identity
     self.last_road_context: str = 'unknown'
     self.last_way_ref: str = ''
+    self.last_osm_hwtype: str = ''     # OSM highway=* class from offline_hw tiles
     self.lane_count: int = 1
     self.lane_count_stable: int = 1
     self.lane_count_stable_since: float = 0.0
@@ -442,6 +454,44 @@ class SpeedLimitMiddleware:
     self.yolo_last_seen: float = 0.0
     self.yolo_timeout: float = 120.0  # seconds before YOLO detection expires
 
+  def _ingest_osm_result(self, result: dict | None):
+    """Update road identity state from an OSM tile query result.
+
+    Accepts any matched way that carries identity or classification — refs
+    (G2), names (白城路), or a bare highwayType (unnamed service roads).
+    """
+    if result and (result['wayRef'] or result['roadName'] or result.get('highwayType')):
+      way_ref = result['wayRef']
+      self.last_way_ref = way_ref
+      self.last_road_name = result['roadName']
+      self.last_osm_hwtype = result.get('highwayType', '')
+
+      # Road context
+      if result['roadContext'] == 0:
+        self.last_road_context = 'freeway'
+      elif result['roadContext'] == 1:
+        self.last_road_context = 'city'
+
+      # Highway type from wayRef.
+      # G = national expressway (120 km/h), S1-S99 = provincial expressway (100 km/h).
+      # S100+ are provincial general roads, not expressways.
+      road_id = result['roadName'] or way_ref
+      hw = ''
+      if way_ref.startswith('G'):
+        hw = 'motorway'
+      elif way_ref.startswith('S') and len(way_ref[1:]) <= 2 and way_ref[1:].isdigit():
+        hw = 'trunk'
+      hw_rank = {'motorway': 4, 'trunk': 3}
+      if road_id != self.last_road_id:
+        self.last_road_id = road_id
+        self.last_highway_type = hw
+      elif hw_rank.get(hw, -1) > hw_rank.get(self.last_highway_type, -1):
+        self.last_highway_type = hw
+    else:
+      self.last_way_ref = ''
+      self.last_road_name = ''
+      self.last_osm_hwtype = ''
+
   def update(self):
     global SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED, LANE_WIDTH_CLASS_TABLE
     self.sm.update(0)
@@ -472,35 +522,7 @@ class SpeedLimitMiddleware:
       except Exception:
         result = None
 
-      if result and result['wayRef']:
-        way_ref = result['wayRef']
-        self.last_way_ref = way_ref
-        self.last_road_name = result['roadName']
-
-        # Road context
-        if result['roadContext'] == 0:
-          self.last_road_context = 'freeway'
-        elif result['roadContext'] == 1:
-          self.last_road_context = 'city'
-
-        # Highway type from wayRef.
-        # G = national expressway (120 km/h), S1-S99 = provincial expressway (100 km/h).
-        # S100+ are provincial general roads, not expressways.
-        road_id = result['roadName'] or way_ref
-        hw = ''
-        if way_ref.startswith('G'):
-          hw = 'motorway'
-        elif way_ref.startswith('S') and len(way_ref[1:]) <= 2 and way_ref[1:].isdigit():
-          hw = 'trunk'
-        hw_rank = {'motorway': 4, 'trunk': 3}
-        if road_id != self.last_road_id:
-          self.last_road_id = road_id
-          self.last_highway_type = hw
-        elif hw_rank.get(hw, -1) > hw_rank.get(self.last_highway_type, -1):
-          self.last_highway_type = hw
-      else:
-        self.last_way_ref = ''
-        self.last_road_name = ''
+      self._ingest_osm_result(result)
 
     # --- Read lane data from vision model ---
     if self.sm.updated['modelV2']:
@@ -604,7 +626,7 @@ class SpeedLimitMiddleware:
 
     inferred_speed = infer_speed_from_road_type(
       self.last_highway_type, self.lane_count_stable, road_ctx_for_infer,
-      width_class=self.lane_width_class,
+      width_class=self.lane_width_class, osm_type=self.last_osm_hwtype,
     )
 
     # Vision cap: when vision confidently sees ≤2 lanes, cap inferred speed.
@@ -691,6 +713,7 @@ class SpeedLimitMiddleware:
       'yoloSpeed': yolo_speed,
       'inferredSpeed': inferred_speed,
       'highwayType': self.last_highway_type,
+      'osmHwType': self.last_osm_hwtype,
       'wayRef': self.last_way_ref,
       'roadName': self.last_road_name,
       'laneCount': self.lane_count_stable,
