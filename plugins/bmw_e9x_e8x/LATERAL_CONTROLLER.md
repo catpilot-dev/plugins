@@ -84,13 +84,16 @@ This document is the canonical reference for the lateral controller registered b
 > correction) is untouched — torque still reduces the moment the error
 > flips sides.
 >
-> **Same date — filter window 6 → 12 ticks (2·cadence).** Offline replay of
-> W ∈ {6,10,12,16} over 334 s of route-393 straights (segs 17–22): the
-> current W=6 blend already cuts sign-flips 62% and band crossings 60% vs
-> raw; W=12 takes a further −31% / −26% at +0.01 s mean (+0.15 s max)
-> correction-onset lag; W=16 adds nothing. The residual error amplitude is
-> sub-Hz modelV2 wander — beyond any causal box filter (vision-only floor).
-> Window stays cadence-coupled (single-knob): 2×cadence = 600 ms at SAD=0.4.
+> **Same date — filter window 6 → 12 ticks. REVERTED 2026-07-07 after one
+> day on-car.** The offline replay (334 s of straights, sign-flip/crossing/
+> onset metrics) predicted a free −31% churn — but route 395 segs 16–20
+> felt "wobbling and lag" on straights, and the measured torque-response
+> lag vs raw error rose **0.44 s → 0.66 s**. Lesson recorded: those replay
+> metrics are blind to small-correction **phase lag** (low-frequency weave);
+> straight-line feel is the primary regime and the user's seat is the
+> authoritative sensor. Window is back to 1×cadence (300 ms box). The
+> hold-floor from the same period was verified working on-car (route 395
+> seg 7: tight-turn residual p2p 9.9°, best yet) and stays.
 
 ---
 
