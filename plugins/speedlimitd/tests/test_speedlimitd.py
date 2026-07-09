@@ -672,7 +672,7 @@ class TestPlannerHook:
   def test_ramp_glide_down_rate(self, hook):
     """Far from target, no gas: cap drops by exactly RAMP_DECEL_MS2 * dt."""
     new_cap, enforced = hook._ramp_cap(30.0, 10.0, 0.1, False, 28.0)
-    assert new_cap == pytest.approx(30.0 - 0.2 * 0.1)
+    assert new_cap == pytest.approx(30.0 - hook.RAMP_DECEL_MS2 * 0.1)
     assert enforced == pytest.approx(new_cap)
 
   def test_ramp_clamps_at_target(self, hook):
@@ -702,7 +702,7 @@ class TestPlannerHook:
   def test_ramp_release_resumes_from_current(self, hook):
     """After floating to 25, release resumes glide from 25 toward target."""
     new_cap, enforced = hook._ramp_cap(25.0, 16.0, 0.1, False, 24.0)
-    assert new_cap == pytest.approx(25.0 - 0.2 * 0.1)
+    assert new_cap == pytest.approx(25.0 - hook.RAMP_DECEL_MS2 * 0.1)
     assert enforced == pytest.approx(new_cap)
 
   def test_ramp_init_holds_current_speed(self, hook):
@@ -735,8 +735,8 @@ class TestPlannerHook:
     times = [100.0, 100.1]
     monkeypatch.setattr(hook.time, 'monotonic', lambda: times.pop(0))
     hook.on_v_cruise(100 / 3.6, 25.0, sm)          # init, holds 25
-    r2 = hook.on_v_cruise(100 / 3.6, 25.0, sm)     # 0.1s later: 25 - 0.2*0.1
-    assert r2 == pytest.approx(25.0 - 0.2 * 0.1, abs=0.01)
+    r2 = hook.on_v_cruise(100 / 3.6, 25.0, sm)     # 0.1s later: 25 - RAMP*0.1
+    assert r2 == pytest.approx(25.0 - hook.RAMP_DECEL_MS2 * 0.1, abs=0.01)
 
   def test_source2_safetycapped_uses_immediate_path(self, hook):
     """source==2 but safetyCapped=True: immediate cap, no ramp, no offset."""

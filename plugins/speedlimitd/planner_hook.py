@@ -13,7 +13,7 @@ LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
 # it momentarily with the gas pedal. See
 # docs/superpowers/specs/2026-07-09-speedlimitd-gentle-ramp-gas-override-design.md
 SOURCE_ROAD_TYPE_INFERENCE = 2  # _sl_data['source'] value for inferred limits
-RAMP_DECEL_MS2 = 0.2            # max deceleration the speed-limit cap may impose
+RAMP_DECEL_MS2 = 0.5            # max deceleration the speed-limit cap may impose
 DT_CLAMP_S = 0.2               # clamp per-cycle dt so a long gap can't jump the ramp
 
 _sl_sub = None
