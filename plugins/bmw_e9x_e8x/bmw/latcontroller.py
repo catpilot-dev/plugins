@@ -252,6 +252,11 @@ def on_lat_controller_init(result, lac, CP):
   STEP_MAX_V  = [15.0, 28.0]     # vEgo breakpoints (m/s)
   STEP_MAX_BP = [0.10, 0.05]     # per-decision torque step cap (frac)
 
+  # κ_meas magnitude below which its SIGN is yaw-rate noise (route 39b
+  # seg 18 observed ±0.0002 at 30 m/s). The ISO overshoot gate requires
+  # |κ_meas| above this floor — see the overshooting comment in update().
+  KMEAS_SIGN_FLOOR = 0.0005
+
   # Rack breakaway torque fraction (stiction floor). 2026-07-03: no longer
   # used to amplify sub-friction commands or emit reverse pulses (stiction
   # special-casing removed — the pulses were churn, not correction; the
@@ -487,7 +492,17 @@ def on_lat_controller_init(result, lac, CP):
       jerk_pred = v * v * (state['desired'] - state['measured']) / model_action_t
       state['a_y_meas'] = a_y_meas
       state['jerk_pred'] = jerk_pred
-      overshooting = (state['desired'] - state['measured']) * state['measured'] < 0
+      # 2026-07-09 (route 39b seg 18): overshoot requires |κ_meas| above the
+      # yaw-noise floor — near zero the SIGN of κ_meas is pure noise
+      # (±0.0002 observed), so the wrong-side test degenerated: a gentle
+      # highway-left build was repeatedly cancel_jerk'd at κ_meas = +0.0002
+      # ("wrong side" by noise) while the car was under-turning. The error
+      # then grew until a late, big correction swung the wheel back and
+      # forth at 108 km/h. Below the floor the guard stays silent — the
+      # step-capped push (≤ 0.7 m/s³ actual jerk at highway) is already
+      # gentler than the guard's own threshold.
+      overshooting = ((state['desired'] - state['measured']) * state['measured'] < 0
+                      and abs(state['measured']) > KMEAS_SIGN_FLOOR)
       cancel_reason = None
       BMW_LATERAL_ACCEL = float(np.interp(abs(state['desired']),
                                           LATERAL_CURVATURE, LATERAL_ACCEL_BP))

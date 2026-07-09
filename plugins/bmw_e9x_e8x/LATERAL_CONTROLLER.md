@@ -101,10 +101,18 @@ This document is the canonical reference for the lateral controller registered b
 > — highway slew halves to ~2 Nm/s, curves (< 54 km/h) keep full entry
 > authority. DRIFT_M deliberately NOT tightened at speed (already 1/v²-tight,
 > ~10× below the noise floor at 100 km/h — tightening adds chase pressure).
-> The seg-18 burst itself is still undiagnosed (C3 offline when analyzed);
-> candidate: hold-gate flicker at κ_des ≈ HOLD_KAPPA_BP[0] with vision noise
-> ± 0.003 comparable to signal — check the burst tick-dump before any
-> hold-gate change.
+> **Same date — burst root-caused and fixed (seg-18 tick dump).** Not hold
+> flicker (hold_f = 0 throughout) and not step aggression: the ISO overshoot
+> gate `(κ_des−κ_meas)·κ_meas < 0` degenerates near κ_meas ≈ 0, where the
+> SIGN of κ_meas is yaw noise (±0.0002 observed). A gentle highway-left
+> build was repeatedly cancel_jerk'd at κ_meas = +0.0002 (wrong-side by
+> noise, jerk threshold 1.5 m/s³ ≡ κ_err 0.0011 at v²=900) while the car
+> under-turned; the error grew to 0.005 until a late −0.35 correction swung
+> back and forth — a guard-induced limit cycle (block gentle early action →
+> force late big action). Fix: `overshooting` additionally requires
+> `|κ_meas| > KMEAS_SIGN_FLOOR = 0.0005`. Note jerk_pred also over-predicts
+> since STEP_MAX: commanded pushes can only produce ~0.7 m/s³ at highway —
+> revisit the guard's role if it misfires again.
 
 ---
 
