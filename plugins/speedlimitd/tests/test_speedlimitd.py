@@ -641,6 +641,127 @@ class TestPlannerHook:
     # No offset (safety_capped=True), and lead override is ignored
     assert result == pytest.approx(40 / 3.6, abs=0.1)
 
+  # ----------------------------------------------------------
+  # Gentle ramp + momentary gas override (source==2 inferred)
+  # ----------------------------------------------------------
+
+  def _make_sm_full(self, gas=False, lead_status=False, lead_vLead=0.0):
+    """SubMaster mock exposing carState.gasPressed and radarState.leadOne."""
+    cs = MagicMock()
+    cs.gasPressed = gas
+    lead = MagicMock()
+    lead.status = lead_status
+    lead.vLead = lead_vLead
+    radar = MagicMock()
+    radar.leadOne = lead
+
+    sm = MagicMock()
+
+    def getitem(key):
+      if key == 'carState':
+        return cs
+      if key == 'radarState':
+        return radar
+      return MagicMock()
+
+    sm.__getitem__ = MagicMock(side_effect=getitem)
+    return sm
+
+  # --- pure ramp helper ---
+
+  def test_ramp_glide_down_rate(self, hook):
+    """Far from target, no gas: cap drops by exactly RAMP_DECEL_MS2 * dt."""
+    new_cap, enforced = hook._ramp_cap(30.0, 10.0, 0.1, False, 28.0)
+    assert new_cap == pytest.approx(30.0 - 0.2 * 0.1)
+    assert enforced == pytest.approx(new_cap)
+
+  def test_ramp_clamps_at_target(self, hook):
+    """Within one step of target: snap to target, never below."""
+    new_cap, enforced = hook._ramp_cap(10.01, 10.0, 1.0, False, 9.0)
+    assert new_cap == pytest.approx(10.0)
+    assert enforced == pytest.approx(10.0)
+
+  def test_ramp_restores_up_immediately(self, hook):
+    """Target above cap (limit rose): restore in one step."""
+    new_cap, enforced = hook._ramp_cap(16.0, 30.0, 0.1, False, 16.0)
+    assert new_cap == pytest.approx(30.0)
+    assert enforced == pytest.approx(30.0)
+
+  def test_ramp_gas_suspends_and_floats(self, hook):
+    """Gas pressed: cap suspended (enforced None) and floats up to v_ego."""
+    new_cap, enforced = hook._ramp_cap(20.0, 16.0, 0.1, True, 25.0)
+    assert enforced is None
+    assert new_cap == pytest.approx(25.0)
+
+  def test_ramp_gas_does_not_lower_cap(self, hook):
+    """Gas pressed with v_ego below cap: cap held, not lowered."""
+    new_cap, enforced = hook._ramp_cap(20.0, 16.0, 0.1, True, 12.0)
+    assert enforced is None
+    assert new_cap == pytest.approx(20.0)
+
+  def test_ramp_release_resumes_from_current(self, hook):
+    """After floating to 25, release resumes glide from 25 toward target."""
+    new_cap, enforced = hook._ramp_cap(25.0, 16.0, 0.1, False, 24.0)
+    assert new_cap == pytest.approx(25.0 - 0.2 * 0.1)
+    assert enforced == pytest.approx(new_cap)
+
+  def test_ramp_init_holds_current_speed(self, hook):
+    """Uninitialized cap with v_ego above target: init to v_ego, don't jump down."""
+    new_cap, enforced = hook._ramp_cap(None, 16.0, 0.0, False, 25.0)
+    assert new_cap == pytest.approx(25.0)
+    assert enforced == pytest.approx(25.0)
+
+  # --- integration through on_v_cruise ---
+
+  def test_source2_first_call_holds_current_speed(self, hook):
+    """Inferred limit (source 2): first cycle holds current speed, not the offset cap."""
+    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
+    sm = self._make_sm_full(gas=False)
+    result = hook.on_v_cruise(100 / 3.6, 25.0, sm)
+    # Holds ~v_ego (25), not the immediate offset cap (60*1.15/3.6 = 19.17)
+    assert result == pytest.approx(25.0, abs=0.1)
+
+  def test_source2_gas_suspends_cap(self, hook):
+    """Inferred limit + gas pressed: cap fully suspended, v_cruise unchanged."""
+    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
+    sm = self._make_sm_full(gas=True)
+    result = hook.on_v_cruise(100 / 3.6, 25.0, sm)
+    assert result == pytest.approx(100 / 3.6)
+
+  def test_source2_glides_down_over_time(self, hook, monkeypatch):
+    """Inferred limit: cap glides down at ~0.2 m/s^2 across cycles."""
+    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
+    sm = self._make_sm_full(gas=False)
+    times = [100.0, 100.1]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: times.pop(0))
+    hook.on_v_cruise(100 / 3.6, 25.0, sm)          # init, holds 25
+    r2 = hook.on_v_cruise(100 / 3.6, 25.0, sm)     # 0.1s later: 25 - 0.2*0.1
+    assert r2 == pytest.approx(25.0 - 0.2 * 0.1, abs=0.01)
+
+  def test_source2_safetycapped_uses_immediate_path(self, hook):
+    """source==2 but safetyCapped=True: immediate cap, no ramp, no offset."""
+    hook._sl_data = {'confirmed': True, 'speedLimit': 40, 'source': 2, 'safetyCapped': True}
+    sm = self._make_sm_full(gas=True)  # gas must NOT override a safety cap
+    result = hook.on_v_cruise(100 / 3.6, 20.0, sm)
+    assert result == pytest.approx(40 / 3.6, abs=0.1)
+
+  def test_source1_yolo_uses_immediate_path(self, hook):
+    """source==1 (YOLO): immediate offset cap, unaffected by ramp/gas."""
+    hook._sl_data = {'confirmed': True, 'speedLimit': 80, 'source': 1, 'safetyCapped': False}
+    sm = self._make_sm_full(gas=False)
+    result = hook.on_v_cruise(100 / 3.6, 20.0, sm)
+    assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
+
+  def test_source2_reset_when_gate_false(self, hook):
+    """Leaving the inferred regime clears ramp state so it re-inits next time."""
+    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
+    sm = self._make_sm_full(gas=False)
+    hook.on_v_cruise(100 / 3.6, 25.0, sm)
+    hook._sl_data = {'confirmed': False, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
+    result = hook.on_v_cruise(100 / 3.6, 25.0, sm)
+    assert result == pytest.approx(100 / 3.6)  # unconfirmed → pass through
+    assert hook._eff_cap_ms is None            # state cleared
+
 
 # ============================================================
 # plugin.json validation
