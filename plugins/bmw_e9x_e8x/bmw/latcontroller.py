@@ -232,14 +232,25 @@ def on_lat_controller_init(result, lac, CP):
 
   # Per-decision torque step cap (2026-07-03, route 385 seg 27 review).
   # Human-style gradual steering: each cadence decision moves the target at
-  # most STEP_MAX from the current torque, the plant responds (~2.5τ per
+  # most step_max from the current torque, the plant responds (~2.5τ per
   # cadence), the next decision re-measures and steps again. Design rule:
   # never apply excessive steering torque abruptly. 0.10 frac = 1.2 Nm per
   # 300 ms ≈ 4 Nm/s max slew (panda wire limit is 10 Nm/s). Full authority
   # builds in ~1.5 s instead of 0.3 s — accepted: speedlimitd slows for
   # curves and the ISO guards still cancel overshoot instantly. First knob
   # to revisit if curve entries ever feel late.
-  STEP_MAX = 0.10
+  #
+  # 2026-07-09 (route 39b seg 18, user safety call): SPEED-SCALED. A slight
+  # highway left showed sudden back-and-forth wheel motion; aggressive
+  # per-decision steps are riskier at highway speed (lane margin consumed
+  # faster, less time to react). Full 0.10 up to 15 m/s (curves keep their
+  # entry authority; speedlimitd owns curve-entry speed), tapering to 0.05
+  # at/above 28 m/s (100 km/h) — highway slew halves to ~2 Nm/s. Deadzone
+  # (DRIFT_M) deliberately NOT tightened at speed: it is already 1/v²-tight
+  # (~0.02° at 28 m/s, ~10× below the vision-noise floor) and tightening
+  # would add chase pressure, not calm.
+  STEP_MAX_V  = [15.0, 28.0]     # vEgo breakpoints (m/s)
+  STEP_MAX_BP = [0.10, 0.05]     # per-decision torque step cap (frac)
 
   # Rack breakaway torque fraction (stiction floor). 2026-07-03: no longer
   # used to amplify sub-friction commands or emit reverse pulses (stiction
@@ -595,7 +606,8 @@ def on_lat_controller_init(result, lac, CP):
           # over-latch → cancel_accel dump → deep-unwind cycle. Max slew
           # is now ~0.33 frac/s (~4 Nm/s); ISO guards still cancel
           # overshoot instantly, speedlimitd handles curve-entry speed.
-          step = float(np.clip(target_frac - state['torque'], -STEP_MAX, STEP_MAX))
+          step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
+          step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
           target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
 
         state['target_frac'] = target_frac

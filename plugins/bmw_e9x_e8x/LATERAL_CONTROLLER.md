@@ -94,6 +94,17 @@ This document is the canonical reference for the lateral controller registered b
 > authoritative sensor. Window is back to 1×cadence (300 ms box). The
 > hold-floor from the same period was verified working on-car (route 395
 > seg 7: tight-turn residual p2p 9.9°, best yet) and stays.
+>
+> **2026-07-09 — STEP_MAX speed-scaled (route 39b seg 18, safety call).**
+> Sudden back-and-forth wheel motion in a slight highway left; aggressive
+> steps are riskier at speed. `step_max = interp(v, [15, 28], [0.10, 0.05])`
+> — highway slew halves to ~2 Nm/s, curves (< 54 km/h) keep full entry
+> authority. DRIFT_M deliberately NOT tightened at speed (already 1/v²-tight,
+> ~10× below the noise floor at 100 km/h — tightening adds chase pressure).
+> The seg-18 burst itself is still undiagnosed (C3 offline when analyzed);
+> candidate: hold-gate flicker at κ_des ≈ HOLD_KAPPA_BP[0] with vision noise
+> ± 0.003 comparable to signal — check the burst tick-dump before any
+> hold-gate change.
 
 ---
 
