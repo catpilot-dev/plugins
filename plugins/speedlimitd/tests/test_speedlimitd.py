@@ -791,6 +791,44 @@ class TestPlannerHook:
     assert hook._baseline_ms is None
     assert hook._gas_floor_ms is None
 
+  # gas-hold expiry: timeout + cancel-on-limit-change -------
+
+  def test_gas_hold_times_out(self, hook, monkeypatch):
+    """Gas hold expires after GAS_HOLD_TIMEOUT_S and follows the limit again."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 40, source=4, safety=True, road='A')
+    hook.on_v_cruise(120 / 3.6, 40 / 3.6, self._sm())
+    hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm(gas=True))  # gas floor at 60
+    clk.tick(hook.GAS_HOLD_TIMEOUT_S + 1.0)                    # past the timeout
+    r = hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm())      # driver still cruising 60
+    assert hook._gas_floor_ms is None                         # hold expired
+    assert r == pytest.approx(40 / 3.6, abs=0.1)              # follows the limit
+
+  def test_gas_hold_cancelled_on_limit_change(self, hook, monkeypatch):
+    """A speed-limit VALUE change (e.g. a curve cap engaging) cancels the gas
+    hold immediately so the car slows for the turn — the route 3a1 fix."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 80, source=2, road='A')
+    hook.on_v_cruise(120 / 3.6, 80 / 3.6, self._sm())
+    hook.on_v_cruise(120 / 3.6, 90 / 3.6, self._sm(gas=True))  # gas floor, limit=80
+    clk.tick(0.2)
+    # left-turn curve cap engages: limit value changes to 40 (safety)
+    self._sl(hook, 40, source=4, safety=True, road='A')
+    r = hook.on_v_cruise(120 / 3.6, 90 / 3.6, self._sm())      # no gas
+    assert hook._gas_floor_ms is None                         # cancelled by the change
+    assert r == pytest.approx(40 / 3.6, abs=0.1)              # slows for the curve now
+
+  def test_gas_hold_persists_when_limit_steady(self, hook, monkeypatch):
+    """Steady limit within the timeout window → hold is retained."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 40, source=4, safety=True, road='A')
+    hook.on_v_cruise(120 / 3.6, 40 / 3.6, self._sm())
+    hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm(gas=True))
+    clk.tick(2.0)                                              # well within timeout
+    r = hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm())
+    assert hook._gas_floor_ms is not None                     # still holding
+    assert r >= 60 / 3.6 - 0.2
+
 
 # ============================================================
 # plugin.json validation
