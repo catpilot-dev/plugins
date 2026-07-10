@@ -540,8 +540,6 @@ class TestPlannerHook:
     mod._baseline_ms = None
     mod._gas_floor_ms = None
     mod._road_id = ''
-    mod._eff_cap_ms = None
-    mod._last_t = None
     return mod
 
   # helpers -------------------------------------------------
@@ -573,12 +571,11 @@ class TestPlannerHook:
                      'roadName': road, 'wayRef': ''}
 
   def _clock(self, monkeypatch, hook, t0=1000.0):
-    state = {'t': t0}
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: state['t'])
-
+    # planner_hook no longer uses a clock (enforcement is immediate — DCC shapes
+    # the decel, no ramp). Kept as a no-op so existing tests still read cleanly.
     class _C:
       def tick(self, dt):
-        state['t'] += dt
+        pass
     return _C()
 
   # basic enforcement (non-inferred, no gas) ----------------
@@ -639,35 +636,6 @@ class TestPlannerHook:
     self._sl(hook, 40, source=4, safety=True)
     assert hook.on_v_cruise(100 / 3.6, 25.0, self._sm(gas=True)) == pytest.approx(100 / 3.6)
 
-  # pure ramp helper ----------------------------------------
-
-  def test_ramp_glide_down_rate(self, hook):
-    """From current speed, cap drops by exactly RAMP_DECEL_MS2 * dt."""
-    new_cap, enforced = hook._ramp_cap(28.0, 10.0, 0.1, 28.0)
-    assert new_cap == pytest.approx(28.0 - hook.RAMP_DECEL_MS2 * 0.1)
-    assert enforced == pytest.approx(new_cap)
-
-  def test_ramp_clamps_at_target(self, hook):
-    new_cap, enforced = hook._ramp_cap(10.01, 10.0, 1.0, 10.01)
-    assert new_cap == pytest.approx(10.0)
-    assert enforced == pytest.approx(10.0)
-
-  def test_ramp_restores_up_immediately(self, hook):
-    new_cap, enforced = hook._ramp_cap(16.0, 30.0, 0.1, 16.0)
-    assert new_cap == pytest.approx(30.0)
-    assert enforced == pytest.approx(30.0)
-
-  def test_ramp_init_holds_current_speed(self, hook):
-    new_cap, enforced = hook._ramp_cap(None, 16.0, 0.0, 25.0)
-    assert new_cap == pytest.approx(25.0)
-    assert enforced == pytest.approx(25.0)
-
-  def test_ramp_never_exceeds_current_speed(self, hook):
-    """A stale high cap is clamped to v_ego so a drop never permits acceleration."""
-    new_cap, enforced = hook._ramp_cap(40.0, 10.0, 0.1, 20.0)
-    assert new_cap == pytest.approx(20.0)
-    assert enforced == pytest.approx(20.0)
-
   # hold-floor behavior -------------------------------------
 
   def test_inferred_spurious_drop_holds_speed(self, hook, monkeypatch):
@@ -684,19 +652,15 @@ class TestPlannerHook:
     assert r >= 100 / 3.6 - 0.2       # held at current speed
     assert r > 75 / 3.6               # definitely NOT braked toward 60
 
-  def test_inferred_real_drop_new_road_slows(self, hook, monkeypatch):
-    """road_id change → baseline resets → a genuinely lower limit slows the car."""
-    clk = self._clock(monkeypatch, hook)
+  def test_inferred_real_drop_new_road_slows(self, hook):
+    """road_id change → baseline resets → new lower limit enforced immediately
+    (DCC shapes the deceleration, no artificial ramp)."""
     self._sl(hook, 100, source=2, road='A')
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
-    clk.tick(0.1)
     self._sl(hook, 40, source=2, road='B')  # new road, real lower limit
-    r = None
-    for _ in range(10):
-      r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
-      clk.tick(0.2)
+    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     assert hook._baseline_ms == pytest.approx(40 * 1.15 / 3.6, abs=0.1)  # baseline reset
-    assert r < 100 / 3.6 - 0.3        # slowing toward the new limit
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # cap enforced immediately
 
   def test_inferred_recovery_allows_accel(self, hook, monkeypatch):
     """Inferred limit rises again → cap restores up, acceleration allowed."""
@@ -788,26 +752,20 @@ class TestPlannerHook:
     self._sl(hook, 60, source=2, confirmed=False, road='A')
     r = hook.on_v_cruise(120 / 3.6, 25.0, self._sm())
     assert r == pytest.approx(120 / 3.6)
-    assert hook._eff_cap_ms is None
     assert hook._baseline_ms is None
     assert hook._gas_floor_ms is None
 
   # baseline floor requires a road identity ------------------
 
-  def test_empty_road_id_disables_baseline_hold(self, hook, monkeypatch):
+  def test_empty_road_id_disables_baseline_hold(self, hook):
     """No OSM identity (road_id='') → baseline hold invalid → the inferred/vision
-    cap controls and the car slows (route 3a1 unnamed motorway_link ramp)."""
-    clk = self._clock(monkeypatch, hook)
+    cap is enforced immediately (route 3a1 unnamed motorway_link ramp)."""
     self._sl(hook, 100, source=2, road='')          # unnamed way
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
-    clk.tick(0.2)
     self._sl(hook, 40, source=2, road='')           # vision cap → 40, still unnamed
-    r = None
-    for _ in range(20):
-      r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
-      clk.tick(0.2)
+    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     assert hook._baseline_ms is None                # baseline not built without identity
-    assert r < 100 / 3.6 - 1.0                      # slowing toward 40, not held at 100
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # enforced immediately, not held
 
   def test_named_road_id_keeps_baseline_hold(self, hook, monkeypatch):
     """With a road identity, spurious same-road drops are still held (unchanged)."""

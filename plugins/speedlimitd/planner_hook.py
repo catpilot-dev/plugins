@@ -1,5 +1,3 @@
-import time
-
 from openpilot.common.constants import CV
 
 # Lead vehicle override: if lead is traveling above the speed limit,
@@ -13,11 +11,10 @@ LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
 # Inferred (road-type, source==2) limits jitter downward when lane lines get
 # faint; a "hold floor" (always <= v_ego) rejects those spurious drops, and the
 # gas pedal suspends enforcement entirely and holds the driver's speed on
-# release. See
+# release. The cap is enforced directly — DCC comfort-limits the deceleration
+# (no artificial ramp). See
 # docs/superpowers/specs/2026-07-10-speedlimitd-driver-intent-enforcement-design.md
 SOURCE_ROAD_TYPE_INFERENCE = 2  # _sl_data['source'] value for inferred limits
-RAMP_DECEL_MS2 = 0.5            # max deceleration the speed-limit cap may impose
-DT_CLAMP_S = 0.2               # clamp per-cycle dt so a long gap can't jump the ramp
 
 _sl_sub = None
 _sl_data = None
@@ -26,8 +23,6 @@ _sl_data = None
 _baseline_ms = None   # inferred running-max target on the current road (floor)
 _gas_floor_ms = None  # driver-override hold floor (all sources), set post gas
 _road_id = ''         # last non-empty OSM road identity
-_eff_cap_ms = None    # ramp state (inferred path)
-_last_t = None
 
 
 def _get_sl_data():
@@ -88,41 +83,15 @@ def _gas_pressed(sm) -> bool:
     return False
 
 
-def _reset_ramp():
-  global _eff_cap_ms, _last_t
-  _eff_cap_ms = None
-  _last_t = None
-
-
 def _reset_all():
-  """Clear ramp + floors (road identity is kept across brief invalid limits)."""
+  """Clear the floors (road identity is kept across brief invalid limits)."""
   global _baseline_ms, _gas_floor_ms
-  _reset_ramp()
   _baseline_ms = None
   _gas_floor_ms = None
 
 
-def _ramp_cap(eff_cap_ms, target_ms, dt, v_ego):
-  """Advance the enforced cap one cycle toward target_ms.
-
-  Downward movement is deceleration-limited to RAMP_DECEL_MS2; upward is
-  immediate. The result is clamped to max(target_ms, v_ego) so a stale-high cap
-  can never permit acceleration on a drop or hold. Returns (new_eff, enforced).
-  """
-  if eff_cap_ms is None:
-    eff_cap_ms = max(target_ms, v_ego)
-
-  if target_ms < eff_cap_ms:
-    eff_cap_ms = max(target_ms, eff_cap_ms - RAMP_DECEL_MS2 * dt)
-  else:
-    eff_cap_ms = target_ms
-
-  eff_cap_ms = min(eff_cap_ms, max(target_ms, v_ego))
-  return eff_cap_ms, eff_cap_ms
-
-
 def on_v_cruise(v_cruise, v_ego, sm):
-  global _baseline_ms, _gas_floor_ms, _road_id, _eff_cap_ms, _last_t
+  global _baseline_ms, _gas_floor_ms, _road_id
   _get_sl_data()  # update from plugin bus
   if _sl_data is None:
     _reset_all()
@@ -142,19 +111,17 @@ def on_v_cruise(v_cruise, v_ego, sm):
   offset_pct = 0 if safety_capped else _effective_offset_percent(speed_limit)
   target_ms = speed_limit * (1 + offset_pct / 100.0) * CV.KPH_TO_MS
 
-  # New (non-empty) road: drop carried floors and re-anchor. A transient empty
-  # road_id (OSM tile gap on the same road) is NOT a change.
+  # New (non-empty) road: drop carried floors. A transient empty road_id (OSM
+  # tile gap on the same road) is NOT a change.
   if road_id != '' and road_id != _road_id:
     _road_id = road_id
     _baseline_ms = None
     _gas_floor_ms = None
-    _reset_ramp()
 
   # Gas pedal: universal suspend (all sources, incl. safety caps). Raise the
   # hold floor to current speed so enforcement resumes from here on release.
   if _gas_pressed(sm):
     _gas_floor_ms = v_ego
-    _reset_ramp()
     return v_cruise
 
   # Ratchet the gas floor down with the driver; clear once eased to the limit.
@@ -178,20 +145,15 @@ def on_v_cruise(v_cruise, v_ego, sm):
   effective_floor = max(floors) if floors else None
   floored_target = target_ms if effective_floor is None else max(target_ms, effective_floor)
 
-  if inferred:
-    now = time.monotonic()
-    dt = 0.0 if _last_t is None else min(max(now - _last_t, 0.0), DT_CLAMP_S)
-    _last_t = now
-    _eff_cap_ms, enforced = _ramp_cap(_eff_cap_ms, floored_target, dt, v_ego)
-    return min(v_cruise, enforced)
-
-  # Non-inferred (YOLO, curvature, OSM-confirmed): immediate enforcement.
-  _reset_ramp()
-  # Fast lead suggests the limit is wrong — skip. Never for safety caps (a fast
-  # lead doesn't make a curve less tight), nor when a gas hold is active.
-  if not safety_capped and _gas_floor_ms is None and _lead_overrides_limit(sm, speed_limit):
+  # Fast lead suggests a non-safety confirmed limit is wrong — skip. Not for
+  # inferred limits (the baseline floor handles those), safety caps (a fast lead
+  # doesn't make a curve less tight — route 2fd), or when a gas hold is active.
+  if not inferred and not safety_capped and _gas_floor_ms is None \
+      and _lead_overrides_limit(sm, speed_limit):
     return v_cruise
 
+  # Enforce the cap directly; DCC comfort-limits the deceleration. floored_target
+  # is <= v_ego whenever the limit dropped, so the cap never commands accel.
   if floored_target < v_cruise:
     return floored_target
   return v_cruise

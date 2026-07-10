@@ -74,17 +74,17 @@ active):
 
 ## Per-source behavior
 
-| Source | Baseline floor | Gas floor | Ramp (0.5 m/s²) | No-gas default |
-|---|---|---|---|---|
-| Inferred `2` (not safety) | yes (always) | yes | yes | hold vs spurious drop; slow only on road_id change |
-| Curvature/safety `4` (`safetyCapped`) | no | yes | **no** (immediate) | brake to cap promptly |
-| YOLO `1`, OSM confirmed | no | yes | no (immediate) | brake to cap |
+| Source | Baseline floor | Gas floor | No-gas default |
+|---|---|---|---|
+| Inferred `2` (not safety) | yes (needs road_id) | yes | hold vs spurious drop; slow to cap when road_id changes or is empty |
+| Curvature/safety `4` (`safetyCapped`) | no | yes | brake to cap |
+| YOLO `1`, OSM confirmed | no | yes | brake to cap |
 
-- **Safety caps keep prompt (immediate) braking** when the driver is not on the
-  gas — the 0.5 m/s² ramp is *not* applied to them, so a tight curve is not
-  approached too slowly. The ramp smooths only the inferred path.
-- The automatic **lead-vehicle override** stays non-safety-only and applies only
-  when no gas floor is active (unchanged from today; route-2fd protection).
+- **All enforcement is immediate** — the cap is enforced directly and DCC
+  comfort-limits the deceleration. No artificial ramp.
+- The automatic **lead-vehicle override** stays non-safety-only, applies only
+  when no gas floor is active, and only to non-inferred sources (route-2fd; the
+  baseline floor handles inferred).
 
 ## Never-speed-up guarantee
 
@@ -134,20 +134,22 @@ floors = [f for f in (baseline_floor, gas_floor) if f is not None]
 effective_floor = max(floors) if floors else None
 floored_target  = target if effective_floor is None else max(target, effective_floor)
 
-if inferred:                   # gentle ramp only on the inferred path
-    dt = clamp(now - _last_t, 0..DT_CLAMP_S); _last_t = now
-    eff_cap, enforced = _ramp_cap(eff_cap, floored_target, dt, v_ego)
-    return min(v_cruise, enforced)
-else:                          # immediate enforcement (prompt for safety caps)
-    reset ramp
-    if not safety_capped and gas_floor is None and _lead_overrides_limit(sm, speed_limit):
-        return v_cruise
-    return min(v_cruise, floored_target)
+# Fast lead ⇒ a non-safety confirmed limit is likely wrong — skip. Not for
+# inferred (baseline floor handles those), safety caps (route 2fd), or gas hold.
+if not inferred and not safety_capped and gas_floor is None \
+    and _lead_overrides_limit(sm, speed_limit):
+    return v_cruise
+
+# Enforce the cap directly. DCC comfort-limits the deceleration (≤1 m/s² on the
+# BMW) — no artificial ramp. floored_target <= v_ego whenever the limit dropped,
+# so the cap never commands acceleration.
+return floored_target if floored_target < v_cruise else v_cruise
 ```
 
-`_ramp_cap(eff_cap, target, dt, v_ego)` (gas branch removed vs the prior spec):
-init `eff_cap = max(target, v_ego)`; glide down at ≤ `RAMP_DECEL_MS2` (0.5),
-restore up immediately; returns `(new_eff_cap, enforced)`.
+**No ramp:** an earlier revision glided the inferred cap down at 0.5 m/s²
+(`_ramp_cap`). Removed — spurious drops are now *held* (not braked), so the ramp
+only smoothed real slowdowns, which DCC already comfort-limits. Enforcement is
+immediate; DCC shapes the deceleration.
 
 ## Walk-through
 
