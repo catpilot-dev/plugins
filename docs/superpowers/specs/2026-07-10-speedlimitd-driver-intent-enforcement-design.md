@@ -66,15 +66,8 @@ active):
 - While `gasPressed`: cap fully suspended (return `v_cruise`); `gas_floor = v_ego`.
 - After release: `gas_floor` persists and **ratchets down** with the driver:
   `gas_floor = min(gas_floor, v_ego)`.
-- Cleared (normal enforcement resumes) when any of: `gas_floor ≤ limit_target`
-  (driver has eased back to the limit); `road_id` changes; **more than
-  `GAS_HOLD_TIMEOUT_S = 15 s` since the last gas press** (timeout backstop); or
-  **the published `speedLimit` value changes** from the value captured at the gas
-  press (e.g. a curve cap engaging for a turn) — the driver's earlier intent
-  must not suppress a *new* limit. The last two were added after route 3a1
-  (segs 17-20) slowed too late for left turns: a held gas floor kept suppressing
-  the curve cap. State: `_gas_t` (press time), `_gas_limit_kph` (press-time
-  value).
+- Cleared (normal enforcement resumes) when `gas_floor ≤ limit_target` (driver
+  has eased back to the limit) or `road_id` changes.
 - Effect: after the driver accelerates over any limit — inferred **or a
   curve/safety cap** — their speed is held on release and followed down as they
   ease off, instead of braking back.

@@ -18,18 +18,15 @@ LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
 SOURCE_ROAD_TYPE_INFERENCE = 2  # _sl_data['source'] value for inferred limits
 RAMP_DECEL_MS2 = 0.5            # max deceleration the speed-limit cap may impose
 DT_CLAMP_S = 0.2               # clamp per-cycle dt so a long gap can't jump the ramp
-GAS_HOLD_TIMEOUT_S = 15.0      # gas-override hold expires after this, then follow the limit
 
 _sl_sub = None
 _sl_data = None
 
 # Enforcement state.
-_baseline_ms = None    # inferred running-max target on the current road (floor)
-_gas_floor_ms = None   # driver-override hold floor (all sources), set post gas
-_gas_t = 0.0           # monotonic time of the last gas press (hold timeout)
-_gas_limit_kph = 0.0   # speedLimit value captured at gas press (cancel on change)
-_road_id = ''          # last non-empty OSM road identity
-_eff_cap_ms = None     # ramp state (inferred path)
+_baseline_ms = None   # inferred running-max target on the current road (floor)
+_gas_floor_ms = None  # driver-override hold floor (all sources), set post gas
+_road_id = ''         # last non-empty OSM road identity
+_eff_cap_ms = None    # ramp state (inferred path)
 _last_t = None
 
 
@@ -125,8 +122,7 @@ def _ramp_cap(eff_cap_ms, target_ms, dt, v_ego):
 
 
 def on_v_cruise(v_cruise, v_ego, sm):
-  global _baseline_ms, _gas_floor_ms, _gas_t, _gas_limit_kph
-  global _road_id, _eff_cap_ms, _last_t
+  global _baseline_ms, _gas_floor_ms, _road_id, _eff_cap_ms, _last_t
   _get_sl_data()  # update from plugin bus
   if _sl_data is None:
     _reset_all()
@@ -145,7 +141,6 @@ def on_v_cruise(v_cruise, v_ego, sm):
 
   offset_pct = 0 if safety_capped else _effective_offset_percent(speed_limit)
   target_ms = speed_limit * (1 + offset_pct / 100.0) * CV.KPH_TO_MS
-  now = time.monotonic()
 
   # New (non-empty) road: drop carried floors and re-anchor. A transient empty
   # road_id (OSM tile gap on the same road) is NOT a change.
@@ -156,26 +151,17 @@ def on_v_cruise(v_cruise, v_ego, sm):
     _reset_ramp()
 
   # Gas pedal: universal suspend (all sources, incl. safety caps). Raise the
-  # hold floor to current speed so enforcement resumes from here on release,
-  # and record the time + limit value so the hold can expire.
+  # hold floor to current speed so enforcement resumes from here on release.
   if _gas_pressed(sm):
     _gas_floor_ms = v_ego
-    _gas_t = now
-    _gas_limit_kph = speed_limit
     _reset_ramp()
     return v_cruise
 
-  # Gas hold lifecycle: expire after GAS_HOLD_TIMEOUT_S, or cancel immediately if
-  # the speed-limit value changes (e.g. a curve cap engaging for a turn) so the
-  # driver's earlier intent no longer suppresses a new limit. Otherwise ratchet
-  # down with the driver and clear once eased back to the limit.
+  # Ratchet the gas floor down with the driver; clear once eased to the limit.
   if _gas_floor_ms is not None:
-    if now - _gas_t > GAS_HOLD_TIMEOUT_S or speed_limit != _gas_limit_kph:
+    _gas_floor_ms = min(_gas_floor_ms, v_ego)
+    if _gas_floor_ms <= target_ms:
       _gas_floor_ms = None
-    else:
-      _gas_floor_ms = min(_gas_floor_ms, v_ego)
-      if _gas_floor_ms <= target_ms:
-        _gas_floor_ms = None
 
   # Baseline (road-continuity) floor — inferred limits only, and only when we
   # actually have an OSM road identity. Without one (unnamed ramp/link, e.g. an
@@ -193,6 +179,7 @@ def on_v_cruise(v_cruise, v_ego, sm):
   floored_target = target_ms if effective_floor is None else max(target_ms, effective_floor)
 
   if inferred:
+    now = time.monotonic()
     dt = 0.0 if _last_t is None else min(max(now - _last_t, 0.0), DT_CLAMP_S)
     _last_t = now
     _eff_cap_ms, enforced = _ramp_cap(_eff_cap_ms, floored_target, dt, v_ego)
