@@ -537,115 +537,16 @@ class TestPlannerHook:
     importlib.reload(mod)
     mod._sl_sub = None
     mod._sl_data = None
+    mod._baseline_ms = None
+    mod._gas_floor_ms = None
+    mod._road_id = ''
+    mod._eff_cap_ms = None
+    mod._last_t = None
     return mod
 
-  def _set_sl_data(self, hook, data):
-    """Set the speed limit state dict directly on the module."""
-    hook._sl_data = data
+  # helpers -------------------------------------------------
 
-  def test_no_speed_limit_state(self, hook):
-    sm = MagicMock()
-    hook._sl_data = None
-    result = hook.on_v_cruise(30.0, 20.0, sm)
-    assert result == 30.0
-
-  def test_unconfirmed_returns_original(self, hook):
-    sm = MagicMock()
-    hook._sl_data = {'confirmed': False, 'speedLimit': 60}
-    result = hook.on_v_cruise(30.0, 20.0, sm)
-    assert result == 30.0
-
-  def test_confirmed_limits_v_cruise_highway(self, hook):
-    """Limit >= 80 kph uses 10% offset."""
-    sm = MagicMock()
-    hook._sl_data = {'confirmed': True, 'speedLimit': 80, 'safetyCapped': False}
-
-    result = hook.on_v_cruise(100.0, 20.0, sm)
-    assert result < 100.0
-    assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
-
-  def test_confirmed_limits_v_cruise_low_speed(self, hook):
-    """Limit < 80 kph uses 15% offset."""
-    sm = MagicMock()
-    hook._sl_data = {'confirmed': True, 'speedLimit': 40, 'safetyCapped': False}
-
-    result = hook.on_v_cruise(100.0, 20.0, sm)
-    assert result == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
-
-  def test_confirmed_limits_v_cruise_mid_speed(self, hook):
-    """Limit 60 kph (< 80) uses 15% offset."""
-    sm = MagicMock()
-    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'safetyCapped': False}
-
-    result = hook.on_v_cruise(100.0, 20.0, sm)
-    assert result == pytest.approx(60 * 1.15 / 3.6, abs=0.1)
-
-  def test_confirmed_no_limit_if_already_below(self, hook):
-    sm = MagicMock()
-    hook._sl_data = {'confirmed': True, 'speedLimit': 120, 'safetyCapped': False}
-
-    # v_cruise = 10 m/s (already well below 120 * 1.10 kph limit)
-    result = hook.on_v_cruise(10.0, 8.0, sm)
-    assert result == 10.0
-
-  def _make_sm(self, hook, speed_limit, confirmed=True, lead_status=False, lead_vLead=0.0, safety_capped=False):
-    """Helper: set _sl_data and build SubMaster mock with radarState."""
-    hook._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit, 'safetyCapped': safety_capped}
-
-    sm = MagicMock()
-    lead = MagicMock()
-    lead.status = lead_status
-    lead.vLead = lead_vLead
-
-    radar = MagicMock()
-    radar.leadOne = lead
-
-    def getitem(key):
-      if key == 'radarState':
-        return radar
-      return MagicMock()
-
-    sm.__getitem__ = MagicMock(side_effect=getitem)
-    return sm
-
-  def test_lead_override_fast_lead_skips_limit(self, hook):
-    """Lead >10% above speed limit → skip capping."""
-    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=95 / 3.6)
-    result = hook.on_v_cruise(100.0, 20.0, sm)
-    assert result == 100.0  # original v_cruise, not capped
-
-  def test_lead_override_slow_lead_keeps_limit(self, hook):
-    """Lead only 5% above speed limit → still cap."""
-    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=84 / 3.6)
-    result = hook.on_v_cruise(100.0, 20.0, sm)
-    assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
-
-  def test_lead_override_no_lead_keeps_limit(self, hook):
-    """No tracked lead → normal capping."""
-    sm = self._make_sm(hook, 80, confirmed=True, lead_status=False, lead_vLead=0)
-    result = hook.on_v_cruise(100.0, 20.0, sm)
-    assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
-
-  def test_lead_override_exactly_at_threshold(self, hook):
-    """Lead exactly at 10% threshold → no override (must be strictly above)."""
-    sm = self._make_sm(hook, 80, confirmed=True, lead_status=True, lead_vLead=88 / 3.6)
-    result = hook.on_v_cruise(100.0, 20.0, sm)
-    assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
-
-  def test_safety_cap_ignores_fast_lead(self, hook):
-    """Safety cap (curve/lookahead) must not be bypassed by a fast lead —
-    geometry doesn't care what the lead is doing. Route 2fd seg15 regression."""
-    sm = self._make_sm(hook, 40, confirmed=True, lead_status=True,
-                       lead_vLead=60 / 3.6, safety_capped=True)
-    result = hook.on_v_cruise(100.0, 20.0, sm)
-    # No offset (safety_capped=True), and lead override is ignored
-    assert result == pytest.approx(40 / 3.6, abs=0.1)
-
-  # ----------------------------------------------------------
-  # Gentle ramp + momentary gas override (source==2 inferred)
-  # ----------------------------------------------------------
-
-  def _make_sm_full(self, gas=False, lead_status=False, lead_vLead=0.0):
+  def _sm(self, gas=False, lead_status=False, lead_vLead=0.0):
     """SubMaster mock exposing carState.gasPressed and radarState.leadOne."""
     cs = MagicMock()
     cs.gasPressed = gas
@@ -654,7 +555,6 @@ class TestPlannerHook:
     lead.vLead = lead_vLead
     radar = MagicMock()
     radar.leadOne = lead
-
     sm = MagicMock()
 
     def getitem(key):
@@ -667,100 +567,229 @@ class TestPlannerHook:
     sm.__getitem__ = MagicMock(side_effect=getitem)
     return sm
 
-  # --- pure ramp helper ---
+  def _sl(self, hook, speed_limit, source=1, safety=False, confirmed=True, road='A'):
+    hook._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit,
+                     'safetyCapped': safety, 'source': source,
+                     'roadName': road, 'wayRef': ''}
+
+  def _clock(self, monkeypatch, hook, t0=1000.0):
+    state = {'t': t0}
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: state['t'])
+
+    class _C:
+      def tick(self, dt):
+        state['t'] += dt
+    return _C()
+
+  # basic enforcement (non-inferred, no gas) ----------------
+
+  def test_no_speed_limit_state(self, hook):
+    hook._sl_data = None
+    assert hook.on_v_cruise(30.0, 20.0, self._sm()) == 30.0
+
+  def test_unconfirmed_returns_original(self, hook):
+    self._sl(hook, 60, confirmed=False)
+    assert hook.on_v_cruise(30.0, 20.0, self._sm()) == 30.0
+
+  def test_confirmed_caps_highway(self, hook):
+    """Limit >= 80 kph uses 10% offset (immediate for non-inferred)."""
+    self._sl(hook, 80, source=1)
+    assert hook.on_v_cruise(100 / 3.6, 20.0, self._sm()) == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
+
+  def test_confirmed_caps_low_speed(self, hook):
+    """Limit < 80 kph uses 15% offset."""
+    self._sl(hook, 40, source=1)
+    assert hook.on_v_cruise(100 / 3.6, 20.0, self._sm()) == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
+
+  def test_no_cap_if_already_below(self, hook):
+    self._sl(hook, 120, source=1)
+    assert hook.on_v_cruise(10.0, 8.0, self._sm()) == 10.0
+
+  def test_safety_cap_no_offset_immediate(self, hook):
+    """Safety cap: no offset, immediate (prompt) enforcement."""
+    self._sl(hook, 40, source=4, safety=True)
+    assert hook.on_v_cruise(100 / 3.6, 20.0, self._sm()) == pytest.approx(40 / 3.6, abs=0.1)
+
+  # lead override (non-safety, no gas) ----------------------
+
+  def test_lead_override_fast_lead_skips(self, hook):
+    self._sl(hook, 80, source=1)
+    sm = self._sm(lead_status=True, lead_vLead=95 / 3.6)
+    assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == 100 / 3.6
+
+  def test_lead_override_slow_lead_keeps(self, hook):
+    self._sl(hook, 80, source=1)
+    sm = self._sm(lead_status=True, lead_vLead=84 / 3.6)
+    assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
+
+  def test_safety_cap_ignores_fast_lead(self, hook):
+    """Route-2fd: a fast lead must not bypass a safety cap."""
+    self._sl(hook, 40, source=4, safety=True)
+    sm = self._sm(lead_status=True, lead_vLead=60 / 3.6)
+    assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == pytest.approx(40 / 3.6, abs=0.1)
+
+  # universal gas suspend -----------------------------------
+
+  def test_gas_suspends_inferred(self, hook):
+    self._sl(hook, 60, source=2)
+    assert hook.on_v_cruise(100 / 3.6, 25.0, self._sm(gas=True)) == pytest.approx(100 / 3.6)
+
+  def test_gas_suspends_safety_cap(self, hook):
+    """Driver pedal suspends even a curve/safety cap."""
+    self._sl(hook, 40, source=4, safety=True)
+    assert hook.on_v_cruise(100 / 3.6, 25.0, self._sm(gas=True)) == pytest.approx(100 / 3.6)
+
+  # pure ramp helper ----------------------------------------
 
   def test_ramp_glide_down_rate(self, hook):
-    """Far from target, no gas: cap drops by exactly RAMP_DECEL_MS2 * dt."""
-    new_cap, enforced = hook._ramp_cap(30.0, 10.0, 0.1, False, 28.0)
-    assert new_cap == pytest.approx(30.0 - hook.RAMP_DECEL_MS2 * 0.1)
+    """From current speed, cap drops by exactly RAMP_DECEL_MS2 * dt."""
+    new_cap, enforced = hook._ramp_cap(28.0, 10.0, 0.1, 28.0)
+    assert new_cap == pytest.approx(28.0 - hook.RAMP_DECEL_MS2 * 0.1)
     assert enforced == pytest.approx(new_cap)
 
   def test_ramp_clamps_at_target(self, hook):
-    """Within one step of target: snap to target, never below."""
-    new_cap, enforced = hook._ramp_cap(10.01, 10.0, 1.0, False, 9.0)
+    new_cap, enforced = hook._ramp_cap(10.01, 10.0, 1.0, 10.01)
     assert new_cap == pytest.approx(10.0)
     assert enforced == pytest.approx(10.0)
 
   def test_ramp_restores_up_immediately(self, hook):
-    """Target above cap (limit rose): restore in one step."""
-    new_cap, enforced = hook._ramp_cap(16.0, 30.0, 0.1, False, 16.0)
+    new_cap, enforced = hook._ramp_cap(16.0, 30.0, 0.1, 16.0)
     assert new_cap == pytest.approx(30.0)
     assert enforced == pytest.approx(30.0)
 
-  def test_ramp_gas_suspends_and_floats(self, hook):
-    """Gas pressed: cap suspended (enforced None) and floats up to v_ego."""
-    new_cap, enforced = hook._ramp_cap(20.0, 16.0, 0.1, True, 25.0)
-    assert enforced is None
-    assert new_cap == pytest.approx(25.0)
-
-  def test_ramp_gas_does_not_lower_cap(self, hook):
-    """Gas pressed with v_ego below cap: cap held, not lowered."""
-    new_cap, enforced = hook._ramp_cap(20.0, 16.0, 0.1, True, 12.0)
-    assert enforced is None
-    assert new_cap == pytest.approx(20.0)
-
-  def test_ramp_release_resumes_from_current(self, hook):
-    """After floating to 25, release resumes glide from 25 toward target."""
-    new_cap, enforced = hook._ramp_cap(25.0, 16.0, 0.1, False, 24.0)
-    assert new_cap == pytest.approx(25.0 - hook.RAMP_DECEL_MS2 * 0.1)
-    assert enforced == pytest.approx(new_cap)
-
   def test_ramp_init_holds_current_speed(self, hook):
-    """Uninitialized cap with v_ego above target: init to v_ego, don't jump down."""
-    new_cap, enforced = hook._ramp_cap(None, 16.0, 0.0, False, 25.0)
+    new_cap, enforced = hook._ramp_cap(None, 16.0, 0.0, 25.0)
     assert new_cap == pytest.approx(25.0)
     assert enforced == pytest.approx(25.0)
 
-  # --- integration through on_v_cruise ---
+  def test_ramp_never_exceeds_current_speed(self, hook):
+    """A stale high cap is clamped to v_ego so a drop never permits acceleration."""
+    new_cap, enforced = hook._ramp_cap(40.0, 10.0, 0.1, 20.0)
+    assert new_cap == pytest.approx(20.0)
+    assert enforced == pytest.approx(20.0)
 
-  def test_source2_first_call_holds_current_speed(self, hook):
-    """Inferred limit (source 2): first cycle holds current speed, not the offset cap."""
-    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
-    sm = self._make_sm_full(gas=False)
-    result = hook.on_v_cruise(100 / 3.6, 25.0, sm)
-    # Holds ~v_ego (25), not the immediate offset cap (60*1.15/3.6 = 19.17)
-    assert result == pytest.approx(25.0, abs=0.1)
+  # hold-floor behavior -------------------------------------
 
-  def test_source2_gas_suspends_cap(self, hook):
-    """Inferred limit + gas pressed: cap fully suspended, v_cruise unchanged."""
-    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
-    sm = self._make_sm_full(gas=True)
-    result = hook.on_v_cruise(100 / 3.6, 25.0, sm)
-    assert result == pytest.approx(100 / 3.6)
+  def test_inferred_spurious_drop_holds_speed(self, hook, monkeypatch):
+    """Same road, uncorroborated inferred drop → hold current speed, no brake."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 100, source=2, road='A')
+    hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    clk.tick(0.1)
+    self._sl(hook, 60, source=2, road='A')  # spurious drop
+    r = None
+    for _ in range(5):
+      r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+      clk.tick(0.1)
+    assert r >= 100 / 3.6 - 0.2       # held at current speed
+    assert r > 75 / 3.6               # definitely NOT braked toward 60
 
-  def test_source2_glides_down_over_time(self, hook, monkeypatch):
-    """Inferred limit: cap glides down at ~0.2 m/s^2 across cycles."""
-    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
-    sm = self._make_sm_full(gas=False)
-    times = [100.0, 100.1]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: times.pop(0))
-    hook.on_v_cruise(100 / 3.6, 25.0, sm)          # init, holds 25
-    r2 = hook.on_v_cruise(100 / 3.6, 25.0, sm)     # 0.1s later: 25 - RAMP*0.1
-    assert r2 == pytest.approx(25.0 - hook.RAMP_DECEL_MS2 * 0.1, abs=0.01)
+  def test_inferred_real_drop_new_road_slows(self, hook, monkeypatch):
+    """road_id change → baseline resets → a genuinely lower limit slows the car."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 100, source=2, road='A')
+    hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    clk.tick(0.1)
+    self._sl(hook, 40, source=2, road='B')  # new road, real lower limit
+    r = None
+    for _ in range(10):
+      r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+      clk.tick(0.2)
+    assert hook._baseline_ms == pytest.approx(40 * 1.15 / 3.6, abs=0.1)  # baseline reset
+    assert r < 100 / 3.6 - 0.3        # slowing toward the new limit
 
-  def test_source2_safetycapped_uses_immediate_path(self, hook):
-    """source==2 but safetyCapped=True: immediate cap, no ramp, no offset."""
-    hook._sl_data = {'confirmed': True, 'speedLimit': 40, 'source': 2, 'safetyCapped': True}
-    sm = self._make_sm_full(gas=True)  # gas must NOT override a safety cap
-    result = hook.on_v_cruise(100 / 3.6, 20.0, sm)
-    assert result == pytest.approx(40 / 3.6, abs=0.1)
+  def test_inferred_recovery_allows_accel(self, hook, monkeypatch):
+    """Inferred limit rises again → cap restores up, acceleration allowed."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 60, source=2, road='A')
+    hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm())
+    clk.tick(0.1)
+    self._sl(hook, 100, source=2, road='A')
+    r = hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm())
+    assert r > 60 / 3.6
 
-  def test_source1_yolo_uses_immediate_path(self, hook):
-    """source==1 (YOLO): immediate offset cap, unaffected by ramp/gas."""
-    hook._sl_data = {'confirmed': True, 'speedLimit': 80, 'source': 1, 'safetyCapped': False}
-    sm = self._make_sm_full(gas=False)
-    result = hook.on_v_cruise(100 / 3.6, 20.0, sm)
-    assert result == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
+  def test_never_speed_up_on_drop(self, hook, monkeypatch):
+    """Cap never rises above the new (lower) limit when it drops."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 100, source=2, road='A')
+    hook.on_v_cruise(120 / 3.6, 50 / 3.6, self._sm())
+    clk.tick(0.1)
+    self._sl(hook, 60, source=2, road='A')
+    r = hook.on_v_cruise(120 / 3.6, 50 / 3.6, self._sm())
+    assert r <= 60 * 1.15 / 3.6 + 0.1   # never above the dropped limit's target
 
-  def test_source2_reset_when_gate_false(self, hook):
-    """Leaving the inferred regime clears ramp state so it re-inits next time."""
-    hook._sl_data = {'confirmed': True, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
-    sm = self._make_sm_full(gas=False)
-    hook.on_v_cruise(100 / 3.6, 25.0, sm)
-    hook._sl_data = {'confirmed': False, 'speedLimit': 60, 'source': 2, 'safetyCapped': False}
-    result = hook.on_v_cruise(100 / 3.6, 25.0, sm)
-    assert result == pytest.approx(100 / 3.6)  # unconfirmed → pass through
-    assert hook._eff_cap_ms is None            # state cleared
+  def test_inferred_gas_release_holds_speed(self, hook, monkeypatch):
+    """Ramp 40, gas to 60, release → hold 60, no brake-back."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 40, source=2, road='A')
+    hook.on_v_cruise(120 / 3.6, 46 / 3.6, self._sm())
+    clk.tick(0.1)
+    hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm(gas=True))
+    clk.tick(0.1)
+    r = hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm(gas=False))
+    assert r >= 60 / 3.6 - 0.2         # holds driver's speed, not braking to 46
+
+  def test_curve_gas_release_holds_speed(self, hook, monkeypatch):
+    """Curve/safety cap follows the gas too: hold driver's speed on release."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 40, source=4, safety=True, road='A')
+    hook.on_v_cruise(120 / 3.6, 40 / 3.6, self._sm())
+    clk.tick(0.1)
+    hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm(gas=True))
+    clk.tick(0.1)
+    r = hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm(gas=False))
+    assert r >= 60 / 3.6 - 0.2         # holds 60 over the curve cap
+
+  def test_curve_no_gas_brakes(self, hook):
+    """Curve cap, no gas, no prior override → prompt braking."""
+    self._sl(hook, 40, source=4, safety=True, road='A')
+    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    assert r == pytest.approx(40 / 3.6, abs=0.1)
+
+  def test_gas_floor_ratchets_and_clears(self, hook, monkeypatch):
+    """After release the hold follows the driver down and clears at the limit."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 40, source=4, safety=True, road='A')
+    hook.on_v_cruise(120 / 3.6, 40 / 3.6, self._sm())
+    clk.tick(0.1)
+    hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm(gas=True))  # gas_floor = 60
+    clk.tick(0.1)
+    r_hold = hook.on_v_cruise(120 / 3.6, 50 / 3.6, self._sm())  # ease to 50
+    assert r_hold == pytest.approx(50 / 3.6, abs=0.2)           # follows down
+    r_settle = hook.on_v_cruise(120 / 3.6, 40 / 3.6, self._sm())  # back at limit
+    assert hook._gas_floor_ms is None                          # cleared
+    assert r_settle == pytest.approx(40 / 3.6, abs=0.2)        # curve enforced again
+
+  def test_road_change_clears_gas_floor(self, hook):
+    """A new road drops any carried gas hold."""
+    self._sl(hook, 40, source=4, safety=True, road='A')
+    hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm(gas=True))  # gas_floor set on road A
+    self._sl(hook, 40, source=4, safety=True, road='B')        # new road
+    r = hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm())
+    assert hook._gas_floor_ms is None
+    assert r == pytest.approx(40 / 3.6, abs=0.1)               # B's cap enforced, no carried hold
+
+  def test_transient_empty_road_does_not_reset(self, hook, monkeypatch):
+    """A momentary empty road_id (OSM gap) must not reset the baseline."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 100, source=2, road='A')
+    hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    clk.tick(0.1)
+    baseline_a = hook._baseline_ms
+    self._sl(hook, 60, source=2, road='')   # OSM dropout: empty road_id
+    hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    assert hook._baseline_ms == pytest.approx(baseline_a)  # baseline preserved
+    assert hook._road_id == 'A'                            # identity unchanged
+
+  def test_invalid_limit_resets_state(self, hook):
+    self._sl(hook, 60, source=2, road='A')
+    hook.on_v_cruise(120 / 3.6, 25.0, self._sm())
+    self._sl(hook, 60, source=2, confirmed=False, road='A')
+    r = hook.on_v_cruise(120 / 3.6, 25.0, self._sm())
+    assert r == pytest.approx(120 / 3.6)
+    assert hook._eff_cap_ms is None
+    assert hook._baseline_ms is None
+    assert hook._gas_floor_ms is None
 
 
 # ============================================================
