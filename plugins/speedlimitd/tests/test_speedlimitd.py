@@ -769,17 +769,18 @@ class TestPlannerHook:
     assert hook._gas_floor_ms is None
     assert r == pytest.approx(40 / 3.6, abs=0.1)               # B's cap enforced, no carried hold
 
-  def test_transient_empty_road_does_not_reset(self, hook, monkeypatch):
-    """A momentary empty road_id (OSM gap) must not reset the baseline."""
+  def test_empty_road_disables_hold_keeps_identity(self, hook, monkeypatch):
+    """An empty road_id disables the baseline hold (no continuity claim without an
+    identity), but _road_id is retained so returning to the same named road is not
+    seen as a road change (no spurious reset of the gas hold / ramp)."""
     clk = self._clock(monkeypatch, hook)
     self._sl(hook, 100, source=2, road='A')
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     clk.tick(0.1)
-    baseline_a = hook._baseline_ms
-    self._sl(hook, 60, source=2, road='')   # OSM dropout: empty road_id
+    self._sl(hook, 60, source=2, road='')   # OSM dropout / unnamed way
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
-    assert hook._baseline_ms == pytest.approx(baseline_a)  # baseline preserved
-    assert hook._road_id == 'A'                            # identity unchanged
+    assert hook._baseline_ms is None                       # hold disabled without identity
+    assert hook._road_id == 'A'                            # identity retained (no false reset)
 
   def test_invalid_limit_resets_state(self, hook):
     self._sl(hook, 60, source=2, road='A')
@@ -828,6 +829,36 @@ class TestPlannerHook:
     r = hook.on_v_cruise(120 / 3.6, 60 / 3.6, self._sm())
     assert hook._gas_floor_ms is not None                     # still holding
     assert r >= 60 / 3.6 - 0.2
+
+  # baseline floor requires a road identity ------------------
+
+  def test_empty_road_id_disables_baseline_hold(self, hook, monkeypatch):
+    """No OSM identity (road_id='') → baseline hold invalid → the inferred/vision
+    cap controls and the car slows (route 3a1 unnamed motorway_link ramp)."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 100, source=2, road='')          # unnamed way
+    hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    clk.tick(0.2)
+    self._sl(hook, 40, source=2, road='')           # vision cap → 40, still unnamed
+    r = None
+    for _ in range(20):
+      r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+      clk.tick(0.2)
+    assert hook._baseline_ms is None                # baseline not built without identity
+    assert r < 100 / 3.6 - 1.0                      # slowing toward 40, not held at 100
+
+  def test_named_road_id_keeps_baseline_hold(self, hook, monkeypatch):
+    """With a road identity, spurious same-road drops are still held (unchanged)."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 100, source=2, road='S20')
+    hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    clk.tick(0.2)
+    self._sl(hook, 40, source=2, road='S20')        # spurious drop, same named road
+    r = None
+    for _ in range(5):
+      r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+      clk.tick(0.2)
+    assert r >= 100 / 3.6 - 0.2                      # held at current speed
 
 
 # ============================================================

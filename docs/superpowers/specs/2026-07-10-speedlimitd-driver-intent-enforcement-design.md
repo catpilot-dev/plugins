@@ -42,7 +42,15 @@ floored_target = max(limit_target, effective_floor)
 Two independent floors combine (`effective_floor = max` of whichever are
 active):
 
-### 1. Baseline floor — road-continuity, INFERRED (`source==2`) only, always active
+### 1. Baseline floor — road-continuity, INFERRED (`source==2`) only, requires a road identity
+- **Only active when `road_id != ''`.** The hold means "same road ⇒ this drop is
+  spurious"; without an OSM identity we cannot assert continuity, so the hold is
+  invalid and the inferred/vision cap controls (the car slows via the ramp).
+  This was added after route 3a1: the interchange is unnamed `motorway_link`
+  ways (`road_id == ''`, the named S20 mainline is ~47 m away and never matched),
+  so the baseline held the car at ~65 and suppressed the correct 40 km/h ramp
+  vision cap. An empty `road_id` disables the hold but does **not** clear
+  `_road_id`, so returning to the same named road is not a false road change.
 - `baseline` = running max of the inferred target since entering the current
   `road_id` (`roadName or wayRef`). Reset when `road_id` changes.
 - **`road_id` change = a new *non-empty* identity that differs from the last

@@ -177,9 +177,12 @@ def on_v_cruise(v_cruise, v_ego, sm):
       if _gas_floor_ms <= target_ms:
         _gas_floor_ms = None
 
-  # Baseline (road-continuity) floor — inferred limits only, always active.
+  # Baseline (road-continuity) floor — inferred limits only, and only when we
+  # actually have an OSM road identity. Without one (unnamed ramp/link, e.g. an
+  # interchange motorway_link) we can't assert "same road", so the hold is
+  # invalid — let the inferred/vision cap control and slow the car instead.
   baseline_floor = None
-  if inferred:
+  if inferred and road_id != '':
     _baseline_ms = target_ms if _baseline_ms is None else max(_baseline_ms, target_ms)
     baseline_floor = min(_baseline_ms, v_ego)
   else:
