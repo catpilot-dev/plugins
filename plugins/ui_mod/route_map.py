@@ -15,6 +15,7 @@ import urllib.request
 from config import PLUGINS_RUNTIME_DIR
 
 import pyray as rl
+import offline_basemap
 
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -27,6 +28,8 @@ USER_AGENT = 'catpilot/1.0'
 
 TRACE_COLOR = rl.Color(70, 91, 234, 255)
 TRACE_WIDTH = 8.0
+ROAD_COLOR = rl.Color(90, 90, 90, 255)
+ROAD_WIDTH = 2.0
 START_COLOR = rl.Color(76, 175, 80, 255)
 END_COLOR = rl.Color(226, 44, 44, 255)
 MARKER_RADIUS = 12
@@ -92,6 +95,8 @@ class RouteMapRenderer:
     self._trace = []
     self._rect_w = 0
     self._rect_h = 0
+    self._offline = False
+    self._polylines = []
 
   def load_trace(self, trace, rect_w=1500, rect_h=900):
     """Set GPS trace, fit entire route in view, and start downloading tiles."""
@@ -133,15 +138,29 @@ class RouteMapRenderer:
     self._tx0, self._tx1, self._ty0, self._ty1 = tx0, tx1, ty0, ty1
     self._center_tx, self._center_ty = cx, cy
 
-    self._tile_keys = [
-      (self._zoom, x, y)
-      for x in range(self._tx0, self._tx1 + 1)
-      for y in range(self._ty0, self._ty1 + 1)
-    ]
+    if offline_basemap.HAVE_CAPNP and offline_basemap.coverage_complete(
+        min_lat, min_lng, max_lat, max_lng):
+      self._offline = True
+      self._polylines = []
+      threading.Thread(
+        target=self._load_offline,
+        args=((min_lat, min_lng, max_lat, max_lng),),
+        daemon=True,
+      ).start()
+    else:
+      self._offline = False
+      self._tile_keys = [
+        (self._zoom, x, y)
+        for x in range(self._tx0, self._tx1 + 1)
+        for y in range(self._ty0, self._ty1 + 1)
+      ]
+      self._downloading = True
+      self._download_done = False
+      threading.Thread(target=self._download_tiles, daemon=True).start()
 
-    self._downloading = True
-    self._download_done = False
-    threading.Thread(target=self._download_tiles, daemon=True).start()
+  def _load_offline(self, bbox):
+    """Background thread: parse offline vector tiles into road polylines."""
+    self._polylines = offline_basemap.load_polylines(*bbox)
 
   def render(self, rect):
     """Render map with trace into the given rect."""
@@ -151,9 +170,6 @@ class RouteMapRenderer:
     if not self._trace:
       return
 
-    # Load any newly downloaded tiles as textures (must be on main thread)
-    self._load_pending()
-
     # Scale: 1 tile pixel = 1 screen pixel (1:1), tiles fill the rect edge-to-edge.
     # Offset so the center GPS point maps to the center of rect.
     ox = rect.x + rect.width / 2 - self._center_tx * TILE_PX
@@ -162,16 +178,24 @@ class RouteMapRenderer:
     # Clip to rect
     rl.begin_scissor_mode(int(rect.x), int(rect.y), int(rect.width), int(rect.height))
 
-    # Draw tiles at 1:1 pixel scale
-    for key in self._tile_keys:
-      tex = self._textures.get(key)
-      if tex and rl.is_texture_valid(tex):
-        z, tx, ty = key
-        dx = ox + tx * TILE_PX
-        dy = oy + ty * TILE_PX
-        src = rl.Rectangle(0, 0, tex.width, tex.height)
-        dst = rl.Rectangle(dx, dy, TILE_PX, TILE_PX)
-        rl.draw_texture_pro(tex, src, dst, rl.Vector2(0, 0), 0, rl.WHITE)
+    # Draw basemap: offline vector roads, or downloaded raster tiles.
+    if self._offline:
+      for poly in self._polylines:
+        for i in range(len(poly) - 1):
+          p0 = self._to_screen(poly[i], ox, oy)
+          p1 = self._to_screen(poly[i + 1], ox, oy)
+          rl.draw_line_ex(p0, p1, ROAD_WIDTH, ROAD_COLOR)
+    else:
+      self._load_pending()
+      for key in self._tile_keys:
+        tex = self._textures.get(key)
+        if tex and rl.is_texture_valid(tex):
+          z, tx, ty = key
+          dx = ox + tx * TILE_PX
+          dy = oy + ty * TILE_PX
+          src = rl.Rectangle(0, 0, tex.width, tex.height)
+          dst = rl.Rectangle(dx, dy, TILE_PX, TILE_PX)
+          rl.draw_texture_pro(tex, src, dst, rl.Vector2(0, 0), 0, rl.WHITE)
 
     # Draw trace polyline (only segments visible in rect)
     for i in range(len(self._trace) - 1):
@@ -256,3 +280,5 @@ class RouteMapRenderer:
     self._textures.clear()
     self._trace = []
     self._tile_keys = []
+    self._offline = False
+    self._polylines = []
