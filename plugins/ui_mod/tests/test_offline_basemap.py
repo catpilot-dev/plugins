@@ -2,7 +2,6 @@
 import importlib.util
 import os
 import sys
-import types
 
 import pytest
 
@@ -11,9 +10,8 @@ UI_MOD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @pytest.fixture
 def obm():
-  # config lives at the plugins root; a stub keeps the test hermetic.
+  # config lives at the plugins root and is importable via PYTHONPATH=plugins;
   # tile_dir is always passed explicitly, so MEDIA_DIR's value is irrelevant.
-  sys.modules.setdefault('config', types.SimpleNamespace(MEDIA_DIR='/data/media'))
   if UI_MOD_DIR not in sys.path:
     sys.path.insert(0, UI_MOD_DIR)
   spec = importlib.util.spec_from_file_location(
@@ -36,7 +34,13 @@ class TestTilePaths:
   def test_tiles_covering_span_2x2(self, obm):
     # lat 31.4..31.6 -> tiles 31.25 & 31.5; lon 117.2..117.4 -> tiles 117.0 & 117.25
     rels = obm._tiles_covering_bbox(31.4, 117.2, 31.6, 117.4)
-    assert len(rels) == 4
+    expected = {
+      os.path.join('30', '116', '31.250000_117.000000_31.500000_117.250000'),
+      os.path.join('30', '116', '31.250000_117.250000_31.500000_117.500000'),
+      os.path.join('30', '116', '31.500000_117.000000_31.750000_117.250000'),
+      os.path.join('30', '116', '31.500000_117.250000_31.750000_117.500000'),
+    }
+    assert set(rels) == expected
 
 
 class TestCoverage:

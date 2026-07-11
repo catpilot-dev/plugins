@@ -97,6 +97,7 @@ class RouteMapRenderer:
     self._rect_h = 0
     self._offline = False
     self._polylines = []
+    self._load_gen = 0
 
   def load_trace(self, trace, rect_w=1500, rect_h=900):
     """Set GPS trace, fit entire route in view, and start downloading tiles."""
@@ -142,9 +143,10 @@ class RouteMapRenderer:
         min_lat, min_lng, max_lat, max_lng):
       self._offline = True
       self._polylines = []
+      gen = self._load_gen
       threading.Thread(
         target=self._load_offline,
-        args=((min_lat, min_lng, max_lat, max_lng),),
+        args=((min_lat, min_lng, max_lat, max_lng), gen),
         daemon=True,
       ).start()
     else:
@@ -158,9 +160,11 @@ class RouteMapRenderer:
       self._download_done = False
       threading.Thread(target=self._download_tiles, daemon=True).start()
 
-  def _load_offline(self, bbox):
+  def _load_offline(self, bbox, gen):
     """Background thread: parse offline vector tiles into road polylines."""
-    self._polylines = offline_basemap.load_polylines(*bbox)
+    polylines = offline_basemap.load_polylines(*bbox)
+    if gen == self._load_gen:
+      self._polylines = polylines
 
   def render(self, rect):
     """Render map with trace into the given rect."""
@@ -282,3 +286,4 @@ class RouteMapRenderer:
     self._tile_keys = []
     self._offline = False
     self._polylines = []
+    self._load_gen += 1
