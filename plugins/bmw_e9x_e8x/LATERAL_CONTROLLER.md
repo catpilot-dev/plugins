@@ -114,6 +114,22 @@ This document is the canonical reference for the lateral controller registered b
 > since STEP_MAX: commanded pushes can only produce ~0.7 m/s³ at highway —
 > revisit the guard's role if it misfires again.
 
+> **2026-07-12 — relax-dwell (route 3a0 seg 8: "gives up mid-turn").**
+> modelV2's κ_des dips 40–50% for ~1 s mid-hairpin and recovers (3× in one
+> turn) while κ_meas stays steady. The controller faithfully followed each
+> dip down the relax staircase; SAT flung the freed wheel ~20° out of the
+> turn, then the step-capped rebuild took 1.5–2 s against SAT. Asymmetry:
+> unwinding is instant and free, rebuilding is slow and fought. Fix: in a
+> MEASURED deep curve (|κ_meas| > RELAX_DWELL_KAPPA = 0.010, κ_des still
+> same-side, torque > FRICTION), an overshoot-side error must persist
+> RELAX_DWELL_TICKS = 20 (1.0 s) before the relax path may command below
+> the current (hold_cap-clipped) torque; during the dwell the target
+> bridges at current torque (action `relax_dwell`). ISO cancels bypass the
+> dwell (measured overshoot still cancels instantly); κ_des sign flips
+> abort it. True exits proceed after ≤1 s (~0.2 m lateral at 9 m/s).
+> hold_cap exonerated by the same investigation (pins were healthy holds).
+> Telemetry gains `relax_ticks`.
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -364,6 +380,7 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | `hold_zero` | `|delta_err| ≤ tolerance`, straight (`hold_f = 0`) — target 0, stiction holds |
 | `hold_curve` | `|delta_err| ≤ tolerance`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
 | `ramp` | active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
+| `relax_dwell` | overshoot-side error in a measured deep curve, within the 1 s dwell — target bridges at current (capped) torque |
 | `cancel_tol` | error fell into 1.2× tolerance band mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights) |
 | `cancel_accel` | overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` — drain to 0 |
 | `cancel_jerk` | overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` — drain to 0 |

@@ -76,6 +76,12 @@ def on_lat_controller_init(result, lac, CP):
   tire aligning forces unwind the wheel (at guard-firing angles aligning
   torque exceeds rack stiction; route 380/384 evidence).
 
+  Relax-dwell (2026-07-12): in a measured deep curve (|κ_meas| > 0.010),
+  an overshoot-side error must persist 1.0 s before the relax path may
+  command below current torque — bridges modelV2's transient mid-turn κ_des
+  dips (the "gives up mid-way" mechanism, route 3a0 seg 8). ISO cancels
+  bypass the dwell; κ_des sign flips (S-curves) abort it instantly.
+
   Tolerance-cancel (every livePose tick): if |δ_err| drops into the success
   band mid push-ramp, drain torque to the sign-guarded, capped hold (0 on
   straights). Without this, the in-flight ramp keeps pushing toward a stale
@@ -257,6 +263,13 @@ def on_lat_controller_init(result, lac, CP):
   # |κ_meas| above this floor — see the overshooting comment in update().
   KMEAS_SIGN_FLOOR = 0.0005
 
+  # Relax-dwell (2026-07-12, route 3a0 seg 8): in a measured deep curve, an
+  # overshoot-side error must persist this long before the relax path may
+  # command below current torque — bridges modelV2's transient mid-turn
+  # κ_des dips (40-50% for ~1 s, κ_meas steady). See deep_relax in update().
+  RELAX_DWELL_TICKS = 20      # livePose ticks (1.0 s at 20 Hz)
+  RELAX_DWELL_KAPPA = 0.010   # |κ_meas| defining a deep curve (1/m)
+
   # Rack breakaway torque fraction (stiction floor). 2026-07-03: no longer
   # used to amplify sub-friction commands or emit reverse pulses (stiction
   # special-casing removed — the pulses were churn, not correction; the
@@ -320,6 +333,7 @@ def on_lat_controller_init(result, lac, CP):
     'tolerance': 0.0,             # debug: current deadzone half-width (rad), κ- and v-dependent
     'hold_f': 0.0,                # debug: curvature hold factor [0,1]
     'hold_cap': 0.0,              # debug: cap on held torque (deadzone-edge P value, frac)
+    'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -472,6 +486,28 @@ def on_lat_controller_init(result, lac, CP):
         held = 0.0
       held_target = float(np.clip(held, -hold_cap, hold_cap))
 
+      # Relax-dwell (route 3a0 seg 8, 2026-07-12). modelV2's κ_des dips
+      # 40–50% for ~1 s MID-hairpin and recovers (three times in one turn),
+      # while κ_meas stays steady — the reference lies, the plant doesn't.
+      # Following the dip down surrenders held torque; SAT flings the freed
+      # wheel ~20° out of the turn ("gives up mid-way"), and the step-capped
+      # rebuild takes 1.5–2 s against SAT. Unwinding is instant and free,
+      # rebuilding is slow and fought — so bridge transient dips: while
+      # DEEPLY in a measured curve, an overshoot-side error must persist
+      # for RELAX_DWELL_TICKS before the relax path may command below the
+      # current (capped) torque. Gates on MEASURED κ (steady through the
+      # dips), requires κ_des still same-side (S-curve sign flips abort
+      # instantly), and torque above breakaway. ISO guards are untouched —
+      # genuine measured overshoot (a_y/jerk) still cancels immediately.
+      # True exits (κ_des drops and stays) proceed after the dwell: cost is
+      # ≤1 s of extra curvature (~0.2 m lateral at 9 m/s).
+      deep_relax = (abs(state['measured']) > RELAX_DWELL_KAPPA
+                    and state['desired'] * state['measured'] > 0.0
+                    and abs(state['torque']) > FRICTION
+                    and delta_err * delta_des < 0.0)
+      state['relax_ticks'] = state['relax_ticks'] + 1 if deep_relax else 0
+      dwelling = 0 < state['relax_ticks'] <= RELAX_DWELL_TICKS
+
       # ISO 11270 half-comfort guard, gated on plant overshoot. Fires only
       # when (κ_des − κ_meas)·κ_meas < 0 — i.e., plant has turned more than
       # the planner asked for (or to the wrong side of zero). During
@@ -612,6 +648,14 @@ def on_lat_controller_init(result, lac, CP):
           # error flips sides. Bounded by hold_cap, STEP_MAX, and t_cap.
           if target_frac * held_target > 0.0:
             target_frac = math.copysign(max(abs(target_frac), abs(held_target)), target_frac)
+          # Relax-dwell bridge (see the deep_relax block above): during the
+          # dwell window, an overshoot-side reference dip may NOT command
+          # below the current (capped) torque — keep the curve and wait the
+          # dip out. Persisting overshoot (> dwell) falls through to the
+          # normal relax staircase; ISO cancels bypass this entirely.
+          if dwelling:
+            target_frac = math.copysign(min(abs(state['torque']), hold_cap), state['torque'])
+            state['action'] = 'relax_dwell'
           # Per-decision step cap (route 385 seg 27 review, 2026-07-03):
           # human-style gradual steering — move at most STEP_MAX toward the
           # P target per decision, let the plant respond one cadence, then
@@ -675,6 +719,7 @@ def on_lat_controller_init(result, lac, CP):
           'hold_f': float(state['hold_f']),
           'hold_cap': float(state['hold_cap']),
           'tolerance': float(state['tolerance']),
+          'relax_ticks': int(state['relax_ticks']),
         }
         state['lat_pub'].send(payload)
       except Exception:
