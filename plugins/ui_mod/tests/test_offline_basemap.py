@@ -49,3 +49,38 @@ class TestCoverage:
 
   def test_coverage_incomplete(self, obm, tmp_path):
     assert obm.coverage_complete(31.6, 117.3, 31.6, 117.3, tile_dir=str(tmp_path)) is False
+
+
+class TestLoadPolylines:
+  def test_no_capnp_returns_empty(self, obm, monkeypatch):
+    monkeypatch.setattr(obm, 'HAVE_CAPNP', False)
+    assert obm.load_polylines(31.6, 117.3, 31.6, 117.3, tile_dir='/nonexistent') == []
+
+  def test_parses_one_way(self, obm, tmp_path):
+    capnp = pytest.importorskip('capnp')
+    schema = capnp.load(obm.SCHEMA_PATH)
+    msg = schema.Offline.new_message()
+    msg.minLat, msg.minLon, msg.maxLat, msg.maxLon = 31.5, 117.25, 31.75, 117.5
+    ways = msg.init('ways', 1)
+    nodes = ways[0].init('nodes', 2)
+    nodes[0].latitude, nodes[0].longitude = 31.60, 117.30
+    nodes[1].latitude, nodes[1].longitude = 31.61, 117.31
+    rel = obm._tile_relpath(31.5, 117.25)
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(msg.to_bytes_packed())
+
+    polys = obm.load_polylines(31.6, 117.3, 31.6, 117.3, tile_dir=str(tmp_path))
+    assert len(polys) == 1
+    assert len(polys[0]) == 2
+    assert polys[0][0] == pytest.approx((31.60, 117.30))
+    assert polys[0][1] == pytest.approx((31.61, 117.31))
+
+  def test_skips_short_and_bad_tiles(self, obm, tmp_path):
+    pytest.importorskip('capnp')
+    # A tile of garbage bytes must be skipped, not raise.
+    rel = obm._tile_relpath(31.5, 117.25)
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'not a capnp message')
+    assert obm.load_polylines(31.6, 117.3, 31.6, 117.3, tile_dir=str(tmp_path)) == []

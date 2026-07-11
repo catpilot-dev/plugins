@@ -14,6 +14,14 @@ OFFLINE_DIR = os.path.join(MEDIA_DIR, "0", "osm", "offline")
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osm_reader.capnp")
 TILE_SIZE = 0.25  # degrees per tile
 
+try:
+  import capnp
+  _SCHEMA = capnp.load(SCHEMA_PATH)
+  HAVE_CAPNP = True
+except (ImportError, OSError):
+  _SCHEMA = None
+  HAVE_CAPNP = False
+
 
 def _tile_relpath(min_lat, min_lon):
   """Relative path (lat_dir/lon_dir/fname) for the tile whose min corner is
@@ -41,3 +49,30 @@ def coverage_complete(min_lat, min_lng, max_lat, max_lng, tile_dir=OFFLINE_DIR):
   """True only if every tile spanning the bbox exists on disk."""
   rels = _tiles_covering_bbox(min_lat, min_lng, max_lat, max_lng)
   return bool(rels) and all(os.path.exists(os.path.join(tile_dir, r)) for r in rels)
+
+
+def load_polylines(min_lat, min_lng, max_lat, max_lng, tile_dir=OFFLINE_DIR):
+  """Parse every covering tile into a list of road polylines.
+
+  Each polyline is a list of (lat, lng) tuples (>= 2 points), matching
+  RouteMapRenderer._to_screen's point convention. Returns [] if capnp is
+  unavailable. Tiles that fail to parse are skipped, not fatal.
+  """
+  if not HAVE_CAPNP:
+    return []
+  polylines = []
+  for rel in _tiles_covering_bbox(min_lat, min_lng, max_lat, max_lng):
+    path = os.path.join(tile_dir, rel)
+    try:
+      with open(path, "rb") as f:
+        data = f.read()
+      offline = _SCHEMA.Offline.from_bytes_packed(
+        data, traversal_limit_in_words=len(data) * 8,
+      )
+      for way in offline.ways:
+        pts = [(n.latitude, n.longitude) for n in way.nodes]
+        if len(pts) >= 2:
+          polylines.append(pts)
+    except Exception:
+      continue
+  return polylines
