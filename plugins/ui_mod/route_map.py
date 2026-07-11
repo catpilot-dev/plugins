@@ -15,7 +15,6 @@ import urllib.request
 from config import PLUGINS_RUNTIME_DIR
 
 import pyray as rl
-import offline_basemap
 
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -28,8 +27,6 @@ USER_AGENT = 'catpilot/1.0'
 
 TRACE_COLOR = rl.Color(70, 91, 234, 255)
 TRACE_WIDTH = 8.0
-ROAD_COLOR = rl.Color(90, 90, 90, 255)
-ROAD_WIDTH = 2.0
 START_COLOR = rl.Color(76, 175, 80, 255)
 END_COLOR = rl.Color(226, 44, 44, 255)
 MARKER_RADIUS = 12
@@ -60,14 +57,6 @@ def _lat_lng_to_tile_xy(lat, lng, zoom):
   x = (lng + 180.0) / 360.0 * n
   y = (1.0 - math.log(math.tan(math.radians(lat)) + 1.0 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n
   return x, y
-
-
-def _tile_xy_to_lat_lng(x, y, zoom):
-  """Inverse of _lat_lng_to_tile_xy — fractional tile coords back to lat/lng."""
-  n = 2 ** zoom
-  lng = x / n * 360.0 - 180.0
-  lat = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / n))))
-  return lat, lng
 
 
 def _tiles_for_rect(center_lat, center_lng, zoom, rect_w, rect_h):
@@ -103,9 +92,6 @@ class RouteMapRenderer:
     self._trace = []
     self._rect_w = 0
     self._rect_h = 0
-    self._offline = False
-    self._polylines = []
-    self._load_gen = 0
 
   def load_trace(self, trace, rect_w=1500, rect_h=900):
     """Set GPS trace, fit entire route in view, and start downloading tiles."""
@@ -147,40 +133,15 @@ class RouteMapRenderer:
     self._tx0, self._tx1, self._ty0, self._ty1 = tx0, tx1, ty0, ty1
     self._center_tx, self._center_ty = cx, cy
 
-    if offline_basemap.HAVE_CAPNP and offline_basemap.coverage_complete(
-        min_lat, min_lng, max_lat, max_lng):
-      self._offline = True
-      self._polylines = []
-      # Visible geographic window (center +/- half the rect at this zoom),
-      # used to cull roads that fall entirely outside the rendered area.
-      half_w = (rect_w / TILE_PX) / 2
-      half_h = (rect_h / TILE_PX) / 2
-      la0, lo0 = _tile_xy_to_lat_lng(cx - half_w, cy - half_h, self._zoom)
-      la1, lo1 = _tile_xy_to_lat_lng(cx + half_w, cy + half_h, self._zoom)
-      view = (min(la0, la1), min(lo0, lo1), max(la0, la1), max(lo0, lo1))
-      gen = self._load_gen
-      threading.Thread(
-        target=self._load_offline,
-        args=((min_lat, min_lng, max_lat, max_lng), view, self._zoom, gen),
-        daemon=True,
-      ).start()
-    else:
-      self._offline = False
-      self._tile_keys = [
-        (self._zoom, x, y)
-        for x in range(self._tx0, self._tx1 + 1)
-        for y in range(self._ty0, self._ty1 + 1)
-      ]
-      self._downloading = True
-      self._download_done = False
-      threading.Thread(target=self._download_tiles, daemon=True).start()
+    self._tile_keys = [
+      (self._zoom, x, y)
+      for x in range(self._tx0, self._tx1 + 1)
+      for y in range(self._ty0, self._ty1 + 1)
+    ]
 
-  def _load_offline(self, bbox, view, zoom, gen):
-    """Background thread: parse offline vector tiles into road polylines,
-    filtered to roads important enough for the zoom and within the view."""
-    polylines = offline_basemap.load_polylines(*bbox, zoom=zoom, view=view)
-    if gen == self._load_gen:
-      self._polylines = polylines
+    self._downloading = True
+    self._download_done = False
+    threading.Thread(target=self._download_tiles, daemon=True).start()
 
   def render(self, rect):
     """Render map with trace into the given rect."""
@@ -190,6 +151,9 @@ class RouteMapRenderer:
     if not self._trace:
       return
 
+    # Load any newly downloaded tiles as textures (must be on main thread)
+    self._load_pending()
+
     # Scale: 1 tile pixel = 1 screen pixel (1:1), tiles fill the rect edge-to-edge.
     # Offset so the center GPS point maps to the center of rect.
     ox = rect.x + rect.width / 2 - self._center_tx * TILE_PX
@@ -198,24 +162,16 @@ class RouteMapRenderer:
     # Clip to rect
     rl.begin_scissor_mode(int(rect.x), int(rect.y), int(rect.width), int(rect.height))
 
-    # Draw basemap: offline vector roads, or downloaded raster tiles.
-    if self._offline:
-      for poly in self._polylines:
-        for i in range(len(poly) - 1):
-          p0 = self._to_screen(poly[i], ox, oy)
-          p1 = self._to_screen(poly[i + 1], ox, oy)
-          rl.draw_line_ex(p0, p1, ROAD_WIDTH, ROAD_COLOR)
-    else:
-      self._load_pending()
-      for key in self._tile_keys:
-        tex = self._textures.get(key)
-        if tex and rl.is_texture_valid(tex):
-          z, tx, ty = key
-          dx = ox + tx * TILE_PX
-          dy = oy + ty * TILE_PX
-          src = rl.Rectangle(0, 0, tex.width, tex.height)
-          dst = rl.Rectangle(dx, dy, TILE_PX, TILE_PX)
-          rl.draw_texture_pro(tex, src, dst, rl.Vector2(0, 0), 0, rl.WHITE)
+    # Draw tiles at 1:1 pixel scale
+    for key in self._tile_keys:
+      tex = self._textures.get(key)
+      if tex and rl.is_texture_valid(tex):
+        z, tx, ty = key
+        dx = ox + tx * TILE_PX
+        dy = oy + ty * TILE_PX
+        src = rl.Rectangle(0, 0, tex.width, tex.height)
+        dst = rl.Rectangle(dx, dy, TILE_PX, TILE_PX)
+        rl.draw_texture_pro(tex, src, dst, rl.Vector2(0, 0), 0, rl.WHITE)
 
     # Draw trace polyline (only segments visible in rect)
     for i in range(len(self._trace) - 1):
@@ -300,6 +256,3 @@ class RouteMapRenderer:
     self._textures.clear()
     self._trace = []
     self._tile_keys = []
-    self._offline = False
-    self._polylines = []
-    self._load_gen += 1

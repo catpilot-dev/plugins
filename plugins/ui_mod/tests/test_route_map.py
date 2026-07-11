@@ -25,10 +25,6 @@ def route_map():
   ]:
     sys.modules.setdefault(mod_name, MagicMock())
 
-  ui_mod_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-  if ui_mod_dir not in sys.path:
-    sys.path.insert(0, ui_mod_dir)
-
   spec = importlib.util.spec_from_file_location('route_map', mod_path)
   mod = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(mod)
@@ -111,58 +107,3 @@ class TestTilePaths:
     r = route_map.RouteMapRenderer()
     path = r._tile_path(14, 100, 200)
     assert route_map.TILE_CACHE_DIR in path
-
-
-# ============================================================
-# Offline vs online mode selection
-# ============================================================
-
-class _FakeThread:
-  """Records the target and args instead of starting a real thread."""
-  started = []
-  last_args = None
-
-  def __init__(self, target=None, args=(), daemon=None):
-    self.target = target
-    self.args = args
-
-  def start(self):
-    _FakeThread.started.append(self.target)
-    _FakeThread.last_args = self.args
-
-
-class TestModeSelection:
-  def _setup(self, route_map, monkeypatch, have_capnp, covered):
-    import offline_basemap
-    monkeypatch.setattr(offline_basemap, 'HAVE_CAPNP', have_capnp)
-    monkeypatch.setattr(offline_basemap, 'coverage_complete', lambda *a, **k: covered)
-    _FakeThread.started = []
-    monkeypatch.setattr(route_map.threading, 'Thread', _FakeThread)
-
-  def test_offline_when_capnp_and_covered(self, route_map, monkeypatch):
-    self._setup(route_map, monkeypatch, have_capnp=True, covered=True)
-    r = route_map.RouteMapRenderer()
-    r.load_trace([(31.60, 117.30), (31.61, 117.31)])
-    assert r._offline is True
-    assert _FakeThread.started == [r._load_offline]
-    # _load_offline(bbox, view, zoom, gen): view is a 4-tuple, zoom an int.
-    bbox, view, zoom, _gen = _FakeThread.last_args
-    assert len(bbox) == 4 and len(view) == 4
-    assert isinstance(zoom, int)
-    # view window must contain the trace bbox it was derived from.
-    assert view[0] <= 31.60 and view[2] >= 31.61
-    assert view[1] <= 117.30 and view[3] >= 117.31
-
-  def test_online_when_not_covered(self, route_map, monkeypatch):
-    self._setup(route_map, monkeypatch, have_capnp=True, covered=False)
-    r = route_map.RouteMapRenderer()
-    r.load_trace([(31.60, 117.30), (31.61, 117.31)])
-    assert r._offline is False
-    assert _FakeThread.started == [r._download_tiles]
-
-  def test_online_when_no_capnp(self, route_map, monkeypatch):
-    self._setup(route_map, monkeypatch, have_capnp=False, covered=True)
-    r = route_map.RouteMapRenderer()
-    r.load_trace([(31.60, 117.30), (31.61, 117.31)])
-    assert r._offline is False
-    assert _FakeThread.started == [r._download_tiles]
