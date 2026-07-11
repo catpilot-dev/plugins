@@ -118,14 +118,17 @@ class TestTilePaths:
 # ============================================================
 
 class _FakeThread:
-  """Records the target instead of starting a real thread."""
+  """Records the target and args instead of starting a real thread."""
   started = []
+  last_args = None
 
   def __init__(self, target=None, args=(), daemon=None):
     self.target = target
+    self.args = args
 
   def start(self):
     _FakeThread.started.append(self.target)
+    _FakeThread.last_args = self.args
 
 
 class TestModeSelection:
@@ -142,6 +145,13 @@ class TestModeSelection:
     r.load_trace([(31.60, 117.30), (31.61, 117.31)])
     assert r._offline is True
     assert _FakeThread.started == [r._load_offline]
+    # _load_offline(bbox, view, zoom, gen): view is a 4-tuple, zoom an int.
+    bbox, view, zoom, _gen = _FakeThread.last_args
+    assert len(bbox) == 4 and len(view) == 4
+    assert isinstance(zoom, int)
+    # view window must contain the trace bbox it was derived from.
+    assert view[0] <= 31.60 and view[2] >= 31.61
+    assert view[1] <= 117.30 and view[3] >= 117.31
 
   def test_online_when_not_covered(self, route_map, monkeypatch):
     self._setup(route_map, monkeypatch, have_capnp=True, covered=False)

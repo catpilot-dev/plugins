@@ -62,6 +62,14 @@ def _lat_lng_to_tile_xy(lat, lng, zoom):
   return x, y
 
 
+def _tile_xy_to_lat_lng(x, y, zoom):
+  """Inverse of _lat_lng_to_tile_xy — fractional tile coords back to lat/lng."""
+  n = 2 ** zoom
+  lng = x / n * 360.0 - 180.0
+  lat = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / n))))
+  return lat, lng
+
+
 def _tiles_for_rect(center_lat, center_lng, zoom, rect_w, rect_h):
   """Compute tile range that covers rect_w x rect_h pixels centered on a GPS point."""
   cx, cy = _lat_lng_to_tile_xy(center_lat, center_lng, zoom)
@@ -143,10 +151,17 @@ class RouteMapRenderer:
         min_lat, min_lng, max_lat, max_lng):
       self._offline = True
       self._polylines = []
+      # Visible geographic window (center +/- half the rect at this zoom),
+      # used to cull roads that fall entirely outside the rendered area.
+      half_w = (rect_w / TILE_PX) / 2
+      half_h = (rect_h / TILE_PX) / 2
+      la0, lo0 = _tile_xy_to_lat_lng(cx - half_w, cy - half_h, self._zoom)
+      la1, lo1 = _tile_xy_to_lat_lng(cx + half_w, cy + half_h, self._zoom)
+      view = (min(la0, la1), min(lo0, lo1), max(la0, la1), max(lo0, lo1))
       gen = self._load_gen
       threading.Thread(
         target=self._load_offline,
-        args=((min_lat, min_lng, max_lat, max_lng), gen),
+        args=((min_lat, min_lng, max_lat, max_lng), view, self._zoom, gen),
         daemon=True,
       ).start()
     else:
@@ -160,9 +175,10 @@ class RouteMapRenderer:
       self._download_done = False
       threading.Thread(target=self._download_tiles, daemon=True).start()
 
-  def _load_offline(self, bbox, gen):
-    """Background thread: parse offline vector tiles into road polylines."""
-    polylines = offline_basemap.load_polylines(*bbox)
+  def _load_offline(self, bbox, view, zoom, gen):
+    """Background thread: parse offline vector tiles into road polylines,
+    filtered to roads important enough for the zoom and within the view."""
+    polylines = offline_basemap.load_polylines(*bbox, zoom=zoom, view=view)
     if gen == self._load_gen:
       self._polylines = polylines
 
