@@ -212,8 +212,10 @@ def make_onnx_runners(
   to full-frame coords; ClassifyFn runs classification at imgsz=128."""
   from ultralytics import YOLO
 
-  det_model = YOLO(str(det_onnx))
-  cls_model = YOLO(str(cls_onnx))
+  # ONNX files carry no task metadata — without an explicit task, ultralytics
+  # guesses (and guessed "detect" for the classifier in the first real run).
+  det_model = YOLO(str(det_onnx), task="detect")
+  cls_model = YOLO(str(cls_onnx), task="classify")
   rx1, ry1, rx2, ry2 = roi
 
   def detect_fn(frame_bgr: np.ndarray) -> list[tuple[Box, float]]:
