@@ -68,7 +68,11 @@ def iter_route_frames(
   """Yields (frame_bgr, t_seconds, frame_idx, segment) for sampled frames across every
   segment dir under route_dir, in segment order. frame_idx/t are cumulative across
   segments (a global decoded-frame counter, t = frame_idx / fps). Segments missing
-  fcamera.hevc are skipped with a printed warning."""
+  fcamera.hevc are skipped with a printed warning. Segments whose fcamera.hevc is present
+  but fails to open/decode (e.g. truncated at ignition-off, as C3 realdata's final segment
+  routinely is) also log a warning and are skipped, without aborting the rest of the route;
+  frames already yielded before the error are kept, and the cumulative frame counter
+  continues into the next segment."""
   stride = max(1, round(fps / sample_hz))
   global_idx = 0
   for segment, seg_dir, _route_name in _segment_dirs(route_dir):
@@ -76,13 +80,17 @@ def iter_route_frames(
     if not hevc_path.exists():
       print(f"warning: {hevc_path} missing, skipping segment {segment}")
       continue
-    with av.open(str(hevc_path)) as container:
-      for frame in container.decode(video=0):
-        if global_idx % stride == 0:
-          frame_bgr = frame.to_ndarray(format="bgr24")
-          t = global_idx / fps
-          yield frame_bgr, t, global_idx, segment
-        global_idx += 1
+    try:
+      with av.open(str(hevc_path)) as container:
+        for frame in container.decode(video=0):
+          if global_idx % stride == 0:
+            frame_bgr = frame.to_ndarray(format="bgr24")
+            t = global_idx / fps
+            yield frame_bgr, t, global_idx, segment
+          global_idx += 1
+    except (av.error.FFmpegError, OSError) as e:
+      print(f"warning: decode error in {hevc_path}: {e}; skipping rest of segment")
+      continue
 
 
 def _timed(fn: Callable) -> tuple[Callable, list[float]]:

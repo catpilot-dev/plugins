@@ -92,6 +92,35 @@ def test_iter_route_frames_missing_hevc_skipped(tmp_path, capsys):
   assert "fcamera.hevc" in captured.out
 
 
+def test_iter_route_frames_corrupt_segment_skipped(tmp_path, capsys):
+  route_dir = tmp_path / "route"
+  route_dir.mkdir()
+
+  seg0 = route_dir / "r--0"
+  seg0.mkdir()
+  _encode_hevc_segment(seg0 / "fcamera.hevc", 20)
+
+  seg1 = route_dir / "r--1"
+  seg1.mkdir()
+  # Present-but-corrupt file (garbage bytes): av.open()/decode() raises InvalidDataError,
+  # mirroring a C3 realdata segment truncated/corrupted at ignition-off.
+  (seg1 / "fcamera.hevc").write_bytes(b"\x00\xff" * 1000)
+
+  seg2 = route_dir / "r--2"
+  seg2.mkdir()
+  _encode_hevc_segment(seg2 / "fcamera.hevc", 20)
+
+  frames = list(iter_route_frames(route_dir, sample_hz=4.0, fps=20.0))
+
+  segments_seen = {f[3] for f in frames}
+  assert 0 in segments_seen
+  assert 2 in segments_seen
+
+  captured = capsys.readouterr()
+  assert "warning" in captured.out.lower()
+  assert "decode error" in captured.out.lower()
+
+
 def test_run_end_to_end_publishes_once_and_writes_files(tmp_path, capsys):
   route_dir = _make_route(tmp_path, route="00000abc--deadbeef01", n_segments=1, n_frames=20)
   out_dir = tmp_path / "out"
