@@ -205,11 +205,13 @@ def run(
 
 
 def make_onnx_runners(
-  det_onnx: Path, cls_onnx: Path, roi: tuple[float, float, float, float], det_conf: float
+  det_onnx: Path, cls_onnx: Path, roi: tuple[float, float, float, float], det_conf: float,
+  det_imgsz: int = 256,
 ) -> tuple[DetectFn, ClassifyFn]:
   """Builds (DetectFn, ClassifyFn) backed by ultralytics YOLO ONNX predictors. DetectFn
-  runs detection on the ROI crop (normalized rect -> px) at imgsz=256 and maps boxes back
-  to full-frame coords; ClassifyFn runs classification at imgsz=128."""
+  runs detection on the ROI crop (normalized rect -> px) at det_imgsz (must match the
+  ONNX graph's fixed input size) and maps boxes back to full-frame coords; ClassifyFn
+  runs classification at imgsz=128."""
   from ultralytics import YOLO
 
   # ONNX files carry no task metadata — without an explicit task, ultralytics
@@ -224,7 +226,7 @@ def make_onnx_runners(
     roi_crop = frame_bgr[oy1:oy2, ox1:ox2]
     if roi_crop.size == 0:
       return []
-    results = det_model.predict(roi_crop, imgsz=256, conf=det_conf, verbose=False)
+    results = det_model.predict(roi_crop, imgsz=det_imgsz, conf=det_conf, verbose=False)
     boxes: list[tuple[Box, float]] = []
     for res in results:
       if res.boxes is None:
@@ -254,12 +256,15 @@ def main(argv: list[str] | None = None) -> None:
   parser.add_argument("--sample-hz", type=float, default=2.0, help="frame sampling rate")
   parser.add_argument("--out", required=True, help="output run dir")
   parser.add_argument("--det-conf", type=float, default=PipelineConfig().det_conf)
+  parser.add_argument("--det-imgsz", type=int, default=256,
+                      help="detector input size; must match the ONNX graph (256 local, 512 kaggle)")
   parser.add_argument("--route-name", default=None, help="override the route name in publishes.jsonl")
   args = parser.parse_args(argv)
 
   roi = ROI_PRESETS[args.roi]
   detect_fn, classify_fn = make_onnx_runners(
-    Path(args.det_onnx).expanduser(), Path(args.cls_onnx).expanduser(), roi, args.det_conf)
+    Path(args.det_onnx).expanduser(), Path(args.cls_onnx).expanduser(), roi, args.det_conf,
+    det_imgsz=args.det_imgsz)
   config = PipelineConfig(det_conf=args.det_conf)
   run(Path(args.route_dir).expanduser(), Path(args.out).expanduser(),
       detect_fn, classify_fn, args.sample_hz, route_name=args.route_name, config=config)
