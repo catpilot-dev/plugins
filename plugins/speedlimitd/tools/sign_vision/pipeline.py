@@ -35,9 +35,8 @@ class SignPipeline:
     self.detect_fn = detect_fn
     self.classify_fn = classify_fn
     self.config = config
-    self._votes: dict[int, deque[float]] = {}          # value -> timestamps of recent votes
-    self._last_vote: dict[int, tuple[float, Box]] = {} # value -> (conf, box) of latest vote
-    self._cooldown_until: dict[int, float] = {}        # value -> suppress publishes before this t
+    self._votes: dict[int, deque[float]] = {}     # value -> timestamps of recent votes
+    self._cooldown_until: dict[int, float] = {}   # value -> suppress publishes before this t
 
   def _box_ok(self, box: Box, frame_w: int, frame_h: int, conf: float) -> bool:
     cfg = self.config
@@ -110,11 +109,9 @@ class SignPipeline:
         continue
       dq = self._votes.setdefault(value, deque())
       dq.append(t)
-      self._last_vote[value] = (conf, box)
       while dq and dq[0] < t - cfg.confirm_window_s:
         dq.popleft()
       if len(dq) >= cfg.confirm_votes:
-        conf, box = self._last_vote[value]
         publishes.append({
           "t": t,
           "frame_idx": frame_idx,
