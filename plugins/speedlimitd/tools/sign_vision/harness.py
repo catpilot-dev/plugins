@@ -50,7 +50,7 @@ def _segment_dirs(route_dir: Path) -> list[tuple[int, Path, str]]:
   `--<int>`, sorted by that int. route_name is the child dir name with the `--<int>`
   suffix stripped."""
   entries = []
-  for child in sorted(Path(route_dir).iterdir()):
+  for child in Path(route_dir).iterdir():
     if not child.is_dir():
       continue
     m = _SEGMENT_RE.match(child.name)

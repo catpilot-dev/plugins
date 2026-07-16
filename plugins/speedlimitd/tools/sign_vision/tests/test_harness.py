@@ -6,6 +6,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 av = pytest.importorskip("av")
+cv2 = pytest.importorskip("cv2")
 
 from plugins.speedlimitd.tools.sign_vision.harness import ROI_PRESETS, iter_route_frames, run
 from plugins.speedlimitd.tools.sign_vision.pipeline import PipelineConfig
