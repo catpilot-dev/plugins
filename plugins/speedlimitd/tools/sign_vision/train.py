@@ -3,7 +3,7 @@
 CLI:
   uv run python train.py det --data ~/catpilot-dev/datasets/sign_vision/det.yaml --epochs 60
   uv run python train.py cls --data ~/catpilot-dev/datasets/sign_vision/cls --epochs 40
-  uv run python train.py export --weights <best.pt> --kind det|cls [--device 0]
+  uv run python train.py export --weights <best.pt> --kind det|cls
 
 Imports ultralytics only inside main() so build_train_kwargs can be tested
 without the library.
@@ -11,6 +11,9 @@ without the library.
 import argparse
 import shutil
 from pathlib import Path
+
+# Image sizes for each model kind (single source of truth)
+IMGSZ = {"det": 256, "cls": 128}
 
 
 def build_train_kwargs(kind: str, data: str, epochs: int, device: str) -> dict:
@@ -32,7 +35,7 @@ def build_train_kwargs(kind: str, data: str, epochs: int, device: str) -> dict:
     return {
       "model": "yolo11n.pt",
       "data": data,
-      "imgsz": 256,
+      "imgsz": IMGSZ["det"],
       "epochs": epochs,
       "device": device,
       "batch": -1,
@@ -41,7 +44,7 @@ def build_train_kwargs(kind: str, data: str, epochs: int, device: str) -> dict:
     return {
       "model": "yolo11n-cls.pt",
       "data": data,
-      "imgsz": 128,
+      "imgsz": IMGSZ["cls"],
       "epochs": epochs,
       "device": device,
       "batch": 64,
@@ -63,10 +66,7 @@ def _export_handler(args) -> None:
   """Handle export subcommand."""
   from ultralytics import YOLO
 
-  if args.kind not in ("det", "cls"):
-    raise ValueError(f"Unknown kind: {args.kind}")
-
-  imgsz = 256 if args.kind == "det" else 128
+  imgsz = IMGSZ[args.kind]
   yolo = YOLO(args.weights)
   yolo.export(format="onnx", imgsz=imgsz)
 
@@ -89,19 +89,24 @@ def main(argv=None) -> None:
   )
   subparsers = parser.add_subparsers(dest="cmd", required=True)
 
-  # train subcommand
-  train_p = subparsers.add_parser("train", help="Train det or cls model")
-  train_p.add_argument("kind", choices=["det", "cls"], help="Model kind")
-  train_p.add_argument("--data", required=True, help="data.yaml (det) or data/ folder (cls)")
-  train_p.add_argument("--epochs", type=int, required=True, help="Training epochs")
-  train_p.add_argument("--device", default="0", help="Device spec (default: 0)")
-  train_p.set_defaults(handler=_train_handler)
+  # det subcommand
+  det_p = subparsers.add_parser("det", help="Train detection model")
+  det_p.add_argument("--data", required=True, help="data.yaml for detection")
+  det_p.add_argument("--epochs", type=int, required=True, help="Training epochs")
+  det_p.add_argument("--device", default="0", help="Device spec (default: 0)")
+  det_p.set_defaults(kind="det", handler=_train_handler)
+
+  # cls subcommand
+  cls_p = subparsers.add_parser("cls", help="Train classification model")
+  cls_p.add_argument("--data", required=True, help="data/ folder for classification")
+  cls_p.add_argument("--epochs", type=int, required=True, help="Training epochs")
+  cls_p.add_argument("--device", default="0", help="Device spec (default: 0)")
+  cls_p.set_defaults(kind="cls", handler=_train_handler)
 
   # export subcommand
   export_p = subparsers.add_parser("export", help="Export trained model to ONNX")
   export_p.add_argument("--weights", required=True, help="Path to best.pt")
   export_p.add_argument("--kind", choices=["det", "cls"], required=True, help="Model kind")
-  export_p.add_argument("--device", default="0", help="Device spec (default: 0)")
   export_p.set_defaults(handler=_export_handler)
 
   args = parser.parse_args(argv)
