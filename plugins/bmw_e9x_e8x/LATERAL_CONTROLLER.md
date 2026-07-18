@@ -130,6 +130,34 @@ This document is the canonical reference for the lateral controller registered b
 > hold_cap exonerated by the same investigation (pins were healthy holds).
 > Telemetry gains `relax_ticks`.
 
+> **2026-07-19 — live noise observer + tolerance noise-floor (route 3ac
+> segs 20-30: straight/mild-turn "unnecessary oscillation").** The hold
+> stack was exonerated (hold_f ≡ 0 across all 11 segments); the real driver
+> is that at 60–90 km/h the 1/v² tolerance (κ ≈ 2–3e-4) sits 5–10× below
+> modelV2's sub-Hz κ_des wander (±1–3e-3), so |delta_err| > tolerance on
+> ~70–80% of ticks: torque reversed direction 25–50×/min and the wheel
+> stick-slipped in 0.5–1° notches. Cross-correlation proved the chase is
+> model-driven (κ_des leads κ_meas by 0.15–1.2 s). A 12-route study showed
+> the noise is not speed-scheduled (it mildly *decreases* with v; the
+> tolerance just shrinks faster) and grows with lead proximity and low
+> laneLineProbs — so it is now observed **live**: fast(1 s)−slow(5 s) EMA
+> band-pass of κ_des → 20 s running variance → σ, trained only on
+> near-straight engaged ticks (|κ_des| < KN_GATE_KAPPA = 0.002, no lane
+> change), frozen elsewhere. The tolerance gets a floor of
+> `KN_SIGMA_MULT(1.5)·σ·L`, faded to zero over |κ_des| ∈ KN_FADE_BP
+> = [0.002, 0.004] (curves keep the pure kinematic band — allowed drift
+> must not grow with curvature) and capped at the kinematic tolerance ×
+> KN_DRIFT_CAP_M/DRIFT_M (implied drift ≤ 0.08 m; the route-31b 0.35°
+> constant band that drifted 1.3–1.7 m is 3–5× above this cap). Replay over
+> 140k near-straight ticks: actionable fraction 70%→36%, error sign-flips
+> −30%, cap binds 5%, 0.00% of curve ticks affected. Telemetry gains
+> `k_sigma`. **Same date — stale action labels expired:** between cadence
+> decisions, a transient label (ramp/relax_dwell/cancel_*) now becomes
+> `idle` once its ramp completes; holds keep their label (they re-fire each
+> cadence). Occupancy counts over the telemetry stream are now honest;
+> the cancel_tol `action=='ramp'` gate is unaffected (in-flight ramps
+> never expire).
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -305,7 +333,19 @@ state['delta_err_raw'] = delta_err_raw    # both published in telemetry
 DRIFT_M     = 0.02              # m of allowed drift over model_action_t (fixed)
 lookahead_m = v * model_action_t
 tolerance   = 2.0 * DRIFT_M * L / (lookahead_m**2) # rad, 1/v² scaling
+# 2026-07-19 noise floor (see header note + KN_* constants in code):
+kn_fade     = interp(|κ_des|, KN_FADE_BP=[0.002, 0.004], [1, 0])
+tol_floor   = KN_SIGMA_MULT(1.5) · σ_live · L · kn_fade
+tolerance   = max(tolerance, min(tol_floor, tolerance · KN_DRIFT_CAP_M/DRIFT_M))
 ```
+
+**2026-07-19: σ-observer noise floor added.** The kinematic band alone shrinks
+below modelV2's own sub-Hz wander at 60–90 km/h (controller actionable 70–80%
+of straight ticks — chase churn, route 3ac). A live band-pass variance
+estimator on κ_des (1 s/5 s EMAs → 20 s variance, trained only near-straight)
+floors the tolerance at 1.5σ·L on straights, fading to zero by |κ_des| = 0.004
+so curves keep the pure kinematic band. Cap: implied drift ≤ 0.08 m
+(KN_DRIFT_CAP_M) — well below the route-31b failure regime.
 
 **2026-07-04: the 2026-07-03 κ-dependent widening (0.02→0.10 m) was REVERTED.**
 Allowed drift must not grow with curvature — lane margin shrinks in tight turns
@@ -384,6 +424,7 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | `cancel_tol` | error fell into 1.2× tolerance band mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights) |
 | `cancel_accel` | overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` — drain to 0 |
 | `cancel_jerk` | overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` — drain to 0 |
+| `idle` | (2026-07-19) between cadence decisions after a transient label's ramp completed — expires ramp/relax_dwell/cancel_* so telemetry occupancy counts are honest; holds never expire (they re-fire each cadence) |
 
 Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`. Added: `hold_curve`. Telemetry gains `hold_f`.
 
@@ -411,6 +452,12 @@ Published each livePose tick:
 | `active` | controller active flag |
 | `a_y_meas` | `v²·κ_meas` (m/s²) |
 | `jerk_pred` | `v²·(κ_des - κ_meas)/model_action_t` (m/s³) |
+| `de_w` | blend weight of the delta_err filter (1 = raw, 0 = fully box-filtered) |
+| `hold_f` | curvature hold factor [0, 1] |
+| `hold_cap` | cap on held torque (deadzone-edge P value, frac) |
+| `tolerance` | live deadzone half-width (rad) — kinematic ∨ noise floor (2026-07-19) |
+| `relax_ticks` | consecutive ticks of overshoot-side error while deep in a curve (dwell counter) |
+| `k_sigma` | (2026-07-19) live σ of modelV2 sub-Hz κ_des wander (1/m), from the noise observer |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 

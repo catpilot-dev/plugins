@@ -183,6 +183,49 @@ def on_lat_controller_init(result, lac, CP):
   # hold_curve (resting torque) + STEP_MAX (bounded chase) instead.
   DRIFT_M = 0.02           # m of allowed drift over model_action_t (fixed)
 
+  # Online modelV2 noise observer + tolerance noise-floor (2026-07-19,
+  # route 3ac segs 20-30 analysis). At 60-90 km/h the 1/v² tolerance
+  # (κ ≈ 2-3e-4) sits 5-10× BELOW modelV2's own sub-Hz κ_des wander
+  # (±1-3e-3 over multi-second stretches), so |delta_err| > tolerance on
+  # ~70-80% of near-straight ticks: the controller never rests, torque
+  # reverses direction 25-50×/min, and the wheel stick-slips in small
+  # notches (xcorr showed κ_des LEADING κ_meas by 0.15-1.2 s — model-driven
+  # chase, not a feedback limit cycle). The noise is NOT speed-caused
+  # (it mildly DECREASES with v; the tolerance just shrinks 1/v² faster)
+  # and grows with lead proximity and low laneLineProbs — so it must be
+  # observed live, not scheduled by speed.
+  #
+  # Observer (livePose rate, trained only when active, no lane change, and
+  # |κ_des| < KN_GATE_KAPPA so real geometry never inflates it; frozen —
+  # not decayed — elsewhere):
+  #   ema_f/ema_s   = 1 s / 5 s EMAs of κ_des; their difference isolates
+  #                   the 0.03-0.16 Hz wander band that drives the chase
+  #                   (tick-jitter is already box-filtered by the blend;
+  #                   slower trends are real road geometry)
+  #   var           = 20 s EMA of band² → σ = √var
+  # Floor: tolerance = max(kinematic, min(KN_SIGMA_MULT·σ·L·fade, cap)),
+  #   fade = interp(|κ_des|, KN_FADE_BP, [1, 0]) — full floor on straights,
+  #   ZERO in real curves (mirrors KD_BLEND_BP: curves trust the model raw,
+  #   straights distrust its noise; also enforces the 2026-07-04 rule that
+  #   allowed drift must not grow with curvature — replay: 0.00% of
+  #   |κ|>0.004 ticks floor-affected);
+  #   cap = kinematic·(KN_DRIFT_CAP_M/DRIFT_M) — the floor may never imply
+  #   more than KN_DRIFT_CAP_M of allowed drift (route 31b lesson bounds it:
+  #   the 0.35° constant band that drifted 1.3-1.7 m is 3-5× above this cap
+  #   at highway speed).
+  # 12-route replay (3a7-3b2, 140k near-straight ticks): σ p50 0.00036
+  # (matches offline window-wander 0.00033); MULT=1.5 cuts actionable ticks
+  # 70%→36% and error sign-flips −30%, cap binds 5%. MULT=2.0 rejected:
+  # cap binds 31% (σ signal saturates); MULT=1.0 too weak (52% actionable).
+  KN_EMA_FAST   = 0.05     # fast EMA α (τ ≈ 1 s at 20 Hz)
+  KN_EMA_SLOW   = 0.01     # slow EMA α (τ ≈ 5 s)
+  KN_VAR_ALPHA  = 0.0025   # variance EMA α (τ ≈ 20 s)
+  KN_SIGMA_PRIOR = 0.00035  # init σ (1/m) — pooled 12-route near-straight median
+  KN_GATE_KAPPA = 0.002    # train σ only below this |κ_des|
+  KN_FADE_BP    = [0.002, 0.004]  # floor weight 1→0 over this |κ_des| band
+  KN_SIGMA_MULT = 1.5      # tolerance floor = MULT·σ·L (≈87% of Gaussian noise in-band)
+  KN_DRIFT_CAP_M = 0.08    # cap: floor may never exceed this effective DRIFT_M
+
   # κ-gated box filter on delta_err. Bare-model κ_des on near-straight
   # produces high-rate sign-flips that propagate into delta_err. Each
   # delta_err sign-flip across the tolerance band triggers
@@ -321,7 +364,7 @@ def on_lat_controller_init(result, lac, CP):
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
-    'action': 'init',          # debug: hold_zero / hold_curve / ramp / cancel_tol / cancel_accel / cancel_jerk
+    'action': 'init',          # debug: hold_zero / hold_curve / ramp / relax_dwell / cancel_tol / cancel_accel / cancel_jerk / idle
     'delta_err': 0.0,          # debug: filtered front-wheel-angle error (rad), what controller acts on
     'delta_err_raw': 0.0,      # debug: pre-filter delta_err (rad)
     'lat_pub': None,
@@ -334,6 +377,10 @@ def on_lat_controller_init(result, lac, CP):
     'hold_f': 0.0,                # debug: curvature hold factor [0,1]
     'hold_cap': 0.0,              # debug: cap on held torque (deadzone-edge P value, frac)
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
+    'kn_ema_f': 0.0,              # noise observer: fast κ_des EMA (τ≈1 s)
+    'kn_ema_s': 0.0,              # noise observer: slow κ_des EMA (τ≈5 s)
+    'kn_var': KN_SIGMA_PRIOR ** 2,  # noise observer: running variance of the wander band
+    'k_sigma': KN_SIGMA_PRIOR,    # debug: live σ of modelV2 sub-Hz κ_des wander (1/m)
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -436,6 +483,18 @@ def on_lat_controller_init(result, lac, CP):
       state['delta_err'] = delta_err
       state['delta_err_raw'] = delta_err_raw
 
+      # Live modelV2 noise observer (see KN_* constants block). Trained only
+      # on near-straight engaged ticks outside lane changes — real curve
+      # geometry and lane-change reframes must never inflate σ; elsewhere
+      # the estimate freezes (curves are transient, and the floor fades to
+      # zero there anyway).
+      if active and not lane_change_active and abs(state['desired']) < KN_GATE_KAPPA:
+        state['kn_ema_f'] += KN_EMA_FAST * (state['desired'] - state['kn_ema_f'])
+        state['kn_ema_s'] += KN_EMA_SLOW * (state['desired'] - state['kn_ema_s'])
+        band = state['kn_ema_f'] - state['kn_ema_s']
+        state['kn_var'] += KN_VAR_ALPHA * (band * band - state['kn_var'])
+        state['k_sigma'] = math.sqrt(state['kn_var'])
+
       # Speed-scaled tolerance: fixed DRIFT_M over model_action_t, 1/v²
       # scaling (κ-widening reverted 2026-07-04 — see DRIFT_M block above:
       # allowed drift must not grow with curvature).
@@ -451,6 +510,15 @@ def on_lat_controller_init(result, lac, CP):
       # build has none of.
       lookahead_m = v * model_action_t
       tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
+      # Noise floor on the tolerance (2026-07-19, see KN_* constants block):
+      # never demand corrections the live σ-observer says are
+      # indistinguishable from modelV2 wander. Fades to zero over KN_FADE_BP
+      # (curves keep the pure kinematic band); capped so the implied allowed
+      # drift never exceeds KN_DRIFT_CAP_M regardless of what σ reports.
+      kn_fade = float(np.interp(abs(state['desired']), KN_FADE_BP, [1.0, 0.0]))
+      tol_floor = KN_SIGMA_MULT * state['k_sigma'] * L * kn_fade
+      tol_cap = tolerance * (KN_DRIFT_CAP_M / DRIFT_M)
+      tolerance = max(tolerance, min(tol_floor, tol_cap))
       state['tolerance'] = tolerance
 
       # Curvature scale for the P-term and caps (computed per tick since the
@@ -589,6 +657,17 @@ def on_lat_controller_init(result, lac, CP):
         state['tick_count'] = 0
       else:
         state['tick_count'] += 1
+        # Expire transient action labels once their ramp completes (parked
+        # fix, folded in 2026-07-19): between cadence decisions the label
+        # used to persist after the ramp finished, so naive telemetry
+        # occupancy counts over-attributed ramp/cancel states (transition-
+        # level counting was the workaround). Holds keep their label — they
+        # re-fire every cadence and their occupancy IS meaningful. The
+        # cancel_tol gate is unaffected: it requires ramp_frames > 0, and
+        # in-flight ramps (ramp_frames > 0) never expire here.
+        if state['ramp_frames'] == 0 and state['action'] in (
+            'ramp', 'relax_dwell', 'cancel_tol', 'cancel_accel', 'cancel_jerk'):
+          state['action'] = 'idle'
 
       if state['tick_count'] >= action_cadence_ticks:
         state['tick_count'] = 0
@@ -720,6 +799,7 @@ def on_lat_controller_init(result, lac, CP):
           'hold_cap': float(state['hold_cap']),
           'tolerance': float(state['tolerance']),
           'relax_ticks': int(state['relax_ticks']),
+          'k_sigma': float(state['k_sigma']),                 # live modelV2 wander σ (1/m)
         }
         state['lat_pub'].send(payload)
       except Exception:
