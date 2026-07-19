@@ -158,6 +158,29 @@ This document is the canonical reference for the lateral controller registered b
 > the cancel_tol `action=='ramp'` gate is unaffected (in-flight ramps
 > never expire).
 
+> **2026-07-19 — sign-persistence gate on the noise floor (route 3b3 "a bit
+> left hug", first on-car data of the floor).** The floor is symmetric so it
+> can't create a directional bias, but it removed the gentle centering the
+> tight kinematic band provided, letting a small pre-existing offset stand:
+> 3b3 showed the signed lane offset shift ~0.13 m left and off-centering
+> magnitude scale with the floor-widening ratio (|offset| 0.17 m at 1.0× →
+> 0.32 m at ≥2×; Spearman(widen, |offset|) = +0.22, well above σ's +0.08).
+> Root cause: the floor widened tolerance against the *instantaneous*
+> delta_err, lumping zero-mean wander (ignore) with a sustained DC offset
+> (must correct) — and the 0.08 m implied-drift cap is per-horizon, so it
+> doesn't bound the *integrated* steady offset (which grows until the model's
+> re-centering demand exceeds 1.5σ·L → ~0.2–0.3 m at highway). Fix: `de_dc`,
+> a slow (τ≈2 s) EMA of delta_err, is a persistence detector — zero-mean
+> wander averages toward 0, a sustained offset accumulates. As
+> `|de_dc|/tol_kin` grows across `KN_PERSIST_BP = [0.7, 1.3]` the floor fades
+> out (`persist_w → 0`), so the steady offset is bounded by `tol_kin` (tight),
+> not the floor. Mirrors relax-dwell's "persistence proves it's real." τ and
+> band are data-set on 3b3 (8353 lane-aligned near-straight ticks: τ=2 s
+> separates centered de_dc/tol_kin ≈ 0.4 from offset ≈ 1.5; the band pulls the
+> floor on 75% of offset ticks while keeping it for 90% of centered ticks).
+> Telemetry gains `de_dc`, `persist_w`. Closed-loop centering recovery is
+> pending on-car verification (open-loop replay validates only the detector).
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -333,11 +356,22 @@ state['delta_err_raw'] = delta_err_raw    # both published in telemetry
 DRIFT_M     = 0.02              # m of allowed drift over model_action_t (fixed)
 lookahead_m = v * model_action_t
 tolerance   = 2.0 * DRIFT_M * L / (lookahead_m**2) # rad, 1/v² scaling
-# 2026-07-19 noise floor (see header note + KN_* constants in code):
+# 2026-07-19 noise floor + sign-persistence gate (see header notes + KN_* code):
+tol_kin     = 2.0 * DRIFT_M * L / (lookahead_m**2)
 kn_fade     = interp(|κ_des|, KN_FADE_BP=[0.002, 0.004], [1, 0])
-tol_floor   = KN_SIGMA_MULT(1.5) · σ_live · L · kn_fade
-tolerance   = max(tolerance, min(tol_floor, tolerance · KN_DRIFT_CAP_M/DRIFT_M))
+de_dc       = slow_EMA(delta_err, τ≈2s)                     # persistent/DC component
+persist_w   = interp(|de_dc|/tol_kin, KN_PERSIST_BP=[0.7, 1.3], [1, 0])
+tol_floor   = KN_SIGMA_MULT(1.5) · σ_live · L · kn_fade · persist_w
+tolerance   = max(tol_kin, min(tol_floor, tol_kin · KN_DRIFT_CAP_M/DRIFT_M))
 ```
+
+**2026-07-19: sign-persistence gate.** The symmetric floor removed the gentle
+centering the tight band gave, letting a small offset stand (route 3b3
+left-hug). `de_dc` (slow EMA of delta_err) detects a *persistent* one-sided
+error — a real position offset, not wander — and fades the floor out
+(`persist_w → 0`) as it grows past `tol_kin`, so the steady offset stays
+bounded by the tight kinematic band while zero-mean wander keeps the full
+floor. See header note for the on-car evidence and tuning.
 
 **2026-07-19: σ-observer noise floor added.** The kinematic band alone shrinks
 below modelV2's own sub-Hz wander at 60–90 km/h (controller actionable 70–80%
@@ -458,6 +492,8 @@ Published each livePose tick:
 | `tolerance` | live deadzone half-width (rad) — kinematic ∨ noise floor (2026-07-19) |
 | `relax_ticks` | consecutive ticks of overshoot-side error while deep in a curve (dwell counter) |
 | `k_sigma` | (2026-07-19) live σ of modelV2 sub-Hz κ_des wander (1/m), from the noise observer |
+| `de_dc` | (2026-07-19) persistent (DC) component of delta_err (rad), slow EMA — the sign-persistence detector |
+| `persist_w` | (2026-07-19) floor weight from the sign-persistence gate (1 = full floor, 0 = floor off, offset being corrected) |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 

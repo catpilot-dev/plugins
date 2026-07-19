@@ -136,5 +136,30 @@ check('hold_curve engaged on-target', st4['action'] in ('hold_curve', 'cancel_to
       f"action={st4['action']}")
 check('held torque not drained to 0', st4['torque'] > 0.03, f"tq={st4['torque']:.3f}")
 
+print('probe 9: sign-persistence gate (zero-mean wander keeps floor; sustained offset pulls it)')
+import math as _m
+def run_wander(lac, st, dc, amp=0.0007, periods=6, n=240, v=25.0):
+  # feed n near-straight ticks of kappa_des = dc + amp*sin, kappa_meas=0.
+  # |kappa_des| stays < KN_FADE_BP[0]=0.002 so kn_fade=1 (isolate persist_w).
+  for i in range(n):
+    k = dc + amp * _m.sin(2*_m.pi*periods*i/n)
+    tick(lac, float(k), v=v, yaw=0.0)
+  return st['tolerance'], st['k_sigma'], st['de_dc'], st['persist_w']
+
+lac5, st5 = fresh()
+tol_w, sig_w, dedc_w, pw_w = run_wander(lac5, st5, dc=0.0)      # centered: zero-mean wander
+lac6, st6 = fresh()
+tol_d, sig_d, dedc_d, pw_d = run_wander(lac6, st6, dc=0.0011)   # sustained left offset + same wander
+kin25 = 2.0*0.02*L/((25.0*0.45)**2)
+check('wander builds sigma (floor has something to stand on)', sig_w > 1e-4, f"sig={sig_w:.5f}")
+check('wander: de_dc ~ 0 (zero-mean averages out)', abs(dedc_w) < 0.5*kin25, f"de_dc/kin={dedc_w/kin25:+.2f}")
+check('wander: persist_w stays high (floor kept)', pw_w > 0.7, f"pw={pw_w:.2f}")
+check('wander: tolerance floored above kinematic', tol_w > kin25*1.1, f"tol={tol_w:.5f} kin={kin25:.5f}")
+check('offset: de_dc accumulates past band', dedc_d/kin25 > 1.3, f"de_dc/kin={dedc_d/kin25:+.2f}")
+check('offset: persist_w pulled low (floor off)', pw_d < 0.2, f"pw={pw_d:.2f}")
+check('offset: tolerance collapses toward kinematic', tol_d < tol_w*0.8, f"tol_off={tol_d:.5f} < tol_wander={tol_w:.5f}")
+check('offset: tolerance ~ kinematic (steady offset bounded by tol_kin)', abs(tol_d-kin25) < 0.15*kin25,
+      f"tol_off={tol_d:.5f} kin={kin25:.5f}")
+
 print(f'\n{PASS} passed, {FAIL} failed')
 sys.exit(1 if FAIL else 0)

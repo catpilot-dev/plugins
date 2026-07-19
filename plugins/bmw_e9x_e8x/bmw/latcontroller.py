@@ -226,6 +226,35 @@ def on_lat_controller_init(result, lac, CP):
   KN_SIGMA_MULT = 1.5      # tolerance floor = MULT·σ·L (≈87% of Gaussian noise in-band)
   KN_DRIFT_CAP_M = 0.08    # cap: floor may never exceed this effective DRIFT_M
 
+  # Sign-persistence gate on the noise floor (2026-07-19, route 3b3 left-hug).
+  # The floor above is symmetric, so it cannot create a directional bias — but
+  # it CAN let a pre-existing one stand: widening the deadzone removes the
+  # gentle centering authority the tight kinematic band provided, so a small
+  # steady position offset (a persistent one-sided delta_err) is no longer
+  # nibbled back. Route 3b3 (first on-car data of the floor) confirmed it:
+  # signed lane offset shifted ~0.13 m left and off-centering magnitude scaled
+  # with the floor-widening ratio (|offset| 0.17 m at 1.0× → 0.32 m at ≥2×).
+  # Root cause: the floor widens tolerance against the INSTANTANEOUS delta_err,
+  # lumping zero-mean wander (which SHOULD be ignored) with a sustained DC
+  # offset (which must still be corrected); the KN_DRIFT_CAP_M cap is
+  # per-horizon and does NOT bound the integrated steady offset.
+  #
+  # Fix: de_dc is a slow (τ≈2 s) EMA of delta_err — a persistence detector.
+  # Zero-mean wander averages toward 0; a sustained one-sided offset
+  # accumulates. As |de_dc| grows past the tight kinematic tolerance the floor
+  # fades out (persist_w → 0), so the steady-state offset is bounded by tol_kin
+  # (tight) instead of tol_floor. Mirrors the relax-dwell principle
+  # ("persistence proves it's real"). Trained on the same near-straight gate as
+  # the σ-observer (curves/lane-changes freeze it; the floor is faded off there
+  # by KN_FADE_BP anyway). Tuning is data-set on route 3b3 (8353 near-straight
+  # lane-aligned ticks): τ=2 s cleanly separates centered stretches
+  # (de_dc/tol_kin ≈ 0.4) from offset stretches (≈1.5) — longer τ blurs them.
+  # Fade band [0.7, 1.3]·tol_kin sits in that gap: pulls the floor on 75% of
+  # offset ticks (→ re-center) while keeping it on for 90% of centered ticks
+  # (→ anti-churn preserved).
+  KN_DC_ALPHA = 0.025      # de_dc EMA α (τ ≈ 2 s) — slower than the wander band
+  KN_PERSIST_BP = [0.7, 1.3]  # |de_dc|/tol_kin: floor weight fades 1→0 across this band
+
   # κ-gated box filter on delta_err. Bare-model κ_des on near-straight
   # produces high-rate sign-flips that propagate into delta_err. Each
   # delta_err sign-flip across the tolerance band triggers
@@ -381,6 +410,8 @@ def on_lat_controller_init(result, lac, CP):
     'kn_ema_s': 0.0,              # noise observer: slow κ_des EMA (τ≈5 s)
     'kn_var': KN_SIGMA_PRIOR ** 2,  # noise observer: running variance of the wander band
     'k_sigma': KN_SIGMA_PRIOR,    # debug: live σ of modelV2 sub-Hz κ_des wander (1/m)
+    'de_dc': 0.0,                # persistence gate: slow EMA of delta_err (DC/offset component)
+    'persist_w': 1.0,            # debug: floor weight from the sign-persistence gate (1=full floor, 0=off)
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -494,6 +525,12 @@ def on_lat_controller_init(result, lac, CP):
         band = state['kn_ema_f'] - state['kn_ema_s']
         state['kn_var'] += KN_VAR_ALPHA * (band * band - state['kn_var'])
         state['k_sigma'] = math.sqrt(state['kn_var'])
+        # Persistence detector (see KN_PERSIST_BP block): slow EMA of the
+        # error the controller acts on. Zero-mean wander averages toward 0;
+        # a sustained one-sided offset accumulates here. Same near-straight
+        # gate — it must reflect the straight-line steady offset, not curve
+        # tracking error (the floor is faded off in curves regardless).
+        state['de_dc'] += KN_DC_ALPHA * (delta_err - state['de_dc'])
 
       # Speed-scaled tolerance: fixed DRIFT_M over model_action_t, 1/v²
       # scaling (κ-widening reverted 2026-07-04 — see DRIFT_M block above:
@@ -509,16 +546,22 @@ def on_lat_controller_init(result, lac, CP):
       # viable on top of an external position-feedback loop, which the public
       # build has none of.
       lookahead_m = v * model_action_t
-      tolerance = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
+      tol_kin = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
       # Noise floor on the tolerance (2026-07-19, see KN_* constants block):
       # never demand corrections the live σ-observer says are
       # indistinguishable from modelV2 wander. Fades to zero over KN_FADE_BP
       # (curves keep the pure kinematic band); capped so the implied allowed
       # drift never exceeds KN_DRIFT_CAP_M regardless of what σ reports.
       kn_fade = float(np.interp(abs(state['desired']), KN_FADE_BP, [1.0, 0.0]))
-      tol_floor = KN_SIGMA_MULT * state['k_sigma'] * L * kn_fade
-      tol_cap = tolerance * (KN_DRIFT_CAP_M / DRIFT_M)
-      tolerance = max(tolerance, min(tol_floor, tol_cap))
+      # Sign-persistence gate (see KN_PERSIST_BP block): pull the floor out as
+      # the persistent (DC) component of delta_err grows past the tight
+      # kinematic band — that is a real position offset, not wander, and must
+      # be corrected. Bounds the steady-state offset by tol_kin, not tol_floor.
+      persist_w = float(np.interp(abs(state['de_dc']) / tol_kin, KN_PERSIST_BP, [1.0, 0.0]))
+      state['persist_w'] = persist_w
+      tol_floor = KN_SIGMA_MULT * state['k_sigma'] * L * kn_fade * persist_w
+      tol_cap = tol_kin * (KN_DRIFT_CAP_M / DRIFT_M)
+      tolerance = max(tol_kin, min(tol_floor, tol_cap))
       state['tolerance'] = tolerance
 
       # Curvature scale for the P-term and caps (computed per tick since the
@@ -800,6 +843,8 @@ def on_lat_controller_init(result, lac, CP):
           'tolerance': float(state['tolerance']),
           'relax_ticks': int(state['relax_ticks']),
           'k_sigma': float(state['k_sigma']),                 # live modelV2 wander σ (1/m)
+          'de_dc': float(state['de_dc']),                     # persistent (DC) component of delta_err (rad)
+          'persist_w': float(state['persist_w']),             # sign-persistence floor weight (1=full floor, 0=off)
         }
         state['lat_pub'].send(payload)
       except Exception:
