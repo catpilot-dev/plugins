@@ -30,39 +30,45 @@ What the prediction fixes (all observed on route 3bf):
   *trajectory* toward the line a couple of seconds before it becomes position
   error. The predictor acts on exactly that signal.
 
-## 2. The prediction — pure geometry, one frame, fixed distance
+## 2. The prediction — pure geometry, one frame, horizon = 2× lateral delay
 
 User-selected source: the lane line's geometry ahead (no time-differentiation
-of a noisy series), evaluated at a **fixed distance** `PRED_DIST = 10 m`
-(user decision 2026-07-23) — the classic look-ahead-error formulation
-(`e + x_la·ψ`). The car's own commanded path is subtracted so a curving line
-tracked by a curving car reads as zero drift:
+of a noisy series), evaluated at the point the car reaches after
+**`PRED_T = PRED_DELAY_MULT × lat_delay`** (user decision 2026-07-23:
+mult = 2, BMW lat_delay ≈ 0.6 s → **≈ 1.2 s horizon**). The car's own
+commanded path is subtracted so a curving line tracked by a curving car reads
+as zero drift:
 
 ```
-y_line    = interp(PRED_DIST, laneLines[idx].x, laneLines[idx].y)  # line 10 m ahead
-y_path    = -kappa_ref · PRED_DIST² / 2                            # where the car will be
-                                                                   # (left-positive κ → −y in
-                                                                   #  the +y=right device frame)
+pred_t    = PRED_DELAY_MULT · lat_delay          # lat_delay live from the hook;
+                                                 # fallback LAT_DELAY_FALLBACK=0.6 s
+x_pred    = clip(v_ego · pred_t, X_PRED_MIN, X_PRED_MAX)       # ≈12 m urban, ≈30 m @90 km/h
+y_line    = interp(x_pred, laneLines[idx].x, laneLines[idx].y)  # line at that point
+y_path    = -kappa_ref · x_pred² / 2                            # where the car will be
+                                                                # (left-positive κ → −y in
+                                                                #  the +y=right device frame)
 gap_pred  = line_sign · (y_line − y_path) − HALF_WIDTH
 gap_pred_f = low_pass(gap_pred, tau=FILTER_TAU)
 ```
 
-- **Why fixed distance beats a fixed time horizon:** 10 m is inside the
-  model's most reliable near-field (a 2 s horizon at highway speed would read
-  the line 40–60 m out, where it is noisiest); the correction geometry is
-  speed-independent (same nudge per metre of road); and the path-compensation
-  term is small and well-conditioned (`κ·50` vs `κ·1800` at 60 m). At urban
-  speeds 10 m ≈ 1–2 s — the "couple of seconds" of the human model.
-  Trade-off, accepted: at highway speed the time-anticipation is ~0.4 s;
-  `PRED_DIST` is a param so replay/drive data can raise it if that lead
-  proves too short.
+- **Why 2× the lateral delay:** a correction commanded now takes ~one
+  `lat_delay` to bend the car's path — predicting less than that ahead is
+  reacting to what can no longer be affected. 2× = one delay for the nudge to
+  act + one to observe the result before the next decision: the human
+  observe-act rhythm, scaled to the plant. This also rejoins the controller's
+  single-knob timing design: the horizon derives from the same liveDelay
+  chain as the tracker's cadence, and adapts if the learned delay changes.
+  The `curvature_correction` hook already passes `lat_delay` (unused until
+  now); `LaneAnchor.update()` gains it as a parameter.
+- `X_PRED_MIN = 5 m` (meaningful prediction at crawl), `X_PRED_MAX = 50 m`
+  (stay inside the model's reliable line region).
 - `kappa_ref` is the smoothed reference the anchor already computes — so the
   prediction *includes the correction already in flight*. Nudging reduces the
   predicted excess, which eases the nudge off as it takes effect: the same
   anti-overshoot feedback a human uses ("I've already turned in a little").
-- Availability guard: needs `laneLines[idx].x/.y` to cover `PRED_DIST`; if
-  not, fall back to `gap_pred = gap_filt` (the design degrades gracefully to
-  the current-gap deadband).
+- Availability guard: needs `laneLines[idx].x/.y` to cover `x_pred`; if not,
+  fall back to `gap_pred = gap_filt` (the design degrades gracefully to the
+  current-gap deadband).
 
 ## 3. The decision
 
@@ -90,9 +96,12 @@ New params (plugin `data/`, `AnchorConfig` fields):
 
 | param | default | meaning |
 |---|---|---|
-| `LaneKeepPredDist` | 10.0 | fixed prediction distance ahead (m) |
+| `LaneKeepPredDelayMult` | 2.0 | prediction horizon as a multiple of the live lateral delay |
 | `LaneKeepGapHardLo` | 0.3 | current-gap floor below which prediction may not defer (m) |
 | `LaneKeepGapHardHi` | 1.5 | current-gap ceiling above which prediction may not defer (m) |
+
+Hard-coded: `LAT_DELAY_FALLBACK = 0.6 s` (used when the hook passes no
+`lat_delay`), `X_PRED_MIN/MAX = 5/50 m`.
 
 Telemetry gains `gap_pred` (filtered); `gap` / `gap_filt` remain, so replay
 can compare the current-gap and predicted-gap decisions tick-by-tick — this
@@ -106,10 +115,10 @@ is the attribution mitigation for the single combined deploy.
    → no phantom excess); hard-floor override both sides; graceful fallback on
    short line arrays; in-band hold / out-of-band nudge on *predicted* gap.
 2. **Replay (C3, non-activating), routes 3bf + 3b7 + 3bb:**
-   - **Prediction accuracy:** `gap_pred(t)` vs the realized gap once the car
-     has travelled `PRED_DIST` (i.e. at `t + PRED_DIST/v`) — error stats; must
-     beat the trivial predictor (`gap(t)` itself). Also report whether the
-     ~0.4 s highway-speed lead is sufficient (informs raising `PRED_DIST`).
+   - **Prediction accuracy:** `gap_pred(t)` vs the realized gap at
+     `t + pred_t` (≈1.2 s later) — error stats; must beat the trivial
+     predictor (`gap(t)` itself). Sweep `PRED_DELAY_MULT` ∈ {1.5, 2.0, 3.0}
+     to confirm 2.0 is well-placed.
    - **Decision quality:** around 3bf's band exits, nudge onset must LEAD the
      current-gap design; during recoveries, nudging must cease earlier; quiet
      segments must stay quiet (no added churn from prediction noise).
