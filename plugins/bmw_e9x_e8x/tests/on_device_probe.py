@@ -85,11 +85,20 @@ check('ramp fired (old code would HOLD: 0.002 < old tol 0.0024)', st2['action'] 
 check('target == full-error P', abs(st2['target_frac'] - expected) < 1e-4,
       f"target={st2['target_frac']:.5f} expected={expected:.5f}")
 
-print('probe 3: HOLD_BAND is the hold trigger')
-k_small = math.tan(0.0005) / L      # delta_err 0.0005 < HOLD_BAND
+print('probe 3: HOLD_BAND (0.001 rad) is the hold trigger — bracketed')
+# Bracket the band from both sides so the probe actually pins its value.
+# Lower: 0.0008 < HOLD_BAND -> must hold.
+# Upper: 0.0012 > HOLD_BAND -> must ramp. This is the discriminating half:
+# the OLD controller's tolerance (noise-floored to ~0.00145 at small kappa)
+# still HOLDS at 0.0012, so this fails until HOLD_BAND lands.
 lac3, st3 = fresh()
-tick(lac3, k_small, v=15.0, yaw=0.0)
-check('inside HOLD_BAND -> hold_zero', st3['action'] == 'hold_zero', f"action={st3['action']}")
+tick(lac3, math.tan(0.0008) / L, v=25.0, yaw=0.0)
+check('0.0008 rad (inside HOLD_BAND) -> hold_zero', st3['action'] == 'hold_zero',
+      f"action={st3['action']}")
+lac3b, st3b = fresh()
+tick(lac3b, math.tan(0.0012) / L, v=25.0, yaw=0.0)
+check('0.0012 rad (outside HOLD_BAND) -> ramp', st3b['action'] == 'ramp',
+      f"action={st3b['action']}")
 
 print('probe 4: delta_err is RAW (box filter deleted)')
 lac4, st4 = fresh()
