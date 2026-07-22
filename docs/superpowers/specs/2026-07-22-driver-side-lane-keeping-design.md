@@ -89,28 +89,40 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
     # returns curvature unchanged (MODEL) or curvature + authority*bias (ANCHOR)
 ```
 
-Curvature sign convention (openpilot): **positive curvature = left turn**
-(counterclockwise, +y), `yaw_rate = v · curvature`.
+**Two sign conventions are in play (VERIFIED from openpilot source + rlog
+data 2026-07-22 — the offline replay caught the original spec having these
+backwards):**
+- **`laneLines` — device frame, `+y = RIGHT`** (`common/transformations/camera.py`:
+  device frame is `x→forward, y→right, z→down`). So the **left ego line
+  (`laneLines[1]`) sits at NEGATIVE y** (~−1.55 observed), the right ego line
+  (`laneLines[2]`) at POSITIVE y. Confirmed by `selfdrive/controls/lib/ldw.py`
+  (left line tested against a negative threshold) and
+  `selfdrive/modeld/fill_model_msg.py` (`leftY = lane_lines[1].y[0]`).
+- **Curvature (`desiredCurvature`, what the bias is added to and the BMW
+  controller consumes) — `positive = left turn` (LEFT-positive).**
 
 ### 3.2 Signals from `modelV2`
 
-- `laneLines[1]` = left ego lane line, `laneLines[2]` = right ego lane line.
-  `.y[0]` = lateral position of the line at the car (device frame, **+y = left**).
+- `laneLines[1]` = left ego lane line (negative y), `laneLines[2]` = right ego
+  lane line (positive y). `.y[0]` = lateral position of the line at the car.
 - `laneLineProbs[idx]` = per-line confidence.
-- `side_sign`: `+1` for `DRIVER_SIDE=left` (`idx=1`), `−1` for `right` (`idx=2`).
-- `gap_center_to_line = side_sign · laneLines[idx].y[0]` (positive both sides).
+- `line_sign`: `−1` for `DRIVER_SIDE=left` (`idx=1`), `+1` for `right` (`idx=2`)
+  — converts the device-frame `y` to a positive driver-side distance.
+- `curv_sign`: `+1` for `left`, `−1` for `right` — the steer-toward-driver-side
+  direction in the left-positive curvature frame. (`line_sign = −curv_sign`.)
+- `gap_center_to_line = line_sign · laneLines[idx].y[0]` (positive both sides).
 - `driver_wheel_to_line = gap_center_to_line − HALF_WIDTH`.
 
 ### 3.3 Control law (ANCHOR)
 
 ```
 prob   = laneLineProbs[idx]
-gap    = side_sign * laneLines[idx].y[0] - HALF_WIDTH
+gap    = line_sign * laneLines[idx].y[0] - HALF_WIDTH        # line_sign: left -1, right +1
 gap_f  = low_pass(gap, tau=FILTER_TAU)                       # measurement-noise reject
 excess = gap_f - clip(gap_f, GAP_MIN, GAP_MAX)               # the tolerance/deadband
 excess = clip(excess, -EXCESS_MAX, EXCESS_MAX)               # glitch reject
 Lp     = v_ego * T_PREVIEW
-kappa_bias_raw = side_sign * 2.0 * excess / Lp**2            # pure-pursuit
+kappa_bias_raw = curv_sign * 2.0 * excess / Lp**2            # pure-pursuit; curv_sign: left +1, right -1
 kappa_bias = clip(kappa_bias_raw, -KAPPA_BIAS_MAX, KAPPA_BIAS_MAX)
 kappa_bias = rate_limit(kappa_bias, KAPPA_RATE_MAX)          # per-tick slew
 authority  = interp(prob, [PROB_ON, PROB_ON+PROB_FADE], [0,1])

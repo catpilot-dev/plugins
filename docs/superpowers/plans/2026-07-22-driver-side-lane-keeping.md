@@ -8,6 +8,16 @@
 
 **Tech Stack:** Python 3.11, plugin framework (`controls.curvature_correction` hook), `PluginPub` plugin-bus telemetry, pytest (`PYTHONPATH=. uv run pytest`).
 
+> **SIGN-CONVENTION CORRECTION (2026-07-22, commit c830da7):** the code
+> examples below (Tasks 2/4/5/9) use a single `side_sign` and assume
+> `laneLines +y = left`. That is WRONG and was caught by the Task 8 offline
+> replay. The device frame is **`+y = right`** (left ego line `laneLines[1]`
+> is at NEGATIVE y), while curvature is **left-positive**. The implemented
+> code splits this into `line_sign` (gap: left −1 / right +1) and `curv_sign`
+> (bias: left +1 / right −1); test lane lines use left-negative / right-positive.
+> See spec §3.2 for the authoritative convention. Tasks 1–8 already reflect the
+> fix in code; the plan text below is left as-authored for history.
+
 ## Global Constraints
 
 - Plugin params live in the plugin's `data/` dir, NEVER `/data/params/d/` (clearAll wipes unknown keys).
