@@ -102,8 +102,8 @@ a = LaneAnchor(AnchorConfig())
 out = None
 for _ in range(500):
   out, t = a.update(0.0, mv_geo(flat(-1.75), flat(1.75)), 25.0, False, lat_delay=0.6)
-check('parallel line: gap_pred==gap, x_pred=30, no bias',
-      abs(t['gap_pred'] - 0.84) < 1e-3 and abs(t['x_pred'] - 30.0) < 1e-6 and abs(out) < 1e-5,
+check('parallel line: gap_pred==gap, x_pred=22.5 (mult 1.5), no bias',
+      abs(t['gap_pred'] - 0.84) < 1e-3 and abs(t['x_pred'] - 22.5) < 1e-6 and abs(out) < 1e-5,
       f"gp={t['gap_pred']:.3f} xp={t['x_pred']:.1f} out={out:.5f}")
 
 a = LaneAnchor(AnchorConfig())

@@ -206,7 +206,7 @@ def _flat(y):
 
 def test_pred_parallel_line_equals_current_gap():
   # straight, parallel line, zero curvature -> gap_pred == gap; in-band -> hold
-  a = LaneAnchor(AnchorConfig())
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))    # gap 0.84 everywhere
   out = None
   for _ in range(500):
@@ -220,7 +220,7 @@ def test_pred_converging_line_nudges_early():
   # In-band NOW (gap 0.84) but the left line converges: at 30 m the gap is
   # only 0.34 -> predicted below band -> nudge AWAY from the left line
   # (steer right = negative curvature) while still in-band.
-  a = LaneAnchor(AnchorConfig())
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   left = [-1.75 + 0.5 * (x / 30.0) for x in _XS]  # -1.75 at car -> -1.25 at 30 m
   mv = _mv_geo(_XS, left, _flat(1.75))
   out = None
@@ -233,7 +233,7 @@ def test_pred_converging_line_nudges_early():
 def test_pred_recovering_line_no_fight():
   # Current gap below band (0.5) but diverging: at 30 m the gap is 0.9 ->
   # predicted in-band -> DO NOT nudge (0.5 is above the 0.3 hard floor).
-  a = LaneAnchor(AnchorConfig())
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   left = [-1.41 - 0.4 * (x / 30.0) for x in _XS]  # gap 0.5 at car -> 0.9 at 30 m
   mv = _mv_geo(_XS, left, _flat(1.75))
   out = None
@@ -247,7 +247,7 @@ def test_pred_recovering_line_no_fight():
 def test_pred_hard_floor_low_overrides_prediction():
   # Wheel 0.2 m from the line: prediction says recovering, but 0.2 < 0.3 hard
   # floor -> correct NOW on the current gap.
-  a = LaneAnchor(AnchorConfig())
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   left = [-1.11 - 0.7 * (x / 30.0) for x in _XS]  # gap 0.2 at car -> 0.9 at 30 m
   mv = _mv_geo(_XS, left, _flat(1.75))
   out = None
@@ -261,7 +261,7 @@ def test_pred_hard_floor_low_overrides_prediction():
 def test_pred_hard_ceiling_overrides_prediction():
   # Gap 1.6 (> 1.5 hard ceiling), prediction says coming back -> correct NOW
   # toward the driver line (steer left = positive).
-  a = LaneAnchor(AnchorConfig())
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   left = [-2.51 + 0.7 * (x / 30.0) for x in _XS]  # gap 1.6 at car -> 0.9 at 30 m
   mv = _mv_geo(_XS, left, _flat(0.95))
   out = None
@@ -278,7 +278,7 @@ def test_pred_curve_no_phantom_drift():
   # curvature -> predicted gap stays 0.84, no phantom excess, no bias beyond
   # the (smoothed) reference itself.
   k = 0.004
-  a = LaneAnchor(AnchorConfig())
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   left = [-1.75 - k * x * x / 2.0 for x in _XS]
   right = [1.75 - k * x * x / 2.0 for x in _XS]
   plan = [-k * x * x / 2.0 for x in _XS]
@@ -295,7 +295,7 @@ def test_pred_plan_drift_toward_line_nudges():
   # (plan y -> -0.5 at 30 m): the tracker will follow that plan, so the
   # predicted gap shrinks (1.25 - 0.91 = 0.34 < 0.6) -> nudge right (negative)
   # even though the current gap (0.84) is comfortably in-band.
-  a = LaneAnchor(AnchorConfig())
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   plan = [-0.5 * (x / 30.0) for x in _XS]
   mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75), plan_ys=plan)
   out = None
@@ -326,7 +326,7 @@ def test_pred_missing_plan_falls_back_to_current_gap():
 def test_pred_right_driver_converging_nudges_left():
   # Right-side driver: right line converging -> nudge AWAY from the right
   # line = steer left = POSITIVE curvature.
-  a = LaneAnchor(AnchorConfig(driver_side='right'))
+  a = LaneAnchor(AnchorConfig(driver_side='right', pred_delay_mult=2.0))
   right = [1.75 - 0.5 * (x / 30.0) for x in _XS]
   mv = _mv_geo(_XS, _flat(-1.75), right)
   out = None
@@ -345,7 +345,7 @@ def test_pred_fallback_short_arrays_behaves_like_current_gap():
 
 
 def test_pred_lat_delay_scales_x_pred():
-  a = LaneAnchor(AnchorConfig())
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))
   _o, t = a.update(0.0, mv, 25.0, False, lat_delay=0.4)
   assert abs(t['x_pred'] - 20.0) < 1e-9            # 25 * 2*0.4

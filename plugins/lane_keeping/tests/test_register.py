@@ -96,7 +96,7 @@ def test_load_config_kappa_filter_tau(data_dir):
 
 def test_load_config_predictive_params(data_dir):
   cfg = register._load_config()
-  assert cfg.pred_delay_mult == 2.0
+  assert cfg.pred_delay_mult == 1.5
   assert cfg.gap_hard_lo == 0.3 and cfg.gap_hard_hi == 1.5
   (data_dir / 'LaneKeepPredDelayMult').write_text('3.0')
   (data_dir / 'LaneKeepGapHardLo').write_text('0.4')

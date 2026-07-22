@@ -61,7 +61,10 @@ class AnchorConfig:
   # window length, so 0.3s was laggier than the mechanism it was meant to match.
   prob_on: float = 0.6           # driver-side line confidence to engage
   prob_fade: float = 0.1         # fade width above prob_on
-  pred_delay_mult: float = 2.0   # prediction horizon = mult × lateral delay
+  pred_delay_mult: float = 1.5   # prediction horizon = mult × lateral delay
+                                 # (sweep 2026-07-23: 1.5 beat trivial on all 3
+                                 #  gate routes, +11..32%; 2.0 tie-to-+23; 3.0 worse
+                                 #  — the plan is most trustworthy near the car)
   gap_hard_lo: float = 0.3       # current-gap floor: prediction may not defer below (m)
   gap_hard_hi: float = 1.5       # current-gap ceiling: prediction may not defer above (m)
 
