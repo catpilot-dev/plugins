@@ -64,6 +64,9 @@ def _load_config():
     kappa_filter_tau=fget('LaneKeepKappaFilterTau', d.kappa_filter_tau),
     prob_on=fget('LaneKeepProbOn', d.prob_on),
     prob_fade=fget('LaneKeepProbFade', d.prob_fade),
+    pred_delay_mult=fget('LaneKeepPredDelayMult', d.pred_delay_mult),
+    gap_hard_lo=fget('LaneKeepGapHardLo', d.gap_hard_lo),
+    gap_hard_hi=fget('LaneKeepGapHardHi', d.gap_hard_hi),
   )
 
 
@@ -86,7 +89,7 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
     _anchor = LaneAnchor(_load_config())
   if not _anchor.cfg.enable:
     return curvature
-  new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing)
+  new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing, lat_delay)
   try:
     _publish(telem)
   except Exception:

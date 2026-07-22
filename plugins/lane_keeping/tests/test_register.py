@@ -92,3 +92,29 @@ def test_load_config_kappa_filter_tau(data_dir):
   (data_dir / 'LaneKeepKappaFilterTau').write_text('0.45')
   cfg2 = register._load_config()
   assert cfg2.kappa_filter_tau == 0.45
+
+
+def test_load_config_predictive_params(data_dir):
+  cfg = register._load_config()
+  assert cfg.pred_delay_mult == 2.0
+  assert cfg.gap_hard_lo == 0.3 and cfg.gap_hard_hi == 1.5
+  (data_dir / 'LaneKeepPredDelayMult').write_text('3.0')
+  (data_dir / 'LaneKeepGapHardLo').write_text('0.4')
+  cfg2 = register._load_config()
+  assert cfg2.pred_delay_mult == 3.0
+  assert cfg2.gap_hard_lo == 0.4
+
+
+def test_hook_passes_lat_delay_through(data_dir, monkeypatch):
+  monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
+  seen = {}
+  class FakeAnchor:
+    cfg = type('C', (), {'enable': True})()
+    def update(self, curvature, model_v2, v_ego, lane_changing, lat_delay=None):
+      seen['lat_delay'] = lat_delay
+      return curvature, {}
+  register._anchor = FakeAnchor()
+  monkeypatch.setattr(register, '_publish', lambda telem: None)
+  mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  register.on_curvature_correction(0.0, mv, 25.0, False, lat_delay=0.55)
+  assert seen['lat_delay'] == 0.55
