@@ -42,3 +42,30 @@ def test_load_config_overrides(data_dir):
   assert cfg.driver_side == 'right'
   assert cfg.gap_min == 0.5
   assert cfg.enable is False
+
+
+def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):
+  import importlib, register
+  importlib.reload(register)
+  monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
+  # force telemetry publish to raise — control path must still return a value
+  monkeypatch.setattr(register, '_publish', lambda telem: (_ for _ in ()).throw(RuntimeError('no bus')))
+  register._anchor = None
+  mv = SimpleNamespace(
+    laneLines=[SimpleNamespace(y=[0.0]), SimpleNamespace(y=[2.3]),
+               SimpleNamespace(y=[-1.2]), SimpleNamespace(y=[0.0])],
+    laneLineProbs=[0.0, 1.0, 1.0, 0.0])
+  out = None
+  for _ in range(2000):
+    out = register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
+  assert out > 0.01           # biased left (too far from left line), pub error swallowed
+
+
+def test_hook_passthrough_when_disabled(data_dir, monkeypatch):
+  import importlib, register
+  importlib.reload(register)
+  monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
+  (data_dir / 'LaneKeepEnable').write_text('0')
+  register._anchor = None
+  mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  assert register.on_curvature_correction(0.0123, mv, 25.0, False) == 0.0123

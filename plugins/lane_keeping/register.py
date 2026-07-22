@@ -51,6 +51,28 @@ def _load_config():
   )
 
 
+_anchor = None
+_pub = None
+
+
+def _publish(telem):
+  global _pub
+  if _pub is None:
+    from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+    _pub = PluginPub('lane_keeping')
+  _pub.send(telem)
+
+
 def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay=None):
-  # Task 7 replaces this passthrough with the anchor + telemetry.
-  return curvature
+  global _anchor
+  if _anchor is None:
+    from anchor import LaneAnchor
+    _anchor = LaneAnchor(_load_config())
+  if not _anchor.cfg.enable:
+    return curvature
+  new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing)
+  try:
+    _publish(telem)
+  except Exception:
+    pass  # telemetry must never break the control path
+  return new_curvature
