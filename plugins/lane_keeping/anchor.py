@@ -106,8 +106,13 @@ class LaneAnchor:
     else:
       self.gap_filt = None
       kappa_target = 0.0
-    # single rate-limit path (also smoothly releases bias to 0 in MODEL state)
+    # single rate-limit path (also smoothly releases bias to 0 when the line is
+    # lost or its confidence fades — no snap on anchor exit).
     max_step = cfg.kappa_rate_max * DT_CTRL
     self.kappa_bias = _clip(kappa_target, self.kappa_bias - max_step, self.kappa_bias + max_step)
+    # Lane change is the exception: hard-zero the bias immediately (bypassing the
+    # smooth release) so the anchor never fights the maneuver, per spec §3.4.
+    if lane_changing:
+      self.kappa_bias = 0.0
     self.state = 'anchor' if (available and authority > 0.0) else 'model'
     return curvature + self.kappa_bias, self._telem(prob, line_y, gap, excess, authority, v_ego)

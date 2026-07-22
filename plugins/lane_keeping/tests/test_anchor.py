@@ -121,6 +121,19 @@ def test_update_disabled_during_lane_change():
   assert abs(out - 0.01) < 1e-6     # authority 0 -> passthrough
 
 
+def test_update_lane_change_hard_zeros_established_bias():
+  # Build up a real bias out-of-band, then a lane change must drop it to exactly
+  # 0 on the FIRST tick (not decay it) so the anchor never fights the maneuver.
+  a = LaneAnchor(AnchorConfig())
+  mv = _mv(left_y=-2.3, right_y=1.2)          # gap 1.39 above band -> steer left
+  _settle(a, mv)                               # establish the bias
+  assert a.kappa_bias > 1e-5                   # bias is genuinely established
+  out, telem = a.update(0.01, mv, 25.0, True)  # now a lane change
+  assert a.kappa_bias == 0.0                   # hard-zeroed immediately, not decaying
+  assert out == 0.01                           # bit-identical passthrough
+  assert telem['state'] == 'model'
+
+
 def test_update_rate_limited():
   a = LaneAnchor(AnchorConfig(kappa_rate_max=0.002))
   mv = _mv(left_y=-2.3, right_y=1.2)
