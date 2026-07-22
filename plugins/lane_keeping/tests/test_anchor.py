@@ -44,3 +44,26 @@ def test_excess_signs_and_clip():
   assert a._excess(9.0) == 0.5
   # glitch far below band -> clipped to -excess_max
   assert a._excess(-9.0) == -0.5
+
+
+def test_pursuit_magnitude_and_sign_left():
+  a = LaneAnchor(AnchorConfig(driver_side='left', t_preview=1.5, kappa_bias_max=1.0))
+  # excess +0.3 (car too far from left line) at 25 m/s:
+  # Lp = 25*1.5 = 37.5; kappa = 2*0.3/37.5^2 = 0.000426..., positive (steer left)
+  k = a._pursuit(0.3, 25.0)
+  assert abs(k - (2 * 0.3 / 37.5 ** 2)) < 1e-9
+  assert k > 0
+  # excess -0.3 (car too close to left line) -> steer right (negative)
+  assert a._pursuit(-0.3, 25.0) < 0
+
+
+def test_pursuit_sign_right_driver():
+  a = LaneAnchor(AnchorConfig(driver_side='right', t_preview=1.5, kappa_bias_max=1.0))
+  # right driver, excess +0.3 (car too far from right line = too far left) -> steer right (negative)
+  assert a._pursuit(0.3, 25.0) < 0
+
+
+def test_pursuit_hard_cap():
+  a = LaneAnchor(AnchorConfig(driver_side='left', t_preview=1.5, kappa_bias_max=0.002))
+  # low speed inflates kappa; cap binds
+  assert abs(a._pursuit(0.5, 5.0)) == 0.002

@@ -57,3 +57,9 @@ class LaneAnchor:
     cfg = self.cfg
     excess = gap_filt - _clip(gap_filt, cfg.gap_min, cfg.gap_max)
     return _clip(excess, -cfg.excess_max, cfg.excess_max)
+
+  def _pursuit(self, excess, v_ego):
+    cfg = self.cfg
+    lp = max(v_ego * cfg.t_preview, 1.0)   # look-ahead floor avoids div0 at standstill
+    kappa = self.side_sign * 2.0 * excess / (lp * lp)
+    return _clip(kappa, -cfg.kappa_bias_max, cfg.kappa_bias_max)
