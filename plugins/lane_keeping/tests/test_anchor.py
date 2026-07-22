@@ -1,9 +1,13 @@
-import os, sys
+import importlib.util, os
 from types import SimpleNamespace
+# Load the pure control core by explicit path under a unique module name — do
+# NOT insert the plugin dir on sys.path, which would shadow other plugins'
+# same-named modules (e.g. bmw's `register`) when the whole suite runs together.
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PLUGIN_DIR not in sys.path:
-  sys.path.insert(0, _PLUGIN_DIR)
-from anchor import AnchorConfig, LaneAnchor
+_spec = importlib.util.spec_from_file_location('lk_anchor', os.path.join(_PLUGIN_DIR, 'anchor.py'))
+_anchor = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_anchor)
+AnchorConfig, LaneAnchor = _anchor.AnchorConfig, _anchor.LaneAnchor
 
 
 # modelV2 device frame: +y = RIGHT, so the LEFT ego line (laneLines[1]) sits at

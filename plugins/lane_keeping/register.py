@@ -3,12 +3,27 @@
 Registers on controls.curvature_correction. Phase 1: coexists with the
 existing DRIFT_M controller; MODEL state is a literal passthrough.
 """
+import importlib.util
 import os
-import sys
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-if _PLUGIN_DIR not in sys.path:
-  sys.path.insert(0, _PLUGIN_DIR)
+
+# Load the sibling `anchor` module by explicit path rather than a bare
+# `from anchor import` off sys.path. A sys.path insert here would leak the
+# plugin dir into the global path and shadow other plugins' same-named modules
+# (e.g. bmw's `register`) when the test suite runs everything together. The
+# runtime registry loads plugins under canonical names for the same reason.
+_anchor_mod = None
+
+
+def _anchor_module():
+  global _anchor_mod
+  if _anchor_mod is None:
+    spec = importlib.util.spec_from_file_location(
+      'lane_keeping_anchor', os.path.join(_PLUGIN_DIR, 'anchor.py'))
+    _anchor_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_anchor_mod)
+  return _anchor_mod
 
 
 def _read_param(key, default=''):
@@ -20,7 +35,7 @@ def _read_param(key, default=''):
 
 
 def _load_config():
-  from anchor import AnchorConfig
+  AnchorConfig = _anchor_module().AnchorConfig
   d = AnchorConfig()
 
   def fget(key, dflt):
@@ -66,7 +81,7 @@ def _publish(telem):
 def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay=None):
   global _anchor
   if _anchor is None:
-    from anchor import LaneAnchor
+    LaneAnchor = _anchor_module().LaneAnchor
     _anchor = LaneAnchor(_load_config())
   if not _anchor.cfg.enable:
     return curvature

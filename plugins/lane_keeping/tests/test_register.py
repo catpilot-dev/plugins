@@ -1,31 +1,51 @@
-import os, sys
+import importlib.util, os, sys
 from types import SimpleNamespace
-_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PLUGIN_DIR not in sys.path:
-  sys.path.insert(0, _PLUGIN_DIR)
-
-
-def test_passthrough_returns_input_curvature():
-  import register
-  mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
-  out = register.on_curvature_correction(0.0123, mv, 25.0, False, lat_delay=0.45)
-  assert out == 0.0123
-
-
 import pytest
+
+# Load register (and the anchor it depends on) by explicit path under unique
+# module names — do NOT insert the plugin dir on sys.path. Two plugins both have
+# a top-level `register.py`; a bare `import register` after a sys.path insert
+# shadows the other plugin's module when the whole suite runs together (breaks
+# bmw's tests). The runtime avoids this via canonical registry module names.
+_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load(name, unique):
+  spec = importlib.util.spec_from_file_location(unique, os.path.join(_PLUGIN_DIR, name + '.py'))
+  m = importlib.util.module_from_spec(spec)
+  sys.modules[unique] = m
+  spec.loader.exec_module(m)
+  return m
+
+
+# register.py loads its sibling anchor by explicit path (no sys.path use), so we
+# only need to load register itself under a unique name.
+register = _load('register', 'lk_register')
+
+
+@pytest.fixture(autouse=True)
+def _reset_register():
+  # Module-level lazy singletons persist across tests; reset before each.
+  register._anchor = None
+  register._pub = None
+  yield
 
 
 @pytest.fixture
 def data_dir(tmp_path, monkeypatch):
-  import register
   d = tmp_path / 'data'
   d.mkdir()
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(tmp_path))
   return d
 
 
+def test_passthrough_returns_input_curvature():
+  mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  out = register.on_curvature_correction(0.0123, mv, 25.0, False, lat_delay=0.45)
+  assert out == 0.0123
+
+
 def test_load_config_defaults(data_dir):
-  import register
   cfg = register._load_config()
   assert cfg.enable is True
   assert cfg.driver_side == 'left'
@@ -34,7 +54,6 @@ def test_load_config_defaults(data_dir):
 
 
 def test_load_config_overrides(data_dir):
-  import register
   (data_dir / 'LaneKeepDriverSide').write_text('right')
   (data_dir / 'LaneKeepGapMin').write_text('0.5')
   (data_dir / 'LaneKeepEnable').write_text('0')
@@ -45,12 +64,9 @@ def test_load_config_overrides(data_dir):
 
 
 def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):
-  import importlib, register
-  importlib.reload(register)
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
   # force telemetry publish to raise — control path must still return a value
   monkeypatch.setattr(register, '_publish', lambda telem: (_ for _ in ()).throw(RuntimeError('no bus')))
-  register._anchor = None
   # left ego line (laneLines[1]) at y=-2.3 (far left, +y=right frame) -> gap 1.39
   # above the band -> steer left (positive, left-positive curvature)
   mv = SimpleNamespace(
@@ -64,10 +80,7 @@ def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):
 
 
 def test_hook_passthrough_when_disabled(data_dir, monkeypatch):
-  import importlib, register
-  importlib.reload(register)
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
   (data_dir / 'LaneKeepEnable').write_text('0')
-  register._anchor = None
   mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
   assert register.on_curvature_correction(0.0123, mv, 25.0, False) == 0.0123
