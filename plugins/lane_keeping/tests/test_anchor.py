@@ -145,3 +145,37 @@ def test_update_rate_limited():
   a.gap_filt = a._gap(mv)           # warm the filter so excess is immediate
   out, telem = a.update(0.01, mv, 25.0, False)
   assert abs(telem['kappa_bias']) <= 0.002 * 0.01 + 1e-12
+
+
+def test_smoothing_lags_a_step_then_converges():
+  # No line -> no position bias, so the output is purely the smoothed reference.
+  a = LaneAnchor(AnchorConfig(kappa_filter_tau=0.3))
+  none_mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  out1, t1 = a.update(0.02, none_mv, 25.0, False)
+  assert abs(out1 - 0.02) < 1e-9          # first sample seeds the filter
+  assert abs(t1['kappa_in'] - 0.02) < 1e-9
+  out2, _ = a.update(0.0, none_mv, 25.0, False)   # step down
+  assert 0.0 < out2 < 0.02                # lags, does not jump
+  for _ in range(500):                    # ~5s >> tau
+    out, _t = a.update(0.0, none_mv, 25.0, False)
+  assert abs(out) < 1e-4                  # converges
+
+
+def test_smoothing_bypassed_during_lane_change():
+  a = LaneAnchor(AnchorConfig(kappa_filter_tau=0.3))
+  none_mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  for _ in range(200):
+    a.update(0.02, none_mv, 25.0, False)  # settle filter at 0.02
+  out, telem = a.update(0.0, none_mv, 25.0, True)   # lane change -> raw
+  assert out == 0.0                       # bit-identical passthrough of raw
+  assert abs(telem['kappa_ref']) < 1e-12
+
+
+def test_smoothing_applies_in_anchor_state_too():
+  # smoothing is unconditional; only the position correction is ANCHOR-gated
+  a = LaneAnchor(AnchorConfig(kappa_filter_tau=0.3))
+  mv = _mv(left_y=-1.75, right_y=1.75)    # gap 0.84 in band -> zero bias
+  a.update(0.02, mv, 25.0, False)
+  out, telem = a.update(0.0, mv, 25.0, False)
+  assert telem['state'] == 'anchor'
+  assert 0.0 < out < 0.02                 # smoothed, bias is zero in-band

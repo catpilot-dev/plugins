@@ -36,6 +36,7 @@ class AnchorConfig:
   kappa_bias_max: float = 0.002  # hard cap on curvature bias (1/m)
   kappa_rate_max: float = 0.002  # bias slew (1/m per second)
   filter_tau: float = 0.7        # gap low-pass time constant (s)
+  kappa_filter_tau: float = 0.3  # low-pass on the model's kappa_des (s)
   prob_on: float = 0.6           # driver-side line confidence to engage
   prob_fade: float = 0.1         # fade width above prob_on
 
@@ -56,6 +57,7 @@ class LaneAnchor:
     self.line_sign = -1.0 if config.driver_side == 'left' else 1.0
     self.curv_sign = 1.0 if config.driver_side == 'left' else -1.0
     self.gap_filt = None
+    self.kappa_filt = None
     self.kappa_bias = 0.0
     self.state = 'model'
 
@@ -74,16 +76,29 @@ class LaneAnchor:
     kappa = self.curv_sign * 2.0 * excess / (lp * lp)
     return _clip(kappa, -cfg.kappa_bias_max, cfg.kappa_bias_max)
 
-  def _telem(self, prob, line_y, gap, excess, authority, v_ego):
+  def _telem(self, prob, line_y, gap, excess, authority, v_ego, kappa_in=0.0, kappa_ref=0.0):
     return {
       'prob': float(prob), 'line_y': float(line_y), 'gap': float(gap),
       'gap_filt': float(self.gap_filt) if self.gap_filt is not None else 0.0,
       'excess': float(excess), 'kappa_bias': float(self.kappa_bias),
       'authority': float(authority), 'state': self.state, 'v_ego': float(v_ego),
+      'kappa_in': float(kappa_in), 'kappa_ref': float(kappa_ref),
     }
 
   def update(self, curvature, model_v2, v_ego, lane_changing):
     cfg = self.cfg
+    # Reference conditioning (Phase 2): low-pass the model's curvature to kill
+    # the fast chatter, so the BMW controller can track it faithfully with no
+    # deadzone. Safe because any lag this introduces shows up as position
+    # drift, which the position correction below closes. A lane change bypasses
+    # it — the model is deliberately reframing the trajectory.
+    if lane_changing or self.kappa_filt is None:
+      self.kappa_filt = curvature
+      kappa_ref = curvature
+    else:
+      a_k = 1.0 - math.exp(-DT_CTRL / cfg.kappa_filter_tau)
+      self.kappa_filt += a_k * (curvature - self.kappa_filt)
+      kappa_ref = self.kappa_filt
     prob = line_y = gap = excess = authority = 0.0
     available = (cfg.enable and model_v2 is not None
                  and len(model_v2.laneLineProbs) > self.driver_idx
@@ -115,4 +130,5 @@ class LaneAnchor:
     if lane_changing:
       self.kappa_bias = 0.0
     self.state = 'anchor' if (available and authority > 0.0) else 'model'
-    return curvature + self.kappa_bias, self._telem(prob, line_y, gap, excess, authority, v_ego)
+    return kappa_ref + self.kappa_bias, self._telem(prob, line_y, gap, excess, authority, v_ego,
+                                                    curvature, kappa_ref)
