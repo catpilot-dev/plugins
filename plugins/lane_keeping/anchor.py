@@ -8,6 +8,9 @@ import math
 from dataclasses import dataclass
 
 DT_CTRL = 0.01  # openpilot control-loop period (s); the hook runs at 100 Hz
+LAT_DELAY_FALLBACK = 0.6  # s; used when the hook passes no lat_delay
+X_PRED_MIN = 5.0          # m; keep a meaningful prediction at crawl
+X_PRED_MAX = 50.0         # m; stay inside the model's reliable line region
 
 
 def _clip(x, lo, hi):
@@ -22,6 +25,21 @@ def _interp(x, xp, fp):
     return fp[1]
   t = (x - xp[0]) / (xp[1] - xp[0])
   return fp[0] + t * (fp[1] - fp[0])
+
+
+def _interp_arr(x, xs, ys):
+  # clamped-left linear interpolation over ascending xs; None past the end or
+  # on malformed arrays (caller falls back to the current-gap deadband)
+  n = len(xs)
+  if n < 2 or n != len(ys):
+    return None
+  if x <= xs[0]:
+    return float(ys[0])
+  for i in range(1, n):
+    if x <= xs[i]:
+      t = (x - xs[i - 1]) / (xs[i] - xs[i - 1])
+      return float(ys[i - 1]) + t * (float(ys[i]) - float(ys[i - 1]))
+  return None
 
 
 @dataclass
@@ -43,6 +61,9 @@ class AnchorConfig:
   # window length, so 0.3s was laggier than the mechanism it was meant to match.
   prob_on: float = 0.6           # driver-side line confidence to engage
   prob_fade: float = 0.1         # fade width above prob_on
+  pred_delay_mult: float = 2.0   # prediction horizon = mult × lateral delay
+  gap_hard_lo: float = 0.3       # current-gap floor: prediction may not defer below (m)
+  gap_hard_hi: float = 1.5       # current-gap ceiling: prediction may not defer above (m)
 
 
 class LaneAnchor:
@@ -61,6 +82,7 @@ class LaneAnchor:
     self.line_sign = -1.0 if config.driver_side == 'left' else 1.0
     self.curv_sign = 1.0 if config.driver_side == 'left' else -1.0
     self.gap_filt = None
+    self.gap_pred_filt = None
     self.kappa_filt = None
     self.kappa_bias = 0.0
     self.state = 'model'
@@ -80,16 +102,19 @@ class LaneAnchor:
     kappa = self.curv_sign * 2.0 * excess / (lp * lp)
     return _clip(kappa, -cfg.kappa_bias_max, cfg.kappa_bias_max)
 
-  def _telem(self, prob, line_y, gap, excess, authority, v_ego, kappa_in=0.0, kappa_ref=0.0):
+  def _telem(self, prob, line_y, gap, excess, authority, v_ego, kappa_in=0.0, kappa_ref=0.0,
+             x_pred=0.0):
     return {
       'prob': float(prob), 'line_y': float(line_y), 'gap': float(gap),
       'gap_filt': float(self.gap_filt) if self.gap_filt is not None else 0.0,
       'excess': float(excess), 'kappa_bias': float(self.kappa_bias),
       'authority': float(authority), 'state': self.state, 'v_ego': float(v_ego),
       'kappa_in': float(kappa_in), 'kappa_ref': float(kappa_ref),
+      'gap_pred': float(self.gap_pred_filt) if self.gap_pred_filt is not None else 0.0,
+      'x_pred': float(x_pred),
     }
 
-  def update(self, curvature, model_v2, v_ego, lane_changing):
+  def update(self, curvature, model_v2, v_ego, lane_changing, lat_delay=None):
     cfg = self.cfg
     # Reference conditioning (Phase 2): low-pass the model's curvature to kill
     # the fast chatter, so the BMW controller can track it faithfully with no
@@ -104,6 +129,7 @@ class LaneAnchor:
       self.kappa_filt += a_k * (curvature - self.kappa_filt)
       kappa_ref = self.kappa_filt
     prob = line_y = gap = excess = authority = 0.0
+    x_pred = 0.0
     available = (cfg.enable and model_v2 is not None
                  and len(model_v2.laneLineProbs) > self.driver_idx
                  and len(model_v2.laneLines) > self.driver_idx
@@ -112,18 +138,46 @@ class LaneAnchor:
       prob = float(model_v2.laneLineProbs[self.driver_idx])
       line_y = float(model_v2.laneLines[self.driver_idx].y[0])
       gap = self.line_sign * line_y - cfg.half_width
+      alpha = 1.0 - math.exp(-DT_CTRL / cfg.filter_tau)
       if self.gap_filt is None:
         self.gap_filt = gap
       else:
-        alpha = 1.0 - math.exp(-DT_CTRL / cfg.filter_tau)
         self.gap_filt += alpha * (gap - self.gap_filt)
-      excess = self._excess(self.gap_filt)
+      # Predictive deadband (2026-07-23 spec): evaluate the driver-side line at
+      # the point the car reaches after pred_delay_mult × lat_delay (~1.2 s for
+      # BMW), subtract the path its commanded curvature will trace, and decide
+      # on THAT gap. A correction commanded now takes ~one lat_delay to act, so
+      # 2× = one delay to act + one to observe — the human rhythm. Falls back
+      # to the current gap when the line geometry can't cover x_pred.
+      pred_t = cfg.pred_delay_mult * (lat_delay if lat_delay else LAT_DELAY_FALLBACK)
+      x_pred = _clip(v_ego * pred_t, X_PRED_MIN, X_PRED_MAX)
+      line = model_v2.laneLines[self.driver_idx]
+      xs = getattr(line, 'x', [])
+      y_line = _interp_arr(x_pred, [float(p) for p in xs], [float(p) for p in line.y]) \
+        if len(xs) == len(line.y) else None
+      if y_line is None:
+        gap_pred = gap
+      else:
+        # left-positive curvature displaces the path toward −y (+y = right)
+        y_path = -self.kappa_filt * x_pred * x_pred / 2.0 if self.kappa_filt is not None else 0.0
+        gap_pred = self.line_sign * (y_line - y_path) - cfg.half_width
+      if self.gap_pred_filt is None:
+        self.gap_pred_filt = gap_pred
+      else:
+        self.gap_pred_filt += alpha * (gap_pred - self.gap_pred_filt)
+      # Hard floors: the prediction may DEFER a correction, never MASK one —
+      # on the paint (or drifting far toward the opposite line), correct NOW.
+      if self.gap_filt < cfg.gap_hard_lo or self.gap_filt > cfg.gap_hard_hi:
+        excess = self._excess(self.gap_filt)
+      else:
+        excess = self._excess(self.gap_pred_filt)
       authority = _interp(prob, [cfg.prob_on, cfg.prob_on + cfg.prob_fade], [0.0, 1.0])
       if lane_changing:
         authority = 0.0
       kappa_target = authority * self._pursuit(excess, v_ego)
     else:
       self.gap_filt = None
+      self.gap_pred_filt = None
       kappa_target = 0.0
     # single rate-limit path (also smoothly releases bias to 0 when the line is
     # lost or its confidence fades — no snap on anchor exit).
@@ -135,4 +189,4 @@ class LaneAnchor:
       self.kappa_bias = 0.0
     self.state = 'anchor' if (available and authority > 0.0) else 'model'
     return kappa_ref + self.kappa_bias, self._telem(prob, line_y, gap, excess, authority, v_ego,
-                                                    curvature, kappa_ref)
+                                                    curvature, kappa_ref, x_pred=x_pred)

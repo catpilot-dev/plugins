@@ -179,3 +179,136 @@ def test_smoothing_applies_in_anchor_state_too():
   out, telem = a.update(0.0, mv, 25.0, False)
   assert telem['state'] == 'anchor'
   assert 0.0 < out < 0.02                 # smoothed, bias is zero in-band
+
+
+# --- predictive deadband (2026-07-23 spec) ---
+# Lane lines with real geometry: y arrays over an x grid (device frame +y=right,
+# so the LEFT line's y values are negative).
+def _mv_geo(xs, left_ys, right_ys, left_p=1.0, right_p=1.0):
+  return SimpleNamespace(
+    laneLines=[SimpleNamespace(x=[], y=[0.0]),
+               SimpleNamespace(x=list(xs), y=list(left_ys)),
+               SimpleNamespace(x=list(xs), y=list(right_ys)),
+               SimpleNamespace(x=[], y=[0.0])],
+    laneLineProbs=[0.0, left_p, right_p, 0.0])
+
+
+_XS = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+
+
+def _flat(y):
+  return [y] * len(_XS)
+
+
+def test_pred_parallel_line_equals_current_gap():
+  # straight, parallel line, zero curvature -> gap_pred == gap; in-band -> hold
+  a = LaneAnchor(AnchorConfig())
+  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))    # gap 0.84 everywhere
+  out = None
+  for _ in range(500):
+    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert abs(t['gap_pred'] - 0.84) < 1e-6
+  assert abs(t['x_pred'] - 30.0) < 1e-9           # 25 m/s * 2*0.6 s
+  assert abs(out) < 1e-6                          # no bias, no reference
+
+
+def test_pred_converging_line_nudges_early():
+  # In-band NOW (gap 0.84) but the left line converges: at 30 m the gap is
+  # only 0.34 -> predicted below band -> nudge AWAY from the left line
+  # (steer right = negative curvature) while still in-band.
+  a = LaneAnchor(AnchorConfig())
+  left = [-1.75 + 0.5 * (x / 30.0) for x in _XS]  # -1.75 at car -> -1.25 at 30 m
+  mv = _mv_geo(_XS, left, _flat(1.75))
+  out = None
+  for _ in range(2000):
+    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert t['gap_pred'] < 0.6                      # predicted out-of-band
+  assert out < -1e-5                              # nudging right (away)
+
+
+def test_pred_recovering_line_no_fight():
+  # Current gap below band (0.5) but diverging: at 30 m the gap is 0.9 ->
+  # predicted in-band -> DO NOT nudge (0.5 is above the 0.3 hard floor).
+  a = LaneAnchor(AnchorConfig())
+  left = [-1.41 - 0.4 * (x / 30.0) for x in _XS]  # gap 0.5 at car -> 0.9 at 30 m
+  mv = _mv_geo(_XS, left, _flat(1.75))
+  out = None
+  for _ in range(2000):
+    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert t['gap_filt'] < 0.6                      # currently out-of-band
+  assert t['gap_pred'] > 0.6                      # predicted back in-band
+  assert abs(out) < 1e-6                          # holds: no fight with recovery
+
+
+def test_pred_hard_floor_low_overrides_prediction():
+  # Wheel 0.2 m from the line: prediction says recovering, but 0.2 < 0.3 hard
+  # floor -> correct NOW on the current gap.
+  a = LaneAnchor(AnchorConfig())
+  left = [-1.11 - 0.7 * (x / 30.0) for x in _XS]  # gap 0.2 at car -> 0.9 at 30 m
+  mv = _mv_geo(_XS, left, _flat(1.75))
+  out = None
+  for _ in range(2000):
+    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert t['gap_filt'] < 0.3
+  assert t['gap_pred'] > 0.6
+  assert out < -1e-5                              # corrects away regardless
+
+
+def test_pred_hard_ceiling_overrides_prediction():
+  # Gap 1.6 (> 1.5 hard ceiling), prediction says coming back -> correct NOW
+  # toward the driver line (steer left = positive).
+  a = LaneAnchor(AnchorConfig())
+  left = [-2.51 + 0.7 * (x / 30.0) for x in _XS]  # gap 1.6 at car -> 0.9 at 30 m
+  mv = _mv_geo(_XS, left, _flat(0.95))
+  out = None
+  for _ in range(2000):
+    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert t['gap_filt'] > 1.5
+  assert t['gap_pred'] < 1.0
+  assert out > 1e-5
+
+
+def test_pred_curve_compensation_no_phantom_drift():
+  # Left curve kappa=0.004: the line curves left (y_line = -1.75 - k*x^2/2)
+  # and the car's commanded path curves with it -> predicted gap stays 0.84,
+  # no phantom excess, no bias beyond the (smoothed) reference itself.
+  k = 0.004
+  a = LaneAnchor(AnchorConfig())
+  left = [-1.75 - k * x * x / 2.0 for x in _XS]
+  right = [1.75 - k * x * x / 2.0 for x in _XS]
+  mv = _mv_geo(_XS, left, right)
+  out = None
+  for _ in range(2000):
+    out, t = a.update(k, mv, 25.0, False, lat_delay=0.6)
+  assert abs(t['gap_pred'] - 0.84) < 0.02
+  assert abs(out - k) < 1e-4                      # reference passes, no nudge
+
+
+def test_pred_right_driver_converging_nudges_left():
+  # Right-side driver: right line converging -> nudge AWAY from the right
+  # line = steer left = POSITIVE curvature.
+  a = LaneAnchor(AnchorConfig(driver_side='right'))
+  right = [1.75 - 0.5 * (x / 30.0) for x in _XS]
+  mv = _mv_geo(_XS, _flat(-1.75), right)
+  out = None
+  for _ in range(2000):
+    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert t['gap_pred'] < 0.6
+  assert out > 1e-5
+
+
+def test_pred_fallback_short_arrays_behaves_like_current_gap():
+  # Old-style single-point lane lines (no x attr / 1-point y): prediction
+  # falls back to the current gap — the pre-existing out-of-band behavior.
+  a = LaneAnchor(AnchorConfig())
+  out = _settle(a, _mv(left_y=-2.3, right_y=1.2))  # gap 1.39, above band
+  assert out > 0.01 + 1e-5                         # still biases (via fallback)
+
+
+def test_pred_lat_delay_scales_x_pred():
+  a = LaneAnchor(AnchorConfig())
+  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))
+  _o, t = a.update(0.0, mv, 25.0, False, lat_delay=0.4)
+  assert abs(t['x_pred'] - 20.0) < 1e-9            # 25 * 2*0.4
+  _o, t = a.update(0.0, mv, 25.0, False)           # no lat_delay -> fallback 0.6
+  assert abs(t['x_pred'] - 30.0) < 1e-9
