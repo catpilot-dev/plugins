@@ -351,3 +351,23 @@ def test_pred_lat_delay_scales_x_pred():
   assert abs(t['x_pred'] - 20.0) < 1e-9            # 25 * 2*0.4
   _o, t = a.update(0.0, mv, 25.0, False)           # no lat_delay -> fallback 0.6
   assert abs(t['x_pred'] - 30.0) < 1e-9
+
+
+def test_lane_change_reseeds_gap_filters():
+  # The driver-side line's IDENTITY changes during a lane change (old left
+  # line hands off to the new lane's left line), so smoothed gap history from
+  # the old lane is meaningless. During the change the filters must track RAW
+  # (re-seed every tick, mirroring kappa_filt), so the first post-change tick
+  # reads the new lane cleanly - no stale re-convergence, no settle-nudge.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  mv_old = _mv_geo(_XS, _flat(-1.31), _flat(2.19))     # old lane: gap 0.40 (below band)
+  for _ in range(2000):
+    a.update(0.0, mv_old, 25.0, False, lat_delay=0.6)  # settle, bias building
+  mv_new = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # new lane: gap 0.84 (in-band)
+  out, t = a.update(0.0, mv_new, 25.0, True, lat_delay=0.6)   # lane-change tick
+  assert abs(t['gap_filt'] - 0.84) < 1e-9              # re-seeded to raw, no lag
+  assert abs(t['gap_pred'] - 0.84) < 1e-9
+  assert out == 0.0                                    # fully inert during the change
+  out, t = a.update(0.0, mv_new, 25.0, False, lat_delay=0.6)  # first tick after
+  assert abs(t['gap_filt'] - 0.84) < 1e-6              # no stale state carried over
+  assert abs(out) < 1e-6                               # in-band -> no settle-nudge

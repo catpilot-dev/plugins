@@ -142,7 +142,14 @@ class LaneAnchor:
       line_y = float(model_v2.laneLines[self.driver_idx].y[0])
       gap = self.line_sign * line_y - cfg.half_width
       alpha = 1.0 - math.exp(-DT_CTRL / cfg.filter_tau)
-      if self.gap_filt is None:
+      # During a lane change, track RAW (re-seed every tick — the kappa_filt
+      # discipline): the driver-side line's identity changes under us mid-
+      # maneuver, so smoothed history from the old lane is meaningless and
+      # would otherwise leak a stale settle-nudge into the new lane. At the
+      # moment the change completes the filter already holds the new lane's
+      # value — a fresh start with zero convergence gap. Output stays inert
+      # during the change regardless (authority 0 + bias hard-zero below).
+      if lane_changing or self.gap_filt is None:
         self.gap_filt = gap
       else:
         self.gap_filt += alpha * (gap - self.gap_filt)
@@ -178,7 +185,7 @@ class LaneAnchor:
         gap_pred = gap
       else:
         gap_pred = self.line_sign * (y_line - y_plan) - cfg.half_width
-      if self.gap_pred_filt is None:
+      if lane_changing or self.gap_pred_filt is None:
         self.gap_pred_filt = gap_pred
       else:
         self.gap_pred_filt += alpha * (gap_pred - self.gap_pred_filt)

@@ -141,5 +141,17 @@ for _ in range(3000):
 check('single-point lines fall back to current-gap deadband', out > 0.01 + 1e-5,
       f'out={out:.5f}')
 
+
+print('probe 10: lane-change filter re-seed (no stale settle-nudge)')
+a = LaneAnchor(AnchorConfig())
+for _ in range(2000):
+  a.update(0.0, mv_geo(flat(-1.31), flat(2.19)), 25.0, False, lat_delay=0.6)   # old lane: gap 0.40
+out, t = a.update(0.0, mv_geo(flat(-1.75), flat(1.75)), 25.0, True, lat_delay=0.6)   # LC, new lane
+ok_lc = abs(t['gap_filt'] - 0.84) < 1e-9 and out == 0.0
+out, t = a.update(0.0, mv_geo(flat(-1.75), flat(1.75)), 25.0, False, lat_delay=0.6)  # first tick after
+check('filters re-seed during LC; first post-LC tick clean',
+      ok_lc and abs(t['gap_filt'] - 0.84) < 1e-6 and abs(out) < 1e-6,
+      f"gf={t['gap_filt']:.3f} out={out:.6f}")
+
 print(f'\n{PASS} passed, {FAIL} failed')
 sys.exit(1 if FAIL else 0)
