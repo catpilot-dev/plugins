@@ -36,7 +36,11 @@ class AnchorConfig:
   kappa_bias_max: float = 0.002  # hard cap on curvature bias (1/m)
   kappa_rate_max: float = 0.002  # bias slew (1/m per second)
   filter_tau: float = 0.7        # gap low-pass time constant (s)
-  kappa_filter_tau: float = 0.3  # low-pass on the model's kappa_des (s)
+  kappa_filter_tau: float = 0.15  # low-pass on the model's kappa_des (s); group
+  # delay tau=0.15s ~= field-verified 300ms box filter's 0.125s group delay.
+  # tau=0.3s would exceed the reverted 600ms box's 0.275s group delay (route
+  # 395: wobbling and lag) -- a first-order tau is NOT comparable to a box
+  # window length, so 0.3s was laggier than the mechanism it was meant to match.
   prob_on: float = 0.6           # driver-side line confidence to engage
   prob_fade: float = 0.1         # fade width above prob_on
 

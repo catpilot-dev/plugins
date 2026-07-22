@@ -88,7 +88,7 @@ def test_hook_passthrough_when_disabled(data_dir, monkeypatch):
 
 def test_load_config_kappa_filter_tau(data_dir):
   cfg = register._load_config()
-  assert cfg.kappa_filter_tau == 0.3          # default
+  assert cfg.kappa_filter_tau == 0.15         # default
   (data_dir / 'LaneKeepKappaFilterTau').write_text('0.45')
   cfg2 = register._load_config()
   assert cfg2.kappa_filter_tau == 0.45

@@ -193,7 +193,7 @@ This document is the canonical reference for the lateral controller registered b
 > `HOLD_BAND = 0.001` rad, sized by rack breakaway (below it the P term commands
 > less than friction, so the wheel cannot move) rather than by allowed drift.
 > modelV2 noise now lives entirely in `lane_keeping`, which low-passes κ_des
-> (`KAPPA_FILTER_TAU = 0.3 s`) and closes the position loop — filtering is safe
+> (`KAPPA_FILTER_TAU = 0.15 s`) and closes the position loop — filtering is safe
 > there because its lag becomes position drift, which that loop cancels. The
 > modelV2 subscription is dropped (it only fed the deleted filter's lane-change
 > gate). Telemetry drops `tolerance`/`delta_err_raw`/`de_w`/`k_sigma`/`de_dc`/
@@ -219,10 +219,10 @@ The custom controller is a **plant-inversion design in front-wheel-angle (δ) sp
 δ_des  = atan(κ_des · L)        L = CP.wheelbase (BMW E90: 2.76 m)
 δ_meas = atan(κ_meas · L)        κ_meas = yawRate / v_ego
 δ_err  = δ_des − δ_meas
-target_nm = T_CAP_SLOPE_BASE · kappa_scale(|κ_des|) · v² · (δ_err − tolerance·sign(δ_err))
+target_nm = T_CAP_SLOPE_BASE · kappa_scale(|κ_des|) · v² · δ_err   # full error, no subtraction (Phase 2)
 ```
 
-Within the tolerance deadzone, target → 0 and stiction holds. Outside, the controller ramps to `target_nm` over `spread_frames` CAN ticks. ISO comfort guards (cancel_jerk / cancel_accel) gated on **actual plant overshoot** brake the ramp if the plant runs past κ_des.
+When `|δ_err| ≤ HOLD_BAND` the cadence decision holds (target → 0 on straight, or holds the last target on a curve) and stiction keeps the rack in place. Outside `HOLD_BAND`, the controller ramps to `target_nm` over `spread_frames` CAN ticks. ISO comfort guards (cancel_jerk / cancel_accel) gated on **actual plant overshoot** brake the ramp if the plant runs past κ_des.
 
 ---
 
@@ -302,7 +302,7 @@ delta_err_raw   = delta_des - delta_meas
         │  delta_err = delta_err_raw, unconditionally — the κ-gated box
         │  filter that used to live here (§4) is deleted. modelV2 noise is
         │  handled upstream by the `lane_keeping` plugin's κ_des low-pass
-        │  (KAPPA_FILTER_TAU = 0.3 s) before this controller ever sees it.
+        │  (KAPPA_FILTER_TAU = 0.15 s) before this controller ever sees it.
         ▼
 state['delta_err'] = delta_err                 # raw, used by controller as-is
         │
@@ -335,7 +335,7 @@ return -state['torque']  (BMW carcontroller flips sign convention)
 in `bmw/latcontroller.py` — `delta_err` is the raw `delta_err_raw` at all
 times, `KD_GATE` and `kd_filter_window` are gone, and there is no `de_buffer`.
 Its job (suppressing modelV2 κ_des wobble on near-straight) now belongs to
-the `lane_keeping` plugin's κ_des low-pass (`KAPPA_FILTER_TAU = 0.3 s`),
+the `lane_keeping` plugin's κ_des low-pass (`KAPPA_FILTER_TAU = 0.15 s`),
 which filters upstream of this controller instead of on `delta_err` inside
 it. The rest of this section is kept for historical context only — see the
 2026-07-22 header note.
@@ -488,7 +488,7 @@ Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 ## 10. Constraints baked into the design
 
 - **Vision-only stack**: catpilot has no HD-map, lidar, radar fusion, or IMU-fusion for κ. All correction must come from `modelV2` outputs. Don't propose external-sensor escape hatches for vision-noise problems.
-- **No position-feedback layer**: there is no lane-offset correction registered on `controls.curvature_correction` in the public build, and adding one based on `modelV2.laneLines` would not fix κ_des wobble on straights (laneLines share the same vision noise source as `desiredCurvature`). The controller must handle vision noise downstream without position feedback.
+- **Position-feedback layer (2026-07-22, Phase 2)**: `lane_keeping` IS registered on `controls.curvature_correction` — it low-passes `modelV2` κ_des (killing fast chatter) and closes a driver-side lane-offset position loop (cancelling sub-Hz wander, which cannot be filtered out of the reference alone). It now owns modelV2 noise handling and lateral position entirely; this `latcontroller` is a faithful tracker with no noise reasoning of its own (§3, §5).
 - **lagd never converges for BMW**: `liveDelay.lateralDelay` is permanently pinned at `SAD + 0.2` because lagd correlates on latcontrol_torque telemetry our controller doesn't produce. `SAD` is the effective knob — not a hint to be overridden.
 - **BMW hydraulic rack**: stiction holds δ at zero torque, no self-centering. The plant-inversion controller is designed around this. **Don't add a FF term on κ_des** (correct for EPS, wrong here).
 
@@ -520,7 +520,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   filter was deleted in Phase 2 (2026-07-22, see § 4). There is nothing to
   retune in this controller for near-straight wobble suppression.
 - Reference smoothing now lives in the `lane_keeping` plugin: retune
-  `KAPPA_FILTER_TAU` there (currently 0.3 s) to trade group delay for
+  `KAPPA_FILTER_TAU` there (currently 0.15 s) to trade group delay for
   smoothing on its κ_des low-pass.
 - In this controller, the only near-straight knob left is `HOLD_BAND`
   (currently 0.001 rad) — the fixed stiction hold-retrigger threshold. It is
@@ -535,7 +535,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 ### If straights feel less smooth than today:
 - First, check that the κ_des wobble character hasn't changed (newer model versions may have different noise).
 - This controller no longer filters — check `lane_keeping`'s `KAPPA_FILTER_TAU`
-  (currently 0.3 s) first; that low-pass is what shapes straight-line feel now.
+  (currently 0.15 s) first; that low-pass is what shapes straight-line feel now.
   Shortening it trades smoothing for responsiveness on its position loop.
 
 ### If real-curve tracking feels under-aggressive:
@@ -589,7 +589,7 @@ ev = list(log.Event.read_multiple_bytes(zstandard.ZstdDecompressor().decompress(
 ```
 
 Key metrics to compute per route:
-- **Sign-flip reduction** on near-straight (filter regime): `delta_err_raw` vs `delta_err` sign-flips per second
+- **Reference-smoothing efficacy** (Phase 2: this now lives in `lane_keeping`, not `latcontroller`): compare `kappa_in` vs `kappa_ref` sign-flips per second from the `lane_keeping` telemetry topic — `delta_err_raw` no longer exists in `bmw_lat_control` telemetry, since the box filter it fed was deleted from this controller.
 - **Lane offset**: from `modelV2.laneLines[1].y[0]` and `modelV2.laneLines[2].y[0]` averaged. RMS should be 0.30-0.45 m on healthy drives.
 - **cancel_jerk / cancel_accel counts**: per lane change (should be < ~10 / LC each)
 - **`de_at_end_raw`**: δ_err at the moment laneChangeState flips back to `off`. Should be < 0.3° on healthy LCs.

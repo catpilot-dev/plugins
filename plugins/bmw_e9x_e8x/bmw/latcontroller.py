@@ -328,11 +328,16 @@ def on_lat_controller_init(result, lac, CP):
       action_cadence_ticks = max(1, round(half_horizon / DT_LIVEPOSE))
       spread_frames = action_cadence_ticks * int(DT_LIVEPOSE / DT_CAN_TICK)
 
-      # Reference is the raw model κ_des — no filter on κ_des itself.
-      # State['desired'] feeds δ_des, kappa_scale, jerk_pred, ISO guards, and
-      # telemetry. Keeping it raw means no held bias (the drift failure mode
-      # of the prior κ_des-hysteresis attempt) and downstream magnitude-
-      # sensitive logic sees the true model intent.
+      # This controller applies no filter of its own to κ_des — but as of
+      # Phase 2 (2026-07-22) `desired_curvature` is no longer the raw model
+      # output at the system level: the `lane_keeping` plugin low-passes
+      # modelV2 κ_des upstream (`KAPPA_FILTER_TAU`, currently 0.15 s) before
+      # this controller ever sees it. So `state['desired']` — and everything
+      # downstream that reads it (`kappa_scale`, `hold_f`, `t_cap`, `jerk_pred`,
+      # and the ISO overshoot gate) — sees that smoothed reference, not raw
+      # modelV2 output. Keeping this controller filter-free means no held bias
+      # here (the drift failure mode of the prior κ_des-hysteresis attempt);
+      # noise-induced lag is now `lane_keeping`'s to own, per its position loop.
       state['desired'] = float(desired_curvature)
 
       # Curvature-dependent hold factor (2026-07-03). In a curve, "on-target"

@@ -103,10 +103,16 @@ return kappa_ref + authority * kappa_bias  # position correction unchanged
 - **Smoothing applies in BOTH states** (ANCHOR and MODEL) — noise handling is
   this layer's job unconditionally. Only the *position correction* is
   ANCHOR-gated.
-- **`KAPPA_FILTER_TAU` default 0.3 s.** Rationale: the reverted box filter was a
-  300 ms window and was considered safe; 600 ms was not (route 395). 0.3 s is
-  therefore the known-safe scale, and is now additionally protected by the
-  position loop. Config param; validated on replay and first drive.
+- **`KAPPA_FILTER_TAU` default 0.15 s.** Rationale: a first-order time constant
+  is not comparable to a box-filter window length — the relevant quantity is
+  group delay. A 300 ms box at 20 Hz has ≈0.125 s group delay; a 600 ms box
+  (reverted after one day on-car, route 395: "wobbling and lag", torque-response
+  lag rose 0.44→0.66 s) has ≈0.275 s. A first-order τ=0.3 s has ≈0.30 s group
+  delay — *laggier* than the 600 ms box that was reverted as unsafe, and unlike
+  the old box filter (which blended to fully-raw above |κ|=0.004, so curves saw
+  zero lag) this filter has no κ gating, so the lag applies in curves too.
+  **τ = 0.15 s** matches the field-verified 300 ms box's ≈0.125 s group delay.
+  Config param; validated on replay and first drive.
 - Lane-change bypass mirrors the existing `kappa_bias` hard-zero.
 
 ## 4. BMW `latcontroller` changes — faithful tracker
@@ -136,8 +142,10 @@ upstream.
    **Sizing:** below the error at which the P term commands less than rack
    breakaway, the wheel cannot move anyway. `e ≈ FRICTION·STEER_MAX /
    (T_CAP_SLOPE·kappa_scale·v²)` ⇒ ≈ 0.001 rad at 25 m/s. **`HOLD_BAND = 0.001`
-   rad** (fixed, config-tunable). Small enough that residual attenuation of the
-   anchor is negligible (previously 0.0012–0.0021 rad and speed-dependent).
+   rad** (fixed hard-coded local in `latcontroller.py`, matching this plugin's
+   style — retuning it needs a code edit and redeploy, it is *not* a param-file
+   knob). Small enough that residual attenuation of the anchor is negligible
+   (previously 0.0012–0.0021 rad and speed-dependent).
 3. **`cancel_tol` (`|delta_err| <= 1.2·tolerance`)** → gated on
    `1.2·HOLD_BAND`.
 
@@ -174,9 +182,15 @@ Add `hold_band` (constant, for band-occupancy forensics). `lane_keeping` gains
   track the model *more* faithfully, not less. The route-31b 1.3–1.7 m drift
   came from a *wide* deadzone leaving error unactioned; zero deadzone is the
   opposite failure mode. That risk is retired, not re-created.
-- **Single large step.** The whole noise stack goes at once. Rollback is one
-  revert to the `af3be5f` controller config; `lane_keeping` can be disabled
-  independently via `.disabled` or `LaneKeepEnable=0`.
+- **Single large step.** The whole noise stack goes at once. **The only valid
+  Phase-2 rollback is reverting the BMW controller to the `af3be5f`
+  configuration.** `lane_keeping` must **NOT** be disabled (via `.disabled` or
+  `LaneKeepEnable=0`) while the simplified controller is deployed: with
+  `lane_keeping` disabled the controller tracks RAW modelV2 κ_des against a
+  0.001 rad `HOLD_BAND` with no deadzone — at ±0.003 1/m wander that is
+  δ_err ≈ 0.008 rad → a P target near 0.43 frac (≈5.2 Nm), continuously
+  sign-flipping and never resting. The two components are coupled: disabling
+  `lane_keeping` alone is not an independent, safe rollback path.
 
 ## 6. Testing
 
