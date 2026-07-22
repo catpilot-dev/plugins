@@ -184,13 +184,17 @@ def test_smoothing_applies_in_anchor_state_too():
 # --- predictive deadband (2026-07-23 spec) ---
 # Lane lines with real geometry: y arrays over an x grid (device frame +y=right,
 # so the LEFT line's y values are negative).
-def _mv_geo(xs, left_ys, right_ys, left_p=1.0, right_p=1.0):
+def _mv_geo(xs, left_ys, right_ys, left_p=1.0, right_p=1.0, plan_ys=None):
+  # position = the model's planned path (y over the same x grid); default is
+  # a straight-ahead plan (zeros) — the prediction is line-minus-plan.
   return SimpleNamespace(
     laneLines=[SimpleNamespace(x=[], y=[0.0]),
                SimpleNamespace(x=list(xs), y=list(left_ys)),
                SimpleNamespace(x=list(xs), y=list(right_ys)),
                SimpleNamespace(x=[], y=[0.0])],
-    laneLineProbs=[0.0, left_p, right_p, 0.0])
+    laneLineProbs=[0.0, left_p, right_p, 0.0],
+    position=SimpleNamespace(x=list(xs),
+                             y=list(plan_ys if plan_ys is not None else [0.0] * len(xs))))
 
 
 _XS = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
@@ -268,20 +272,55 @@ def test_pred_hard_ceiling_overrides_prediction():
   assert out > 1e-5
 
 
-def test_pred_curve_compensation_no_phantom_drift():
-  # Left curve kappa=0.004: the line curves left (y_line = -1.75 - k*x^2/2)
-  # and the car's commanded path curves with it -> predicted gap stays 0.84,
-  # no phantom excess, no bias beyond the (smoothed) reference itself.
+def test_pred_curve_no_phantom_drift():
+  # Left curve kappa=0.004: the line curves left (y = -1.75 - k*x^2/2) and the
+  # MODEL PLAN curves with it (same geometry) -> line-minus-plan cancels the
+  # curvature -> predicted gap stays 0.84, no phantom excess, no bias beyond
+  # the (smoothed) reference itself.
   k = 0.004
   a = LaneAnchor(AnchorConfig())
   left = [-1.75 - k * x * x / 2.0 for x in _XS]
   right = [1.75 - k * x * x / 2.0 for x in _XS]
-  mv = _mv_geo(_XS, left, right)
+  plan = [-k * x * x / 2.0 for x in _XS]
+  mv = _mv_geo(_XS, left, right, plan_ys=plan)
   out = None
   for _ in range(2000):
     out, t = a.update(k, mv, 25.0, False, lat_delay=0.6)
   assert abs(t['gap_pred'] - 0.84) < 0.02
   assert abs(out - k) < 1e-4                      # reference passes, no nudge
+
+
+def test_pred_plan_drift_toward_line_nudges():
+  # Straight, parallel lines, but the PLAN drifts toward the left line
+  # (plan y -> -0.5 at 30 m): the tracker will follow that plan, so the
+  # predicted gap shrinks (1.25 - 0.91 = 0.34 < 0.6) -> nudge right (negative)
+  # even though the current gap (0.84) is comfortably in-band.
+  a = LaneAnchor(AnchorConfig())
+  plan = [-0.5 * (x / 30.0) for x in _XS]
+  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75), plan_ys=plan)
+  out = None
+  for _ in range(2000):
+    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert t['gap_pred'] < 0.6
+  assert out < -1e-5
+
+
+def test_pred_missing_plan_falls_back_to_current_gap():
+  # Good line geometry but NO position attr -> prediction unavailable ->
+  # deadband acts on the current gap (which is in-band here -> no bias).
+  a = LaneAnchor(AnchorConfig())
+  left = [-1.75 + 0.5 * (x / 30.0) for x in _XS]  # converging line...
+  mv = SimpleNamespace(
+    laneLines=[SimpleNamespace(x=[], y=[0.0]),
+               SimpleNamespace(x=list(_XS), y=list(left)),
+               SimpleNamespace(x=list(_XS), y=list(_flat(1.75))),
+               SimpleNamespace(x=[], y=[0.0])],
+    laneLineProbs=[0.0, 1.0, 1.0, 0.0])           # ...but no position: fallback
+  out = None
+  for _ in range(500):
+    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert abs(t['gap_pred'] - t['gap_filt']) < 1e-9   # fell back to current gap
+  assert abs(out) < 1e-6                             # current gap in-band -> hold
 
 
 def test_pred_right_driver_converging_nudges_left():

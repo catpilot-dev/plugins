@@ -44,12 +44,26 @@ pred_t    = PRED_DELAY_MULT · lat_delay          # lat_delay live from the hook
                                                  # fallback LAT_DELAY_FALLBACK=0.6 s
 x_pred    = clip(v_ego · pred_t, X_PRED_MIN, X_PRED_MAX)       # ≈12 m urban, ≈30 m @90 km/h
 y_line    = interp(x_pred, laneLines[idx].x, laneLines[idx].y)  # line at that point
-y_path    = -kappa_ref · x_pred² / 2                            # where the car will be
-                                                                # (left-positive κ → −y in
-                                                                #  the +y=right device frame)
-gap_pred  = line_sign · (y_line − y_path) − HALF_WIDTH
+y_plan    = interp(x_pred, position.x, position.y)              # THE MODEL'S OWN PLAN
+gap_pred  = line_sign · (y_line − y_plan) − HALF_WIDTH
 gap_pred_f = low_pass(gap_pred, tau=FILTER_TAU)
 ```
+
+> **REVISED 2026-07-23 after the replay gate (user-approved).** The original
+> design computed the car's future position by constant-curvature
+> extrapolation (`y_path = −κ_ref·x_pred²/2`) and explicitly avoided the
+> model's planned path "to stay decoupled from plan noise." **The gate proved
+> that reasoning backwards.** The κ term multiplies κ_des sub-Hz noise by
+> `x_pred²/2` (~450 m² at 30 m): measured predictor RMSE 0.33–0.55 m across
+> routes 3bf/3b7/3bb — 2–6× *worse* than the trivial "gap doesn't change"
+> predictor (0.15–0.17 m), degrading exactly as horizon². The plan-based
+> difference measures **0.128–0.138 m, beating trivial on all three routes,
+> bias ≤ 0.015 m** — because the plan and the lane line come from the same
+> vision frame, so their coherent wander (the 2026-07-12 "plan-coherent
+> dips" finding) cancels in the difference. It is also semantically exact:
+> the Phase-2 tracker faithfully follows the plan, so line-minus-plan at
+> `x_pred` *is* the predicted gap. Fallback extends to the plan: if
+> `position.x/y` can't cover `x_pred`, `gap_pred = gap`.
 
 - **Why 2× the lateral delay:** a correction commanded now takes ~one
   `lat_delay` to bend the car's path — predicting less than that ahead is
@@ -130,6 +144,6 @@ is the attribution mitigation for the single combined deploy.
 
 - No change to nudge magnitude/shape (pure-pursuit + caps + rate limit stay).
 - No change to the Phase-2 tracker.
-- No multi-hypothesis prediction, no use of the model's planned lateral path
-  beyond the already-smoothed `kappa_ref` (keeps the predictor decoupled from
-  plan noise).
+- No multi-hypothesis prediction. (~~No use of the model's planned lateral
+  path~~ — REVERSED 2026-07-23 with gate evidence, see §2: the plan IS the
+  path source now; the κ-extrapolation it replaced was the noisier option.)

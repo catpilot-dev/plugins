@@ -86,13 +86,16 @@ check('lane change bypasses the filter', o == 0.0)
 
 print('probe 9: predictive deadband')
 XS = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
-def mv_geo(left_ys, right_ys):
+def mv_geo(left_ys, right_ys, plan_ys=None):
+  # position = the model's planned path; prediction is line-minus-plan
   return SimpleNamespace(
     laneLines=[SimpleNamespace(x=[], y=[0.0]),
                SimpleNamespace(x=list(XS), y=list(left_ys)),
                SimpleNamespace(x=list(XS), y=list(right_ys)),
                SimpleNamespace(x=[], y=[0.0])],
-    laneLineProbs=[0.0, 1.0, 1.0, 0.0])
+    laneLineProbs=[0.0, 1.0, 1.0, 0.0],
+    position=SimpleNamespace(x=list(XS),
+                             y=list(plan_ys if plan_ys is not None else [0.0] * len(XS))))
 flat = lambda y: [y] * len(XS)
 
 a = LaneAnchor(AnchorConfig())
@@ -124,6 +127,13 @@ for _ in range(2000):
   out, t = a.update(0.0, mv_geo(crit, flat(1.75)), 25.0, False, lat_delay=0.6)
 check('hard floor: 0.2m gap corrects despite recovering prediction',
       t['gap_filt'] < 0.3 and out < -1e-5, f"gf={t['gap_filt']:.3f} out={out:.5f}")
+
+a = LaneAnchor(AnchorConfig())
+drift_plan = [-0.5 * (x / 30.0) for x in XS]      # plan drifts toward the left line
+for _ in range(2000):
+  out, t = a.update(0.0, mv_geo(flat(-1.75), flat(1.75), plan_ys=drift_plan), 25.0, False, lat_delay=0.6)
+check('plan drifting toward line: predicted out-of-band, nudges right',
+      t['gap_pred'] < 0.6 and out < -1e-5, f"gp={t['gap_pred']:.3f} out={out:.5f}")
 
 a = LaneAnchor(AnchorConfig())
 for _ in range(3000):

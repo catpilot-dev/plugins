@@ -145,22 +145,36 @@ class LaneAnchor:
         self.gap_filt += alpha * (gap - self.gap_filt)
       # Predictive deadband (2026-07-23 spec): evaluate the driver-side line at
       # the point the car reaches after pred_delay_mult × lat_delay (~1.2 s for
-      # BMW), subtract the path its commanded curvature will trace, and decide
-      # on THAT gap. A correction commanded now takes ~one lat_delay to act, so
-      # 2× = one delay to act + one to observe — the human rhythm. Falls back
-      # to the current gap when the line geometry can't cover x_pred.
+      # BMW), subtract WHERE THE MODEL'S OWN PLAN puts the car at that point,
+      # and decide on THAT gap. A correction commanded now takes ~one lat_delay
+      # to act, so 2× = one delay to act + one to observe — the human rhythm.
+      #
+      # Why the plan and not a constant-curvature extrapolation (replay gate
+      # 2026-07-23): a κ_ref·x²/2 path term multiplies κ_des sub-Hz noise by
+      # x_pred²/2 (~450 m² at 30 m) — measured predictor RMSE 0.33–0.55 m,
+      # 2–6× WORSE than assuming the gap doesn't change. The plan and the lane
+      # line come from the same vision frame, so their coherent wander cancels
+      # in the difference: measured 0.13–0.14 m, beating trivial (0.15–0.17)
+      # on all three gate routes. It is also semantically exact — the Phase-2
+      # tracker faithfully follows the plan, so line-minus-plan at x_pred IS
+      # the predicted gap. Falls back to the current gap when the line or plan
+      # geometry can't cover x_pred.
       pred_t = cfg.pred_delay_mult * (lat_delay if lat_delay else LAT_DELAY_FALLBACK)
       x_pred = _clip(v_ego * pred_t, X_PRED_MIN, X_PRED_MAX)
       line = model_v2.laneLines[self.driver_idx]
       xs = getattr(line, 'x', [])
       y_line = _interp_arr(x_pred, [float(p) for p in xs], [float(p) for p in line.y]) \
         if len(xs) == len(line.y) else None
-      if y_line is None:
+      plan = getattr(model_v2, 'position', None)
+      y_plan = None
+      if plan is not None:
+        pxs = getattr(plan, 'x', [])
+        if len(pxs) == len(plan.y):
+          y_plan = _interp_arr(x_pred, [float(p) for p in pxs], [float(p) for p in plan.y])
+      if y_line is None or y_plan is None:
         gap_pred = gap
       else:
-        # left-positive curvature displaces the path toward −y (+y = right)
-        y_path = -self.kappa_filt * x_pred * x_pred / 2.0 if self.kappa_filt is not None else 0.0
-        gap_pred = self.line_sign * (y_line - y_path) - cfg.half_width
+        gap_pred = self.line_sign * (y_line - y_plan) - cfg.half_width
       if self.gap_pred_filt is None:
         self.gap_pred_filt = gap_pred
       else:
