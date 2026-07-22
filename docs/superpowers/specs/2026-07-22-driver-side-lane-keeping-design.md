@@ -154,7 +154,7 @@ steers away. Verified for both `DRIVER_SIDE` values.
 | `DRIVER_SIDE` | `left` | which ego line to anchor (`left`/`right`) |
 | `HALF_WIDTH` | 0.91 | car half-width (m); E90 ≈ 1.817 m |
 | `GAP_MIN` / `GAP_MAX` | 0.6 / 1.0 | driver-wheel-to-line comfort band (m) |
-| `T_PREVIEW` | 1.5 | pure-pursuit look-ahead time (s) |
+| `T_PREVIEW` | 1.5 | pure-pursuit look-ahead time (s); speed-independent correction accel = `2·excess/T_PREVIEW²` (~0.44 m/s² at full excess). **Kept at 1.5 s deliberately — shortening it makes high-speed steering more aggressive (route-39b lesson); validated in offline replay (§4.2) before on-car.** |
 | `EXCESS_MAX` | 0.5 | max deadband excess acted on (m) |
 | `KAPPA_BIAS_MAX` | 0.002 | hard cap on curvature bias (1/m); binds only below ~54 km/h, keeps low-speed corrections gentle |
 | `KAPPA_RATE_MAX` | 0.002 /s | bias slew (1/m per second; ≈ full range in 1 s), converted to per-tick at the 100 Hz control rate; refined on replay/on-car |
