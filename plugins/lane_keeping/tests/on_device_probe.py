@@ -75,5 +75,61 @@ m = mv(-2.3, 1.2); a.gap_filt = a._gap(m)
 _o, t = a.update(0.01, m, 25.0, False)
 check('first tick bias <= rate*DT', abs(t['kappa_bias']) <= 0.002 * 0.01 + 1e-12)
 
+print('probe 8: kappa_des smoothing (previously uncovered)')
+a = LaneAnchor(AnchorConfig())
+none_mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+a.update(0.02, none_mv, 25.0, False)
+o, t = a.update(0.0, none_mv, 25.0, False)
+check('reference lags a step (smoothing active)', 0.0 < o < 0.02, f'o={o:.4f}')
+o, t = a.update(0.0, none_mv, 25.0, True)
+check('lane change bypasses the filter', o == 0.0)
+
+print('probe 9: predictive deadband')
+XS = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+def mv_geo(left_ys, right_ys):
+  return SimpleNamespace(
+    laneLines=[SimpleNamespace(x=[], y=[0.0]),
+               SimpleNamespace(x=list(XS), y=list(left_ys)),
+               SimpleNamespace(x=list(XS), y=list(right_ys)),
+               SimpleNamespace(x=[], y=[0.0])],
+    laneLineProbs=[0.0, 1.0, 1.0, 0.0])
+flat = lambda y: [y] * len(XS)
+
+a = LaneAnchor(AnchorConfig())
+out = None
+for _ in range(500):
+  out, t = a.update(0.0, mv_geo(flat(-1.75), flat(1.75)), 25.0, False, lat_delay=0.6)
+check('parallel line: gap_pred==gap, x_pred=30, no bias',
+      abs(t['gap_pred'] - 0.84) < 1e-3 and abs(t['x_pred'] - 30.0) < 1e-6 and abs(out) < 1e-5,
+      f"gp={t['gap_pred']:.3f} xp={t['x_pred']:.1f} out={out:.5f}")
+
+a = LaneAnchor(AnchorConfig())
+conv = [-1.75 + 0.5 * (x / 30.0) for x in XS]
+for _ in range(2000):
+  out, t = a.update(0.0, mv_geo(conv, flat(1.75)), 25.0, False, lat_delay=0.6)
+check('converging line: nudges early (right/negative)', t['gap_pred'] < 0.6 and out < -1e-5,
+      f"gp={t['gap_pred']:.3f} out={out:.5f}")
+
+a = LaneAnchor(AnchorConfig())
+recov = [-1.41 - 0.4 * (x / 30.0) for x in XS]
+for _ in range(2000):
+  out, t = a.update(0.0, mv_geo(recov, flat(1.75)), 25.0, False, lat_delay=0.6)
+check('recovering: current out-of-band but predictor holds',
+      t['gap_filt'] < 0.6 and t['gap_pred'] > 0.6 and abs(out) < 1e-5,
+      f"gf={t['gap_filt']:.3f} gp={t['gap_pred']:.3f} out={out:.5f}")
+
+a = LaneAnchor(AnchorConfig())
+crit = [-1.11 - 0.7 * (x / 30.0) for x in XS]
+for _ in range(2000):
+  out, t = a.update(0.0, mv_geo(crit, flat(1.75)), 25.0, False, lat_delay=0.6)
+check('hard floor: 0.2m gap corrects despite recovering prediction',
+      t['gap_filt'] < 0.3 and out < -1e-5, f"gf={t['gap_filt']:.3f} out={out:.5f}")
+
+a = LaneAnchor(AnchorConfig())
+for _ in range(3000):
+  out, _t = a.update(0.01, mv(-2.3, 1.2), 25.0, False, lat_delay=0.6)
+check('single-point lines fall back to current-gap deadband', out > 0.01 + 1e-5,
+      f'out={out:.5f}')
+
 print(f'\n{PASS} passed, {FAIL} failed')
 sys.exit(1 if FAIL else 0)
