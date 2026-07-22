@@ -52,3 +52,8 @@ class LaneAnchor:
   def _gap(self, model_v2):
     line_y = float(model_v2.laneLines[self.driver_idx].y[0])
     return self.side_sign * line_y - self.cfg.half_width
+
+  def _excess(self, gap_filt):
+    cfg = self.cfg
+    excess = gap_filt - _clip(gap_filt, cfg.gap_min, cfg.gap_max)
+    return _clip(excess, -cfg.excess_max, cfg.excess_max)
