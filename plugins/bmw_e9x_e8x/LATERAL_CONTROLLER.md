@@ -181,6 +181,24 @@ This document is the canonical reference for the lateral controller registered b
 > Telemetry gains `de_dc`, `persist_w`. Closed-loop centering recovery is
 > pending on-car verification (open-loop replay validates only the detector).
 
+> **2026-07-22 — Phase 2: noise handling offloaded to lane_keeping.** Route 3bf
+> proved the position anchor cannot work through a deadzone: its bias was only
+> 1.98× the tolerance and the controller took no action on 44% of correcting
+> ticks (a 75 s excursion had the bias saturated, correctly signed, and never
+> recovering). The controller is now a faithful tracker. **Deleted:** `DRIFT_M`
+> + kinematic `tolerance`, the `KD_BLEND` box filter, the σ-observer noise floor
+> (`KN_*`, `k_sigma`), and the sign-persistence gate (`de_dc`, `persist_w`).
+> **P acts on the full `delta_err`** — the tolerance subtraction is gone, and it
+> was the attenuator. The stiction hold retriggers on a fixed
+> `HOLD_BAND = 0.001` rad, sized by rack breakaway (below it the P term commands
+> less than friction, so the wheel cannot move) rather than by allowed drift.
+> modelV2 noise now lives entirely in `lane_keeping`, which low-passes κ_des
+> (`KAPPA_FILTER_TAU = 0.3 s`) and closes the position loop — filtering is safe
+> there because its lag becomes position drift, which that loop cancels. The
+> modelV2 subscription is dropped (it only fed the deleted filter's lane-change
+> gate). Telemetry drops `tolerance`/`delta_err_raw`/`de_w`/`k_sigma`/`de_dc`/
+> `persist_w` and gains `hold_band`.
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -352,54 +370,21 @@ state['delta_err_raw'] = delta_err_raw    # both published in telemetry
 
 ## 5. The kinematic deadzone
 
-```python
-DRIFT_M     = 0.02              # m of allowed drift over model_action_t (fixed)
-lookahead_m = v * model_action_t
-tolerance   = 2.0 * DRIFT_M * L / (lookahead_m**2) # rad, 1/v² scaling
-# 2026-07-19 noise floor + sign-persistence gate (see header notes + KN_* code):
-tol_kin     = 2.0 * DRIFT_M * L / (lookahead_m**2)
-kn_fade     = interp(|κ_des|, KN_FADE_BP=[0.002, 0.004], [1, 0])
-de_dc       = slow_EMA(delta_err, τ≈2s)                     # persistent/DC component
-persist_w   = interp(|de_dc|/tol_kin, KN_PERSIST_BP=[0.7, 1.3], [1, 0])
-tol_floor   = KN_SIGMA_MULT(1.5) · σ_live · L · kn_fade · persist_w
-tolerance   = max(tol_kin, min(tol_floor, tol_kin · KN_DRIFT_CAP_M/DRIFT_M))
-```
+**DELETED 2026-07-22 (Phase 2).** The kinematic `DRIFT_M` deadzone, the
+σ-observer noise floor and the sign-persistence gate are gone. They existed
+because the controller was the only loop closing against drift; that job now
+belongs to the `lane_keeping` position loop, which also owns modelV2 noise.
 
-**2026-07-19: sign-persistence gate.** The symmetric floor removed the gentle
-centering the tight band gave, letting a small offset stand (route 3b3
-left-hug). `de_dc` (slow EMA of delta_err) detects a *persistent* one-sided
-error — a real position offset, not wander — and fades the floor out
-(`persist_w → 0`) as it grows past `tol_kin`, so the steady offset stays
-bounded by the tight kinematic band while zero-mean wander keeps the full
-floor. See header note for the on-car evidence and tuning.
+What remains is `HOLD_BAND = 0.001` rad — **not** a deadzone. P acts on the full
+`delta_err` at all times; `HOLD_BAND` only decides when the rack is "on target"
+so the curvature hold (§ hold_curve) can take over. It is sized by stiction:
+below `FRICTION·STEER_MAX / (T_CAP_SLOPE·kappa_scale·v²)` ≈ 0.001 rad at 25 m/s
+the P term commands less than rack breakaway, so the wheel cannot move anyway.
 
-**2026-07-19: σ-observer noise floor added.** The kinematic band alone shrinks
-below modelV2's own sub-Hz wander at 60–90 km/h (controller actionable 70–80%
-of straight ticks — chase churn, route 3ac). A live band-pass variance
-estimator on κ_des (1 s/5 s EMAs → 20 s variance, trained only near-straight)
-floors the tolerance at 1.5σ·L on straights, fading to zero by |κ_des| = 0.004
-so curves keep the pure kinematic band. Cap: implied drift ≤ 0.08 m
-(KN_DRIFT_CAP_M) — well below the route-31b failure regime.
-
-**2026-07-04: the 2026-07-03 κ-dependent widening (0.02→0.10 m) was REVERTED.**
-Allowed drift must not grow with curvature — lane margin shrinks in tight turns
-and position error matters more there, not less. The tight-turn noise-chasing
-the widening tried to solve is handled by `hold_curve` (resting torque) +
-`STEP_MAX` (bounded chase). The hold cap now uses its own fixed reference
-(`HOLD_CAP_DRIFT_M = 0.10`), decoupled from this deadzone.
-
-**Physical meaning**: tolerance is the front-wheel-angle error that produces ≤ `drift_m` of lateral position drift over `model_action_t` of forward travel. Near-straight at 85 kph: tolerance ≈ 0.027°. Near-straight at 30 kph: ≈ 0.36°. Tight turn (κ=0.02) at 34 kph: ≈ 0.85°.
-
-**Why κ-dependent drift_m (2026-07-03)**: in route-384 tight turns the fixed 0.02 m band (~0.17° at 9.4 m/s) was ~3σ smaller than the δ_err vision noise (0.008–0.012 rad) — the controller never rested in the deadzone and chased noise. At 0.10 m the band (~0.85°) is ~1.5σ: `hold_curve` becomes the resting state and P fires on real excursions only. Near-straight keeps 0.02 m (the κ ramp starts at 0.004, above the ±0.003 wobble band), and at highway speed the 1/v² term dominates regardless (κ=0.007 @ 20 m/s → ~0.09°) — so this does not re-create the route-31b failure below.
-
-**Why 1/v² and not constant-angle**: a constant 0.35° deadzone was tried (commit 715114d) and reverted (d43fb19) after route 31b seg 8/15 showed the controller silent for 98% of samples while `δ_err` sat inside the wide band, producing 1.3–1.7 m lateral drift at 85 kph with no position-feedback layer running. The 1/v² formula tightens the deadzone exactly where it matters (high speed) and is the only safe choice without a position-feedback layer.
-
-**Used in three places** in the cadence decision:
-- `if abs(delta_err) ≤ 1.2 · tolerance` → cancel_tol band (drain to hold_f·torque)
-- `if abs(delta_err) ≤ tolerance` → hold_zero / hold_curve
-- `effective_err = delta_err - copysign(tolerance, delta_err)` → soft-deadband in target_nm formula
-
-Telemetry publishes the live `tolerance` (and `hold_f`) for band-occupancy forensics.
+Historical note: a constant-angle deadzone was tried in 2026-05 and reverted
+(route 31b, 1.3–1.7 m drift) precisely because no position-feedback layer
+existed. That constraint is now satisfied — but note the resolution was to
+delete the deadzone, not to widen it.
 
 ---
 
@@ -451,8 +436,8 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | state | when entered |
 |---|---|
 | `init` | controller construction |
-| `hold_zero` | `|delta_err| ≤ tolerance`, straight (`hold_f = 0`) — target 0, stiction holds |
-| `hold_curve` | `|delta_err| ≤ tolerance`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
+| `hold_zero` | `|delta_err| ≤ HOLD_BAND`, straight (`hold_f = 0`) — target 0, stiction holds |
+| `hold_curve` | `|delta_err| ≤ HOLD_BAND`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
 | `ramp` | active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
 | `relax_dwell` | overshoot-side error in a measured deep curve, within the 1 s dwell — target bridges at current (capped) torque |
 | `cancel_tol` | error fell into 1.2× tolerance band mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights) |
@@ -474,8 +459,7 @@ Published each livePose tick:
 | `desired_raw` | identical to `desired` (kept for back-compat with older filter designs) |
 | `measured` | κ_meas from livePose yaw rate / v_ego |
 | `err` | κ_des − κ_meas (debug) |
-| `delta_err` | **filtered** front-wheel angle error (rad) — what controller acts on |
-| `delta_err_raw` | pre-filter δ_err (rad) — for filter diagnostics |
+| `delta_err` | front-wheel angle error (rad) — what controller acts on |
 | `target_frac` | current cadence-decision target torque fraction (−1..1) |
 | `ramp_step` | per-CAN-tick torque increment |
 | `ramp_frames` | CAN frames remaining in current ramp |
@@ -486,14 +470,10 @@ Published each livePose tick:
 | `active` | controller active flag |
 | `a_y_meas` | `v²·κ_meas` (m/s²) |
 | `jerk_pred` | `v²·(κ_des - κ_meas)/model_action_t` (m/s³) |
-| `de_w` | blend weight of the delta_err filter (1 = raw, 0 = fully box-filtered) |
 | `hold_f` | curvature hold factor [0, 1] |
 | `hold_cap` | cap on held torque (deadzone-edge P value, frac) |
-| `tolerance` | live deadzone half-width (rad) — kinematic ∨ noise floor (2026-07-19) |
 | `relax_ticks` | consecutive ticks of overshoot-side error while deep in a curve (dwell counter) |
-| `k_sigma` | (2026-07-19) live σ of modelV2 sub-Hz κ_des wander (1/m), from the noise observer |
-| `de_dc` | (2026-07-19) persistent (DC) component of delta_err (rad), slow EMA — the sign-persistence detector |
-| `persist_w` | (2026-07-19) floor weight from the sign-persistence gate (1 = full floor, 0 = floor off, offset being corrected) |
+| `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 

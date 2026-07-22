@@ -34,12 +34,12 @@ def on_lat_controller_init(result, lac, CP):
   self-centering — the wheel holds its angle at zero torque *near center*.
   In curves, self-aligning torque exceeds rack stiction above ~40° wheel
   (route 380/384), so on-target there requires standing torque. So:
-    - Inside tolerance, straight (|κ_des| < HOLD_KAPPA_BP[0]): drive torque
+    - On-target, straight (|κ_des| < HOLD_KAPPA_BP[0]): drive torque
       → 0 and let stiction hold. No chatter.
-    - Inside tolerance, curve: hold hold_f·torque — the torque that achieved
+    - On-target, curve: hold hold_f·torque — the torque that achieved
       on-target ≈ the self-aligning torque. Re-derived each decision from
       state['torque']; bounded by the P-term's own command, no ratchet.
-    - Outside tolerance: compute the torque that would move the front wheel by
+    - Off-target: compute the torque that would move the front wheel by
       δ_err over 500 ms (plant-inversion accounting for first-order lag), ramp
       to it over one 250 ms decision.
 
@@ -48,13 +48,19 @@ def on_lat_controller_init(result, lac, CP):
     δ_meas = atan(κ_meas · L)        κ_meas = yawRate / v_ego
     δ_err  = δ_des − δ_meas
 
-  Tolerance (physical DRIFT_M = 0.02 m over model_action_t, speed-adaptive
-  1/v²; the 2026-07-03 κ-widening was reverted 2026-07-04 — allowed drift
-  must not grow with curvature):
-    tolerance = 2 · DRIFT_M · L / (v · model_action_t)²
+  On-target trigger (Phase 2, 2026-07-22): HOLD_BAND = 0.001 rad, fixed —
+  not the speed-adaptive kinematic DRIFT_M deadzone it replaced. It exists
+  only to decide when the rack has arrived so the curvature hold can take
+  over; it is sized by rack breakaway (below it P commands less than
+  friction, so the wheel can't move anyway), not by allowed lateral drift.
+  modelV2 noise handling and lateral-drift correction now live upstream in
+  the lane_keeping plugin's position loop:
+    on_target = |δ_err| ≤ HOLD_BAND
 
-  Plant-inversion target torque, angle domain (linear tire regime):
-    τ_Nm_target = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
+  Plant-inversion target torque, angle domain (linear tire regime). P acts
+  on the FULL error — no tolerance subtraction (Phase 2: it was attenuating
+  the lane_keeping position correction upstream):
+    τ_Nm_target = T_CAP_SLOPE · v² · δ_err
     Clamp to ±T_CAP(v, δ):
       T_CAP_NM = min(STEER_MAX, T_CAP_BASE + T_CAP_SLOPE · v²·|δ_des|)
     Same slope drives both target and cap.
@@ -82,17 +88,18 @@ def on_lat_controller_init(result, lac, CP):
   dips (the "gives up mid-way" mechanism, route 3a0 seg 8). ISO cancels
   bypass the dwell; κ_des sign flips (S-curves) abort it instantly.
 
-  Tolerance-cancel (every livePose tick): if |δ_err| drops into the success
-  band mid push-ramp, drain torque to the sign-guarded, capped hold (0 on
-  straights). Without this, the in-flight ramp keeps pushing toward a stale
-  target until the next 250 ms cadence notices.
+  cancel_tol (every livePose tick): if |δ_err| drops into the on-target
+  band (1.2 × HOLD_BAND) mid push-ramp, drain torque to the sign-guarded,
+  capped hold (0 on straights). Without this, the in-flight ramp keeps
+  pushing toward a stale target until the next 250 ms cadence notices.
 
   2026-07-03 simplification: all stiction special-casing removed (breakaway
   ±FRICTION amplification, brake_zero reverse pulse, cancel reverse-FRICTION
   pulses). Route 384 telemetry showed ~40% of in-turn decisions were friction
   pulses — torque reversals that churned rather than corrected. The straight-
-  line wobble those mechanisms targeted is modelV2 vision noise, handled by
-  the blended delta_err box filter instead (blend since 2026-07-04).
+  line wobble those mechanisms targeted is modelV2 vision noise; as of Phase 2
+  (2026-07-22) that's handled upstream by the lane_keeping plugin (κ_des
+  low-pass + position loop), not by anything in this controller.
 
   No online adaptation: plant behavior is fully described by T_CAP_SLOPE,
   T_CAP_BASE_NM, and FRICTION. Tune these offline from route data; there's
@@ -133,15 +140,15 @@ def on_lat_controller_init(result, lac, CP):
   #     τ_Nm_hold = T_CAP_SLOPE · v² · δ                (aligning torque)
   # Drives both authority cap and target torque:
   #   T_CAP(v, δ)  = T_CAP_BASE_NM + T_CAP_SLOPE · v² · |δ_des|   (≤ STEER_MAX)
-  #   target_Nm    = T_CAP_SLOPE · v² · effective_err
+  #   target_Nm    = T_CAP_SLOPE · v² · delta_err   (Phase 2: full error, no soft-deadband)
   # BASE covers the speed- and angle-independent stiction floor.
   # T_CAP_SLOPE_BASE = 1.0: gentle baseline gain on straights. A curvature-
   # dependent scale T_CAP_SCALE(|κ_des|) bumps it up to 3.0× on tight curves
   # (linear interp 0.001..0.01 1/m). Rationale: small κ_des needs gentle gain
   # to avoid ringing on near-straight sections (seg-14 evidence); tight κ_des
   # needs enough authority to chase the planner without lag (seg-6 evidence).
-  # The soft-deadband and per-tick tolerance-cancel handle the boundary
-  # smoothness.
+  # The per-tick cancel_tol guard (HOLD_BAND-based) handles boundary
+  # smoothness; there is no soft-deadband since Phase 2 (2026-07-22).
   T_CAP_BASE_NM = 2.0
   T_CAP_SLOPE_BASE = 1.0
   T_CAP_SCALE_KAPPA = [0.001, 0.01, 0.02]        # |κ_des| breakpoints (1/m)
@@ -149,8 +156,9 @@ def on_lat_controller_init(result, lac, CP):
   # Plant prediction horizon — sourced per-tick from controlsd's lat_delay
   # (= liveDelay.lateralDelay + LAT_SMOOTH_SECONDS) and matched to where
   # modeld samples κ_des: lat_action_t = lat_delay + DT_MDL (modeld.py:391).
-  # Used by jerk_pred (the ISO-jerk overshoot guard) and by the kinematic
-  # deadzone formula (DRIFT_M_BP block below) — same horizon for both.
+  # Used by jerk_pred (the ISO-jerk overshoot guard) and by the hold-cap's
+  # fixed-reference drift formula (HOLD_CAP_DRIFT_M block below) — same
+  # horizon for both.
   #
   # For BMW: lagd never converges (it correlates on latcontrol_torque
   # telemetry that our front-wheel-angle plant-inversion controller doesn't
@@ -161,8 +169,9 @@ def on_lat_controller_init(result, lac, CP):
   DT_MDL = 0.05                                  # openpilot model dt (common/realtime.py)
   MODEL_ACTION_T_FALLBACK = 0.55                 # used only if lat_delay arrives as 0/None
 
-  # Curvature-dependent hold (2026-07-03): inside the tolerance band the
-  # target is hold_f·torque instead of 0, hold_f = interp(|κ_des|, BP, [0,1]).
+  # Curvature-dependent hold (2026-07-03): inside the on-target band
+  # (|delta_err| ≤ HOLD_BAND) the target is hold_f·torque instead of 0,
+  # hold_f = interp(|κ_des|, BP, [0,1]).
   # Below BP[0] (straights; above the ±0.003 modelV2 wobble amplitude) the
   # target is 0 as before. Between BP[0] and BP[1] the partial factor gives
   # a geometric relax (each decision multiplies held torque by hold_f);
@@ -172,7 +181,9 @@ def on_lat_controller_init(result, lac, CP):
   # lets the wheel unwind (route 380/384 0.6 Hz limit cycle).
   HOLD_KAPPA_BP = [0.004, 0.010]
   # Reference drift scale for the hold-torque cap ONLY (decoupled from the
-  # deadzone DRIFT_M on 2026-07-04 — see the hold_cap block in update()).
+  # kinematic DRIFT_M deadzone on 2026-07-04 — see the hold_cap block in
+  # update()). That DRIFT_M deadzone was deleted entirely in Phase 2
+  # (2026-07-22); this fixed reference is unaffected and unchanged.
   HOLD_CAP_DRIFT_M = 0.10
 
   # Per-decision torque step cap (2026-07-03, route 385 seg 27 review).
@@ -190,10 +201,13 @@ def on_lat_controller_init(result, lac, CP):
   # per-decision steps are riskier at highway speed (lane margin consumed
   # faster, less time to react). Full 0.10 up to 15 m/s (curves keep their
   # entry authority; speedlimitd owns curve-entry speed), tapering to 0.05
-  # at/above 28 m/s (100 km/h) — highway slew halves to ~2 Nm/s. Deadzone
-  # (DRIFT_M) deliberately NOT tightened at speed: it is already 1/v²-tight
-  # (~0.02° at 28 m/s, ~10× below the vision-noise floor) and tightening
-  # would add chase pressure, not calm.
+  # at/above 28 m/s (100 km/h) — highway slew halves to ~2 Nm/s.
+  # (Historical note: at the time this was written, the deadzone was the
+  # 1/v²-tight kinematic DRIFT_M, deliberately not tightened further at
+  # speed. Phase 2 (2026-07-22) deleted that deadzone entirely; HOLD_BAND
+  # is now a FIXED 0.001 rad with no speed adaptation — at v=28 m/s it is
+  # roughly 3× WIDER than the old tol_kin was, not tighter. Speed-adaptive
+  # drift correction now lives in lane_keeping's position loop, not here.)
   STEP_MAX_V  = [15.0, 28.0]     # vEgo breakpoints (m/s)
   STEP_MAX_BP = [0.10, 0.05]     # per-decision torque step cap (frac)
 
@@ -212,9 +226,10 @@ def on_lat_controller_init(result, lac, CP):
   # Rack breakaway torque fraction (stiction floor). 2026-07-03: no longer
   # used to amplify sub-friction commands or emit reverse pulses (stiction
   # special-casing removed — the pulses were churn, not correction; the
-  # straight-line wobble they targeted is modelV2 vision noise, handled by
-  # the delta_err box filter). Retained only as the tolerance-cancel guard:
-  # ramps below this can't move the rack, so there is nothing to cancel.
+  # straight-line wobble they targeted is modelV2 vision noise, now handled
+  # upstream by lane_keeping since Phase 2, 2026-07-22). Retained only as
+  # the cancel_tol guard threshold: ramps below this can't move the rack,
+  # so there is nothing to cancel.
   FRICTION = 0.05
 
   # Stiction hold trigger (Phase 2, 2026-07-22). Replaces the DRIFT_M kinematic
@@ -276,7 +291,7 @@ def on_lat_controller_init(result, lac, CP):
     'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
     'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
     'hold_f': 0.0,                # debug: curvature hold factor [0,1]
-    'hold_cap': 0.0,              # debug: cap on held torque (deadzone-edge P value, frac)
+    'hold_cap': 0.0,              # debug: cap on held torque (P value at the HOLD_CAP_DRIFT_M reference drift, frac)
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
   }
 
@@ -324,7 +339,7 @@ def on_lat_controller_init(result, lac, CP):
       # is achieved WITH torque applied — that standing torque ≈ the self-
       # aligning torque, which above ~40° wheel exceeds rack stiction
       # (route 380/384: hold-at-zero let the wheel unwind → 0.6 Hz limit
-      # cycle). hold_f scales the deadzone / tolerance-cancel target:
+      # cycle). hold_f scales the on-target / cancel_tol target:
       # 0 on straights (pure stiction-hold, below-BP includes the ±0.003
       # modelV2 wobble band), 1 in real curves (keep what got us on-target).
       # The held value is bounded by what the P-term was already commanding
@@ -359,7 +374,7 @@ def on_lat_controller_init(result, lac, CP):
       kappa_scale = float(np.interp(abs(state['desired']),
                                     T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP))
 
-      # Held torque for the deadzone / tolerance-cancel (route 385 seg 27
+      # Held torque for the on-target hold / cancel_tol (route 385 seg 27
       # review, 2026-07-03). "Keep what you have" needs two qualifiers:
       #   - sign-guard: never hold torque opposing the commanded curve — on a
       #     rack with no self-centering that actively drives the wrong way
@@ -369,15 +384,16 @@ def on_lat_controller_init(result, lac, CP):
       #     on-target" is arrival momentum, not holding torque (seg 27
       #     latched 0.588 where steady SAT ≈ 0.15 → cancel_accel dump →
       #     deep unwind cycle).
-      # 2026-07-04: the cap is DECOUPLED from the deadzone tolerance. It was
-      # originally slope·kappa_scale·v²·tolerance, but when the κ-widened
-      # DRIFT_M was reverted (deadzone back to 0.02 m), deriving the cap from
-      # the now-tight tolerance would shrink it ~5× (0.31 → 0.06 at the
-      # route-384 operating point) — BELOW the measured steady SAT
-      # (0.08–0.15 frac), breaking hold_curve. The cap keeps its own fixed
-      # reference drift (HOLD_CAP_DRIFT_M = 0.10 m — the field-verified
-      # scale from the seg-27 fix), so the deadzone and the hold cap tune
-      # independently.
+      # 2026-07-04: the cap was DECOUPLED from the kinematic DRIFT_M deadzone
+      # that existed at the time. It was originally slope·kappa_scale·v²·
+      # tolerance, but when the κ-widened DRIFT_M was reverted (deadzone back
+      # to 0.02 m), deriving the cap from the now-tight tolerance would have
+      # shrunk it ~5× (0.31 → 0.06 at the route-384 operating point) — BELOW
+      # the measured steady SAT (0.08–0.15 frac), breaking hold_curve. The
+      # cap keeps its own fixed reference drift (HOLD_CAP_DRIFT_M = 0.10 m —
+      # the field-verified scale from the seg-27 fix), so it tunes
+      # independently. That DRIFT_M deadzone was deleted entirely in Phase 2
+      # (2026-07-22); this fixed reference is unaffected and unchanged.
       hold_cap = (T_CAP_SLOPE_BASE * kappa_scale * v * v
                   * (2.0 * HOLD_CAP_DRIFT_M * L / (lookahead_m ** 2))) / CCP.STEER_MAX
       state['hold_cap'] = hold_cap
@@ -505,13 +521,14 @@ def on_lat_controller_init(result, lac, CP):
         state['tick_count'] = 0
 
         # Plant-inversion target torque in angle domain — the steady-state
-        # aligning torque required to hold δ_err. Soft-deadband subtracts
-        # the tolerance from |δ_err| so τ_Nm starts at 0 when crossing the
-        # boundary instead of stepping to T_CAP_SLOPE·v²·tolerance (~1.1 Nm
-        # at 120 kph) — without it, the boundary crossing would dominate
-        # the torque profile and feel like a discrete step.
-        #   τ_Nm = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
-        # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
+        # aligning torque required to hold δ_err. Phase 2 (2026-07-22): P
+        # acts on the FULL δ_err, no soft-deadband subtraction — see the
+        # target_nm formula below and the 2026-07-22 header note in
+        # LATERAL_CONTROLLER.md for why (it was attenuating the upstream
+        # lane_keeping position correction).
+        #   τ_Nm = T_CAP_SLOPE · v² · δ_err
+        # On-target (|δ_err| ≤ HOLD_BAND) → stiction holds; no chatter at
+        # the boundary (see the hold_curve / hold_zero branch below).
         if abs(delta_err) <= HOLD_BAND:
           # On-target. Straights (hold_f=0): drain to 0, stiction holds.
           # Curves (hold_f→1): keep the torque that achieved on-target —
@@ -520,9 +537,10 @@ def on_lat_controller_init(result, lac, CP):
           # driver (route 380/384). Re-derived from state['torque'] each
           # decision: bounded by the P-term's own command, no ratchet.
           # (brake_zero one-shot reverse pulse removed 2026-07-03 —
-          # residual deadzone-entry momentum is left to rack friction.)
+          # residual on-target-entry momentum is left to rack friction.)
           # held_target is sign-guarded (never counter-curve) and capped at
-          # the deadzone-edge P value — see the hold_cap block above.
+          # the P value implied by HOLD_CAP_DRIFT_M — see the hold_cap
+          # block above.
           target_frac = held_target
           state['action'] = 'hold_curve' if held_target != 0.0 else 'hold_zero'
         else:
@@ -614,10 +632,10 @@ def on_lat_controller_init(result, lac, CP):
           state['lat_pub'] = PluginPub('bmw_lat_control')
         payload = {
           'desired': float(state['desired']),
-          'desired_raw': float(desired_curvature),     # pre-filter, for box-filter diagnostics
+          'desired_raw': float(desired_curvature),     # bit-identical to 'desired' (Phase 2: kept for telemetry schema back-compat)
           'measured': float(state['measured']),
           'err': float(err),
-          'delta_err': float(state['delta_err']),             # filtered (what controller acts on)
+          'delta_err': float(state['delta_err']),             # what controller acts on (Phase 2: raw, no filter)
           'target_frac': float(state['target_frac']),
           'ramp_step': float(state['ramp_step']),
           'ramp_frames': int(state['ramp_frames']),
