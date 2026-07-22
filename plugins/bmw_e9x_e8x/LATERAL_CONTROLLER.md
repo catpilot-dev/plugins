@@ -197,7 +197,10 @@ This document is the canonical reference for the lateral controller registered b
 > there because its lag becomes position drift, which that loop cancels. The
 > modelV2 subscription is dropped (it only fed the deleted filter's lane-change
 > gate). Telemetry drops `tolerance`/`delta_err_raw`/`de_w`/`k_sigma`/`de_dc`/
-> `persist_w` and gains `hold_band`.
+> `persist_w` and gains `hold_band`. **Sections below describing the κ-gated
+> delta_err box filter, the kinematic/noise-floor tolerance, or `effective_err`
+> as live code are historical where they conflict with this note — see § 3, § 4,
+> § 12, and § 13, all updated in place below.**
 
 ---
 
@@ -295,35 +298,29 @@ delta_des       = atan(state['desired'] · L)
 delta_meas      = atan(state['measured'] · L)
 delta_err_raw   = delta_des - delta_meas
         │
-        ▼  κ-gated box filter on delta_err (only at near-straight wobble)
-        │  lane_change_active = (_sm['modelV2'].meta.laneChangeState != off)
-        │  if |state['desired']| ≥ KD_GATE or lane_change_active:
-        │       buffer cleared, delta_err = delta_err_raw (passthrough)
-        │  else:
-        │       buffer.append(delta_err_raw); window = action_cadence_ticks
-        │       delta_err = sum(buffer) / len(buffer)   (equal-weight box)
+        ▼  Phase 2 (2026-07-22): NO filter on delta_err either.
+        │  delta_err = delta_err_raw, unconditionally — the κ-gated box
+        │  filter that used to live here (§4) is deleted. modelV2 noise is
+        │  handled upstream by the `lane_keeping` plugin's κ_des low-pass
+        │  (KAPPA_FILTER_TAU = 0.3 s) before this controller ever sees it.
         ▼
-state['delta_err'] = delta_err                 # filtered, used by controller
-        ▼
-tolerance = 2 · DRIFT_M · L / (v · model_action_t)²    (kinematic, 1/v² scaling)
+state['delta_err'] = delta_err                 # raw, used by controller as-is
         │
         ▼  ISO comfort guards (gated on actual overshoot)
         │  overshooting = (κ_des - κ_meas) · κ_meas < 0
         │  if overshooting and |a_y_meas| > BMW_LATERAL_ACCEL → cancel_accel
         │  elif overshooting and |jerk_pred| > BMW_LATERAL_JERK → cancel_jerk
-        │  → target_frac = -copysign(FRICTION, κ_meas)
+        │  → target_frac drains to 0 (reverse-FRICTION pulse removed 2026-07-03)
         ▼
 Cadence decision (every action_cadence_ticks):
-   if |delta_err| ≤ tolerance:
-      hold_zero (target_frac = 0)   OR   brake_zero (-FRICTION reverse, one-shot)
+   if |delta_err| ≤ HOLD_BAND:
+      hold_zero (target_frac = 0, straight)   OR   hold_curve (target_frac = held_target, curve)
    else:
       kappa_scale = interp(|κ_des|, T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP)
-      effective_err = delta_err - copysign(tolerance, delta_err)
-      target_nm = T_CAP_SLOPE_BASE · kappa_scale · v² · effective_err
+      target_nm = T_CAP_SLOPE_BASE · kappa_scale · v² · delta_err   # FULL error, no subtraction
       target_frac = target_nm / STEER_MAX
-      if |target_frac| < FRICTION: target_frac = copysign(FRICTION, delta_err)  (breakaway)
-      cap to ±t_cap_frac
-      action = 'ramp' (or 'breakaway')
+      cap to ±t_cap_frac; hold-floor keeps |target_frac| ≥ |held_target| when same-signed
+      action = 'ramp'
         ▼
 Per-CAN-tick ramp: state['torque'] += ramp_step toward state['target_frac']
         ▼
@@ -332,9 +329,18 @@ return -state['torque']  (BMW carcontroller flips sign convention)
 
 ---
 
-## 4. The κ-gated box filter on delta_err
+## 4. The κ-gated box filter on delta_err (DELETED 2026-07-22)
 
-**Purpose**: suppress high-rate sign-flips in `delta_err` caused by vision-only κ_des wobble on near-straight (no position-feedback layer running). Each sign-flip across the tolerance band triggers `cancel_tol` / `brake_zero` with a counter-direction FRICTION pulse — those are the felt "swaying" pulses.
+**DELETED 2026-07-22 (Phase 2).** The filter described below no longer exists
+in `bmw/latcontroller.py` — `delta_err` is the raw `delta_err_raw` at all
+times, `KD_GATE` and `kd_filter_window` are gone, and there is no `de_buffer`.
+Its job (suppressing modelV2 κ_des wobble on near-straight) now belongs to
+the `lane_keeping` plugin's κ_des low-pass (`KAPPA_FILTER_TAU = 0.3 s`),
+which filters upstream of this controller instead of on `delta_err` inside
+it. The rest of this section is kept for historical context only — see the
+2026-07-22 header note.
+
+**Purpose (historical)**: suppress high-rate sign-flips in `delta_err` caused by vision-only κ_des wobble on near-straight (no position-feedback layer running). Each sign-flip across the tolerance band triggers `cancel_tol` / `brake_zero` with a counter-direction FRICTION pulse — those are the felt "swaying" pulses.
 
 **Target choice**: filter applied to `delta_err`, **not** to raw κ_des. Keeps `state['desired']` raw so:
 - Reference is always fresh — no held bias → no drift accumulation
@@ -397,7 +403,7 @@ T_CAP_SCALE_KAPPA = [0.001, 0.01,  0.02]   # |κ_des| breakpoints (1/m)
 T_CAP_SCALE_BP    = [1.0,   2.5,   3.0]    # multiplicative scale on T_CAP_SLOPE_BASE
 
 kappa_scale = np.interp(|κ_des|, T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP)
-target_nm   = T_CAP_SLOPE_BASE · kappa_scale · v² · effective_err
+target_nm   = T_CAP_SLOPE_BASE · kappa_scale · v² · delta_err   # full error, Phase 2
 t_cap_nm    = T_CAP_BASE_NM + T_CAP_SLOPE_BASE · kappa_scale · v² · |δ_des|  (≤ STEER_MAX=12)
 ```
 
@@ -440,7 +446,7 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | `hold_curve` | `|delta_err| ≤ HOLD_BAND`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
 | `ramp` | active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
 | `relax_dwell` | overshoot-side error in a measured deep curve, within the 1 s dwell — target bridges at current (capped) torque |
-| `cancel_tol` | error fell into 1.2× tolerance band mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights) |
+| `cancel_tol` | error fell into the on-target band (1.2× `HOLD_BAND`) mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights) |
 | `cancel_accel` | overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` — drain to 0 |
 | `cancel_jerk` | overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` — drain to 0 |
 | `idle` | (2026-07-19) between cadence decisions after a transient label's ramp completed — expires ramp/relax_dwell/cancel_* so telemetry occupancy counts are honest; holds never expire (they re-fire each cadence) |
@@ -471,7 +477,7 @@ Published each livePose tick:
 | `a_y_meas` | `v²·κ_meas` (m/s²) |
 | `jerk_pred` | `v²·(κ_des - κ_meas)/model_action_t` (m/s³) |
 | `hold_f` | curvature hold factor [0, 1] |
-| `hold_cap` | cap on held torque (deadzone-edge P value, frac) |
+| `hold_cap` | cap on held torque (P value implied by the fixed `HOLD_CAP_DRIFT_M` reference, frac — independent of the deleted tolerance) |
 | `relax_ticks` | consecutive ticks of overshoot-side error while deep in a curve (dwell counter) |
 | `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
 
@@ -510,8 +516,16 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - Range `[0.3, 0.5]` keeps cadence in `[5, 7]` ticks (250-350 ms). Don't go below 0.3.
 
 ### To suppress more wobble at near-straight (filter):
-- Widen `KD_GATE` (e.g. 0.002 → 0.003) — filter operates over a wider κ range. Trades crisp response at very-low-κ for more smoothing.
-- Larger `kd_filter_window` would add more group delay; currently coupled to `action_cadence_ticks` so it'll grow with SAD bumps automatically.
+- `KD_GATE` and `kd_filter_window` no longer exist — the κ-gated delta_err box
+  filter was deleted in Phase 2 (2026-07-22, see § 4). There is nothing to
+  retune in this controller for near-straight wobble suppression.
+- Reference smoothing now lives in the `lane_keeping` plugin: retune
+  `KAPPA_FILTER_TAU` there (currently 0.3 s) to trade group delay for
+  smoothing on its κ_des low-pass.
+- In this controller, the only near-straight knob left is `HOLD_BAND`
+  (currently 0.001 rad) — the fixed stiction hold-retrigger threshold. It is
+  sized by rack breakaway, not by allowed wobble; widening it to fight noise
+  reintroduces the drift failure mode the deleted deadzone had (§ 5).
 
 ### If lane-change overshoot reappears on the post-LC phase:
 - Look at `bmw_lat_control` log for that LC: is `de_at_end_raw > 0.3°`? Is post-LC `|torque|` > 3 N?
@@ -520,7 +534,9 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 
 ### If straights feel less smooth than today:
 - First, check that the κ_des wobble character hasn't changed (newer model versions may have different noise).
-- The current 60% sign-flip reduction at gate 0.002 is the design point. Going tighter (0.001) makes the filter operate only at zero-crossings — less aggregate reduction. Going looser (0.005) starts compromising real small-amplitude corrections.
+- This controller no longer filters — check `lane_keeping`'s `KAPPA_FILTER_TAU`
+  (currently 0.3 s) first; that low-pass is what shapes straight-line feel now.
+  Shortening it trades smoothing for responsiveness on its position loop.
 
 ### If real-curve tracking feels under-aggressive:
 - Increase `T_CAP_SCALE_BP[1]` or `T_CAP_SCALE_BP[2]` (currently 2.5, 3.0 at `|κ| = 0.01, 0.02`).
@@ -543,8 +559,8 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | State init dict | 320-360 | Per-controller persistent state |
 | `update()` function | 360+ | Per-CAN-tick body, with livePose-gated heavy logic |
 | Plant horizon block | inside update | `model_action_t`, cadence/spread computed from `lat_delay` |
-| κ-filter block | inside update | δ_err box filter with κ-gate + LC-disable |
-| Tolerance | inside update | Kinematic 1/v² deadzone |
+| Hold-cap / hold-floor block | inside update | `hold_cap` (HOLD_CAP_DRIFT_M reference), `held_target`, sign-guard |
+| HOLD_BAND on-target check | inside update | Fixed stiction hold-retrigger threshold (no deadzone; § 5) |
 | ISO guards | inside update | Overshoot-gated cancel_jerk / cancel_accel |
 | Cadence decision | inside update | hold_zero / hold_curve / ramp / target_nm formula |
 | Ramp application | inside update | Per-CAN-tick torque ramp |

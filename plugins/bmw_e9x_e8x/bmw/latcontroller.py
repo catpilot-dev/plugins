@@ -484,9 +484,10 @@ def on_lat_controller_init(result, lac, CP):
         state['tick_count'] = 0
       elif (state['action'] == 'ramp' and abs(delta_err) <= 1.2*HOLD_BAND
             and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION):
-        # Tolerance-cancel: error fell into the success band while a PUSH
-        # ramp is still in flight. Without this, the ramp keeps driving
-        # torque toward a stale target until the next 250 ms cadence.
+        # Success-band cancel: error fell into the on-target band (1.2x
+        # HOLD_BAND) while a PUSH ramp is still in flight. Without this,
+        # the ramp keeps driving torque toward a stale target until the
+        # next 250 ms cadence.
         # Gated on action=='ramp' (route 385 review, 2026-07-03): hold
         # ramps also set ramp_frames, and un-gated this branch fired on
         # them every in-band tick — pinning tick_count (cadence stretched
