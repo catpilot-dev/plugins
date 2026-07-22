@@ -51,9 +51,11 @@ def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):
   # force telemetry publish to raise — control path must still return a value
   monkeypatch.setattr(register, '_publish', lambda telem: (_ for _ in ()).throw(RuntimeError('no bus')))
   register._anchor = None
+  # left ego line (laneLines[1]) at y=-2.3 (far left, +y=right frame) -> gap 1.39
+  # above the band -> steer left (positive, left-positive curvature)
   mv = SimpleNamespace(
-    laneLines=[SimpleNamespace(y=[0.0]), SimpleNamespace(y=[2.3]),
-               SimpleNamespace(y=[-1.2]), SimpleNamespace(y=[0.0])],
+    laneLines=[SimpleNamespace(y=[0.0]), SimpleNamespace(y=[-2.3]),
+               SimpleNamespace(y=[1.2]), SimpleNamespace(y=[0.0])],
     laneLineProbs=[0.0, 1.0, 1.0, 0.0])
   out = None
   for _ in range(2000):

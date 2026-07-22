@@ -44,14 +44,24 @@ class LaneAnchor:
   def __init__(self, config: AnchorConfig):
     self.cfg = config
     self.driver_idx = 1 if config.driver_side == 'left' else 2
-    self.side_sign = 1.0 if config.driver_side == 'left' else -1.0
+    # Two different sign conventions are in play:
+    #  - modelV2 laneLines are in the device frame, +y = RIGHT (camera.py), so
+    #    laneLines[1] (left ego line) sits at NEGATIVE y and laneLines[2]
+    #    (right) at POSITIVE y. Distance from car center to the driver-side
+    #    line is therefore -y (left) or +y (right): line_sign converts to it.
+    #  - desiredCurvature (what the bias is added to, consumed by the BMW
+    #    controller) is LEFT-positive. To reduce a positive excess (car too far
+    #    from the driver line) steer TOWARD the driver side: left -> +curvature
+    #    (left turn), right -> -curvature: curv_sign gives that direction.
+    self.line_sign = -1.0 if config.driver_side == 'left' else 1.0
+    self.curv_sign = 1.0 if config.driver_side == 'left' else -1.0
     self.gap_filt = None
     self.kappa_bias = 0.0
     self.state = 'model'
 
   def _gap(self, model_v2):
     line_y = float(model_v2.laneLines[self.driver_idx].y[0])
-    return self.side_sign * line_y - self.cfg.half_width
+    return self.line_sign * line_y - self.cfg.half_width
 
   def _excess(self, gap_filt):
     cfg = self.cfg
@@ -61,7 +71,7 @@ class LaneAnchor:
   def _pursuit(self, excess, v_ego):
     cfg = self.cfg
     lp = max(v_ego * cfg.t_preview, 1.0)   # look-ahead floor avoids div0 at standstill
-    kappa = self.side_sign * 2.0 * excess / (lp * lp)
+    kappa = self.curv_sign * 2.0 * excess / (lp * lp)
     return _clip(kappa, -cfg.kappa_bias_max, cfg.kappa_bias_max)
 
   def _telem(self, prob, line_y, gap, excess, authority, v_ego):
@@ -82,7 +92,7 @@ class LaneAnchor:
     if available:
       prob = float(model_v2.laneLineProbs[self.driver_idx])
       line_y = float(model_v2.laneLines[self.driver_idx].y[0])
-      gap = self.side_sign * line_y - cfg.half_width
+      gap = self.line_sign * line_y - cfg.half_width
       if self.gap_filt is None:
         self.gap_filt = gap
       else:
