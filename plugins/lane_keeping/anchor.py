@@ -63,3 +63,41 @@ class LaneAnchor:
     lp = max(v_ego * cfg.t_preview, 1.0)   # look-ahead floor avoids div0 at standstill
     kappa = self.side_sign * 2.0 * excess / (lp * lp)
     return _clip(kappa, -cfg.kappa_bias_max, cfg.kappa_bias_max)
+
+  def _telem(self, prob, line_y, gap, excess, authority, v_ego):
+    return {
+      'prob': float(prob), 'line_y': float(line_y), 'gap': float(gap),
+      'gap_filt': float(self.gap_filt) if self.gap_filt is not None else 0.0,
+      'excess': float(excess), 'kappa_bias': float(self.kappa_bias),
+      'authority': float(authority), 'state': self.state, 'v_ego': float(v_ego),
+    }
+
+  def update(self, curvature, model_v2, v_ego, lane_changing):
+    cfg = self.cfg
+    prob = line_y = gap = excess = authority = 0.0
+    available = (cfg.enable and model_v2 is not None
+                 and len(model_v2.laneLineProbs) > self.driver_idx
+                 and len(model_v2.laneLines) > self.driver_idx
+                 and len(model_v2.laneLines[self.driver_idx].y) > 0)
+    if available:
+      prob = float(model_v2.laneLineProbs[self.driver_idx])
+      line_y = float(model_v2.laneLines[self.driver_idx].y[0])
+      gap = self.side_sign * line_y - cfg.half_width
+      if self.gap_filt is None:
+        self.gap_filt = gap
+      else:
+        alpha = 1.0 - math.exp(-DT_CTRL / cfg.filter_tau)
+        self.gap_filt += alpha * (gap - self.gap_filt)
+      excess = self._excess(self.gap_filt)
+      authority = _interp(prob, [cfg.prob_on, cfg.prob_on + cfg.prob_fade], [0.0, 1.0])
+      if lane_changing:
+        authority = 0.0
+      kappa_target = authority * self._pursuit(excess, v_ego)
+    else:
+      self.gap_filt = None
+      kappa_target = 0.0
+    # single rate-limit path (also smoothly releases bias to 0 in MODEL state)
+    max_step = cfg.kappa_rate_max * DT_CTRL
+    self.kappa_bias = _clip(kappa_target, self.kappa_bias - max_step, self.kappa_bias + max_step)
+    self.state = 'anchor' if (available and authority > 0.0) else 'model'
+    return curvature + self.kappa_bias, self._telem(prob, line_y, gap, excess, authority, v_ego)

@@ -67,3 +67,62 @@ def test_pursuit_hard_cap():
   a = LaneAnchor(AnchorConfig(driver_side='left', t_preview=1.5, kappa_bias_max=0.002))
   # low speed inflates kappa; cap binds
   assert abs(a._pursuit(0.5, 5.0)) == 0.002
+
+
+def _settle(a, mv, v=25.0, lane_changing=False, n=2000):
+  out = None
+  for _ in range(n):
+    out, _t = a.update(0.01, mv, v, lane_changing)
+  return out
+
+
+def test_update_passthrough_when_no_line():
+  a = LaneAnchor(AnchorConfig())
+  mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  out, telem = a.update(0.0123, mv, 25.0, False)
+  assert out == 0.0123              # bit-identical passthrough
+  assert telem['state'] == 'model'
+
+
+def test_update_passthrough_when_low_prob():
+  a = LaneAnchor(AnchorConfig(prob_on=0.6))
+  mv = _mv(left_y=1.75, right_y=-1.75, left_p=0.4)   # below prob_on
+  out, telem = a.update(0.0123, mv, 25.0, False)
+  assert out == 0.0123
+  assert telem['state'] == 'model'
+
+
+def test_update_no_bias_in_band():
+  a = LaneAnchor(AnchorConfig())
+  # left line 1.75 -> gap 0.84, inside [0.6,1.0]
+  out = _settle(a, _mv(left_y=1.75, right_y=-1.75))
+  assert abs(out - 0.01) < 1e-6     # curvature unchanged (bias ~0)
+
+
+def test_update_biases_left_when_too_far_from_left_line():
+  a = LaneAnchor(AnchorConfig())
+  # left line 2.3 -> gap 1.39, above band -> steer left (positive bias)
+  out = _settle(a, _mv(left_y=2.3, right_y=-1.2))
+  assert out > 0.01 + 1e-5
+
+
+def test_update_biases_right_when_too_close_to_left_line():
+  a = LaneAnchor(AnchorConfig())
+  # left line 1.3 -> gap 0.39, below band -> steer right (negative bias)
+  out = _settle(a, _mv(left_y=1.3, right_y=-2.2))
+  assert out < 0.01 - 1e-5
+
+
+def test_update_disabled_during_lane_change():
+  a = LaneAnchor(AnchorConfig())
+  out = _settle(a, _mv(left_y=2.3, right_y=-1.2), lane_changing=True)
+  assert abs(out - 0.01) < 1e-6     # authority 0 -> passthrough
+
+
+def test_update_rate_limited():
+  a = LaneAnchor(AnchorConfig(kappa_rate_max=0.002))
+  mv = _mv(left_y=2.3, right_y=-1.2)
+  # first engaged tick can move at most kappa_rate_max*DT_CTRL from 0
+  a.gap_filt = a._gap(mv)           # warm the filter so excess is immediate
+  out, telem = a.update(0.01, mv, 25.0, False)
+  assert abs(telem['kappa_bias']) <= 0.002 * 0.01 + 1e-12
