@@ -161,139 +161,6 @@ def on_lat_controller_init(result, lac, CP):
   DT_MDL = 0.05                                  # openpilot model dt (common/realtime.py)
   MODEL_ACTION_T_FALLBACK = 0.55                 # used only if lat_delay arrives as 0/None
 
-  # Feedback deadzone: engage only when δ_err would cause ≥ DRIFT_M
-  # lateral drift within model_action_t (per-tick horizon).
-  #   drift(T) = ½ · δ_err / L · v² · T²  ⇒  δ_tol = 2 · DRIFT_M · L / (v·T)²
-  # The 1/v² factor gives natural speed adaptation (tighter at high v).
-  # 2026-05-20: a constant-angle reformulation (TOL_DEG_CONST = 0.35°) was
-  # tried and reverted — the wide highway-speed deadzone allowed sustained
-  # δ_err inside the band to accumulate into 1.3–1.7 m lateral drift
-  # (route 31b seg 8/15) when no position-feedback layer was running. The
-  # 1/v² scaling is what keeps the κ-controller actively tracking at highway
-  # speed when it's the sole loop closing against drift.
-  #
-  # 2026-07-04: κ-dependent widening (0.02→0.10 m at tight κ, added
-  # 2026-07-03) REVERTED to a fixed value — the logic was wrong: in large
-  # curvature the lane margin shrinks and position error matters MORE, so
-  # the allowed drift must not grow with κ (if anything it should tighten).
-  # Route 38b confirmed the widening was also a bystander in the mild-turn
-  # wobble (widening factor 1.1× there — the wobble was unfiltered κ_des
-  # noise, now handled by the blended delta_err filter). The noise-chasing
-  # problem the widening tried to solve in tight turns is covered by
-  # hold_curve (resting torque) + STEP_MAX (bounded chase) instead.
-  DRIFT_M = 0.02           # m of allowed drift over model_action_t (fixed)
-
-  # Online modelV2 noise observer + tolerance noise-floor (2026-07-19,
-  # route 3ac segs 20-30 analysis). At 60-90 km/h the 1/v² tolerance
-  # (κ ≈ 2-3e-4) sits 5-10× BELOW modelV2's own sub-Hz κ_des wander
-  # (±1-3e-3 over multi-second stretches), so |delta_err| > tolerance on
-  # ~70-80% of near-straight ticks: the controller never rests, torque
-  # reverses direction 25-50×/min, and the wheel stick-slips in small
-  # notches (xcorr showed κ_des LEADING κ_meas by 0.15-1.2 s — model-driven
-  # chase, not a feedback limit cycle). The noise is NOT speed-caused
-  # (it mildly DECREASES with v; the tolerance just shrinks 1/v² faster)
-  # and grows with lead proximity and low laneLineProbs — so it must be
-  # observed live, not scheduled by speed.
-  #
-  # Observer (livePose rate, trained only when active, no lane change, and
-  # |κ_des| < KN_GATE_KAPPA so real geometry never inflates it; frozen —
-  # not decayed — elsewhere):
-  #   ema_f/ema_s   = 1 s / 5 s EMAs of κ_des; their difference isolates
-  #                   the 0.03-0.16 Hz wander band that drives the chase
-  #                   (tick-jitter is already box-filtered by the blend;
-  #                   slower trends are real road geometry)
-  #   var           = 20 s EMA of band² → σ = √var
-  # Floor: tolerance = max(kinematic, min(KN_SIGMA_MULT·σ·L·fade, cap)),
-  #   fade = interp(|κ_des|, KN_FADE_BP, [1, 0]) — full floor on straights,
-  #   ZERO in real curves (mirrors KD_BLEND_BP: curves trust the model raw,
-  #   straights distrust its noise; also enforces the 2026-07-04 rule that
-  #   allowed drift must not grow with curvature — replay: 0.00% of
-  #   |κ|>0.004 ticks floor-affected);
-  #   cap = kinematic·(KN_DRIFT_CAP_M/DRIFT_M) — the floor may never imply
-  #   more than KN_DRIFT_CAP_M of allowed drift (route 31b lesson bounds it:
-  #   the 0.35° constant band that drifted 1.3-1.7 m is 3-5× above this cap
-  #   at highway speed).
-  # 12-route replay (3a7-3b2, 140k near-straight ticks): σ p50 0.00036
-  # (matches offline window-wander 0.00033); MULT=1.5 cuts actionable ticks
-  # 70%→36% and error sign-flips −30%, cap binds 5%. MULT=2.0 rejected:
-  # cap binds 31% (σ signal saturates); MULT=1.0 too weak (52% actionable).
-  KN_EMA_FAST   = 0.05     # fast EMA α (τ ≈ 1 s at 20 Hz)
-  KN_EMA_SLOW   = 0.01     # slow EMA α (τ ≈ 5 s)
-  KN_VAR_ALPHA  = 0.0025   # variance EMA α (τ ≈ 20 s)
-  KN_SIGMA_PRIOR = 0.00035  # init σ (1/m) — pooled 12-route near-straight median
-  KN_GATE_KAPPA = 0.002    # train σ only below this |κ_des|
-  KN_FADE_BP    = [0.002, 0.004]  # floor weight 1→0 over this |κ_des| band
-  KN_SIGMA_MULT = 1.5      # tolerance floor = MULT·σ·L (≈87% of Gaussian noise in-band)
-  KN_DRIFT_CAP_M = 0.08    # cap: floor may never exceed this effective DRIFT_M
-
-  # Sign-persistence gate on the noise floor (2026-07-19, route 3b3 left-hug).
-  # The floor above is symmetric, so it cannot create a directional bias — but
-  # it CAN let a pre-existing one stand: widening the deadzone removes the
-  # gentle centering authority the tight kinematic band provided, so a small
-  # steady position offset (a persistent one-sided delta_err) is no longer
-  # nibbled back. Route 3b3 (first on-car data of the floor) confirmed it:
-  # signed lane offset shifted ~0.13 m left and off-centering magnitude scaled
-  # with the floor-widening ratio (|offset| 0.17 m at 1.0× → 0.32 m at ≥2×).
-  # Root cause: the floor widens tolerance against the INSTANTANEOUS delta_err,
-  # lumping zero-mean wander (which SHOULD be ignored) with a sustained DC
-  # offset (which must still be corrected); the KN_DRIFT_CAP_M cap is
-  # per-horizon and does NOT bound the integrated steady offset.
-  #
-  # Fix: de_dc is a slow (τ≈2 s) EMA of delta_err — a persistence detector.
-  # Zero-mean wander averages toward 0; a sustained one-sided offset
-  # accumulates. As |de_dc| grows past the tight kinematic tolerance the floor
-  # fades out (persist_w → 0), so the steady-state offset is bounded by tol_kin
-  # (tight) instead of tol_floor. Mirrors the relax-dwell principle
-  # ("persistence proves it's real"). Trained on the same near-straight gate as
-  # the σ-observer (curves/lane-changes freeze it; the floor is faded off there
-  # by KN_FADE_BP anyway). Tuning is data-set on route 3b3 (8353 near-straight
-  # lane-aligned ticks): τ=2 s cleanly separates centered stretches
-  # (de_dc/tol_kin ≈ 0.4) from offset stretches (≈1.5) — longer τ blurs them.
-  # Fade band [0.7, 1.3]·tol_kin sits in that gap: pulls the floor on 75% of
-  # offset ticks (→ re-center) while keeping it on for 90% of centered ticks
-  # (→ anti-churn preserved).
-  KN_DC_ALPHA = 0.025      # de_dc EMA α (τ ≈ 2 s) — slower than the wander band
-  KN_PERSIST_BP = [0.7, 1.3]  # |de_dc|/tol_kin: floor weight fades 1→0 across this band
-
-  # κ-gated box filter on delta_err. Bare-model κ_des on near-straight
-  # produces high-rate sign-flips that propagate into delta_err. Each
-  # delta_err sign-flip across the tolerance band triggers
-  # a cancel_tol cycle (and, before the 2026-07-03 stiction-logic removal,
-  # a counter-direction FRICTION pulse)
-  # — the actual felt swaying isn't κ_des amplitude, it's the rate of
-  # those unwind pulses.
-  #
-  # Filter target is delta_err (not raw κ_des) — keeps state['desired']
-  # raw so:
-  #   - the reference is always fresh, no held bias → no drift accumulation
-  #     (the failure mode of the prior hysteresis-on-κ_des attempt, daef207,
-  #     which held κ_des for up to 44 s and produced 32% time |offset|>0.5m
-  #     on route 322 with no controller correction)
-  #   - kappa_scale, jerk_pred, ISO guards all see raw κ_des magnitude
-  #     (no smoothed-magnitude distortion)
-  # The smoothed view is given only to the cadence decision's error band
-  # check — that's where sign-flips matter for cancel events.
-  #
-  # 2026-07-04: hard gate replaced by a BLEND (route 38b seg 10/11 evidence).
-  # The old on/off gate (KD_GATE=0.002, narrowed from 0.005 on 2026-05-22)
-  # created a coverage gap exactly at mild-curve κ ≈ 0.002: a highway mild
-  # turn sits ON the boundary, so the filter flickered on/off at ~0.5 Hz and
-  # the ±0.003 vision noise passed raw ~half the time — felt as a small
-  # wheel wobble (1.6–2.3° p2p). Now:
-  #   w_raw     = interp(|κ_des|, KD_BLEND_BP, [0, 1])
-  #   delta_err = w_raw·raw + (1−w_raw)·box_filtered
-  # Straights (|κ| < 0.002): fully filtered, unchanged ("almost perfect" —
-  # route 38b user verdict). Real curves (|κ| ≥ 0.004): fully raw, unchanged
-  # (no filter lag on curve entry). Mild curves: proportional smoothing, no
-  # boundary flicker. The 2026-05-22 concern (filtering delays real small
-  # corrections) is softened by STEP_MAX bounding correction aggressiveness
-  # anyway. Lane changes still fully bypass (buffer cleared).
-  # de_filter_window = action_cadence_ticks for single-knob coupling:
-  # at SAD=0.4 → cadence=6 → window=6 (300 ms box, 150 ms group delay).
-  # A 2× window was tried 2026-07-06 and reverted 2026-07-07 (route 395:
-  # felt lag/weave on straights; torque lag 0.44→0.66 s).
-  KD_BLEND_BP = [0.002, 0.004]              # |raw κ_des| blend: below→filtered, above→raw
-
   # Curvature-dependent hold (2026-07-03): inside the tolerance band the
   # target is hold_f·torque instead of 0, hold_f = interp(|κ_des|, BP, [0,1]).
   # Below BP[0] (straights; above the ±0.003 modelV2 wobble amplitude) the
@@ -350,6 +217,18 @@ def on_lat_controller_init(result, lac, CP):
   # ramps below this can't move the rack, so there is nothing to cancel.
   FRICTION = 0.05
 
+  # Stiction hold trigger (Phase 2, 2026-07-22). Replaces the DRIFT_M kinematic
+  # deadzone, which existed only because there was no position feedback — that
+  # job now belongs to the lane_keeping position loop, which also owns modelV2
+  # noise. This band exists ONLY to decide when the rack is "on target" so the
+  # curvature hold can take over; it is sized by STICTION, not by drift: below
+  # the error where the P term commands less than rack breakaway
+  # (FRICTION·STEER_MAX / (T_CAP_SLOPE·kappa_scale·v²) ≈ 0.001 rad at 25 m/s)
+  # the wheel cannot move anyway. Small enough that it does not meaningfully
+  # attenuate the lane_keeping position correction — the Phase 1 failure mode,
+  # where the old 0.0012–0.0021 rad tolerance ate 44% of the anchor's command.
+  HOLD_BAND = 0.001        # rad of front-wheel-angle error treated as on-target
+
   # ISO 11270 comfort guard, κ-dependent. At small κ (near-straight), tighter
   # half-ISO; ramps up to full ISO at tight curves (where larger accel/jerk
   # are part of normal driving).
@@ -382,10 +261,7 @@ def on_lat_controller_init(result, lac, CP):
   # Rear-axle bicycle-model wheelbase (m). Used for κ ↔ δ conversion.
   L = float(CP.wheelbase)
 
-  # modelV2 subscribed for meta.laneChangeState (filter-disable gate, see below).
-  # Future modelV2 fields (lane line confidence, position uncertainty, frameId,
-  # desire predictions, etc.) accessible via the same subscription.
-  _sm = messaging.SubMaster(['livePose', 'modelV2'])
+  _sm = messaging.SubMaster(['livePose'])
 
   state = {
     'torque': 0.0,             # current commanded torque fraction (advances by ramp_step each CAN tick)
@@ -394,24 +270,14 @@ def on_lat_controller_init(result, lac, CP):
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
     'action': 'init',          # debug: hold_zero / hold_curve / ramp / relax_dwell / cancel_tol / cancel_accel / cancel_jerk / idle
-    'delta_err': 0.0,          # debug: filtered front-wheel-angle error (rad), what controller acts on
-    'delta_err_raw': 0.0,      # debug: pre-filter delta_err (rad)
+    'delta_err': 0.0,          # debug: front-wheel-angle error (rad), what controller acts on
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
-    'de_buffer': [],            # rolling window of recent delta_err for box filter
-    'de_w': 1.0,                # debug: blend weight (1=raw, 0=fully filtered)
     'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
     'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
-    'tolerance': 0.0,             # debug: current deadzone half-width (rad), κ- and v-dependent
     'hold_f': 0.0,                # debug: curvature hold factor [0,1]
     'hold_cap': 0.0,              # debug: cap on held torque (deadzone-edge P value, frac)
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
-    'kn_ema_f': 0.0,              # noise observer: fast κ_des EMA (τ≈1 s)
-    'kn_ema_s': 0.0,              # noise observer: slow κ_des EMA (τ≈5 s)
-    'kn_var': KN_SIGMA_PRIOR ** 2,  # noise observer: running variance of the wander band
-    'k_sigma': KN_SIGMA_PRIOR,    # debug: live σ of modelV2 sub-Hz κ_des wander (1/m)
-    'de_dc': 0.0,                # persistence gate: slow EMA of delta_err (DC/offset component)
-    'persist_w': 1.0,            # debug: floor weight from the sign-persistence gate (1=full floor, 0=off)
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -478,91 +344,14 @@ def on_lat_controller_init(result, lac, CP):
       delta_meas = math.atan(state['measured'] * L)
       delta_err_raw = delta_des - delta_meas
 
-      # Blended box filter on delta_err (see KD_BLEND_BP block above).
-      # Smooths the controller's view of the error signal so wobble-induced
-      # delta_err sign-flips don't repeatedly cross the tolerance band and
-      # trigger cancel_tol churn. 2026-07-04: BLENDED, not gated (route 38b
-      # — see KD_BLEND_BP block above): fully filtered on straights, fully
-      # raw in real curves, proportional in between; no boundary flicker.
-      # Lane changes bypass entirely (buffer cleared): canonical signal for
-      # "model is reframing the trajectory" (route 31d seg 7 evidence).
-      # Filter window = action_cadence_ticks (300 ms box at SAD=0.4).
-      # 2026-07-07: the 2026-07-06 lengthening to 2× (600 ms) was REVERTED
-      # after one day on-car — route 395 segs 16-20: felt "wobbling and
-      # lag" on straights; measured torque-response lag vs raw error rose
-      # 0.44 s → 0.66 s. Lesson: the offline replay metrics that justified
-      # 2× (sign-flips, band crossings, big-excursion onset lag) are BLIND
-      # to small-correction phase lag, which manifests as low-frequency
-      # weave. Straight-line feel is the primary regime — do not lengthen
-      # this window again without an on-car A/B; the residual straight
-      # noise is sub-Hz modelV2 wander a causal box cannot remove anyway.
-      # state['delta_err'] holds the BLENDED value (used downstream).
-      # Telemetry publishes raw, blended, and the blend weight.
-      lane_change_active = (_sm['modelV2'].meta.laneChangeState != log.LaneChangeState.off)
-      if lane_change_active:
-        state['de_buffer'].clear()
-        state['de_w'] = 1.0
-        delta_err = delta_err_raw
-      else:
-        state['de_buffer'].append(delta_err_raw)
-        if len(state['de_buffer']) > action_cadence_ticks:
-          state['de_buffer'].pop(0)
-        filtered = sum(state['de_buffer']) / len(state['de_buffer'])
-        w_raw = float(np.interp(abs(state['desired']), KD_BLEND_BP, [0.0, 1.0]))
-        state['de_w'] = w_raw
-        delta_err = w_raw * delta_err_raw + (1.0 - w_raw) * filtered
+      # Phase 2: no filtering here. modelV2 noise is handled upstream by
+      # lane_keeping (it low-passes kappa_des and closes the position loop),
+      # so this controller tracks whatever reference it is given, faithfully.
+      delta_err = delta_err_raw
       state['delta_err'] = delta_err
-      state['delta_err_raw'] = delta_err_raw
 
-      # Live modelV2 noise observer (see KN_* constants block). Trained only
-      # on near-straight engaged ticks outside lane changes — real curve
-      # geometry and lane-change reframes must never inflate σ; elsewhere
-      # the estimate freezes (curves are transient, and the floor fades to
-      # zero there anyway).
-      if active and not lane_change_active and abs(state['desired']) < KN_GATE_KAPPA:
-        state['kn_ema_f'] += KN_EMA_FAST * (state['desired'] - state['kn_ema_f'])
-        state['kn_ema_s'] += KN_EMA_SLOW * (state['desired'] - state['kn_ema_s'])
-        band = state['kn_ema_f'] - state['kn_ema_s']
-        state['kn_var'] += KN_VAR_ALPHA * (band * band - state['kn_var'])
-        state['k_sigma'] = math.sqrt(state['kn_var'])
-        # Persistence detector (see KN_PERSIST_BP block): slow EMA of the
-        # error the controller acts on. Zero-mean wander averages toward 0;
-        # a sustained one-sided offset accumulates here. Same near-straight
-        # gate — it must reflect the straight-line steady offset, not curve
-        # tracking error (the floor is faded off in curves regardless).
-        state['de_dc'] += KN_DC_ALPHA * (delta_err - state['de_dc'])
-
-      # Speed-scaled tolerance: fixed DRIFT_M over model_action_t, 1/v²
-      # scaling (κ-widening reverted 2026-07-04 — see DRIFT_M block above:
-      # allowed drift must not grow with curvature).
-      # Restored 2026-05-20 after route 31b seg 8/15 showed the constant-angle
-      # 0.35° deadzone (commit 715114d, now reverted) allowed 1.3–1.7 m lateral
-      # drift at 85 kph with no position-feedback layer running: δ_err of
-      # 0.2–0.35° sat inside the 0.35° band for seconds while stiction held
-      # the rack at zero, and the car coasted ~half a lane out of position
-      # with 98% torque=0. The kinematic 1/v² formula keeps the deadzone tight
-      # at highway speed (~0.05° at 85 kph near-straight) so the κ-controller
-      # stays active against drift. The constant-angle reformulation is only
-      # viable on top of an external position-feedback loop, which the public
-      # build has none of.
+      # Lookahead is still needed for the hold cap below.
       lookahead_m = v * model_action_t
-      tol_kin = 2.0 * DRIFT_M * L / (lookahead_m ** 2)
-      # Noise floor on the tolerance (2026-07-19, see KN_* constants block):
-      # never demand corrections the live σ-observer says are
-      # indistinguishable from modelV2 wander. Fades to zero over KN_FADE_BP
-      # (curves keep the pure kinematic band); capped so the implied allowed
-      # drift never exceeds KN_DRIFT_CAP_M regardless of what σ reports.
-      kn_fade = float(np.interp(abs(state['desired']), KN_FADE_BP, [1.0, 0.0]))
-      # Sign-persistence gate (see KN_PERSIST_BP block): pull the floor out as
-      # the persistent (DC) component of delta_err grows past the tight
-      # kinematic band — that is a real position offset, not wander, and must
-      # be corrected. Bounds the steady-state offset by tol_kin, not tol_floor.
-      persist_w = float(np.interp(abs(state['de_dc']) / tol_kin, KN_PERSIST_BP, [1.0, 0.0]))
-      state['persist_w'] = persist_w
-      tol_floor = KN_SIGMA_MULT * state['k_sigma'] * L * kn_fade * persist_w
-      tol_cap = tol_kin * (KN_DRIFT_CAP_M / DRIFT_M)
-      tolerance = max(tol_kin, min(tol_floor, tol_cap))
-      state['tolerance'] = tolerance
 
       # Curvature scale for the P-term and caps (computed per tick since the
       # hold cap below needs it too; keyed on raw |κ_des|, see T_CAP_SCALE
@@ -677,7 +466,7 @@ def on_lat_controller_init(result, lac, CP):
           state['ramp_frames'] = spread_frames
         state['action'] = cancel_reason
         state['tick_count'] = 0
-      elif (state['action'] == 'ramp' and abs(delta_err) <= 1.2*tolerance
+      elif (state['action'] == 'ramp' and abs(delta_err) <= 1.2*HOLD_BAND
             and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION):
         # Tolerance-cancel: error fell into the success band while a PUSH
         # ramp is still in flight. Without this, the ramp keeps driving
@@ -723,7 +512,7 @@ def on_lat_controller_init(result, lac, CP):
         # the torque profile and feel like a discrete step.
         #   τ_Nm = T_CAP_SLOPE · v² · (δ_err − tolerance·sign(δ_err))
         # Inside tolerance → 0 (stiction holds; no chatter at the boundary).
-        if abs(delta_err) <= tolerance:
+        if abs(delta_err) <= HOLD_BAND:
           # On-target. Straights (hold_f=0): drain to 0, stiction holds.
           # Curves (hold_f→1): keep the torque that achieved on-target —
           # it approximates the self-aligning torque, which beats stiction
@@ -739,8 +528,11 @@ def on_lat_controller_init(result, lac, CP):
         else:
           # kappa_scale computed per tick above (shared with hold_cap):
           # 1.0 on straights rising to 3.0 at |κ_des| ≥ 0.02.
-          effective_err = delta_err - math.copysign(tolerance, delta_err)
-          target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * effective_err
+          # Phase 2: P acts on the FULL error — the tolerance subtraction is
+          # gone. It was the term that attenuated the lane_keeping position
+          # correction (Phase 1, route 3bf: 44% of correcting ticks produced no
+          # action at all). Nothing here shrinks the commanded curvature now.
+          target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
           target_frac = target_nm / CCP.STEER_MAX
           # Sub-friction targets are commanded as-is (breakaway ±FRICTION
           # amplification removed 2026-07-03): commands below the rack's
@@ -826,8 +618,6 @@ def on_lat_controller_init(result, lac, CP):
           'measured': float(state['measured']),
           'err': float(err),
           'delta_err': float(state['delta_err']),             # filtered (what controller acts on)
-          'delta_err_raw': float(state['delta_err_raw']),     # pre-filter, for diagnostics
-          'de_w': float(state['de_w']),                       # filter blend weight (1=raw)
           'target_frac': float(state['target_frac']),
           'ramp_step': float(state['ramp_step']),
           'ramp_frames': int(state['ramp_frames']),
@@ -840,11 +630,8 @@ def on_lat_controller_init(result, lac, CP):
           'jerk_pred': float(state['jerk_pred']),
           'hold_f': float(state['hold_f']),
           'hold_cap': float(state['hold_cap']),
-          'tolerance': float(state['tolerance']),
+          'hold_band': float(HOLD_BAND),                      # stiction hold trigger (rad)
           'relax_ticks': int(state['relax_ticks']),
-          'k_sigma': float(state['k_sigma']),                 # live modelV2 wander σ (1/m)
-          'de_dc': float(state['de_dc']),                     # persistent (DC) component of delta_err (rad)
-          'persist_w': float(state['persist_w']),             # sign-persistence floor weight (1=full floor, 0=off)
         }
         state['lat_pub'].send(payload)
       except Exception:
