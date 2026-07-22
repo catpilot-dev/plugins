@@ -19,11 +19,17 @@ import numpy as np
 import zstandard
 from cereal import log as capnp_log
 from anchor import AnchorConfig, LaneAnchor
+import anchor as anchor_mod
 
 BASE = '/data/media/0/realdata'
 GAP_MIN, GAP_MAX = 0.6, 1.0
 LAT_DELAY = 0.6          # replay approximation of the live liveDelay value
 TICK = 0.05              # modelV2 ~20 Hz in the rlog
+# The live hook runs at 100 Hz (DT_CTRL=0.01) but this replay steps once per
+# modelV2 frame (~20 Hz). Patch the module dt so every EMA (gap, gap_pred,
+# kappa filters) and the bias slew limit see the true per-call cadence —
+# exact fix via the exponential-filter identity, not an approximation.
+anchor_mod.DT_CTRL = TICK
 
 
 def frames(route):
@@ -67,13 +73,20 @@ for route in (sys.argv[1:] or ['000003bf--47fd55882c']):
     v = np.array([r[2] for r in rows]); anc = np.array([r[3] for r in rows])
     # 1. prediction accuracy: realized gap pred_t later (pred_t varies with v
     #    only through the x_pred clip; use time shift pred_t = mult*LAT_DELAY)
-    shift = max(1, int(round(mult * LAT_DELAY / TICK)))
-    ok = anc[:-shift] & anc[shift:]
+    pred_t = mult * LAT_DELAY
+    shift = max(1, int(round(pred_t / TICK)))
+    if len(rows) <= shift:
+      print(f'  mult={mult}: no data'); continue
+    unclipped = (v[:-shift] * pred_t > 5.0 + 1e-6) & (v[:-shift] * pred_t < 50.0 - 1e-6)
+    ok = anc[:-shift] & anc[shift:] & unclipped
+    if not ok.any():
+      print(f'  mult={mult}: no unclipped anchor ticks'); continue
     err_pred = gp[:-shift][ok] - gf[shift:][ok]
     err_triv = gf[:-shift][ok] - gf[shift:][ok]
     print(f'  mult={mult}: n={ok.sum()}  pred RMSE={np.sqrt(np.mean(err_pred**2)):.3f} m'
           f'  trivial RMSE={np.sqrt(np.mean(err_triv**2)):.3f} m'
-          f'  (improvement {100*(1 - np.sqrt(np.mean(err_pred**2))/max(np.sqrt(np.mean(err_triv**2)),1e-9)):.0f}%)')
+          f'  (improvement {100*(1 - np.sqrt(np.mean(err_pred**2))/max(np.sqrt(np.mean(err_triv**2)),1e-9)):.0f}%)'
+          f'  clip-excluded={100 * (1 - ok.sum() / max((anc[:-shift] & anc[shift:]).sum(), 1)):.0f}%')
     if mult != 2.0:
       continue
     # 2. decision quality at mult=2.0
@@ -82,24 +95,32 @@ for route in (sys.argv[1:] or ['000003bf--47fd55882c']):
     # onset lead: for each current-gap band exit, how much earlier did the
     # predictor start nudging?
     leads = []
-    exits = np.where((~cur_nudge[:-1]) & cur_nudge[1:] & anc[1:])[0] + 1
+    prev_exit = 0
+    exits = np.where((~cur_nudge[:-1]) & cur_nudge[1:] & anc[1:] & anc[:-1])[0] + 1
     for i in exits:
       j = i
-      while j > 0 and prd_nudge[j - 1] and anc[j - 1]:
+      while j > prev_exit and prd_nudge[j - 1] and anc[j - 1]:
         j -= 1
       leads.append((i - j) * TICK)
+      prev_exit = i
     # ease-off: ticks where current is out-of-band but predictor already holds
     rec = cur_nudge & (~prd_nudge) & anc
     # false alarms: predictor nudges, current holds, and no current-gap exit
     # follows within pred_t
-    fa = 0; tot_pn = 0
-    for i in np.where(prd_nudge & (~cur_nudge) & anc)[0]:
-      tot_pn += 1
-      if not cur_nudge[i:i + shift].any():
+    po = prd_nudge & (~cur_nudge) & anc
+    e2 = np.diff(np.concatenate([[0], po.astype(int), [0]]))
+    starts = np.where(e2 == 1)[0]; ends = np.where(e2 == -1)[0]
+    fa = 0
+    for s_, e_ in zip(starts, ends):
+      # a run is a false alarm only if NO current-gap nudge occurs from its
+      # start through shift ticks past its end (tails of genuine early onsets
+      # and lingering post-exit ticks are not separate alarms)
+      if not cur_nudge[s_:min(len(cur_nudge), e_ + shift)].any():
         fa += 1
+    tot_pn = len(starts)
     print(f'    exits={len(exits)}  onset lead p50={np.median(leads) if leads else 0:.2f}s'
           f' p90={np.percentile(leads, 90) if leads else 0:.2f}s')
     print(f'    ease-off ticks (current out, predictor holds): {rec.sum()}'
           f' ({100 * rec.sum() / max(cur_nudge.sum(), 1):.0f}% of out-of-band time)')
-    print(f'    predictor-only nudges: {tot_pn}  false-alarm (no exit follows): '
+    print(f'    predictor-only nudge RUNS: {tot_pn}  false-alarm (no exit follows): '
           f'{fa} ({100 * fa / max(tot_pn, 1):.0f}%)')
