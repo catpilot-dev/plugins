@@ -61,6 +61,7 @@ def _load_config():
     kappa_bias_max=fget('LaneKeepKappaBiasMax', d.kappa_bias_max),
     kappa_rate_max=fget('LaneKeepKappaRateMax', d.kappa_rate_max),
     filter_tau=fget('LaneKeepFilterTau', d.filter_tau),
+    kappa_filter_tau=fget('LaneKeepKappaFilterTau', d.kappa_filter_tau),
     prob_on=fget('LaneKeepProbOn', d.prob_on),
     prob_fade=fget('LaneKeepProbFade', d.prob_fade),
   )
