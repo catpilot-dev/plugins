@@ -380,10 +380,10 @@ def test_trim_accumulates_below_band_correct_direction():
   # trim_rate, independent of the (tiny) proportional nudge.
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09))     # gap 0.50, below band
-  for _ in range(1000):                            # 10 s
-    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  for _ in range(500):                             # 5 s (mid-ramp, below the cap)
+    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
   assert a.kappa_trim < -0.5e-4                    # accumulated rightward
-  expected = -1e-4 * 10.0                          # trim_rate * t (before cap)
+  expected = -1e-4 * 5.0                           # trim_rate * t (before cap)
   assert abs(a.kappa_trim - expected) < 2e-5       # ~linear ramp
 
 
@@ -391,7 +391,7 @@ def test_trim_caps():
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09))
   for _ in range(3000):                            # 30 s >> cap time
-    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
   assert abs(a.kappa_trim + 1e-3) < 1e-9           # clamped at -trim_max
 
 
@@ -400,10 +400,10 @@ def test_trim_leaks_in_band():
   a.kappa_trim = -8e-4
   mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # gap 0.84, in-band
   for _ in range(1000):                            # 10 s of leak
-    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
   assert -8e-4 < a.kappa_trim < -5e-4              # decaying, slowly (leak << rate)
   for _ in range(50000):                           # long in-band -> exactly zero
-    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
   assert a.kappa_trim == 0.0
 
 
@@ -413,12 +413,12 @@ def test_trim_unwinds_on_opposite_error_no_ratchet():
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   below = _mv_geo(_XS, _flat(-1.41), _flat(2.09))  # gap 0.50 -> trim goes negative
   for _ in range(1000):
-    a.update(0.0, below, 25.0, False, lat_delay=0.6)
+    a.update(0.0, below, 17.0, False, lat_delay=0.6)
   t_neg = a.kappa_trim
   assert t_neg < -0.5e-4
   above = _mv_geo(_XS, _flat(-2.11), _flat(1.39))  # gap 1.20 -> above band
   for _ in range(1500):                            # unwinds through zero
-    a.update(0.0, above, 25.0, False, lat_delay=0.6)
+    a.update(0.0, above, 17.0, False, lat_delay=0.6)
   assert a.kappa_trim > 0.0                        # crossed zero: no ratchet
 
 
@@ -426,7 +426,7 @@ def test_trim_zeroed_on_lane_change():
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   a.kappa_trim = -8e-4
   mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))
-  a.update(0.0, mv, 25.0, True, lat_delay=0.6)
+  a.update(0.0, mv, 17.0, True, lat_delay=0.6)
   assert a.kappa_trim == 0.0
 
 
@@ -434,7 +434,7 @@ def test_trim_added_to_output():
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   a.kappa_trim = -6e-4
   mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # in-band: bias ~0
-  out, t = a.update(0.01, mv, 25.0, False, lat_delay=0.6)
+  out, t = a.update(0.01, mv, 17.0, False, lat_delay=0.6)
   assert abs(out - (0.01 - 6e-4)) < 2e-5           # kappa_ref + trim (leak negligible)
   assert abs(t['kappa_trim'] - a.kappa_trim) < 1e-12
 
@@ -444,5 +444,43 @@ def test_trim_right_driver_mirror():
   a = LaneAnchor(AnchorConfig(driver_side='right', pred_delay_mult=2.0))
   mv = _mv_geo(_XS, _flat(-2.09), _flat(1.41))     # right gap 0.50, below band
   for _ in range(1000):
-    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
   assert a.kappa_trim > 0.5e-4
+
+
+def test_trim_leaks_when_authority_zero():
+  # Review finding: a visible-but-untrusted line (authority 0) must LEAK the
+  # trim like line-loss does — never freeze DC state without a trusted
+  # measurement, and never snap a stale trim back when confidence returns.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a.kappa_trim = -8e-4
+  mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09), left_p=0.4)   # below band, prob<prob_on
+  for _ in range(1000):                            # 10 s
+    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
+  assert -7e-4 < a.kappa_trim < -5.5e-4            # leaked ~2e-4, not frozen at -8e-4
+
+
+def test_trim_leaks_when_line_lost():
+  # Review coverage gap: the unavailable-branch leak with a NONZERO trim.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a.kappa_trim = -8e-4
+  none_mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  for _ in range(1000):                            # 10 s
+    a.update(0.0, none_mv, 17.0, False, lat_delay=0.6)
+  assert -7e-4 < a.kappa_trim < -5.5e-4            # leaking, not frozen/integrating
+
+
+def test_trim_speed_accel_clamp():
+  # Review finding: flat kappa cap means v^2*trim grows quadratically. The
+  # dynamic clamp bounds |v^2 * kappa_trim| <= trim_accel_max (0.3 m/s^2).
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a.kappa_trim = -1e-3                             # at the flat cap
+  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # in-band
+  a.update(0.0, mv, 30.0, False, lat_delay=0.6)    # highway speed
+  cap = 0.3 / 900.0                                # trim_accel_max / v^2
+  assert abs(a.kappa_trim) <= cap + 1e-9           # clamped immediately
+  # and at the 3c0 operating point (~17.8 m/s) the full flat cap remains usable
+  a2 = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a2.kappa_trim = -1e-3
+  a2.update(0.0, mv, 17.0, False, lat_delay=0.6)
+  assert abs(a2.kappa_trim) > 0.9e-3               # 0.3/289=1.04e-3 > flat cap

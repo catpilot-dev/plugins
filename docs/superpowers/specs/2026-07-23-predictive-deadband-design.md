@@ -165,15 +165,25 @@ out-of-band:  kappa_trim += trim_rate·DT·authority, toward curv_sign·excess
                the hold-bias lesson: block only windup, never unwind)
 in-band:      kappa_trim leaks to exactly 0 at trim_leak (5× slower)
 line lost:    leak only — never integrate blind
+low confidence (visible line, authority 0): leak — never freeze DC state
+              without a trusted measurement (review finding)
 lane change:  hard-zero (with the bias)
-cap:          ±trim_max
+cap:          ±min(trim_max, trim_accel_max/v²)  — re-clamped EVERY tick
 ```
+
+**Why the speed clamp (review finding):** the pursuit term's lateral accel is
+speed-independent by construction (v² cancels), but a flat κ cap on the trim
+would grow as v²·trim_max (≈0.9 m/s² at 108 km/h). `trim_accel_max = 0.3 m/s²`
+bounds it; below the crossover √(trim_accel_max/trim_max) ≈ 17.3 m/s the flat
+cap governs (the 3c0 droop regime at 17.8 m/s keeps ~full authority), above it
+the accel bound sheds trim gently as v rises.
 
 | param | default | meaning |
 |---|---|---|
 | `LaneKeepTrimRate` | 1e-4 /m/s | out-of-band slew — full cap in 10 s |
 | `LaneKeepTrimMax` | 1e-3 /m | hard cap; half the pursuit cap |
 | `LaneKeepTrimLeak` | 2e-5 /m/s | in-band decay |
+| `LaneKeepTrimAccelMax` | 0.3 m/s² | lateral-accel bound: \|v²·κ_trim\| ≤ this |
 
 Telemetry gains `kappa_trim`. **Validation limits:** replay verifies the trim's
 mechanics on the 3c0 telemetry (direction, ramp rate, cap, no oscillation);

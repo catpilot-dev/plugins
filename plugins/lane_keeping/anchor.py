@@ -74,6 +74,8 @@ class AnchorConfig:
   trim_rate: float = 1e-4        # trim slew while out-of-band (1/m per s) — full cap in 10 s
   trim_max: float = 1e-3         # hard cap (1/m); half of kappa_bias_max
   trim_leak: float = 2e-5        # in-band decay toward 0 (1/m per s) — 5× slower than rate
+  trim_accel_max: float = 0.3    # lateral-accel bound on the trim: |v²·κ_trim| ≤ this (m/s²);
+                                 # at the 3c0 operating point (17.8 m/s) the flat cap still binds
   pred_delay_mult: float = 1.5   # prediction horizon = mult × lateral delay
                                  # (sweep 2026-07-23: 1.5 beat trivial on all 3
                                  #  gate routes, +11..32%; 2.0 tie-to-+23; 3.0 worse
@@ -219,11 +221,15 @@ class LaneAnchor:
       # disturbances the proportional law cannot cancel (route 3c0 droop).
       # Signed: opposite-side excess unwinds at the same rate (no ratchet).
       # Authority-scaled so a fading line also fades the accumulation.
-      if excess != 0.0:
+      if excess != 0.0 and authority > 0.0:
         step = self.cfg.trim_rate * DT_CTRL * authority
         self.kappa_trim = _clip(self.kappa_trim + math.copysign(step, self.curv_sign * excess),
                                 -self.cfg.trim_max, self.cfg.trim_max)
       elif self.kappa_trim != 0.0:
+        # In-band, OR visible-but-untrusted line (authority 0 — review
+        # finding): leak. Never freeze DC state without a trusted
+        # measurement, and never snap a stale trim back at full value when
+        # confidence returns.
         self.kappa_trim -= math.copysign(
           min(self.cfg.trim_leak * DT_CTRL, abs(self.kappa_trim)), self.kappa_trim)
     else:
@@ -235,6 +241,14 @@ class LaneAnchor:
       if self.kappa_trim != 0.0:
         self.kappa_trim -= math.copysign(
           min(self.cfg.trim_leak * DT_CTRL, abs(self.kappa_trim)), self.kappa_trim)
+    # Speed-dependent trim clamp (review finding): the pursuit term's lateral
+    # accel is speed-independent by construction (v² cancels in 2·excess/Lp²·v²)
+    # but the trim's is NOT — a flat κ cap would grow as v²·trim_max (0.9 m/s²
+    # at 108 km/h). Bound it explicitly: |v²·κ_trim| ≤ trim_accel_max.
+    # Re-clamped every tick, so accelerating onto a highway sheds excess trim
+    # gently as v rises (v changes slowly; no step).
+    cap_eff = min(cfg.trim_max, cfg.trim_accel_max / max(v_ego * v_ego, 1.0))
+    self.kappa_trim = _clip(self.kappa_trim, -cap_eff, cap_eff)
     # single rate-limit path (also smoothly releases bias to 0 when the line is
     # lost or its confidence fades — no snap on anchor exit).
     max_step = cfg.kappa_rate_max * DT_CTRL

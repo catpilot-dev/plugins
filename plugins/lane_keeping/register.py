@@ -67,6 +67,7 @@ def _load_config():
     trim_rate=fget('LaneKeepTrimRate', d.trim_rate),
     trim_max=fget('LaneKeepTrimMax', d.trim_max),
     trim_leak=fget('LaneKeepTrimLeak', d.trim_leak),
+    trim_accel_max=fget('LaneKeepTrimAccelMax', d.trim_accel_max),
     pred_delay_mult=fget('LaneKeepPredDelayMult', d.pred_delay_mult),
     gap_hard_lo=fget('LaneKeepGapHardLo', d.gap_hard_lo),
     gap_hard_hi=fget('LaneKeepGapHardHi', d.gap_hard_hi),
