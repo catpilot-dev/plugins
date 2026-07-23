@@ -4,7 +4,7 @@
 > (comfort-band anchoring) is replaced by the AC stabilizer
 > (`2026-07-23-ac-stabilizer-design.md`) after route 3c1 proved the e2e model
 > counter-steers sustained position preferences. The plugin structure, sign
-> conventions, prediction, floors, and UX described here remain accurate.
+> conventions, and UX described here remain accurate.
 
 **Date:** 2026-07-22
 **Branch:** `lane_keeping` (off `dev` @ af3be5f)
