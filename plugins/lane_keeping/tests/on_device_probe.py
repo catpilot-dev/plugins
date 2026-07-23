@@ -154,20 +154,24 @@ check('filters re-seed during LC; first post-LC tick clean',
       f"gf={t['gap_filt']:.3f} out={out:.6f}")
 
 
-print('probe 11: integral trim (DC authority; hold-bias no-ratchet lesson)')
+print('probe 11: AC stabilizer (concede the line, damp the wander)')
+def mv_at(gap):
+  y = -(gap + 0.91)
+  return mv_geo(flat(y), flat(1.75))
 a = LaneAnchor(AnchorConfig())
-below = mv_geo(flat(-1.41), flat(2.09))            # gap 0.50, below band
-for _ in range(1000):
-  a.update(0.0, below, 25.0, False, lat_delay=0.6)
-ok_dir = a.kappa_trim < -0.5e-4                    # builds rightward (negative)
-above = mv_geo(flat(-2.11), flat(1.39))            # gap 1.20, above band
-for _ in range(1500):
-  a.update(0.0, above, 25.0, False, lat_delay=0.6)
-ok_unwind = a.kappa_trim > 0.0                     # unwound through zero: no ratchet
-a.update(0.0, above, 25.0, True, lat_delay=0.6)
-check('trim builds, unwinds on opposite error, zeroed on lane change',
-      ok_dir and ok_unwind and a.kappa_trim == 0.0,
-      f"trim_after_lc={a.kappa_trim}")
+out = None
+for _ in range(3000):
+  out, t = a.update(0.0, mv_at(1.39), 17.0, False, lat_delay=0.6)
+check('constant out-of-band gap is CONCEDED (anti-3c1)', abs(out) < 1e-6 and abs(t['gap_dc'] - 1.39) < 0.05,
+      f"out={out:.6f} dc={t['gap_dc']:.2f}")
+for i in range(600):
+  out, t = a.update(0.0, mv_at(1.39 + 0.05 * (i / 100.0)), 17.0, False, lat_delay=0.6)
+check('drift is damped (positive/leftward vs rightward drift)', out > 1e-5, f'out={out:.6f}')
+a2 = LaneAnchor(AnchorConfig())
+out, _t = None, None
+for _ in range(3000):
+  out, _t = a2.update(0.0, mv_at(0.2), 17.0, False, lat_delay=0.6)
+check('hard floor still absolute at 0.2 m', out < -1e-5, f'out={out:.6f}')
 
 print(f'\n{PASS} passed, {FAIL} failed')
 sys.exit(1 if FAIL else 0)
