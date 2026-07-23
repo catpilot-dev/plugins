@@ -75,7 +75,8 @@ class AnchorConfig:
   trim_max: float = 1e-3         # hard cap (1/m); half of kappa_bias_max
   trim_leak: float = 2e-5        # in-band decay toward 0 (1/m per s) — 5× slower than rate
   trim_accel_max: float = 0.3    # lateral-accel bound on the trim: |v²·κ_trim| ≤ this (m/s²);
-                                 # at the 3c0 operating point (17.8 m/s) the flat cap still binds
+                                 # crossover √(0.3/1e-3)≈17.3 m/s — the 3c0 operating point
+                                 # (17.8 m/s) sits just past it, keeping ~95% of the flat cap
   pred_delay_mult: float = 1.5   # prediction horizon = mult × lateral delay
                                  # (sweep 2026-07-23: 1.5 beat trivial on all 3
                                  #  gate routes, +11..32%; 2.0 tie-to-+23; 3.0 worse

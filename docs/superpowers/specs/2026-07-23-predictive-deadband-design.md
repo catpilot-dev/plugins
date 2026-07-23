@@ -175,7 +175,7 @@ cap:          ±min(trim_max, trim_accel_max/v²)  — re-clamped EVERY tick
 speed-independent by construction (v² cancels), but a flat κ cap on the trim
 would grow as v²·trim_max (≈0.9 m/s² at 108 km/h). `trim_accel_max = 0.3 m/s²`
 bounds it; below the crossover √(trim_accel_max/trim_max) ≈ 17.3 m/s the flat
-cap governs (the 3c0 droop regime at 17.8 m/s keeps ~full authority), above it
+cap governs (the 3c0 droop regime at 17.8 m/s sits just past it, keeping ~95% authority), above it
 the accel bound sheds trim gently as v rises.
 
 | param | default | meaning |

@@ -123,5 +123,8 @@ def test_hook_passes_lat_delay_through(data_dir, monkeypatch):
 def test_load_config_trim_params(data_dir):
   cfg = register._load_config()
   assert cfg.trim_rate == 1e-4 and cfg.trim_max == 1e-3 and cfg.trim_leak == 2e-5
+  assert cfg.trim_accel_max == 0.3
   (data_dir / 'LaneKeepTrimMax').write_text('0.0015')
-  assert register._load_config().trim_max == 0.0015
+  (data_dir / 'LaneKeepTrimAccelMax').write_text('0.5')
+  cfg2 = register._load_config()
+  assert cfg2.trim_max == 0.0015 and cfg2.trim_accel_max == 0.5
