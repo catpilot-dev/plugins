@@ -67,15 +67,22 @@ def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
   # force telemetry publish to raise — control path must still return a value
   monkeypatch.setattr(register, '_publish', lambda telem: (_ for _ in ()).throw(RuntimeError('no bus')))
-  # left ego line (laneLines[1]) at y=-2.3 (far left, +y=right frame) -> gap 1.39
-  # above the band -> steer left (positive, left-positive curvature)
-  mv = SimpleNamespace(
-    laneLines=[SimpleNamespace(y=[0.0]), SimpleNamespace(y=[-2.3]),
-               SimpleNamespace(y=[1.2]), SimpleNamespace(y=[0.0])],
-    laneLineProbs=[0.0, 1.0, 1.0, 0.0])
+  # A constant out-of-band gap concedes under the AC stabilizer (zero-mean by
+  # construction), so seed the DC tracker then drift away from it -> the AC
+  # term builds a bias (left ego line drifting away, +y=right frame).
+  def mv_at(gap):
+    y = -(gap + 0.91)
+    xs = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+    return SimpleNamespace(
+      laneLines=[SimpleNamespace(x=[], y=[0.0]), SimpleNamespace(x=xs, y=[y]*6),
+                 SimpleNamespace(x=xs, y=[1.75]*6), SimpleNamespace(x=[], y=[0.0])],
+      laneLineProbs=[0.0, 1.0, 1.0, 0.0],
+      position=SimpleNamespace(x=xs, y=[0.0]*6))
+  for _ in range(1000):                          # seed DC at 0.84
+    register.on_curvature_correction(0.01, mv_at(0.84), 25.0, False, lat_delay=0.45)
   out = None
-  for _ in range(2000):
-    out = register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
+  for i in range(600):                           # drift -> bias builds, pub error swallowed
+    out = register.on_curvature_correction(0.01, mv_at(0.84 + 0.05*(i/100.0)), 25.0, False, lat_delay=0.45)
   assert out > 0.01           # biased left (too far from left line), pub error swallowed
 
 
@@ -120,35 +127,31 @@ def test_hook_passes_lat_delay_through(data_dir, monkeypatch):
   assert seen['lat_delay'] == 0.55
 
 
-def test_load_config_trim_params(data_dir):
+def test_load_config_ac_params(data_dir):
   cfg = register._load_config()
-  assert cfg.trim_rate == 1e-4 and cfg.trim_max == 1e-3 and cfg.trim_leak == 2e-5
-  assert cfg.trim_accel_max == 0.3
-  (data_dir / 'LaneKeepTrimMax').write_text('0.0015')
-  (data_dir / 'LaneKeepTrimAccelMax').write_text('0.5')
-  cfg2 = register._load_config()
-  assert cfg2.trim_max == 0.0015 and cfg2.trim_accel_max == 0.5
+  assert cfg.dc_tau == 20.0 and cfg.ac_deadband == 0.10
+  (data_dir / 'LaneKeepDcTau').write_text('30')
+  assert register._load_config().dc_tau == 30.0
 
 
 def test_live_toggle_disables_and_releases(data_dir, monkeypatch):
-  # The Driving-panel toggle writes data/LaneKeepEnable; the hook re-reads it
-  # every ~100 ticks and the correction releases smoothly (no restart needed).
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
   monkeypatch.setattr(register, '_publish', lambda telem: None)
-  mv = SimpleNamespace(
-    laneLines=[SimpleNamespace(y=[0.0]), SimpleNamespace(y=[-2.3]),
-               SimpleNamespace(y=[1.2]), SimpleNamespace(y=[0.0])],
-    laneLineProbs=[0.0, 1.0, 1.0, 0.0])
+  def mv_at(gap):
+    y = -(gap + 0.91)
+    xs = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+    return SimpleNamespace(
+      laneLines=[SimpleNamespace(x=[], y=[0.0]), SimpleNamespace(x=xs, y=[y]*6),
+                 SimpleNamespace(x=xs, y=[1.75]*6), SimpleNamespace(x=[], y=[0.0])],
+      laneLineProbs=[0.0, 1.0, 1.0, 0.0],
+      position=SimpleNamespace(x=xs, y=[0.0]*6))
+  for _ in range(1000):                          # seed DC at 0.84
+    register.on_curvature_correction(0.0, mv_at(0.84), 17.0, False, lat_delay=0.45)
   out = None
-  for _ in range(2000):
-    out = register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
-  built = out - 0.01
-  assert built > 5e-4                      # bias + trim established
+  for i in range(600):                           # drift -> stabilizer damps
+    out = register.on_curvature_correction(0.0, mv_at(0.84 + 0.05*(i/100.0)), 17.0, False, lat_delay=0.45)
+  assert out > 1e-5
   (data_dir / 'LaneKeepEnable').write_text('0')
-  for _ in range(500):                     # >100 ticks: re-read fires; releases
-    out = register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
-  assert abs(out - 0.01) < 2e-4            # bias gone, trim mostly retired
-  (data_dir / 'LaneKeepEnable').write_text('1')
-  for _ in range(2000):                    # toggling back re-engages
-    out = register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
-  assert out - 0.01 > 5e-4
+  for i in range(500):                           # toggle off mid-drift: releases
+    out = register.on_curvature_correction(0.0, mv_at(1.14 + 0.05*(i/100.0)), 17.0, False, lat_delay=0.45)
+  assert abs(out) < 1e-6
