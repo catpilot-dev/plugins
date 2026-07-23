@@ -440,3 +440,30 @@ def test_dc_frozen_during_hard_floor_and_assists_recovery():
   for _ in range(200):
     out, t = a.update(0.0, _mv_at(0.7), 17.0, False, lat_delay=0.6)
   assert out <= 1e-6                               # never positive (toward floor)
+
+
+def test_dc_seed_requires_authority():
+  # Final-review fix: an untrusted line (authority 0) must not SEED the DC —
+  # a stale seed would snap back as a nudge when confidence returns.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  mv_low = _mv_geo(_XS, _flat(-1.75), _flat(1.75), left_p=0.3)
+  for _ in range(200):
+    a.update(0.0, mv_low, 17.0, False, lat_delay=0.6)
+  assert a.gap_dc is None                          # never seeded untrusted
+  out, t = _run(a, 0.84, 200)                      # trust arrives -> seeds now
+  assert abs(t['gap_dc'] - 0.84) < 0.05
+  assert abs(out) < 1e-6
+
+
+def test_disable_resets_dc_for_fresh_ab():
+  # Deliberate toggle-off forgets the reference; re-enable starts fresh on
+  # the current line (clean A/B), instead of nudging toward a stale DC.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  _run(a, 0.84, 1000)
+  a.cfg.enable = False
+  a.update(0.0, _mv_at(0.84), 17.0, False, lat_delay=0.6)
+  assert a.gap_dc is None
+  a.cfg.enable = True
+  out, t = _run(a, 1.3, 500)                       # re-enable at a NEW position
+  assert abs(t['gap_dc'] - 1.3) < 0.05             # fresh seed, no old memory
+  assert abs(out) < 1e-6                           # conceded immediately

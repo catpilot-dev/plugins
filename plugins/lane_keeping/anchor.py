@@ -1,8 +1,11 @@
 """Driver-side lane keeping — pure control core (no cereal/zmq imports).
 
-Anchors the driver-side wheel-to-line gap in a [gap_min, gap_max] deadband
-via a bounded pure-pursuit curvature bias. See design spec
-docs/superpowers/specs/2026-07-22-driver-side-lane-keeping-design.md.
+AC STABILIZER (Phase 3): damps the wander of the driver-side wheel-to-line
+gap around the model's own chosen line (a slow DC tracker concedes the line;
+only deadbanded deviations from it are corrected via a bounded pure-pursuit
+bias). Hard floors at the extremes remain absolute best-effort. See
+docs/superpowers/specs/2026-07-23-ac-stabilizer-design.md (which supersedes
+the positioner design in the 2026-07-22/predictive-deadband specs).
 """
 import math
 from dataclasses import dataclass
@@ -214,14 +217,16 @@ class LaneAnchor:
       in_floor = self.gap_filt < cfg.gap_hard_lo or self.gap_filt > cfg.gap_hard_hi
       if lane_changing:
         self.gap_dc = None
-      elif not in_floor:
-        # Never seed or adapt while the hard-floor override is active: the
-        # excursion the floor is fighting must not become the reference
-        # (review finding — adapting there made the stabilizer damp the
-        # RECOVERY on floor exit; frozen, it mildly assists it instead).
+      elif not in_floor and authority > 0.0:
+        # Seed AND adapt only from a TRUSTED measurement (final review: an
+        # authority-0 seed pins a stale reference that snaps back on
+        # confidence return — the same failure class fixed twice before).
+        # Never while the hard-floor override is active either: the excursion
+        # the floor is fighting must not become the reference (frozen, the
+        # post-floor AC term mildly assists the recovery instead).
         if self.gap_dc is None:
           self.gap_dc = self.gap_pred_filt
-        elif authority > 0.0:
+        else:
           a_dc = 1.0 - math.exp(-DT_CTRL / cfg.dc_tau)
           self.gap_dc += a_dc * (self.gap_pred_filt - self.gap_dc)
       # Decision: hard floors are ABSOLUTE (best-effort at the extremes);
@@ -238,6 +243,11 @@ class LaneAnchor:
       self.gap_filt = None
       self.gap_pred_filt = None
       kappa_target = 0.0
+      if not cfg.enable:
+        # Deliberate disable (Driving-panel toggle): forget the reference —
+        # re-enabling starts fresh on the current line, a clean A/B. Line
+        # DROPOUTS (enable True) keep the frozen DC through the gap.
+        self.gap_dc = None
     # single rate-limit path (also smoothly releases bias to 0 when the line is
     # lost or its confidence fades — no snap on anchor exit).
     max_step = cfg.kappa_rate_max * DT_CTRL

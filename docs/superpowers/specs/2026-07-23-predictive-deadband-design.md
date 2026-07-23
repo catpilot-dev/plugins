@@ -1,5 +1,10 @@
 # Predictive Deadband — anchor decides on the *predicted* gap
 
+> **SUPERSEDED IN PART (2026-07-23):** the decision law (absolute band) and §7
+> integral trim are replaced by the AC stabilizer — see
+> `2026-07-23-ac-stabilizer-design.md`. The prediction machinery (§2) remains
+> in use, feeding the AC error.
+
 **Date:** 2026-07-23
 **Status:** design approved (conversation 2026-07-23), pending implementation
 **Amends:** `2026-07-22-lateral-controller-simplification-design.md` (Phase 2, branch `phase2_simplify`)
