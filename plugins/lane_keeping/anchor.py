@@ -211,18 +211,24 @@ class LaneAnchor:
       # Seeds on the first anchor sample; adapts only while the measurement is
       # trusted; FROZEN on low authority (dropouts keep the reference); RESET
       # by a lane change (new lane, new line identity, new DC).
+      in_floor = self.gap_filt < cfg.gap_hard_lo or self.gap_filt > cfg.gap_hard_hi
       if lane_changing:
         self.gap_dc = None
-      elif self.gap_dc is None:
-        self.gap_dc = self.gap_pred_filt
-      elif authority > 0.0:
-        a_dc = 1.0 - math.exp(-DT_CTRL / cfg.dc_tau)
-        self.gap_dc += a_dc * (self.gap_pred_filt - self.gap_dc)
+      elif not in_floor:
+        # Never seed or adapt while the hard-floor override is active: the
+        # excursion the floor is fighting must not become the reference
+        # (review finding — adapting there made the stabilizer damp the
+        # RECOVERY on floor exit; frozen, it mildly assists it instead).
+        if self.gap_dc is None:
+          self.gap_dc = self.gap_pred_filt
+        elif authority > 0.0:
+          a_dc = 1.0 - math.exp(-DT_CTRL / cfg.dc_tau)
+          self.gap_dc += a_dc * (self.gap_pred_filt - self.gap_dc)
       # Decision: hard floors are ABSOLUTE (best-effort at the extremes);
       # otherwise damp only the AC — the deviation from the tracked line.
       # Zero-mean by construction: a static scene, at ANY gap, concedes.
       excess_ac = (self.gap_pred_filt - self.gap_dc) if self.gap_dc is not None else 0.0
-      if self.gap_filt < cfg.gap_hard_lo or self.gap_filt > cfg.gap_hard_hi:
+      if in_floor:
         excess = self._excess(self.gap_filt)
       else:
         excess = excess_ac - _clip(excess_ac, -cfg.ac_deadband, cfg.ac_deadband)

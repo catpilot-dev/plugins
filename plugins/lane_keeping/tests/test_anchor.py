@@ -276,7 +276,7 @@ def test_lane_change_reseeds_gap_filters():
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   mv_old = _mv_geo(_XS, _flat(-1.31), _flat(2.19))     # old lane: gap 0.40 (below band)
   for _ in range(2000):
-    a.update(0.0, mv_old, 25.0, False, lat_delay=0.6)  # settle, bias building
+    a.update(0.0, mv_old, 25.0, False, lat_delay=0.6)  # settle filters
   mv_new = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # new lane: gap 0.84 (in-band)
   out, t = a.update(0.0, mv_new, 25.0, True, lat_delay=0.6)   # lane-change tick
   assert abs(t['gap_filt'] - 0.84) < 1e-9              # re-seeded to raw, no lag
@@ -318,7 +318,6 @@ def _run(a, gap, n, v=17.0, lc=False):
 def test_constant_offset_is_conceded_anywhere():
   # THE anti-3c1 regression test: a static gap — even far out of the old
   # band — produces ZERO correction after seeding. The line is the model's.
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   for g in (1.39, 0.45, 0.84):
     a2 = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
     out, t = _run(a2, g, 3000)
@@ -421,3 +420,23 @@ def test_rate_limited_on_step():
   a.gap_pred_filt = 1.3
   _o, t = a.update(0.0, _mv_at(1.3), 17.0, False, lat_delay=0.6)
   assert abs(t['kappa_bias']) <= 0.002 * 0.01 + 1e-12
+
+
+def test_dc_frozen_during_hard_floor_and_assists_recovery():
+  # Review finding: the DC must never learn the excursion the hard floor is
+  # fighting. Frozen during the floor regime, the post-floor AC term points
+  # WITH the recovery (or is silent) — never back toward the floor.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  _run(a, 0.84, 1000)                              # seed DC at 0.84
+  dc0 = a.gap_dc
+  _run(a, 0.2, 1000)                               # deep in the low floor, 10 s
+  # DC may creep only during the gap-filter's ~1.3 s transit into the floor
+  # regime (tau=0.7 lag before gap_filt crosses 0.3); once in_floor, it is
+  # frozen. The property: the excursion's BULK (0.64 m) is never learned.
+  assert abs(a.gap_dc - dc0) < 0.05                # learned <8% of the excursion
+  out, t = a.update(0.0, _mv_at(0.7), 17.0, False, lat_delay=0.6)  # recovering
+  # gap 0.7 < dc 0.84 -> excess_ac negative -> steer right (gap-increasing):
+  # assists the recovery toward the old line; must NOT push back to the floor
+  for _ in range(200):
+    out, t = a.update(0.0, _mv_at(0.7), 17.0, False, lat_delay=0.6)
+  assert out <= 1e-6                               # never positive (toward floor)
