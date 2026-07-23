@@ -96,7 +96,7 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
   # the smoothed reference unconditionally (raw kappa_des against a
   # deadzone-free tracker is the documented-unsafe rollback). cfg.enable
   # only gates the POSITION correction inside update(): the bias
-  # rate-releases, the trim retires at trim_rate, smoothing stays on.
+  # rate-releases, the stabilizer releases smoothly, smoothing stays on.
   _tick += 1
   if _tick % 100 == 0:
     _anchor.cfg.enable = _read_param('LaneKeepEnable') not in ('0', 'false', 'False')
