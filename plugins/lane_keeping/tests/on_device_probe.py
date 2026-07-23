@@ -49,16 +49,14 @@ print('probe 2: in-band no bias')
 # left line at y=-1.75 -> gap 0.84 in [0.6,1.0]
 check('gap 0.84 in [0.6,1.0] -> no bias', abs(settle(LaneAnchor(AnchorConfig()), mv(-1.75, 1.75)) - 0.01) < 1e-6)
 
-print('probe 3: out-of-band bias, left driver')
-# left line at y=-2.3 -> gap 1.39 above band -> steer left (positive)
-check('too far from left line -> steer left', settle(LaneAnchor(AnchorConfig()), mv(-2.3, 1.2)) > 0.01 + 1e-5)
-# left line at y=-1.3 -> gap 0.39 below band -> steer right (negative)
-check('too close to left line -> steer right', settle(LaneAnchor(AnchorConfig()), mv(-1.3, 2.2)) < 0.01 - 1e-5)
+print('probe 3: constant offsets are CONCEDED, left driver (AC stabilizer)')
+# static gap 1.39 (above old band) and 0.39 (below): the line is the model's
+check('constant far gap conceded', abs(settle(LaneAnchor(AnchorConfig()), mv(-2.3, 1.2)) - 0.01) < 1e-6)
+check('constant near gap conceded', abs(settle(LaneAnchor(AnchorConfig()), mv(-1.3, 2.2)) - 0.01) < 1e-6)
 
-print('probe 4: out-of-band bias, right driver')
-# right driver: right line (laneLines[2]) at y=+2.3 -> gap 1.39 above band -> steer right (negative)
-check('right driver too far from right line -> steer right',
-      settle(LaneAnchor(AnchorConfig(driver_side='right')), mv(-1.2, 2.3)) < 0.01 - 1e-5)
+print('probe 4: constant offset conceded, right driver')
+check('right driver constant gap conceded',
+      abs(settle(LaneAnchor(AnchorConfig(driver_side='right')), mv(-1.2, 2.3)) - 0.01) < 1e-6)
 
 print('probe 5: lane-change disable')
 check('lane change -> passthrough', abs(settle(LaneAnchor(AnchorConfig()), mv(-2.3, 1.2), lc=True) - 0.01) < 1e-6)
@@ -110,8 +108,8 @@ a = LaneAnchor(AnchorConfig())
 conv = [-1.75 + 0.5 * (x / 30.0) for x in XS]
 for _ in range(2000):
   out, t = a.update(0.0, mv_geo(conv, flat(1.75)), 25.0, False, lat_delay=0.6)
-check('converging line: nudges early (right/negative)', t['gap_pred'] < 0.6 and out < -1e-5,
-      f"gp={t['gap_pred']:.3f} out={out:.5f}")
+check('converging line: prediction sees it, static scene conceded',
+      t['gap_pred'] < 0.6 and abs(out) < 1e-6, f"gp={t['gap_pred']:.3f} out={out:.5f}")
 
 a = LaneAnchor(AnchorConfig())
 recov = [-1.41 - 0.4 * (x / 30.0) for x in XS]
@@ -129,17 +127,18 @@ check('hard floor: 0.2m gap corrects despite recovering prediction',
       t['gap_filt'] < 0.3 and out < -1e-5, f"gf={t['gap_filt']:.3f} out={out:.5f}")
 
 a = LaneAnchor(AnchorConfig())
-drift_plan = [-0.5 * (x / 30.0) for x in XS]      # plan drifts toward the left line
+drift_plan = [-0.5 * (x / 30.0) for x in XS]      # plan angles toward the left line
 for _ in range(2000):
   out, t = a.update(0.0, mv_geo(flat(-1.75), flat(1.75), plan_ys=drift_plan), 25.0, False, lat_delay=0.6)
-check('plan drifting toward line: predicted out-of-band, nudges right',
-      t['gap_pred'] < 0.6 and out < -1e-5, f"gp={t['gap_pred']:.3f} out={out:.5f}")
+check('plan-toward-line: prediction sees it, static scene conceded',
+      t['gap_pred'] < 0.6 and abs(out) < 1e-6, f"gp={t['gap_pred']:.3f} out={out:.5f}")
 
 a = LaneAnchor(AnchorConfig())
 for _ in range(3000):
-  out, _t = a.update(0.01, mv(-2.3, 1.2), 25.0, False, lat_delay=0.6)
-check('single-point lines fall back to current-gap deadband', out > 0.01 + 1e-5,
-      f'out={out:.5f}')
+  out, t = a.update(0.01, mv(-2.3, 1.2), 25.0, False, lat_delay=0.6)
+check('single-point lines: fallback wired (gap_pred==gap_filt), conceded',
+      abs(t['gap_pred'] - t['gap_filt']) < 1e-9 and abs(out - 0.01) < 1e-6,
+      f"gp={t['gap_pred']:.3f} gf={t['gap_filt']:.3f} out={out:.5f}")
 
 
 print('probe 10: lane-change filter re-seed (no stale settle-nudge)')
