@@ -76,6 +76,7 @@ def _load_config():
 
 _anchor = None
 _pub = None
+_tick = 0
 
 
 def _publish(telem):
@@ -87,12 +88,20 @@ def _publish(telem):
 
 
 def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay=None):
-  global _anchor
+  global _anchor, _tick
   if _anchor is None:
     LaneAnchor = _anchor_module().LaneAnchor
     _anchor = LaneAnchor(_load_config())
-  if not _anchor.cfg.enable:
-    return curvature
+  # Live enable toggle (~1 s latency): the Driving-panel switch writes
+  # data/LaneKeepEnable; re-read it cheaply every 100 ticks. NOTE: disabling
+  # must NOT short-circuit this hook — since Phase 2 the BMW tracker needs
+  # the smoothed reference unconditionally (raw kappa_des against a
+  # deadzone-free tracker is the documented-unsafe rollback). cfg.enable
+  # only gates the POSITION correction inside update(): the bias
+  # rate-releases, the trim retires at trim_rate, smoothing stays on.
+  _tick += 1
+  if _tick % 100 == 0:
+    _anchor.cfg.enable = _read_param('LaneKeepEnable') not in ('0', 'false', 'False')
   new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing, lat_delay)
   try:
     _publish(telem)

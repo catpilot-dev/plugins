@@ -129,6 +129,19 @@ class DrivingLayout(Widget):
     )
     items.append(self._personality)
 
+    # --- Lane Keeping (driver-side anchor, if plugin enabled) ---
+    if _plugin_enabled('lane_keeping'):
+      current = read_plugin_param('lane_keeping', 'LaneKeepEnable') != '0'
+      self._lane_keeping = toggle_item(
+        "Lane Keeping",
+        "Holds a steady margin to the driver-side lane line (green ring on the "
+        "emblem when working). Turn off to compare with pure model driving — "
+        "takes effect within a second, releasing smoothly.",
+        current,
+        callback=self._on_lane_keeping,
+      )
+      items.append(self._lane_keeping)
+
     # --- Lane Centering in Turns (if plugin enabled) ---
     if _plugin_enabled('lane_centering'):
       current = read_plugin_param('lane_centering', 'LaneCenteringEnabled') != '0'
@@ -211,6 +224,9 @@ class DrivingLayout(Widget):
 
   def _set_personality(self, button_index):
     self._params.put("LongitudinalPersonality", button_index)
+
+  def _on_lane_keeping(self, state):
+    write_plugin_param('lane_keeping', 'LaneKeepEnable', '1' if state else '0')
 
   def _on_lane_centering(self, state):
     write_plugin_param('lane_centering', 'LaneCenteringEnabled', '1' if state else '0')

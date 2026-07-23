@@ -184,13 +184,19 @@ Add `hold_band` (constant, for band-occupancy forensics). `lane_keeping` gains
   opposite failure mode. That risk is retired, not re-created.
 - **Single large step.** The whole noise stack goes at once. **The only valid
   Phase-2 rollback is reverting the BMW controller to the `af3be5f`
-  configuration.** `lane_keeping` must **NOT** be disabled (via `.disabled` or
-  `LaneKeepEnable=0`) while the simplified controller is deployed: with
-  `lane_keeping` disabled the controller tracks RAW modelV2 κ_des against a
-  0.001 rad `HOLD_BAND` with no deadzone — at ±0.003 1/m wander that is
-  δ_err ≈ 0.008 rad → a P target near 0.43 frac (≈5.2 Nm), continuously
-  sign-flipping and never resting. The two components are coupled: disabling
-  `lane_keeping` alone is not an independent, safe rollback path.
+  configuration.** The `lane_keeping` PLUGIN must **NOT** be removed from the
+  hook (via `.disabled`) while the simplified controller is deployed: without
+  it the controller tracks RAW modelV2 κ_des against a 0.001 rad `HOLD_BAND`
+  with no deadzone — at ±0.003 1/m wander that is δ_err ≈ 0.008 rad → a P
+  target near 0.43 frac (≈5.2 Nm), continuously sign-flipping and never
+  resting. The two components are coupled: removing `lane_keeping` alone is
+  not an independent, safe rollback path.
+  **REVISED 2026-07-23:** `LaneKeepEnable=0` (the Driving-panel "Lane Keeping"
+  toggle) is now SAFE by construction — since the toggle rework it gates only
+  the POSITION correction inside `update()` (bias rate-releases, trim retires
+  at `trim_rate`), while the reference smoothing runs unconditionally. The
+  hook is never short-circuited. Only the `.disabled` full-plugin removal
+  remains coupled to the controller revert.
 
 ## 6. Testing
 

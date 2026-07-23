@@ -484,3 +484,28 @@ def test_trim_speed_accel_clamp():
   a2.kappa_trim = -1e-3
   a2.update(0.0, mv, 17.0, False, lat_delay=0.6)
   assert abs(a2.kappa_trim) > 0.9e-3               # 0.3/289=1.04e-3 > flat cap
+
+
+def test_disabled_retires_trim_at_trim_rate():
+  # A deliberate disable (cfg.enable False) retires the trim at trim_rate
+  # (~10s from full), not the slow line-dropout leak (~50s).
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a.kappa_trim = -8e-4
+  a.cfg.enable = False
+  mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09))     # geometry irrelevant: disabled
+  for _ in range(500):                             # 5 s
+    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
+  assert -3.5e-4 < a.kappa_trim < -2.5e-4          # ~5e-4 retired (rate 1e-4/s)
+
+
+def test_disabled_keeps_smoothing():
+  # Disabling the anchor must NOT disable the reference conditioning —
+  # a step in kappa_des still comes out smoothed (Phase 2 safety invariant).
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a.cfg.enable = False
+  mv = _mv_geo(_XS, _flat(-1.31), _flat(2.19))     # would nudge if enabled
+  for _ in range(200):
+    a.update(0.02, mv, 17.0, False, lat_delay=0.6) # settle filter at 0.02
+  out, t = a.update(0.0, mv, 17.0, False, lat_delay=0.6)   # step down
+  assert 0.0 < out < 0.02                          # smoothed, lagging
+  assert t['kappa_bias'] == 0.0 and t['state'] == 'model'  # no position correction

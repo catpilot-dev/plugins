@@ -128,3 +128,27 @@ def test_load_config_trim_params(data_dir):
   (data_dir / 'LaneKeepTrimAccelMax').write_text('0.5')
   cfg2 = register._load_config()
   assert cfg2.trim_max == 0.0015 and cfg2.trim_accel_max == 0.5
+
+
+def test_live_toggle_disables_and_releases(data_dir, monkeypatch):
+  # The Driving-panel toggle writes data/LaneKeepEnable; the hook re-reads it
+  # every ~100 ticks and the correction releases smoothly (no restart needed).
+  monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
+  monkeypatch.setattr(register, '_publish', lambda telem: None)
+  mv = SimpleNamespace(
+    laneLines=[SimpleNamespace(y=[0.0]), SimpleNamespace(y=[-2.3]),
+               SimpleNamespace(y=[1.2]), SimpleNamespace(y=[0.0])],
+    laneLineProbs=[0.0, 1.0, 1.0, 0.0])
+  out = None
+  for _ in range(2000):
+    out = register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
+  built = out - 0.01
+  assert built > 5e-4                      # bias + trim established
+  (data_dir / 'LaneKeepEnable').write_text('0')
+  for _ in range(500):                     # >100 ticks: re-read fires; releases
+    out = register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
+  assert abs(out - 0.01) < 2e-4            # bias gone, trim mostly retired
+  (data_dir / 'LaneKeepEnable').write_text('1')
+  for _ in range(2000):                    # toggling back re-engages
+    out = register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
+  assert out - 0.01 > 5e-4

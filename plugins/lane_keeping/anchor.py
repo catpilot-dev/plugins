@@ -243,11 +243,15 @@ class LaneAnchor:
       self.gap_filt = None
       self.gap_pred_filt = None
       kappa_target = 0.0
-      # No measurement: never integrate blind — leak the trim gently instead
-      # (brief line dropouts keep most of it; long loss decays to exactly 0).
+      # No measurement: never integrate blind. Line DROPOUTS leak gently
+      # (trim_leak — brief dropouts keep most of the trim); a deliberate
+      # user DISABLE (cfg.enable False, e.g. the Driving-panel toggle)
+      # retires it at trim_rate instead (~10 s from full) — prompt but
+      # still bounded and smooth.
       if self.kappa_trim != 0.0:
+        rate = self.cfg.trim_leak if cfg.enable else self.cfg.trim_rate
         self.kappa_trim -= math.copysign(
-          min(self.cfg.trim_leak * DT_CTRL, abs(self.kappa_trim)), self.kappa_trim)
+          min(rate * DT_CTRL, abs(self.kappa_trim)), self.kappa_trim)
     # Speed-dependent trim clamp (review finding): the pursuit term's lateral
     # accel is speed-independent by construction (v² cancels in 2·excess/Lp²·v²)
     # but the trim's is NOT — a flat κ cap would grow as v²·trim_max (0.9 m/s²
