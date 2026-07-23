@@ -59,6 +59,12 @@ class AnchorConfig:
   # tau=0.3s would exceed the reverted 600ms box's 0.275s group delay (route
   # 395: wobbling and lag) -- a first-order tau is NOT comparable to a box
   # window length, so 0.3s was laggier than the mechanism it was meant to match.
+  dc_tau: float = 20.0           # DC-tracker time constant (s) — the forgetting time.
+                                 # The stabilizer concedes any disagreement older than
+                                 # ~this: zero-mean correction by construction, so the
+                                 # 3c1 arm-wrestle (model counter-steers a sustained
+                                 # bias to a stalemate) is structurally impossible.
+  ac_deadband: float = 0.10      # AC excess ignored below this (m) — micro-noise
   prob_on: float = 0.5           # driver-side line confidence to engage.
                                  # 0.6->0.5 (2026-07-23, measured): gap noise in prob
                                  # [0.5,0.6) is 0.047-0.050 m — statistically the same as
@@ -67,22 +73,6 @@ class AnchorConfig:
                                  # quality cliff is real and route-inconsistent (3c0's
                                  # [0.4,0.5): 0.242 m noise, 11% jumps >0.3 m) — do not.
   prob_fade: float = 0.1         # fade width above prob_on
-  # Integral trim (2026-07-23, route 3c0): the pure-pursuit nudge is
-  # proportional to excess, so it droops against a persistent disturbance
-  # (the model shading left on narrow roads): measured 52% of ticks below
-  # band, 90 s episodes with zero recovery, saturation only 13% — classic
-  # P-only steady-state error. The trim is the DC authority P lacks: a slow
-  # SIGNED integrator — accumulates while out-of-band, so an opposite-side
-  # error unwinds it at the same rate it wound (the hold-bias lesson:
-  # anti-windup may block only windup, never unwind; no ratchet possible),
-  # leaks gently to exactly zero while in-band, hard-capped at half the
-  # pursuit cap, authority-scaled, zeroed on lane change.
-  trim_rate: float = 1e-4        # trim slew while out-of-band (1/m per s) — full cap in 10 s
-  trim_max: float = 1e-3         # hard cap (1/m); half of kappa_bias_max
-  trim_leak: float = 2e-5        # in-band decay toward 0 (1/m per s) — 5× slower than rate
-  trim_accel_max: float = 0.3    # lateral-accel bound on the trim: |v²·κ_trim| ≤ this (m/s²);
-                                 # crossover √(0.3/1e-3)≈17.3 m/s — the 3c0 operating point
-                                 # (17.8 m/s) sits just past it, keeping ~95% of the flat cap
   pred_delay_mult: float = 1.5   # prediction horizon = mult × lateral delay
                                  # (sweep 2026-07-23: 1.5 beat trivial on all 3
                                  #  gate routes, +11..32%; 2.0 tie-to-+23; 3.0 worse
@@ -110,7 +100,7 @@ class LaneAnchor:
     self.gap_pred_filt = None
     self.kappa_filt = None
     self.kappa_bias = 0.0
-    self.kappa_trim = 0.0
+    self.gap_dc = None
     self.state = 'model'
 
   def _gap(self, model_v2):
@@ -129,16 +119,16 @@ class LaneAnchor:
     return _clip(kappa, -cfg.kappa_bias_max, cfg.kappa_bias_max)
 
   def _telem(self, prob, line_y, gap, excess, authority, v_ego, kappa_in=0.0, kappa_ref=0.0,
-             x_pred=0.0):
+             x_pred=0.0, gap_dc=0.0, excess_ac=0.0):
     return {
       'prob': float(prob), 'line_y': float(line_y), 'gap': float(gap),
       'gap_filt': float(self.gap_filt) if self.gap_filt is not None else 0.0,
       'excess': float(excess), 'kappa_bias': float(self.kappa_bias),
       'authority': float(authority), 'state': self.state, 'v_ego': float(v_ego),
       'kappa_in': float(kappa_in), 'kappa_ref': float(kappa_ref),
-      'kappa_trim': float(self.kappa_trim),
       'gap_pred': float(self.gap_pred_filt) if self.gap_pred_filt is not None else 0.0,
       'x_pred': float(x_pred),
+      'gap_dc': float(gap_dc), 'excess_ac': float(excess_ac),
     }
 
   def update(self, curvature, model_v2, v_ego, lane_changing, lat_delay=None):
@@ -157,6 +147,7 @@ class LaneAnchor:
       kappa_ref = self.kappa_filt
     prob = line_y = gap = excess = authority = 0.0
     x_pred = 0.0
+    excess_ac = 0.0
     available = (cfg.enable and model_v2 is not None
                  and len(model_v2.laneLineProbs) > self.driver_idx
                  and len(model_v2.laneLines) > self.driver_idx
@@ -213,53 +204,34 @@ class LaneAnchor:
         self.gap_pred_filt = gap_pred
       else:
         self.gap_pred_filt += alpha * (gap_pred - self.gap_pred_filt)
-      # Hard floors: the prediction may DEFER a correction, never MASK one —
-      # on the paint (or drifting far toward the opposite line), correct NOW.
-      if self.gap_filt < cfg.gap_hard_lo or self.gap_filt > cfg.gap_hard_hi:
-        excess = self._excess(self.gap_filt)
-      else:
-        excess = self._excess(self.gap_pred_filt)
       authority = _interp(prob, [cfg.prob_on, cfg.prob_on + cfg.prob_fade], [0.0, 1.0])
       if lane_changing:
         authority = 0.0
+      # DC tracker (Phase 3): adiabatically follow the model's chosen line.
+      # Seeds on the first anchor sample; adapts only while the measurement is
+      # trusted; FROZEN on low authority (dropouts keep the reference); RESET
+      # by a lane change (new lane, new line identity, new DC).
+      if lane_changing:
+        self.gap_dc = None
+      elif self.gap_dc is None:
+        self.gap_dc = self.gap_pred_filt
+      elif authority > 0.0:
+        a_dc = 1.0 - math.exp(-DT_CTRL / cfg.dc_tau)
+        self.gap_dc += a_dc * (self.gap_pred_filt - self.gap_dc)
+      # Decision: hard floors are ABSOLUTE (best-effort at the extremes);
+      # otherwise damp only the AC — the deviation from the tracked line.
+      # Zero-mean by construction: a static scene, at ANY gap, concedes.
+      excess_ac = (self.gap_pred_filt - self.gap_dc) if self.gap_dc is not None else 0.0
+      if self.gap_filt < cfg.gap_hard_lo or self.gap_filt > cfg.gap_hard_hi:
+        excess = self._excess(self.gap_filt)
+      else:
+        excess = excess_ac - _clip(excess_ac, -cfg.ac_deadband, cfg.ac_deadband)
+        excess = _clip(excess, -cfg.excess_max, cfg.excess_max)
       kappa_target = authority * self._pursuit(excess, v_ego)
-      # Integral trim (see trim_* constants): slow signed integration of the
-      # SAME excess the nudge acts on — DC authority against persistent
-      # disturbances the proportional law cannot cancel (route 3c0 droop).
-      # Signed: opposite-side excess unwinds at the same rate (no ratchet).
-      # Authority-scaled so a fading line also fades the accumulation.
-      if excess != 0.0 and authority > 0.0:
-        step = self.cfg.trim_rate * DT_CTRL * authority
-        self.kappa_trim = _clip(self.kappa_trim + math.copysign(step, self.curv_sign * excess),
-                                -self.cfg.trim_max, self.cfg.trim_max)
-      elif self.kappa_trim != 0.0:
-        # In-band, OR visible-but-untrusted line (authority 0 — review
-        # finding): leak. Never freeze DC state without a trusted
-        # measurement, and never snap a stale trim back at full value when
-        # confidence returns.
-        self.kappa_trim -= math.copysign(
-          min(self.cfg.trim_leak * DT_CTRL, abs(self.kappa_trim)), self.kappa_trim)
     else:
       self.gap_filt = None
       self.gap_pred_filt = None
       kappa_target = 0.0
-      # No measurement: never integrate blind. Line DROPOUTS leak gently
-      # (trim_leak — brief dropouts keep most of the trim); a deliberate
-      # user DISABLE (cfg.enable False, e.g. the Driving-panel toggle)
-      # retires it at trim_rate instead (~10 s from full) — prompt but
-      # still bounded and smooth.
-      if self.kappa_trim != 0.0:
-        rate = self.cfg.trim_leak if cfg.enable else self.cfg.trim_rate
-        self.kappa_trim -= math.copysign(
-          min(rate * DT_CTRL, abs(self.kappa_trim)), self.kappa_trim)
-    # Speed-dependent trim clamp (review finding): the pursuit term's lateral
-    # accel is speed-independent by construction (v² cancels in 2·excess/Lp²·v²)
-    # but the trim's is NOT — a flat κ cap would grow as v²·trim_max (0.9 m/s²
-    # at 108 km/h). Bound it explicitly: |v²·κ_trim| ≤ trim_accel_max.
-    # Re-clamped every tick, so accelerating onto a highway sheds excess trim
-    # gently as v rises (v changes slowly; no step).
-    cap_eff = min(cfg.trim_max, cfg.trim_accel_max / max(v_ego * v_ego, 1.0))
-    self.kappa_trim = _clip(self.kappa_trim, -cap_eff, cap_eff)
     # single rate-limit path (also smoothly releases bias to 0 when the line is
     # lost or its confidence fades — no snap on anchor exit).
     max_step = cfg.kappa_rate_max * DT_CTRL
@@ -268,7 +240,8 @@ class LaneAnchor:
     # smooth release) so the anchor never fights the maneuver, per spec §3.4.
     if lane_changing:
       self.kappa_bias = 0.0
-      self.kappa_trim = 0.0
     self.state = 'anchor' if (available and authority > 0.0) else 'model'
-    return kappa_ref + self.kappa_bias + self.kappa_trim, self._telem(prob, line_y, gap, excess, authority, v_ego,
-                                                    curvature, kappa_ref, x_pred=x_pred)
+    return kappa_ref + self.kappa_bias, self._telem(prob, line_y, gap, excess, authority, v_ego,
+                                                    curvature, kappa_ref, x_pred=x_pred,
+                                                    gap_dc=self.gap_dc if self.gap_dc is not None else 0.0,
+                                                    excess_ac=excess_ac)

@@ -105,46 +105,10 @@ def test_update_no_bias_in_band():
   assert abs(out - 0.01) < 1e-6     # curvature unchanged (bias ~0)
 
 
-def test_update_biases_left_when_too_far_from_left_line():
-  a = LaneAnchor(AnchorConfig())
-  # left line at y=-2.3 -> gap 1.39, above band -> steer left (positive bias)
-  out = _settle(a, _mv(left_y=-2.3, right_y=1.2))
-  assert out > 0.01 + 1e-5
-
-
-def test_update_biases_right_when_too_close_to_left_line():
-  a = LaneAnchor(AnchorConfig())
-  # left line at y=-1.3 -> gap 0.39, below band -> steer right (negative bias)
-  out = _settle(a, _mv(left_y=-1.3, right_y=2.2))
-  assert out < 0.01 - 1e-5
-
-
 def test_update_disabled_during_lane_change():
   a = LaneAnchor(AnchorConfig())
   out = _settle(a, _mv(left_y=-2.3, right_y=1.2), lane_changing=True)
   assert abs(out - 0.01) < 1e-6     # authority 0 -> passthrough
-
-
-def test_update_lane_change_hard_zeros_established_bias():
-  # Build up a real bias out-of-band, then a lane change must drop it to exactly
-  # 0 on the FIRST tick (not decay it) so the anchor never fights the maneuver.
-  a = LaneAnchor(AnchorConfig())
-  mv = _mv(left_y=-2.3, right_y=1.2)          # gap 1.39 above band -> steer left
-  _settle(a, mv)                               # establish the bias
-  assert a.kappa_bias > 1e-5                   # bias is genuinely established
-  out, telem = a.update(0.01, mv, 25.0, True)  # now a lane change
-  assert a.kappa_bias == 0.0                   # hard-zeroed immediately, not decaying
-  assert out == 0.01                           # bit-identical passthrough
-  assert telem['state'] == 'model'
-
-
-def test_update_rate_limited():
-  a = LaneAnchor(AnchorConfig(kappa_rate_max=0.002))
-  mv = _mv(left_y=-2.3, right_y=1.2)
-  # first engaged tick can move at most kappa_rate_max*DT_CTRL from 0
-  a.gap_filt = a._gap(mv)           # warm the filter so excess is immediate
-  out, telem = a.update(0.01, mv, 25.0, False)
-  assert abs(telem['kappa_bias']) <= 0.002 * 0.01 + 1e-12
 
 
 def test_smoothing_lags_a_step_then_converges():
@@ -216,34 +180,6 @@ def test_pred_parallel_line_equals_current_gap():
   assert abs(out) < 1e-6                          # no bias, no reference
 
 
-def test_pred_converging_line_nudges_early():
-  # In-band NOW (gap 0.84) but the left line converges: at 30 m the gap is
-  # only 0.34 -> predicted below band -> nudge AWAY from the left line
-  # (steer right = negative curvature) while still in-band.
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  left = [-1.75 + 0.5 * (x / 30.0) for x in _XS]  # -1.75 at car -> -1.25 at 30 m
-  mv = _mv_geo(_XS, left, _flat(1.75))
-  out = None
-  for _ in range(2000):
-    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
-  assert t['gap_pred'] < 0.6                      # predicted out-of-band
-  assert out < -1e-5                              # nudging right (away)
-
-
-def test_pred_recovering_line_no_fight():
-  # Current gap below band (0.5) but diverging: at 30 m the gap is 0.9 ->
-  # predicted in-band -> DO NOT nudge (0.5 is above the 0.3 hard floor).
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  left = [-1.41 - 0.4 * (x / 30.0) for x in _XS]  # gap 0.5 at car -> 0.9 at 30 m
-  mv = _mv_geo(_XS, left, _flat(1.75))
-  out = None
-  for _ in range(2000):
-    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
-  assert t['gap_filt'] < 0.6                      # currently out-of-band
-  assert t['gap_pred'] > 0.6                      # predicted back in-band
-  assert abs(out) < 1e-6                          # holds: no fight with recovery
-
-
 def test_pred_hard_floor_low_overrides_prediction():
   # Wheel 0.2 m from the line: prediction says recovering, but 0.2 < 0.3 hard
   # floor -> correct NOW on the current gap.
@@ -290,21 +226,6 @@ def test_pred_curve_no_phantom_drift():
   assert abs(out - k) < 1e-4                      # reference passes, no nudge
 
 
-def test_pred_plan_drift_toward_line_nudges():
-  # Straight, parallel lines, but the PLAN drifts toward the left line
-  # (plan y -> -0.5 at 30 m): the tracker will follow that plan, so the
-  # predicted gap shrinks (1.25 - 0.91 = 0.34 < 0.6) -> nudge right (negative)
-  # even though the current gap (0.84) is comfortably in-band.
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  plan = [-0.5 * (x / 30.0) for x in _XS]
-  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75), plan_ys=plan)
-  out = None
-  for _ in range(2000):
-    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
-  assert t['gap_pred'] < 0.6
-  assert out < -1e-5
-
-
 def test_pred_missing_plan_falls_back_to_current_gap():
   # Good line geometry but NO position attr -> prediction unavailable ->
   # deadband acts on the current gap (which is in-band here -> no bias).
@@ -323,25 +244,18 @@ def test_pred_missing_plan_falls_back_to_current_gap():
   assert abs(out) < 1e-6                             # current gap in-band -> hold
 
 
-def test_pred_right_driver_converging_nudges_left():
-  # Right-side driver: right line converging -> nudge AWAY from the right
-  # line = steer left = POSITIVE curvature.
-  a = LaneAnchor(AnchorConfig(driver_side='right', pred_delay_mult=2.0))
-  right = [1.75 - 0.5 * (x / 30.0) for x in _XS]
-  mv = _mv_geo(_XS, _flat(-1.75), right)
-  out = None
-  for _ in range(2000):
-    out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
-  assert t['gap_pred'] < 0.6
-  assert out > 1e-5
-
-
 def test_pred_fallback_short_arrays_behaves_like_current_gap():
   # Old-style single-point lane lines (no x attr / 1-point y): prediction
-  # falls back to the current gap — the pre-existing out-of-band behavior.
+  # falls back to the current gap — same fallback wiring as before, but
+  # under the Phase-3 pivot a CONSTANT gap (even out of the old band) is
+  # conceded rather than corrected, so the outcome changes accordingly.
   a = LaneAnchor(AnchorConfig())
-  out = _settle(a, _mv(left_y=-2.3, right_y=1.2))  # gap 1.39, above band
-  assert out > 0.01 + 1e-5                         # still biases (via fallback)
+  mv = _mv(left_y=-2.3, right_y=1.2)  # gap 1.39, constant
+  out = t = None
+  for _ in range(2000):
+    out, t = a.update(0.01, mv, 25.0, False)
+  assert abs(t['gap_pred'] - t['gap_filt']) < 1e-9   # fell back to current gap
+  assert abs(out - 0.01) < 1e-6                       # constant gap -> conceded
 
 
 def test_pred_lat_delay_scales_x_pred():
@@ -373,131 +287,6 @@ def test_lane_change_reseeds_gap_filters():
   assert abs(out) < 1e-6                               # in-band -> no settle-nudge
 
 
-# --- integral trim (2026-07-23: route 3c0 showed P-only droop) ---
-
-def test_trim_accumulates_below_band_correct_direction():
-  # Left driver stuck below band: trim must build NEGATIVE (steer right) at
-  # trim_rate, independent of the (tiny) proportional nudge.
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09))     # gap 0.50, below band
-  for _ in range(500):                             # 5 s (mid-ramp, below the cap)
-    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
-  assert a.kappa_trim < -0.5e-4                    # accumulated rightward
-  expected = -1e-4 * 5.0                           # trim_rate * t (before cap)
-  assert abs(a.kappa_trim - expected) < 2e-5       # ~linear ramp
-
-
-def test_trim_caps():
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09))
-  for _ in range(3000):                            # 30 s >> cap time
-    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
-  assert abs(a.kappa_trim + 1e-3) < 1e-9           # clamped at -trim_max
-
-
-def test_trim_leaks_in_band():
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  a.kappa_trim = -8e-4
-  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # gap 0.84, in-band
-  for _ in range(1000):                            # 10 s of leak
-    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
-  assert -8e-4 < a.kappa_trim < -5e-4              # decaying, slowly (leak << rate)
-  for _ in range(50000):                           # long in-band -> exactly zero
-    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
-  assert a.kappa_trim == 0.0
-
-
-def test_trim_unwinds_on_opposite_error_no_ratchet():
-  # THE hold-bias regression test: an opposite-side error must unwind the
-  # trim at full rate — anti-windup may block only windup, never unwind.
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  below = _mv_geo(_XS, _flat(-1.41), _flat(2.09))  # gap 0.50 -> trim goes negative
-  for _ in range(1000):
-    a.update(0.0, below, 17.0, False, lat_delay=0.6)
-  t_neg = a.kappa_trim
-  assert t_neg < -0.5e-4
-  above = _mv_geo(_XS, _flat(-2.11), _flat(1.39))  # gap 1.20 -> above band
-  for _ in range(1500):                            # unwinds through zero
-    a.update(0.0, above, 17.0, False, lat_delay=0.6)
-  assert a.kappa_trim > 0.0                        # crossed zero: no ratchet
-
-
-def test_trim_zeroed_on_lane_change():
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  a.kappa_trim = -8e-4
-  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))
-  a.update(0.0, mv, 17.0, True, lat_delay=0.6)
-  assert a.kappa_trim == 0.0
-
-
-def test_trim_added_to_output():
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  a.kappa_trim = -6e-4
-  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # in-band: bias ~0
-  out, t = a.update(0.01, mv, 17.0, False, lat_delay=0.6)
-  assert abs(out - (0.01 - 6e-4)) < 2e-5           # kappa_ref + trim (leak negligible)
-  assert abs(t['kappa_trim'] - a.kappa_trim) < 1e-12
-
-
-def test_trim_right_driver_mirror():
-  # Right driver too close to the right line: trim must build POSITIVE (left).
-  a = LaneAnchor(AnchorConfig(driver_side='right', pred_delay_mult=2.0))
-  mv = _mv_geo(_XS, _flat(-2.09), _flat(1.41))     # right gap 0.50, below band
-  for _ in range(1000):
-    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
-  assert a.kappa_trim > 0.5e-4
-
-
-def test_trim_leaks_when_authority_zero():
-  # Review finding: a visible-but-untrusted line (authority 0) must LEAK the
-  # trim like line-loss does — never freeze DC state without a trusted
-  # measurement, and never snap a stale trim back when confidence returns.
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  a.kappa_trim = -8e-4
-  mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09), left_p=0.4)   # below band, prob<prob_on
-  for _ in range(1000):                            # 10 s
-    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
-  assert -7e-4 < a.kappa_trim < -5.5e-4            # leaked ~2e-4, not frozen at -8e-4
-
-
-def test_trim_leaks_when_line_lost():
-  # Review coverage gap: the unavailable-branch leak with a NONZERO trim.
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  a.kappa_trim = -8e-4
-  none_mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
-  for _ in range(1000):                            # 10 s
-    a.update(0.0, none_mv, 17.0, False, lat_delay=0.6)
-  assert -7e-4 < a.kappa_trim < -5.5e-4            # leaking, not frozen/integrating
-
-
-def test_trim_speed_accel_clamp():
-  # Review finding: flat kappa cap means v^2*trim grows quadratically. The
-  # dynamic clamp bounds |v^2 * kappa_trim| <= trim_accel_max (0.3 m/s^2).
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  a.kappa_trim = -1e-3                             # at the flat cap
-  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # in-band
-  a.update(0.0, mv, 30.0, False, lat_delay=0.6)    # highway speed
-  cap = 0.3 / 900.0                                # trim_accel_max / v^2
-  assert abs(a.kappa_trim) <= cap + 1e-9           # clamped immediately
-  # and at the 3c0 operating point (~17.8 m/s) the full flat cap remains usable
-  a2 = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  a2.kappa_trim = -1e-3
-  a2.update(0.0, mv, 17.0, False, lat_delay=0.6)
-  assert abs(a2.kappa_trim) > 0.9e-3               # 0.3/289=1.04e-3 > flat cap
-
-
-def test_disabled_retires_trim_at_trim_rate():
-  # A deliberate disable (cfg.enable False) retires the trim at trim_rate
-  # (~10s from full), not the slow line-dropout leak (~50s).
-  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
-  a.kappa_trim = -8e-4
-  a.cfg.enable = False
-  mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09))     # geometry irrelevant: disabled
-  for _ in range(500):                             # 5 s
-    a.update(0.0, mv, 17.0, False, lat_delay=0.6)
-  assert -3.5e-4 < a.kappa_trim < -2.5e-4          # ~5e-4 retired (rate 1e-4/s)
-
-
 def test_disabled_keeps_smoothing():
   # Disabling the anchor must NOT disable the reference conditioning —
   # a step in kappa_des still comes out smoothed (Phase 2 safety invariant).
@@ -509,3 +298,126 @@ def test_disabled_keeps_smoothing():
   out, t = a.update(0.0, mv, 17.0, False, lat_delay=0.6)   # step down
   assert 0.0 < out < 0.02                          # smoothed, lagging
   assert t['kappa_bias'] == 0.0 and t['state'] == 'model'  # no position correction
+
+
+# --- Phase 3: AC stabilizer (damp the wander, concede the line) ---
+
+def _mv_at(gap):
+  # left-driver scene with the LEFT line placed to give the requested gap
+  y = -(gap + 0.91)
+  return _mv_geo(_XS, _flat(y), _flat(1.75))
+
+
+def _run(a, gap, n, v=17.0, lc=False):
+  out = t = None
+  for _ in range(n):
+    out, t = a.update(0.0, _mv_at(gap), v, lc, lat_delay=0.6)
+  return out, t
+
+
+def test_constant_offset_is_conceded_anywhere():
+  # THE anti-3c1 regression test: a static gap — even far out of the old
+  # band — produces ZERO correction after seeding. The line is the model's.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  for g in (1.39, 0.45, 0.84):
+    a2 = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+    out, t = _run(a2, g, 3000)
+    assert abs(out) < 1e-6, f'gap {g} not conceded'
+    assert abs(t['excess_ac']) < 0.02
+    assert abs(t['gap_dc'] - g) < 0.05          # DC tracked the line
+
+
+def test_drift_is_damped():
+  # A drifting gap (the integrated sub-Hz wander) IS corrected while it
+  # drifts: gap rising = car moving away from the left line (rightward)
+  # -> damp with positive (leftward) curvature.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  _run(a, 0.84, 1000)                            # seed DC at 0.84
+  out = None
+  for i in range(600):                           # 6 s drift at ~0.05 m/s
+    g = 0.84 + 0.05 * (i / 100.0)
+    out, t = a.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+  assert out > 1e-5                              # damping the motion, leftward
+  assert t['excess_ac'] > 0.1                    # beyond the AC deadband
+
+
+def test_step_damped_then_conceded():
+  # A step disturbance is resisted transiently, then forgotten with dc_tau.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0, dc_tau=2.0))   # fast tau for test
+  _run(a, 0.84, 1000)                            # settle
+  out_peak = 0.0
+  for _ in range(300):                           # 3 s after step to gap 1.2
+    out, _t = a.update(0.0, _mv_at(1.2), 17.0, False, lat_delay=0.6)
+    out_peak = max(out_peak, out)
+  assert out_peak > 1e-5                         # transient resistance fired
+  out, t = _run(a, 1.2, 2000)                    # 20 s >> dc_tau -> conceded
+  assert abs(out) < 1e-6
+  assert abs(t['gap_dc'] - 1.2) < 0.05
+
+
+def test_ac_deadband_ignores_micro_noise():
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  _run(a, 0.84, 1000)
+  out = None
+  for i in range(400):                           # ±0.05 m oscillation < deadband 0.10
+    g = 0.84 + 0.05 * (1 if (i // 50) % 2 else -1)
+    out, _t = a.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+  assert abs(out) < 1e-6
+
+
+def test_lane_change_resets_dc_and_concedes_new_lane():
+  # After a lane change the DC re-seeds: the new lane's position — whatever
+  # it is — is immediately the reference. No settle-nudge, no old-lane memory.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  _run(a, 0.84, 1000)
+  a.update(0.0, _mv_at(0.5), 17.0, True, lat_delay=0.6)    # LC tick, new lane geometry
+  assert a.gap_dc is None                        # reset during LC
+  out, t = _run(a, 0.5, 500)                     # post-LC: 0.5 is the new normal
+  assert abs(out) < 1e-6
+  assert abs(t['gap_dc'] - 0.5) < 0.05
+
+
+def test_dc_freezes_when_untrusted():
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  _run(a, 0.84, 1000)
+  dc0 = a.gap_dc
+  mv_low = _mv_geo(_XS, _flat(-1.75), _flat(1.75), left_p=0.3)   # authority 0
+  for _ in range(500):
+    a.update(0.0, mv_low, 17.0, False, lat_delay=0.6)
+  assert a.gap_dc == dc0                         # frozen, not adapted/reset
+  none_mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  for _ in range(500):
+    a.update(0.0, none_mv, 17.0, False, lat_delay=0.6)
+  assert a.gap_dc == dc0                         # dropouts keep the reference
+
+
+def test_hard_floors_still_absolute():
+  # At the extremes the ABSOLUTE band still governs — even though the DC
+  # would concede, a 0.2 m gap keeps a sustained (best-effort) push away.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  out, _t = _run(a, 0.2, 3000)
+  assert out < -1e-5                             # steering right, sustained
+  a2 = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  out, _t = _run(a2, 1.6, 3000)
+  assert out > 1e-5                              # ceiling: steering left
+
+
+def test_lane_change_hard_zeros_bias_built_from_drift():
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  _run(a, 0.84, 1000)
+  for i in range(600):                           # build bias from a drift
+    a.update(0.0, _mv_at(0.84 + 0.05 * (i / 100.0)), 17.0, False, lat_delay=0.6)
+  assert a.kappa_bias > 1e-5
+  out, t = a.update(0.01, _mv_at(1.14), 17.0, True, lat_delay=0.6)
+  assert a.kappa_bias == 0.0                     # hard-zeroed on the LC tick
+  assert out == 0.01                             # bit-identical passthrough
+  assert t['state'] == 'model'
+
+
+def test_rate_limited_on_step():
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0, kappa_rate_max=0.002))
+  _run(a, 0.84, 1000)
+  a.gap_filt = 1.3                               # warm the filters into a step
+  a.gap_pred_filt = 1.3
+  _o, t = a.update(0.0, _mv_at(1.3), 17.0, False, lat_delay=0.6)
+  assert abs(t['kappa_bias']) <= 0.002 * 0.01 + 1e-12
