@@ -118,3 +118,10 @@ def test_hook_passes_lat_delay_through(data_dir, monkeypatch):
   mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
   register.on_curvature_correction(0.0, mv, 25.0, False, lat_delay=0.55)
   assert seen['lat_delay'] == 0.55
+
+
+def test_load_config_trim_params(data_dir):
+  cfg = register._load_config()
+  assert cfg.trim_rate == 1e-4 and cfg.trim_max == 1e-3 and cfg.trim_leak == 2e-5
+  (data_dir / 'LaneKeepTrimMax').write_text('0.0015')
+  assert register._load_config().trim_max == 0.0015

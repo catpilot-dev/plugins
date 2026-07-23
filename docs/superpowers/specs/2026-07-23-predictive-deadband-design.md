@@ -147,3 +147,38 @@ is the attribution mitigation for the single combined deploy.
 - No multi-hypothesis prediction. (~~No use of the model's planned lateral
   path~~ — REVERSED 2026-07-23 with gate evidence, see §2: the plan IS the
   path source now; the κ-extrapolation it replaced was the noisier option.)
+
+## 7. Integral trim (added 2026-07-23 after route 3c0 — user: "the correction is too weak")
+
+First on-car data measured classic P-only droop: the pure-pursuit nudge is
+proportional to excess, so near the band edge it is tiny and equilibrates
+against a persistent disturbance (the model shading left on narrow roads) —
+gap below band 52% of ticks, episodes to 90 s with zero recovery, saturation
+only 13%. A proportional outer loop cannot cancel a DC disturbance.
+
+**`kappa_trim`** — a slow, bounded, signed integrator supplying the missing DC
+authority, added to the output alongside the nudge:
+
+```
+out-of-band:  kappa_trim += trim_rate·DT·authority, toward curv_sign·excess
+              (SIGNED: an opposite-side excess unwinds at the same rate —
+               the hold-bias lesson: block only windup, never unwind)
+in-band:      kappa_trim leaks to exactly 0 at trim_leak (5× slower)
+line lost:    leak only — never integrate blind
+lane change:  hard-zero (with the bias)
+cap:          ±trim_max
+```
+
+| param | default | meaning |
+|---|---|---|
+| `LaneKeepTrimRate` | 1e-4 /m/s | out-of-band slew — full cap in 10 s |
+| `LaneKeepTrimMax` | 1e-3 /m | hard cap; half the pursuit cap |
+| `LaneKeepTrimLeak` | 2e-5 /m/s | in-band decay |
+
+Telemetry gains `kappa_trim`. **Validation limits:** replay verifies the trim's
+mechanics on the 3c0 telemetry (direction, ramp rate, cap, no oscillation);
+the closed-loop displacement it wins back CANNOT be measured offline — the
+disturbance response involves the model re-planning against the car's actual
+position. The next drive is the gate: gap in-band % and left-touch % on
+3c0-like roads. Curve-cutting (route 3c0's second finding) is deliberately
+NOT addressed here — one change at a time; re-measure curves after the DC fix.

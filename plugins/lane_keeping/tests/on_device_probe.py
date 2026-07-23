@@ -153,5 +153,21 @@ check('filters re-seed during LC; first post-LC tick clean',
       ok_lc and abs(t['gap_filt'] - 0.84) < 1e-6 and abs(out) < 1e-6,
       f"gf={t['gap_filt']:.3f} out={out:.6f}")
 
+
+print('probe 11: integral trim (DC authority; hold-bias no-ratchet lesson)')
+a = LaneAnchor(AnchorConfig())
+below = mv_geo(flat(-1.41), flat(2.09))            # gap 0.50, below band
+for _ in range(1000):
+  a.update(0.0, below, 25.0, False, lat_delay=0.6)
+ok_dir = a.kappa_trim < -0.5e-4                    # builds rightward (negative)
+above = mv_geo(flat(-2.11), flat(1.39))            # gap 1.20, above band
+for _ in range(1500):
+  a.update(0.0, above, 25.0, False, lat_delay=0.6)
+ok_unwind = a.kappa_trim > 0.0                     # unwound through zero: no ratchet
+a.update(0.0, above, 25.0, True, lat_delay=0.6)
+check('trim builds, unwinds on opposite error, zeroed on lane change',
+      ok_dir and ok_unwind and a.kappa_trim == 0.0,
+      f"trim_after_lc={a.kappa_trim}")
+
 print(f'\n{PASS} passed, {FAIL} failed')
 sys.exit(1 if FAIL else 0)

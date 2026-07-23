@@ -61,6 +61,19 @@ class AnchorConfig:
   # window length, so 0.3s was laggier than the mechanism it was meant to match.
   prob_on: float = 0.6           # driver-side line confidence to engage
   prob_fade: float = 0.1         # fade width above prob_on
+  # Integral trim (2026-07-23, route 3c0): the pure-pursuit nudge is
+  # proportional to excess, so it droops against a persistent disturbance
+  # (the model shading left on narrow roads): measured 52% of ticks below
+  # band, 90 s episodes with zero recovery, saturation only 13% — classic
+  # P-only steady-state error. The trim is the DC authority P lacks: a slow
+  # SIGNED integrator — accumulates while out-of-band, so an opposite-side
+  # error unwinds it at the same rate it wound (the hold-bias lesson:
+  # anti-windup may block only windup, never unwind; no ratchet possible),
+  # leaks gently to exactly zero while in-band, hard-capped at half the
+  # pursuit cap, authority-scaled, zeroed on lane change.
+  trim_rate: float = 1e-4        # trim slew while out-of-band (1/m per s) — full cap in 10 s
+  trim_max: float = 1e-3         # hard cap (1/m); half of kappa_bias_max
+  trim_leak: float = 2e-5        # in-band decay toward 0 (1/m per s) — 5× slower than rate
   pred_delay_mult: float = 1.5   # prediction horizon = mult × lateral delay
                                  # (sweep 2026-07-23: 1.5 beat trivial on all 3
                                  #  gate routes, +11..32%; 2.0 tie-to-+23; 3.0 worse
@@ -88,6 +101,7 @@ class LaneAnchor:
     self.gap_pred_filt = None
     self.kappa_filt = None
     self.kappa_bias = 0.0
+    self.kappa_trim = 0.0
     self.state = 'model'
 
   def _gap(self, model_v2):
@@ -113,6 +127,7 @@ class LaneAnchor:
       'excess': float(excess), 'kappa_bias': float(self.kappa_bias),
       'authority': float(authority), 'state': self.state, 'v_ego': float(v_ego),
       'kappa_in': float(kappa_in), 'kappa_ref': float(kappa_ref),
+      'kappa_trim': float(self.kappa_trim),
       'gap_pred': float(self.gap_pred_filt) if self.gap_pred_filt is not None else 0.0,
       'x_pred': float(x_pred),
     }
@@ -199,10 +214,27 @@ class LaneAnchor:
       if lane_changing:
         authority = 0.0
       kappa_target = authority * self._pursuit(excess, v_ego)
+      # Integral trim (see trim_* constants): slow signed integration of the
+      # SAME excess the nudge acts on — DC authority against persistent
+      # disturbances the proportional law cannot cancel (route 3c0 droop).
+      # Signed: opposite-side excess unwinds at the same rate (no ratchet).
+      # Authority-scaled so a fading line also fades the accumulation.
+      if excess != 0.0:
+        step = self.cfg.trim_rate * DT_CTRL * authority
+        self.kappa_trim = _clip(self.kappa_trim + math.copysign(step, self.curv_sign * excess),
+                                -self.cfg.trim_max, self.cfg.trim_max)
+      elif self.kappa_trim != 0.0:
+        self.kappa_trim -= math.copysign(
+          min(self.cfg.trim_leak * DT_CTRL, abs(self.kappa_trim)), self.kappa_trim)
     else:
       self.gap_filt = None
       self.gap_pred_filt = None
       kappa_target = 0.0
+      # No measurement: never integrate blind — leak the trim gently instead
+      # (brief line dropouts keep most of it; long loss decays to exactly 0).
+      if self.kappa_trim != 0.0:
+        self.kappa_trim -= math.copysign(
+          min(self.cfg.trim_leak * DT_CTRL, abs(self.kappa_trim)), self.kappa_trim)
     # single rate-limit path (also smoothly releases bias to 0 when the line is
     # lost or its confidence fades — no snap on anchor exit).
     max_step = cfg.kappa_rate_max * DT_CTRL
@@ -211,6 +243,7 @@ class LaneAnchor:
     # smooth release) so the anchor never fights the maneuver, per spec §3.4.
     if lane_changing:
       self.kappa_bias = 0.0
+      self.kappa_trim = 0.0
     self.state = 'anchor' if (available and authority > 0.0) else 'model'
-    return kappa_ref + self.kappa_bias, self._telem(prob, line_y, gap, excess, authority, v_ego,
+    return kappa_ref + self.kappa_bias + self.kappa_trim, self._telem(prob, line_y, gap, excess, authority, v_ego,
                                                     curvature, kappa_ref, x_pred=x_pred)

@@ -371,3 +371,78 @@ def test_lane_change_reseeds_gap_filters():
   out, t = a.update(0.0, mv_new, 25.0, False, lat_delay=0.6)  # first tick after
   assert abs(t['gap_filt'] - 0.84) < 1e-6              # no stale state carried over
   assert abs(out) < 1e-6                               # in-band -> no settle-nudge
+
+
+# --- integral trim (2026-07-23: route 3c0 showed P-only droop) ---
+
+def test_trim_accumulates_below_band_correct_direction():
+  # Left driver stuck below band: trim must build NEGATIVE (steer right) at
+  # trim_rate, independent of the (tiny) proportional nudge.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09))     # gap 0.50, below band
+  for _ in range(1000):                            # 10 s
+    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert a.kappa_trim < -0.5e-4                    # accumulated rightward
+  expected = -1e-4 * 10.0                          # trim_rate * t (before cap)
+  assert abs(a.kappa_trim - expected) < 2e-5       # ~linear ramp
+
+
+def test_trim_caps():
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  mv = _mv_geo(_XS, _flat(-1.41), _flat(2.09))
+  for _ in range(3000):                            # 30 s >> cap time
+    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert abs(a.kappa_trim + 1e-3) < 1e-9           # clamped at -trim_max
+
+
+def test_trim_leaks_in_band():
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a.kappa_trim = -8e-4
+  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # gap 0.84, in-band
+  for _ in range(1000):                            # 10 s of leak
+    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert -8e-4 < a.kappa_trim < -5e-4              # decaying, slowly (leak << rate)
+  for _ in range(50000):                           # long in-band -> exactly zero
+    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert a.kappa_trim == 0.0
+
+
+def test_trim_unwinds_on_opposite_error_no_ratchet():
+  # THE hold-bias regression test: an opposite-side error must unwind the
+  # trim at full rate — anti-windup may block only windup, never unwind.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  below = _mv_geo(_XS, _flat(-1.41), _flat(2.09))  # gap 0.50 -> trim goes negative
+  for _ in range(1000):
+    a.update(0.0, below, 25.0, False, lat_delay=0.6)
+  t_neg = a.kappa_trim
+  assert t_neg < -0.5e-4
+  above = _mv_geo(_XS, _flat(-2.11), _flat(1.39))  # gap 1.20 -> above band
+  for _ in range(1500):                            # unwinds through zero
+    a.update(0.0, above, 25.0, False, lat_delay=0.6)
+  assert a.kappa_trim > 0.0                        # crossed zero: no ratchet
+
+
+def test_trim_zeroed_on_lane_change():
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a.kappa_trim = -8e-4
+  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))
+  a.update(0.0, mv, 25.0, True, lat_delay=0.6)
+  assert a.kappa_trim == 0.0
+
+
+def test_trim_added_to_output():
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+  a.kappa_trim = -6e-4
+  mv = _mv_geo(_XS, _flat(-1.75), _flat(1.75))     # in-band: bias ~0
+  out, t = a.update(0.01, mv, 25.0, False, lat_delay=0.6)
+  assert abs(out - (0.01 - 6e-4)) < 2e-5           # kappa_ref + trim (leak negligible)
+  assert abs(t['kappa_trim'] - a.kappa_trim) < 1e-12
+
+
+def test_trim_right_driver_mirror():
+  # Right driver too close to the right line: trim must build POSITIVE (left).
+  a = LaneAnchor(AnchorConfig(driver_side='right', pred_delay_mult=2.0))
+  mv = _mv_geo(_XS, _flat(-2.09), _flat(1.41))     # right gap 0.50, below band
+  for _ in range(1000):
+    a.update(0.0, mv, 25.0, False, lat_delay=0.6)
+  assert a.kappa_trim > 0.5e-4
