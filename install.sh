@@ -339,6 +339,16 @@ fi
 if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
   touch "$PLUGINS_DEST/c3_compat/.enforced"
 fi
+# lane_keeping is coupled to the Phase-2 BMW lateral controller: the tracker
+# needs its smoothed reference unconditionally, so removing the plugin from
+# the hook (.disabled) is the documented-unsafe rollback. Enforced always-on;
+# the ONLY user control is the Driving-panel "Lane Keeping" toggle, which
+# gates the position anchor while the conditioning keeps running. Clear any
+# stale .disabled — the registry loader honors it even when enforced.
+if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
+  touch "$PLUGINS_DEST/lane_keeping/.enforced"
+  rm -f "$PLUGINS_DEST/lane_keeping/.disabled"
+fi
 # mapd v2.0.6 uses slotless carState subscription (gomsgq) which causes
 # msgq ring buffer corruption on C3's USB panda. Not enforced until fixed.
 # if [[ -d "$PLUGINS_DEST/mapd" ]]; then
