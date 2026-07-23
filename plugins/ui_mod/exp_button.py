@@ -3,7 +3,7 @@
 Replaces stock steering wheel / atomic icons with the vehicle brand emblem.
   - Normal: white icon on dark background
   - Experimental: color emblem on dark background
-  - Lane centering active: green ring around the button
+  - Lane keeping working (anchor engaged): green ring around the button
 """
 import os
 import time
@@ -19,7 +19,7 @@ EMBLEMS_DIR = os.path.join(PLUGINS_REPO_DIR, 'logos', 'emblems')
 
 # Colors
 BG_COLOR = rl.Color(0, 0, 0, 77)               # 30% opacity black
-RING_LANE_CENTERING = rl.Color(76, 175, 80, 255)  # green
+RING_LANE_KEEPING = rl.Color(76, 175, 80, 255)  # green
 RING_WIDTH = 12.0
 
 
@@ -40,7 +40,7 @@ class ExpButton(Widget):
     self._txt_icon: rl.Texture | None = None      # white-on-transparent
     self._txt_emblem: rl.Texture | None = None     # color emblem
     self._textures_loaded: bool = False
-    self._lane_centering_active: bool = False
+    self._lane_keeping_active: bool = False
     self._lcc_sub = None
     self._rect = rl.Rectangle(0, 0, button_size, button_size)
 
@@ -93,28 +93,31 @@ class ExpButton(Widget):
     if not self._textures_loaded:
       self._load_textures()
 
-    # Check lane centering state via plugin bus (live) or pluginBusLog cereal (replay)
+    # Check lane keeping state via plugin bus (live) or pluginBusLog cereal
+    # (replay). The lane_keeping plugin publishes its full telemetry at the
+    # hook rate; state == 'anchor' means the driver-side line is trusted and
+    # the position loop is live — "lane keeping is working".
     try:
       if self._lcc_sub is None:
         from openpilot.selfdrive.plugins.plugin_bus import PluginSub
-        self._lcc_sub = PluginSub(['lane_centering_state'])
+        self._lcc_sub = PluginSub(['lane_keeping'])
       msg = self._lcc_sub.drain()
       if msg is not None:
         _, data = msg
-        self._lane_centering_active = data.get('active', False)
+        self._lane_keeping_active = data.get('state') == 'anchor'
     except Exception:
       pass
 
     # Fallback: read from pluginBusLog (replayed from rlog)
-    if not self._lane_centering_active:
+    if not self._lane_keeping_active:
       try:
         sm = ui_state.sm
         if sm.updated.get('pluginBusLog', False):
           for entry in sm['pluginBusLog'].entries:
-            if entry.topic == 'lane_centering_state':
+            if entry.topic == 'lane_keeping':
               import json
               data = json.loads(entry.json)
-              self._lane_centering_active = data.get('active', False)
+              self._lane_keeping_active = data.get('state') == 'anchor'
       except Exception:
         pass
 
@@ -137,9 +140,9 @@ class ExpButton(Widget):
     # Dark background always
     rl.draw_circle(center_x, center_y, radius, BG_COLOR)
 
-    # Green ring when lane centering active and openpilot engaged
-    if self._lane_centering_active and ui_state.sm["selfdriveState"].enabled:
-      rl.draw_ring(rl.Vector2(center_x, center_y), radius - RING_WIDTH, radius, 0, 360, 36, RING_LANE_CENTERING)
+    # Green ring when lane keeping is working and openpilot engaged
+    if self._lane_keeping_active and ui_state.sm["selfdriveState"].enabled:
+      rl.draw_ring(rl.Vector2(center_x, center_y), radius - RING_WIDTH, radius, 0, 360, 36, RING_LANE_KEEPING)
 
     # Experimental mode: color emblem; normal mode: white icon
     alpha = 180 if self.is_pressed or not self._engageable else 255
