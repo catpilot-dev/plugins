@@ -59,7 +59,13 @@ class AnchorConfig:
   # tau=0.3s would exceed the reverted 600ms box's 0.275s group delay (route
   # 395: wobbling and lag) -- a first-order tau is NOT comparable to a box
   # window length, so 0.3s was laggier than the mechanism it was meant to match.
-  prob_on: float = 0.6           # driver-side line confidence to engage
+  prob_on: float = 0.5           # driver-side line confidence to engage.
+                                 # 0.6->0.5 (2026-07-23, measured): gap noise in prob
+                                 # [0.5,0.6) is 0.047-0.050 m — statistically the same as
+                                 # the trusted [0.6,0.8) band (0.034-0.061); gains 4-7%
+                                 # anchor time on worn-marking roads. Below 0.5 the
+                                 # quality cliff is real and route-inconsistent (3c0's
+                                 # [0.4,0.5): 0.242 m noise, 11% jumps >0.3 m) — do not.
   prob_fade: float = 0.1         # fade width above prob_on
   # Integral trim (2026-07-23, route 3c0): the pure-pursuit nudge is
   # proportional to excess, so it droops against a persistent disturbance
