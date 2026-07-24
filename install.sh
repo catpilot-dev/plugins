@@ -227,6 +227,9 @@ install_plugins() {
       rm -rf "$dest"
       cp -r "$plugin_dir" "$dest"
       if $had_data; then
+        # The repo copy may ship a data/ skeleton (e.g. lane_keeping); the
+        # preserved params must replace it, not nest inside it.
+        rm -rf "$dest/data"
         mv "/tmp/_plugin_data_$$" "$dest/data"
       fi
       if $was_disabled; then
