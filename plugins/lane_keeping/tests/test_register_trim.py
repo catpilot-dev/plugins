@@ -89,6 +89,17 @@ def test_load_trim_config_overrides(data_dir):
   assert cfg.gap_lo == 0.5 and cfg.gap_hi == 1.2
 
 
+def test_clamp_deg_default_matches_trim_config_max_deg():
+  # Guards silent drift of the hand-kept _CLAMP_DEG_DEFAULT constant (the
+  # modeld-side reader deliberately does NOT import calib_trim.py — see
+  # register.py's comment above _CLAMP_DEG_DEFAULT) against TrimConfig's real
+  # default. Import TrimConfig here, in the test, by the same explicit-path
+  # pattern as everything else in this file — the reader path itself must
+  # stay import-free.
+  calib_trim = _load('calib_trim', 'lk_calib_trim_clamp_check')
+  assert register._CLAMP_DEG_DEFAULT == calib_trim.TrimConfig().max_deg
+
+
 # --------------------------------------------------------------------------
 # Writer
 # --------------------------------------------------------------------------
