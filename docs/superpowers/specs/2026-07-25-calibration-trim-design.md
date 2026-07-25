@@ -69,8 +69,11 @@ lane_keeping plugin (modeld process, via hook)
   all anchor gating). modeld only APPLIES a number.
 - Transport is the plugin's own data dir (atomic rename), consistent with
   the framework's param convention. File persists across reboots — δ is
-  quasi-static compensation and SHOULD survive a restart; the in-band
-  decay rule (§5) retires stale compensation within ~1 min of driving.
+  quasi-static compensation and SHOULD survive a restart: the trim law
+  SEEDS delta_deg from the clamped file value at construction, so the
+  controls law, the file, and modeld agree at startup with no step; the
+  in-band decay rule (§5) retires stale compensation within ~1 min of
+  driving.
 - Both call sites live in `modeld.py` only (the de-bias is applied to
   `posenet_send` after `fill_pose_msg`, before `pm.send`). No change to
   `fill_model_msg.py` or calibrationd.
@@ -94,13 +97,18 @@ if yaw_bias_deg != 0.0:
   c, s = np.cos(b), np.sin(b)
   for vec in (posenet_send.cameraOdometry.trans, posenet_send.cameraOdometry.rot):
     x, y = vec[0], vec[1]
-    vec[0] = c * x + s * y      # R_z(-b): undo the frame rotation the
-    vec[1] = -s * x + c * y     # biased warp induced in the pose head
+    vec[0] = c * x - s * y      # R_z(+b): undo the frame rotation the
+    vec[1] = s * x + c * y      # biased warp induced in the pose head
 ```
 
 De-bias sign contract: the warp was biased by +b about device z; the pose
-head then reports vectors in a frame rotated by +b relative to true device;
-rotating the reported vectors by R_z(−b) restores the true frame. The
+head then reports vectors with components `reported = R_z(b)^T @ true`
+(frame rotated by +b); restoring truth is `true = R_z(+b) @ reported`.
+Worked observable: straight driving, true trans [v,0,0] → biased report
+v·[cos b, −sin b] → calibrationd yaw observation −b (the arms race);
+after R_z(+b): [v,0] → observation 0. Pinned by
+selfdrive/modeld/tests/test_calib_bias.py including
+test_calibrationd_yaw_observation_blind_to_bias. The
 IMPLEMENTATION must carry this derivation as a comment, and the on-car
 blindness gate (§8) is the empirical check: during a fixed-δ drive,
 `liveCalibration.rpyCalib` must not drift by more than 0.05° beyond its
