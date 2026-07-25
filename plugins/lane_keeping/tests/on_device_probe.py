@@ -238,7 +238,7 @@ finally:
 print('probe 24: trim law mode-1 (0.3 deg, 2000 ticks) — monotone, slew-capped, converges')
 trim24 = CalibTrim(TrimConfig(mode=1, fixed_deg=0.3))
 prev24, monotone24, step_ok24, d24 = 0.0, True, True, 0.0
-step_cap = 0.02 * calib_trim.DT_CTRL + 1e-9   # default slew_deg_s * DT_CTRL, with float slack
+step_cap = trim24.cfg.slew_deg_s * calib_trim.DT_CTRL + 1e-9   # default slew_deg_s * DT_CTRL, with float slack
 for _ in range(2000):
   d24, _t24 = trim24.update(0.8, 1.0, False, 15.0, True)
   if d24 < prev24 - 1e-12:
