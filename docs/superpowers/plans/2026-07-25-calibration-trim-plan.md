@@ -343,7 +343,7 @@ class CalibTrim:
 - [ ] Steps: failing tests → implement → pass → commit `lane_keeping: trim wiring (writer + modeld.calib_bias reader)`. Requirements the tests must pin:
   1. `_load_trim_config()` reads all §5 params with `fget`/int casts, defaults from `TrimConfig()`.
   2. In `on_curvature_correction`: after anchor update, `_trim.update(telem.get('gap_dc'), telem.get('authority', 0.0), lane_changing, v_ego, cfg.enable)`; every 100 ticks write via `_write_yaw_file(delta)`: `tmp = path + '.tmp'`; write `f"{delta:.3f}"`; `os.replace(tmp, path)`; skip when `round(delta,3)` unchanged. Trim exceptions swallowed like telemetry (`try/except` — trim must never break the control path).
-  3. `on_calib_bias(default)`: module-level cache `{val, calls}`; re-read file every 100 calls; missing/invalid → 0.0; clamp to ±TrimConfig().max_deg read at import-default (no config load in this path); registered in `register()` under `modeld.calib_bias`.
+  3. `on_calib_bias(default)`: module-level cache `{val, calls}`; re-read file every 100 calls; missing/invalid → 0.0; clamp to a module-level constant `_CLAMP_DEG_DEFAULT = 0.8` (mirrors TrimConfig.max_deg — NO trim-module import in this path, per spec §6); registered declaratively in plugin.json under `modeld.calib_bias`.
   4. Test: writer atomicity (no partial file mid-write — assert tmp never left behind), round-trip float, reader cache refresh at call 100, reader 0.0 on garbage file, reader clamp, and `authority` key present in anchor telemetry (import anchor by path, run one update, assert key).
 
 ### Task 4: probes, docs, ledger
