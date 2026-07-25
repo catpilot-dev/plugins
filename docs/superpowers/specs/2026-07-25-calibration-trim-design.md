@@ -198,9 +198,23 @@ raise the slew to chase episodes.
   estimate the TRUE mounting; stored calibration is never polluted. This
   is mandatory — without it calibrationd cancels δ at its own filter
   timescale and the integrator escalates against it.
-- **Our feedback measurement stays valid.** The anchor's gap is measured
-  at x=0, where a yaw rotation shifts nothing (δ·0). The slow loop closes
-  on an (approximately) unbiased measurement.
+- **Our feedback measurement stays valid — the un-trimmed gap remains the
+  reference** (user requirement, 2026-07-25). Two mechanisms, both free:
+  (a) the hard-floor gap is measured at x=0, the rotation center — a yaw
+  rotation shifts points by δ·x, i.e. nothing at x=0 (second order
+  ≈ 0.1 mm at 0.8°); (b) gap_pred is `line − plan` at x_pred, and both
+  terms live in the same biased frame and shift by the same δ·x_pred, so
+  the DIFFERENCE is exactly bias-invariant. To first order the loop
+  therefore closes on the true, un-trimmed lane distance already.
+  RESIDUAL RISK: the model is a neural net, not a geometric projector —
+  its near-field line regression under a rotated warp may deviate from
+  pure geometry by some unknown fraction of δ. Since δ is commanded and
+  known, this contamination is measurable (§8 step-response separation)
+  and, if the ID drive shows it exceeds 0.05 m at 0.3°, correctable by
+  subtracting the fitted contamination gain `c·δ` from the measured gaps
+  in anchor.py (add only if measured — YAGNI until the data says so).
+  δ (`trim_delta_deg`) is published in the plugin telemetry so every
+  future log can separate commanded bias from measured gap offline.
 - **Fail-safe chain.** Plugin exception → hooks.run returns 0.0 → both
   call sites no-op. File missing → 0.0. Law crash → hook exception →
   0.0. modeld never sees a step: writer slews, reader clamps.
@@ -236,6 +250,15 @@ Identification drive (mode 1) — AFTER the lane-keeping-OFF baseline drive:
    yields `CalibTrimYawSign` and gain (m/deg). Blindness gate:
    `liveCalibration.rpyCalib` yaw drift ≤ 0.05° beyond baseline drift.
    κ_des/steering churn unchanged (the model should not "notice").
+   MEASUREMENT-CONTAMINATION separation (un-trimmed-reference gate): at
+   the mode-1 engage point δ ramps over ~15 s while the vehicle responds
+   over its own dynamics; regress measured gap (x=0) and gap_pred against
+   δ(t) during the ramp vs the settled plateau. An instantaneous
+   gap-vs-δ component (present during ramp before the car has moved,
+   slope c m/deg) is measurement contamination; the settled remainder is
+   real repositioning. Gate for mode 2: |c|·0.8° ≤ 0.05 m, else add the
+   `c·δ` subtraction to anchor.py (§7) and re-verify before closing the
+   loop.
 3. Repeat with −0.3° if sign ambiguous.
 Mode 2 is GATED on: blindness gate passed, sign measured, gain in a sane
 range (0.1–1.0 m/deg — outside that, the mechanism doesn't work as
