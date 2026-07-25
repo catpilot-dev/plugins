@@ -263,3 +263,22 @@ def test_calib_bias_reader_path_does_not_import_trim_module(data_dir, monkeypatc
   monkeypatch.setattr(register, '_trim_module', _boom)
   (data_dir / 'CalibTrimYawDeg').write_text('5.0')
   assert register.on_calib_bias(0.0) == pytest.approx(0.8)
+
+
+# --------------------------------------------------------------------------
+# Construction-time seeding wiring (spec section 3): the hook must seed a
+# freshly-constructed trim from the persisted yaw file so controls, file,
+# and modeld agree at startup with no step.
+# --------------------------------------------------------------------------
+
+def test_hook_seeds_fresh_trim_from_persisted_yaw_file(data_dir, monkeypatch):
+  (data_dir / 'CalibTrimYawDeg').write_text('0.300')
+  captured = []
+  monkeypatch.setattr(register, '_publish', lambda telem: captured.append(dict(telem)))
+  assert register._trim is None                          # fresh construction about to happen
+  register.on_curvature_correction(0.0, _mv_at(0.84), 25.0, False, lat_delay=0.45)
+  # first published value must reflect the seed, not a reset to 0 (mode 0
+  # default then decays over subsequent ticks — assert the FIRST value only;
+  # one hook call = one slew step of 0.02 deg/s * 0.01 s = 0.0002 deg off
+  # the raw 0.3 seed, hence the loose tolerance).
+  assert captured[0]['trim_delta_deg'] == pytest.approx(0.3, abs=1e-3)

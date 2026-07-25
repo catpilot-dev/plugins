@@ -36,6 +36,14 @@ All transitions are rate-limited by `CalibTrimSlewDegS` (0.02°/s default —
 (pure float file read, clamped to a hand-kept default independent of
 `calib_trim.py`).
 
+Trim params (`CalibTrim*`) are read at process start (`_load_trim_config`
+runs once, on first `on_curvature_correction` call, when `_trim` is
+lazily constructed) — changing them requires an offroad restart to take
+effect. `LaneKeepEnable=0` (the Driving-panel toggle) is the one LIVE
+off-switch: it is re-read every ~1 s and retires an active trim by
+slewing `delta` to zero within ~40 s (0.8° max / 0.02°/s), same as any
+other disable.
+
 Design spec: `docs/superpowers/specs/2026-07-25-calibration-trim-design.md`.
 Deployment (identification drive, mode 2 enable) is gated on explicit user
 go per spec §9 — implementing and testing this does not deploy it.

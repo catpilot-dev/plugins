@@ -213,7 +213,11 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
   try:
     if _trim is None:
       CalibTrim = _trim_module().CalibTrim
-      _trim = CalibTrim(_load_trim_config())
+      # Seed from the persisted file (spec section 3: controls law, file,
+      # and modeld agree at startup with no step). _read_yaw_deg() already
+      # handles missing/garbage/nonfinite -> 0.0 and clamps — safe to call
+      # here in the controls process.
+      _trim = CalibTrim(_load_trim_config(), initial_deg=_read_yaw_deg())
     delta_deg, ttelem = _trim.update(
       _anchor.gap_dc, telem.get('authority', 0.0),
       lane_changing, v_ego, _anchor.cfg.enable)

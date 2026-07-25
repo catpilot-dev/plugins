@@ -6,6 +6,7 @@ state; every transition is slew-limited; the value is written to
 data/CalibTrimYawDeg by register.py and applied inside modeld via the
 modeld.calib_bias hook.
 """
+import math
 from dataclasses import dataclass
 
 DT_CTRL = 0.01
@@ -30,9 +31,16 @@ class TrimConfig:
 
 
 class CalibTrim:
-  def __init__(self, cfg: TrimConfig):
+  def __init__(self, cfg: TrimConfig, initial_deg: float = 0.0):
+    # Seed delta_deg from the (already clamped-on-disk) persisted file value
+    # so the controls law, the file, and modeld agree at startup with no
+    # step (spec section 3). A nonfinite seed (shouldn't happen — the file
+    # reader clamps — but defend anyway) collapses to 0.0 rather than
+    # propagating nan/inf into the slew-limited state.
+    if not math.isfinite(initial_deg):
+      initial_deg = 0.0
     self.cfg = cfg
-    self.delta_deg = 0.0
+    self.delta_deg = _clip(initial_deg, -cfg.max_deg, cfg.max_deg)
     self._in_band_ticks = 0
 
   def _slew_toward(self, target, rate):

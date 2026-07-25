@@ -139,3 +139,28 @@ def test_mode2_none_gap_dc_holds():
   d, t = _run(trim, 100 * 10, gap_dc=None)
   assert d == d0                                          # held exactly, no crash
   assert not t['integrating']
+
+
+# --------------------------------------------------------------------------
+# Construction-time seeding (spec section 3): delta_deg starts from the
+# clamped persisted file value, not always 0 — controls law, file, and
+# modeld must agree at startup with no step.
+# --------------------------------------------------------------------------
+
+def test_seed_sets_delta_immediately_and_mode0_slews_down_from_it():
+  trim = ct.CalibTrim(ct.TrimConfig(mode=0), initial_deg=0.3)
+  assert trim.delta_deg == pytest.approx(0.3)             # seeded immediately, no step
+  d1, _ = trim.update(0.8, 1.0, False, 15.0, True)         # mode 0: slews toward 0
+  assert d1 < 0.3                                          # slewing DOWN from 0.3, not a reset
+  assert d1 == pytest.approx(0.3 - 0.02 * ct.DT_CTRL, abs=1e-9)
+
+
+def test_seed_clamps_to_max_deg():
+  trim = ct.CalibTrim(ct.TrimConfig(mode=0, max_deg=0.8), initial_deg=5.0)
+  assert trim.delta_deg == pytest.approx(0.8)
+
+
+def test_seed_nonfinite_becomes_zero():
+  for bad in (float('nan'), float('inf'), float('-inf')):
+    trim = ct.CalibTrim(ct.TrimConfig(mode=0), initial_deg=bad)
+    assert trim.delta_deg == 0.0
