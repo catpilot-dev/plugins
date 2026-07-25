@@ -24,6 +24,11 @@
       "module": "register",
       "function": "on_curvature_correction",
       "priority": 50
+    },
+    "modeld.calib_bias": {
+      "module": "register",
+      "function": "on_calib_bias",
+      "priority": 50
     }
   }
 }
