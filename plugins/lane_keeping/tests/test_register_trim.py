@@ -206,3 +206,49 @@ def test_hook_writes_yaw_file_on_cadence(data_dir, monkeypatch):
   assert not path.exists()          # nothing written before the 100th tick
   register.on_curvature_correction(0.0, _mv_at(0.84), 25.0, False, lat_delay=0.45)
   assert path.exists()              # 100th tick writes
+
+
+# --------------------------------------------------------------------------
+# Mode-2 sentinel guard: gap_dc must be the anchor's own None-preserving
+# attribute, NOT the lossy 0.0 telemetry float (anchor.py:262 maps its
+# internal None -> 0.0 for the published message only). A hard-floor state
+# with a TRUSTED line but an unseeded DC must never be mistaken for a
+# trusted gap_dc == 0.0, which would spuriously satisfy calib_trim's
+# `gap_dc < cfg.gap_lo` branch and integrate against a floor excursion.
+# --------------------------------------------------------------------------
+
+def _configure_mode2(data_dir):
+  (data_dir / 'CalibTrimMode').write_text('2')
+  (data_dir / 'CalibTrimYawSign').write_text('1')
+
+
+@pytest.mark.parametrize('gap', [0.05, 2.0])  # below gap_hard_lo=0.3 / above gap_hard_hi=1.5
+def test_mode2_hard_floor_unseeded_dc_never_integrates(data_dir, monkeypatch, gap):
+  _configure_mode2(data_dir)
+  captured = []
+  monkeypatch.setattr(register, '_publish', lambda telem: captured.append(dict(telem)))
+  for _ in range(200):
+    register.on_curvature_correction(0.0, _mv_at(gap), 25.0, False, lat_delay=0.45)
+  assert len(captured) == 200
+  # sanity: the scenario really is a trusted-line hard floor with no DC seed
+  assert captured[-1]['authority'] == pytest.approx(1.0)
+  assert register._anchor.gap_dc is None
+  for telem in captured:
+    assert telem['trim_integrating'] is False
+    assert telem['trim_delta_deg'] == 0.0
+
+
+# --------------------------------------------------------------------------
+# modeld reader path must not import the trim module (spec §6: "float file
+# read, nothing else"). Break _trim_module() and confirm the reader still
+# clamps correctly — if the reader secretly depended on it, the exception
+# would be swallowed by _read_yaw_deg's broad except and silently mask the
+# clamp as 0.0 instead of the expected 0.8.
+# --------------------------------------------------------------------------
+
+def test_calib_bias_reader_path_does_not_import_trim_module(data_dir, monkeypatch):
+  def _boom():
+    raise AssertionError('modeld reader path must not touch the trim module')
+  monkeypatch.setattr(register, '_trim_module', _boom)
+  (data_dir / 'CalibTrimYawDeg').write_text('5.0')
+  assert register.on_calib_bias(0.0) == pytest.approx(0.8)

@@ -126,7 +126,11 @@ _last_yaw_written = None
 # Lives at module scope so it survives across frames without any anchor/trim
 # state (separate process from the controls-side singletons above).
 _calib_bias_cache = {'val': 0.0, 'calls': 0}
-_clamp_deg = None
+# Mirrors TrimConfig.max_deg's default (0.8). The modeld-side reader must not
+# import calib_trim.py at all (spec §6: "float file read, nothing else") — this
+# constant is the deliberate, independent stand-in. modeld's own ±1.0 call-site
+# clamp is a separate, independent line of defense on top of this one.
+_CLAMP_DEG_DEFAULT = 0.8
 
 
 def _write_yaw_file(delta):
@@ -146,19 +150,16 @@ def _write_yaw_file(delta):
 
 
 def _clamp_bound():
-  # ±max_deg *default* (TrimConfig()'s import default, 0.8) — NOT the configured
-  # param. Computed once; the trim module is dependency-free so this is a cheap
-  # one-time import, never a per-frame config load.
-  global _clamp_deg
-  if _clamp_deg is None:
-    _clamp_deg = _trim_module().TrimConfig().max_deg
-  return _clamp_deg
+  # ±max_deg *default* — NOT the configured param, and NOT read from calib_trim.py
+  # (spec §6: the modeld-side reader path must not import the trim module — pure
+  # float file read, nothing else). See _CLAMP_DEG_DEFAULT above.
+  return _CLAMP_DEG_DEFAULT
 
 
 def _read_yaw_deg():
   # Pure float file read for the modeld process: missing/unparseable/nonfinite
   # → 0.0; result clamped to ±max_deg default. No anchor/trim state, no config
-  # load — this runs inside modeld's frame loop.
+  # load, no trim-module import — this runs inside modeld's frame loop.
   try:
     with open(os.path.join(_PLUGIN_DIR, 'data', 'CalibTrimYawDeg')) as f:
       v = float(f.read().strip())
@@ -214,7 +215,7 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
       CalibTrim = _trim_module().CalibTrim
       _trim = CalibTrim(_load_trim_config())
     delta_deg, ttelem = _trim.update(
-      telem.get('gap_dc'), telem.get('authority', 0.0),
+      _anchor.gap_dc, telem.get('authority', 0.0),
       lane_changing, v_ego, _anchor.cfg.enable)
     telem['trim_delta_deg'] = ttelem.get('delta_deg')
     telem['trim_err'] = ttelem.get('err')
