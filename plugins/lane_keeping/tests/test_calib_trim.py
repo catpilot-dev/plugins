@@ -1,6 +1,8 @@
 import importlib.util
 import os
 
+import pytest
+
 _DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 spec = importlib.util.spec_from_file_location('lk_calib_trim', os.path.join(_DIR, 'calib_trim.py'))
 ct = importlib.util.module_from_spec(spec)
@@ -18,8 +20,9 @@ def _run(trim, n, **kw):
 
 def test_mode0_stays_zero():
   trim = ct.CalibTrim(ct.TrimConfig(mode=0))
-  d, _ = _run(trim, 1000)
+  d, t = _run(trim, 1000)
   assert d == 0.0
+  assert t['err'] == 0.0
 
 
 def test_mode1_slews_to_fixed_and_respects_cap():
@@ -94,3 +97,45 @@ def test_frozen_gap_dc_accepted():
   trim = ct.CalibTrim(ct.TrimConfig(mode=2, yaw_sign=1))
   d, t = _run(trim, 100 * 10, gap_dc=0.43)             # frozen below band
   assert t['integrating'] and d != 0.0
+
+
+def test_mode2_dwell_resets_after_hold_dropout():
+  trim = ct.CalibTrim(ct.TrimConfig(mode=2, yaw_sign=1))
+  _run(trim, 100 * 20, gap_dc=0.3)                       # build up delta
+  d_built, _ = trim.update(0.3, 1.0, False, 15.0, True)
+  assert d_built != 0.0
+  # partial dwell in-band: 4 s — not enough to trigger decay on its own
+  d_partial, _ = _run(trim, 100 * 4, gap_dc=0.8)
+  assert abs(d_partial - d_built) <= 0.02 * 0.05 + 1e-9  # unchanged (no decay yet)
+  # dropout: gate fails (authority=0) for 30 s — a blind period, NOT
+  # observed dwell; must not carry forward toward the 5 s requirement
+  d_held, t_held = _run(trim, 100 * 30, gap_dc=0.8, authority=0.0)
+  assert d_held == d_partial
+  assert not t_held['integrating']
+  # back in-band: dwell restarts from zero — the first fresh 5 s must NOT decay
+  d_first5, _ = _run(trim, 100 * 5, gap_dc=0.8)
+  assert d_first5 == d_held                              # unchanged through fresh 5 s
+  # beyond the fresh 5 s, decay finally begins
+  d_decayed, _ = _run(trim, 100 * 5, gap_dc=0.8)
+  assert abs(d_decayed) < abs(d_first5)
+
+
+def test_mode2_upper_band_violation_opposite_sign():
+  trim_lo = ct.CalibTrim(ct.TrimConfig(mode=2, yaw_sign=1))
+  d_lo, _ = _run(trim_lo, 100 * 10, gap_dc=0.3)          # below gap_lo: err=-0.3
+
+  trim_hi = ct.CalibTrim(ct.TrimConfig(mode=2, yaw_sign=1))
+  d_hi, t_hi = _run(trim_hi, 100 * 10, gap_dc=1.4)       # above gap_hi=1.0: err=+0.4
+
+  assert (d_lo > 0) != (d_hi > 0)                        # opposite integration direction
+  assert t_hi['integrating']
+  assert t_hi['err'] == pytest.approx(0.4)
+
+
+def test_mode2_none_gap_dc_holds():
+  trim = ct.CalibTrim(ct.TrimConfig(mode=2, yaw_sign=1))
+  _run(trim, 100 * 20, gap_dc=0.3)
+  d0, _ = trim.update(0.3, 1.0, False, 15.0, True)
+  d, t = _run(trim, 100 * 10, gap_dc=None)
+  assert d == d0                                          # held exactly, no crash
+  assert not t['integrating']

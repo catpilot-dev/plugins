@@ -42,11 +42,13 @@ class CalibTrim:
   def update(self, gap_dc, authority, lane_changing, v_ego, enabled):
     cfg = self.cfg
     integrating = False
+    err = 0.0
     if not enabled or cfg.mode == 0 or (cfg.mode == 2 and cfg.yaw_sign not in (1, -1)):
       self._slew_toward(0.0, cfg.slew_deg_s)
       self._in_band_ticks = 0
     elif cfg.mode == 1:
       self._slew_toward(_clip(cfg.fixed_deg, -cfg.max_deg, cfg.max_deg), cfg.slew_deg_s)
+      self._in_band_ticks = 0
     else:  # mode 2, sign valid
       gate = (gap_dc is not None and authority > 0.0
               and not lane_changing and v_ego >= HOLD_MIN_SPEED)
@@ -66,7 +68,12 @@ class CalibTrim:
           self._in_band_ticks += 1
           if self._in_band_ticks * DT_CTRL > IN_BAND_DWELL_S:
             self._slew_toward(0.0, cfg.slew_deg_s / 2.0)
+      else:
+        # gate failed: a blind period is not observed continuous in-band
+        # dwell — a fresh IN_BAND_DWELL_S of *observed* in-band is required
+        # after any dropout before decay may resume.
+        self._in_band_ticks = 0
       # gate False: hold (no integrate, no decay)
     self.delta_deg = _clip(self.delta_deg, -cfg.max_deg, cfg.max_deg)
-    telem = {'delta_deg': self.delta_deg, 'mode': cfg.mode, 'integrating': integrating}
+    telem = {'delta_deg': self.delta_deg, 'err': err, 'mode': cfg.mode, 'integrating': integrating}
     return self.delta_deg, telem
