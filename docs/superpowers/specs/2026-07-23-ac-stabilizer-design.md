@@ -153,3 +153,26 @@ vs off — with the DC conceded, the *only* difference should be less wander.
 - Curve-cutting elimination (model intent; softened transiently at best;
   real fix is model-level — 0.11.2 yardstick).
 - Any change to the Phase-2 tracker.
+
+## Addendum 2026-07-27: Asymmetric damping near the driver-side line
+
+Soak finding (routes 3ca/3cd vs 3c5): symmetric damping cannot distinguish
+the model's ESCAPE from the line from wander — both are AC — so it
+partially opposes recoveries, stretching model-alone 2.8 s touches to
+~10 s (narrow-shoulder matched geometry: 12.6–15% line time vs
+model-alone 7.1%). The floors' removal eliminated the sustained push;
+this is the milder, symmetric-damping residual.
+
+Rule (gap-space, side-agnostic): when `gap_filt < asym_gap` (new
+AnchorConfig field, default 0.6 m, param `LaneKeepAsymGap`, 0 = disabled
+→ exact prior behavior), the post-deadband excess is clamped to
+`min(excess, 0)` — corrections toward the driver-side line are
+suppressed; away-pushes (fast sag below the conceding DC) are kept.
+Removes opposition only; introduces no sustained bias (the kept
+direction acts only on deviations below a reference that concedes in
+~dc_tau); no arms-race vector. This is the only place besides the
+(param-disabled) floors where the absolute gap — and therefore
+half_width — enters the law; the damper core remains width-independent.
+
+Prediction to verify in soak: narrow-shoulder line time 13% → ~7%,
+worst hold ~10 s → ~3 s, churn unchanged.
