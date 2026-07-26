@@ -147,7 +147,6 @@ def on_lat_controller_init(result, lac, CP):
   no scale_by_bin or shadow estimator anymore.
   """
   import math
-  import numpy as np
   from cereal import log
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
