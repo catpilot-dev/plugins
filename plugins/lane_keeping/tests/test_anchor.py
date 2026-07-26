@@ -547,6 +547,31 @@ def test_asym_gap_side_agnostic_right_driver():
   assert abs(a.kappa_bias) < 1e-6
 
 
+def test_crossing_ramp_sag_bounded_gate_inactive_no_sign_flip():
+  # Deliberate line-crossing ramp (review follow-up): gap sags at ~0.1 m/s
+  # from ~0.6 m through 0 to about -0.4 m (past the line), floors disabled
+  # (gap_hard_lo/hi wide open) to isolate the AC decision branch and match
+  # the live config's asym_gap=0.6. A sag is excess <= 0 throughout, so the
+  # asym gate (which only ever touches excess > 0) must be a no-op: (1) the
+  # away-push bias never exceeds kappa_bias_max, (2) the trajectory is
+  # bit-identical to asym_gap=0.0, (3) the sign never flips toward the line.
+  cfg_kwargs = dict(pred_delay_mult=2.0, asym_gap=0.6, gap_hard_lo=-99.0, gap_hard_hi=99.0)
+  a_asym = LaneAnchor(AnchorConfig(**cfg_kwargs))
+  a_sym = LaneAnchor(AnchorConfig(**{**cfg_kwargs, 'asym_gap': 0.0}))
+  _run(a_asym, 0.6, 1000)
+  _run(a_sym, 0.6, 1000)
+  biases_asym, biases_sym = [], []
+  for i in range(1000):                               # 0.6 -> ~-0.4 over 10 s at 0.1 m/s
+    g = 0.6 - 0.1 * (i / 100.0)
+    out_a, _ta = a_asym.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+    out_s, _ts = a_sym.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+    biases_asym.append(out_a)
+    biases_sym.append(out_s)
+    assert abs(a_asym.kappa_bias) <= a_asym.cfg.kappa_bias_max + 1e-12   # (1) bounded
+  assert biases_asym == biases_sym                    # (2) gate inactive during the sag
+  assert all(b <= 1e-9 for b in biases_asym)           # (3) never toward the line, no flip
+
+
 def test_disable_resets_dc_for_fresh_ab():
   # Deliberate toggle-off forgets the reference; re-enable starts fresh on
   # the current line (clean A/B), instead of nudging toward a stale DC.
