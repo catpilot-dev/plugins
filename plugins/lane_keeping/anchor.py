@@ -82,6 +82,10 @@ class AnchorConfig:
                                  #  — the plan is most trustworthy near the car)
   gap_hard_lo: float = 0.3       # current-gap floor: prediction may not defer below (m)
   gap_hard_hi: float = 1.5       # current-gap ceiling: prediction may not defer above (m)
+  asym_gap: float = 0.6          # suppress toward-line damping when gap_filt is below this (m);
+                                 # 0 disables (exact prior symmetric behavior). The only
+                                 # width-dependent term besides the hard floors above — see
+                                 # Addendum 2026-07-27 in the AC stabilizer design doc.
 
 
 class LaneAnchor:
@@ -238,6 +242,13 @@ class LaneAnchor:
       else:
         excess = excess_ac - _clip(excess_ac, -cfg.ac_deadband, cfg.ac_deadband)
         excess = _clip(excess, -cfg.excess_max, cfg.excess_max)
+        # Addendum 2026-07-27: near the driver-side line, suppress only the
+        # toward-line direction (excess > 0 -> pursuit steers toward the
+        # driver line, restoring the DC) — that is the direction that opposes
+        # the model's own escape from a too-close line. Away-pushes
+        # (excess <= 0) are kept unconditionally.
+        if cfg.asym_gap > 0.0 and self.gap_filt < cfg.asym_gap and excess > 0.0:
+          excess = 0.0
       kappa_target = authority * self._pursuit(excess, v_ego)
     else:
       self.gap_filt = None

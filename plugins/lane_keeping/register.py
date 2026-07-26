@@ -90,6 +90,7 @@ def _load_config():
     pred_delay_mult=fget('LaneKeepPredDelayMult', d.pred_delay_mult),
     gap_hard_lo=fget('LaneKeepGapHardLo', d.gap_hard_lo),
     gap_hard_hi=fget('LaneKeepGapHardHi', d.gap_hard_hi),
+    asym_gap=fget('LaneKeepAsymGap', d.asym_gap),
   )
 
 

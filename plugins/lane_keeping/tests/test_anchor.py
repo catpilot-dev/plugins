@@ -455,6 +455,98 @@ def test_dc_seed_requires_authority():
   assert abs(out) < 1e-6
 
 
+# --- Addendum 2026-07-27: asymmetric damping near the driver-side line ---
+# asym_gap suppresses only the toward-line direction (excess > 0 -> pursuit
+# steers toward the driver line, restoring the DC) when gap_filt is close to
+# the line. Away-pushes (excess <= 0, sagging further toward the line) are
+# always kept, at any asym_gap setting.
+
+def _mv_at_right(gap):
+  # right-driver scene with the RIGHT line placed to give the requested gap
+  # (mirrors _mv_at's left-driver construction)
+  y = gap + 0.91
+  return _mv_geo(_XS, _flat(-1.75), _flat(y))
+
+
+def test_asym_gap_near_line_escape_not_opposed():
+  # Escape: gap rising away from a near-line DC (asym_gap default 0.6). The
+  # toward-line direction is suppressed throughout -> bias relaxes to (stays
+  # at) zero and never grows toward the line.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))   # asym_gap=0.6 default
+  _run(a, 0.45, 1000)                                 # seed a near-line DC
+  max_bias = 0.0
+  for i in range(600):                                # escape stays < asym_gap (0.6)
+    g = 0.45 + 0.025 * (i / 100.0)
+    a.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+    max_bias = max(max_bias, a.kappa_bias)
+  assert max_bias < 1e-6                              # never grew toward the line
+  assert abs(a.kappa_bias) < 1e-6                      # relaxed to zero
+
+
+def test_asym_gap_near_line_sag_still_pushed_away():
+  # Sag: gap falling further toward a near-line DC. The away-push direction
+  # is kept, and identically so regardless of asym_gap (only excess > 0 is
+  # ever touched by the gate).
+  a_asym = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))               # asym_gap=0.6
+  a_sym = LaneAnchor(AnchorConfig(pred_delay_mult=2.0, asym_gap=0.0))  # symmetric
+  _run(a_asym, 0.45, 1000)
+  _run(a_sym, 0.45, 1000)
+  out_asym = out_sym = None
+  for i in range(1000):                               # sag stays above the hard floor (0.3)
+    g = 0.45 - 0.0145 * (i / 100.0)
+    out_asym, _t = a_asym.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+    out_sym, _t = a_sym.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+  assert out_asym < -1e-6                             # pushed away (right, left-driver)
+  assert out_asym == out_sym                          # bit-identical to the symmetric run
+
+
+def test_asym_gap_far_from_line_unchanged():
+  # Gap stays comfortably above asym_gap (0.6) throughout -> the gate never
+  # engages, so asym_gap=0.6 and asym_gap=0.0 must produce bit-identical
+  # bias trajectories (same scenario as test_drift_is_damped).
+  a1 = LaneAnchor(AnchorConfig(pred_delay_mult=2.0, asym_gap=0.6))
+  a2 = LaneAnchor(AnchorConfig(pred_delay_mult=2.0, asym_gap=0.0))
+  _run(a1, 0.84, 1000)
+  _run(a2, 0.84, 1000)
+  biases1, biases2 = [], []
+  for i in range(600):
+    g = 0.84 + 0.05 * (i / 100.0)
+    out1, _t1 = a1.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+    out2, _t2 = a2.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+    biases1.append(out1)
+    biases2.append(out2)
+  assert biases1 == biases2                           # bit-identical trajectories
+
+
+def test_asym_gap_zero_disables_suppression():
+  # Same near-line escape as test_asym_gap_near_line_escape_not_opposed, but
+  # with asym_gap=0.0: the OLD symmetric behavior returns — a nonzero
+  # toward-line bias appears, proving the switch works both ways.
+  a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0, asym_gap=0.0))
+  _run(a, 0.45, 1000)
+  out = None
+  for i in range(600):
+    g = 0.45 + 0.025 * (i / 100.0)
+    out, _t = a.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
+  assert out > 1e-6                                   # toward-line bias, NOT suppressed
+
+
+def test_asym_gap_side_agnostic_right_driver():
+  # Same escape-not-opposed scenario, mirrored onto a right-side driver
+  # (mirrored y values, per the existing right-side test convention).
+  a = LaneAnchor(AnchorConfig(driver_side='right', pred_delay_mult=2.0))  # asym_gap=0.6
+  out = t = None
+  for _ in range(1000):
+    out, t = a.update(0.0, _mv_at_right(0.45), 17.0, False, lat_delay=0.6)
+  max_bias = 0.0
+  for i in range(600):
+    g = 0.45 + 0.025 * (i / 100.0)
+    a.update(0.0, _mv_at_right(g), 17.0, False, lat_delay=0.6)
+    max_bias = max(max_bias, abs(a.kappa_bias))
+  assert max_bias < 1e-6                              # never grew toward the (right) line
+  assert abs(a.kappa_bias) < 1e-6
+
+
 def test_disable_resets_dc_for_fresh_ab():
   # Deliberate toggle-off forgets the reference; re-enable starts fresh on
   # the current line (clean A/B), instead of nudging toward a stale DC.
