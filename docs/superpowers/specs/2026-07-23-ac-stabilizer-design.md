@@ -168,9 +168,17 @@ AnchorConfig field, default 0.6 m, param `LaneKeepAsymGap`, 0 = disabled
 → exact prior behavior), the post-deadband excess is clamped to
 `min(excess, 0)` — corrections toward the driver-side line are
 suppressed; away-pushes (fast sag below the conceding DC) are kept.
-Removes opposition only; introduces no sustained bias (the kept
-direction acts only on deviations below a reference that concedes in
-~dc_tau); no arms-race vector. This is the only place besides the
+Removes opposition only; introduces no NEW sustained bias. Scope of that
+claim (review 2026-07-27): it holds for steps and stationary deviations,
+NOT for sustained ramps — a deliberate line-crossing at rate r leaves the
+first-order DC tracker lagging by r*dc_tau, producing a sustained
+away-push (~60-77% of cap at r=0.1 m/s) for the crossing's duration.
+That ramp-lag push is PRE-EXISTING damper behavior (identical under
+symmetric damping; the gate only removes the toward-line half, inactive
+during a sag) and is structurally the 3c1 arms-race mechanism in the
+crossing direction — the on-car soak must watch for crossing-direction
+stalemates (deep sustained negative gaps), which would indict the ramp
+lag, not this gate. This is the only place besides the
 (param-disabled) floors where the absolute gap — and therefore
 half_width — enters the law; the damper core remains width-independent.
 
