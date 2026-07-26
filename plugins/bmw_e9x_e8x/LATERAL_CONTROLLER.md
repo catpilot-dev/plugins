@@ -201,6 +201,30 @@ This document is the canonical reference for the lateral controller registered b
 > delta_err box filter, the kinematic/noise-floor tolerance, or `effective_err`
 > as live code are historical where they conflict with this note — see § 3, § 4,
 > § 12, and § 13, all updated in place below.**
+>
+> **2026-07-27 — hold gate moved from curvature to lateral accel (route 3ca
+> seg 23).** `hold_f` no longer gates on `|κ_des|` (`HOLD_KAPPA_BP`). Whether
+> "drain to zero and let stiction hold" is safe on-target depends on
+> self-aligning torque (SAT), which scales as **v²·κ**, not κ alone — the old
+> gate silently baked in the ~12 m/s tuning speed of the route 380/384
+> hairpin fix. Route 3ca seg 23 (19.4 m/s, κ 0.0033, a_y 1.25) sat below
+> `HOLD_KAPPA_BP[0] = 0.004` → `hold_f = 0` → drain → 0.6 Hz-class hunting
+> (30% zero-torque decisions in a sustained turn, 1.8× command-wobble
+> amplification) — a mild-but-fast curve with plenty of SAT to unwind the
+> wheel, misclassified as "straight." Now:
+> `hold_f = interp(v²·|κ_des|, HOLD_AY_BP=[0.5, 0.9], [0, 1])`, extracted as
+> the pure module-level function `hold_factor(v_ego, kappa_des_abs)` in
+> `bmw/latcontroller.py` (unit-testable without constructing the
+> controller). `[0.5, 0.9]` preserves full hold at the route 380/384
+> operating point (a_y ≥ 0.97), fixes the 3ca seg 23 drain, keeps drain on
+> straights and gentle-slow curves (a_y < 0.5, including the reference mild
+> curve — 12.4 m/s, κ 0.0023, a_y 0.35 — which damps fine with drain), and
+> drops hold at parking speeds regardless of κ (SAT there is far below
+> stiction). `hold_f` remains functionally near-binary: the held target
+> re-derives from `state['torque']` every ~100–300 ms decision, so partial
+> values only persist for the one decision they're computed on. **§ 5 and
+> § 8 below use `HOLD_KAPPA_BP`/curvature language in places where that is
+> now historical — the live gate is `HOLD_AY_BP` as described here.**
 
 ---
 

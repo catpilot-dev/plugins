@@ -102,6 +102,67 @@ class TestLateralControllerModule:
 
 
 # ============================================================
+# hold_factor — curvature hold gate (2026-07-27: moved from |kappa_des| to
+# commanded lateral accel v²·|kappa_des|; route 3ca seg 23 hunting fix).
+# Pure function, module-level, no controller construction needed.
+# ============================================================
+
+class TestHoldFactor:
+  def test_3ca_seg23_mild_fast_curve_now_holds(self, mock_deps):
+    """19.4 m/s, kappa 0.0033 -> a_y 1.25: above HOLD_AY_BP[1], full hold.
+    This is the case that was broken under the old kappa-only gate
+    (HOLD_KAPPA_BP[0] = 0.004 > 0.0033 -> hold_f was 0 -> drain -> hunting)."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(19.4, 0.0033) == 1.0
+
+  def test_tight_slow_curve_holds(self, mock_deps):
+    """9.0 m/s, kappa 0.012 -> a_y 0.972: at/above HOLD_AY_BP[1], full hold
+    (route 380/384 hairpin fix operating point)."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(9.0, 0.012) == 1.0
+
+  def test_reference_mild_curve_still_drains(self, mock_deps):
+    """12.4 m/s, kappa 0.0023 -> a_y 0.354: below HOLD_AY_BP[0], drains to 0
+    (the reference case that damps fine with drain — must stay drained)."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(12.4, 0.0023) == 0.0
+
+  def test_fast_straight_drains(self, mock_deps):
+    """19.4 m/s, kappa 0.0008 -> a_y 0.301: near-straight at highway speed,
+    below HOLD_AY_BP[0], drains to 0."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(19.4, 0.0008) == 0.0
+
+  def test_parking_speed_tight_kappa_drains(self, mock_deps):
+    """3.0 m/s, kappa 0.05 -> a_y 0.45: tight kappa but parking-speed slow,
+    SAT far below stiction -> drains to 0 despite the large kappa. This is
+    the case a kappa-only gate would get wrong in the other direction."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(3.0, 0.05) == 0.0
+
+  def test_transition_sliver_is_partial(self):
+    """14.0 m/s, kappa 0.0035 -> a_y 0.686: strictly inside (HOLD_AY_BP[0],
+    HOLD_AY_BP[1]) -> partial hold factor, neither 0 nor 1."""
+    from bmw.latcontroller import hold_factor
+    f = hold_factor(14.0, 0.0035)
+    assert 0.0 < f < 1.0
+    # a_y = 14.0**2 * 0.0035 = 0.686; interp over [0.5, 0.9] -> (0.686-0.5)/0.4
+    assert f == pytest.approx((14.0 * 14.0 * 0.0035 - 0.5) / 0.4, abs=1e-9)
+
+  def test_boundary_bp0_is_zero(self):
+    from bmw.latcontroller import hold_factor, HOLD_AY_BP
+    v = 10.0
+    kappa = HOLD_AY_BP[0] / (v * v)
+    assert hold_factor(v, kappa) == pytest.approx(0.0)
+
+  def test_boundary_bp1_is_one(self):
+    from bmw.latcontroller import hold_factor, HOLD_AY_BP
+    v = 10.0
+    kappa = HOLD_AY_BP[1] / (v * v)
+    assert hold_factor(v, kappa) == pytest.approx(1.0)
+
+
+# ============================================================
 # Cruise Ceiling Memory
 # ============================================================
 

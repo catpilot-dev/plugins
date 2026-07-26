@@ -26,6 +26,45 @@ _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
+import numpy as np
+
+# Hold gate, lateral-acceleration-dependent (2026-07-27, route 3ca seg 23).
+# Whether "drain to zero and let stiction hold" is safe on-target depends on
+# self-aligning torque (SAT), which scales as v²·κ — NOT on κ alone. The
+# original gate (2026-07-03) used |κ_des| directly, encoding the ~12 m/s
+# tuning speed of the route 380/384 hairpin fix into a curvature threshold
+# that silently assumed a fixed speed. Route 3ca seg 23 broke that
+# assumption: 19.4 m/s, κ 0.0033, a_y 1.25 sat BELOW the old
+# HOLD_KAPPA_BP[0]=0.004 → hold_f=0 → drain → 0.6 Hz-class hunting (30%
+# zero-torque decisions in a sustained turn, 1.8× command-wobble
+# amplification) — a mild-but-fast curve with plenty of SAT to unwind the
+# wheel, misclassified as "straight" by the κ-only gate.
+# Reference points:
+#   route 3ca seg 23  (19.4 m/s, κ 0.0033, a_y 1.25)  → must hold (was broken)
+#   reference mild curve (12.4 m/s, κ 0.0023, a_y 0.35) → damps fine with drain
+#   route 380/384 hairpin fix operating point (a_y ≥ 0.97) → must keep FULL hold
+# HOLD_AY_BP = [0.5, 0.9] preserves full hold at the 380/384 operating point,
+# fixes the 3ca seg 23 mild-fast-curve drain, keeps drain on straights and
+# gentle-slow curves (a_y < 0.5), and drops hold at parking speeds where SAT
+# is far below stiction and drain is safe regardless of κ.
+# hold_f is functionally near-binary in practice: the held target is
+# re-derived from state['torque'] every 100 ms-class decision tick, so
+# mid-range (partial) hold_f values only persist for the one decision they're
+# computed on — they don't accumulate or hold state, and decay sub-second.
+HOLD_AY_BP = [0.5, 0.9]  # m/s² of commanded a_y = v²·|kappa_des|
+
+
+def hold_factor(v_ego, kappa_des_abs):
+  """Curvature-hold blend factor [0, 1], gated on commanded lateral accel.
+
+  0 → pure stiction-hold (drain torque to 0, on-target).
+  1 → keep the standing torque (it approximates self-aligning torque, which
+      beats rack stiction at this loading).
+  Pure function of (v_ego, |kappa_des|) — no state — so it's directly
+  testable without constructing the controller.
+  """
+  return float(np.interp(v_ego * v_ego * kappa_des_abs, HOLD_AY_BP, [0.0, 1.0]))
+
 
 def on_lat_controller_init(result, lac, CP):
   """Plant-inversion at 500 ms horizon in front-wheel-angle space.
@@ -34,11 +73,13 @@ def on_lat_controller_init(result, lac, CP):
   self-centering — the wheel holds its angle at zero torque *near center*.
   In curves, self-aligning torque exceeds rack stiction above ~40° wheel
   (route 380/384), so on-target there requires standing torque. So:
-    - On-target, straight (|κ_des| < HOLD_KAPPA_BP[0]): drive torque
-      → 0 and let stiction hold. No chatter.
-    - On-target, curve: hold hold_f·torque — the torque that achieved
-      on-target ≈ the self-aligning torque. Re-derived each decision from
-      state['torque']; bounded by the P-term's own command, no ratchet.
+    - On-target, low commanded a_y (v²·|κ_des| < HOLD_AY_BP[0]): drive
+      torque → 0 and let stiction hold. No chatter. Gated on a_y, not κ
+      alone — SAT scales as v²·κ (2026-07-27, route 3ca seg 23).
+    - On-target, higher commanded a_y: hold hold_f·torque — the torque that
+      achieved on-target ≈ the self-aligning torque. Re-derived each
+      decision from state['torque']; bounded by the P-term's own command,
+      no ratchet.
     - Off-target: compute the torque that would move the front wheel by
       δ_err over 500 ms (plant-inversion accounting for first-order lag), ramp
       to it over one 250 ms decision.
@@ -169,17 +210,11 @@ def on_lat_controller_init(result, lac, CP):
   DT_MDL = 0.05                                  # openpilot model dt (common/realtime.py)
   MODEL_ACTION_T_FALLBACK = 0.55                 # used only if lat_delay arrives as 0/None
 
-  # Curvature-dependent hold (2026-07-03): inside the on-target band
-  # (|delta_err| ≤ HOLD_BAND) the target is hold_f·torque instead of 0,
-  # hold_f = interp(|κ_des|, BP, [0,1]).
-  # Below BP[0] (straights; above the ±0.003 modelV2 wobble amplitude) the
-  # target is 0 as before. Between BP[0] and BP[1] the partial factor gives
-  # a geometric relax (each decision multiplies held torque by hold_f);
-  # at/above BP[1] the torque that achieved on-target is held outright.
-  # Rationale: in a curve, on-target is reached WITH torque applied — that
-  # torque ≈ SAT, and above ~40° wheel SAT beats rack stiction, so target-0
-  # lets the wheel unwind (route 380/384 0.6 Hz limit cycle).
-  HOLD_KAPPA_BP = [0.004, 0.010]
+  # Curvature-dependent hold: SEE HOLD_AY_BP / hold_factor() at module scope
+  # (top of file). The gate moved from |κ_des| to commanded lateral accel
+  # (v²·|κ_des|) on 2026-07-27 — SAT that determines whether stiction can
+  # safely hold the wheel scales with v²·κ, not κ alone; see the module-level
+  # comment for the route 3ca seg 23 evidence and reference operating points.
   # Reference drift scale for the hold-torque cap ONLY (decoupled from the
   # kinematic DRIFT_M deadzone on 2026-07-04 — see the hold_cap block in
   # update()). That DRIFT_M deadzone was deleted entirely in Phase 2
@@ -290,7 +325,7 @@ def on_lat_controller_init(result, lac, CP):
     'desired': 0.0, 'measured': 0.0,
     'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
     'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
-    'hold_f': 0.0,                # debug: curvature hold factor [0,1]
+    'hold_f': 0.0,                # debug: lateral-accel hold factor [0,1] (gated on v²·|kappa_des|)
     'hold_cap': 0.0,              # debug: cap on held torque (P value at the HOLD_CAP_DRIFT_M reference drift, frac)
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
   }
@@ -340,24 +375,29 @@ def on_lat_controller_init(result, lac, CP):
       # noise-induced lag is now `lane_keeping`'s to own, per its position loop.
       state['desired'] = float(desired_curvature)
 
-      # Curvature-dependent hold factor (2026-07-03). In a curve, "on-target"
-      # is achieved WITH torque applied — that standing torque ≈ the self-
-      # aligning torque, which above ~40° wheel exceeds rack stiction
-      # (route 380/384: hold-at-zero let the wheel unwind → 0.6 Hz limit
-      # cycle). hold_f scales the on-target / cancel_tol target:
-      # 0 on straights (pure stiction-hold, below-BP includes the ±0.003
-      # modelV2 wobble band), 1 in real curves (keep what got us on-target).
-      # The held value is bounded by what the P-term was already commanding
-      # and re-derives from state['torque'] every decision — no learning
-      # state, no ratchet (the hold-bias integral failure mode).
-      hold_f = float(np.interp(abs(state['desired']), HOLD_KAPPA_BP, [0.0, 1.0]))
-      state['hold_f'] = hold_f
-
       # 8.5 m/s = ~30 kph, BMW DCC minimum engagement speed. Below this the
       # controller is never active, so the floor only protects κ_meas from
       # div-by-near-zero during disengaged crawl.
       v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 8.5)
       state['measured'] = float(lp.angularVelocityDevice.z) / v
+
+      # Lateral-accel-dependent hold factor (2026-07-27; see HOLD_AY_BP /
+      # hold_factor() at module scope). In a curve, "on-target" is achieved
+      # WITH torque applied — that standing torque ≈ the self-aligning
+      # torque (SAT), which scales as v²·κ and above HOLD_AY_BP[1] exceeds
+      # rack stiction (route 380/384: hold-at-zero let the wheel unwind →
+      # 0.6 Hz limit cycle). hold_f scales the on-target / cancel_tol
+      # target: 0 below HOLD_AY_BP[0] (pure stiction-hold — straights and
+      # gentle-slow curves, where SAT can't beat stiction anyway), 1 at/above
+      # HOLD_AY_BP[1] (keep what got us on-target). Gated on commanded a_y
+      # (v²·|κ_des|), not |κ_des| alone — a κ-only gate misses mild-but-fast
+      # curves where SAT is already large (route 3ca seg 23: 19.4 m/s,
+      # κ 0.0033, a_y 1.25 — plenty of SAT, but below the old κ-only
+      # threshold). The held value is bounded by what the P-term was already
+      # commanding and re-derives from state['torque'] every decision — no
+      # learning state, no ratchet (the hold-bias integral failure mode).
+      hold_f = hold_factor(v, abs(state['desired']))
+      state['hold_f'] = hold_f
 
       # Front-wheel-angle error (rear-axle bicycle model).
       delta_des = math.atan(state['desired'] * L)
@@ -536,12 +576,14 @@ def on_lat_controller_init(result, lac, CP):
         # On-target (|δ_err| ≤ HOLD_BAND) → stiction holds; no chatter at
         # the boundary (see the hold_curve / hold_zero branch below).
         if abs(delta_err) <= HOLD_BAND:
-          # On-target. Straights (hold_f=0): drain to 0, stiction holds.
-          # Curves (hold_f→1): keep the torque that achieved on-target —
-          # it approximates the self-aligning torque, which beats stiction
-          # at curve angles; target-0 here was the 0.6 Hz limit cycle's
-          # driver (route 380/384). Re-derived from state['torque'] each
-          # decision: bounded by the P-term's own command, no ratchet.
+          # On-target. Low commanded a_y (hold_f=0 — straights and gentle-
+          # slow curves): drain to 0, stiction holds. Higher commanded a_y
+          # (hold_f→1): keep the torque that achieved on-target — it
+          # approximates the self-aligning torque, which beats stiction at
+          # that loading; target-0 here was the 0.6 Hz limit cycle's driver
+          # (route 380/384) and, before the a_y gate, also the route 3ca
+          # seg 23 mild-fast-curve hunting. Re-derived from state['torque']
+          # each decision: bounded by the P-term's own command, no ratchet.
           # (brake_zero one-shot reverse pulse removed 2026-07-03 —
           # residual on-target-entry momentum is left to rack friction.)
           # held_target is sign-guarded (never counter-curve) and capped at
