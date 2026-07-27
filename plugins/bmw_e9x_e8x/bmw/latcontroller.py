@@ -556,8 +556,14 @@ def on_lat_controller_init(result, lac, CP):
       # forth at 108 km/h. Below the floor the guard stays silent — the
       # step-capped push (≤ 0.7 m/s³ actual jerk at highway) is already
       # gentler than the guard's own threshold.
+      # 2026-07-28 (route 3ce S-exit census): drain only torque that feeds
+      # the measured turn; counter-turn or zero torque is already the
+      # remedy — draining it locks out the active unwind (route 3ce S-exit
+      # census: 2 silent 1.6-1.9 s drain-lockouts on sharp leg exits). Mid-
+      # curve overshoot with into-turn torque cancels exactly as before.
       overshooting = ((state['desired'] - state['measured']) * state['measured'] < 0
-                      and abs(state['measured']) > KMEAS_SIGN_FLOOR)
+                      and abs(state['measured']) > KMEAS_SIGN_FLOOR
+                      and state['torque'] * state['measured'] > 0.0)
       cancel_reason = None
       # Accel guard referenced to COMMANDED a_y (2026-07-27) — see the
       # accel_guard_threshold() comment (module scope) and the ISO 11270
