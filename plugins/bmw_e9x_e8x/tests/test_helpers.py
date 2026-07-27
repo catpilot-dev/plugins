@@ -114,6 +114,13 @@ def make_opendbc_mocks() -> dict:
   # car_helpers.interfaces must be a real dict for monkey-patching
   mods['opendbc.car.car_helpers'].interfaces = {}
 
+  # ISO comfort ceilings must be real floats, not MagicMock — latcontroller.py
+  # hoisted the ISO_LATERAL_ACCEL import to module scope (2026-07-27, accel
+  # guard rework) so accel_guard_threshold() can do real min()/max() against
+  # it at import time. Values match opendbc.car.lateral.
+  mods['opendbc.car.lateral'].ISO_LATERAL_ACCEL = 3.0
+  mods['opendbc.car.lateral'].ISO_LATERAL_JERK = 5.0
+
   # Wire up real classes for dataclass-inheriting code
   mods['opendbc.car'].Bus = Bus
   mods['opendbc.car'].Platforms = Platforms

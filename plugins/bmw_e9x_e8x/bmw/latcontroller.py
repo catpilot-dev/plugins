@@ -28,6 +28,16 @@ if _PLUGIN_DIR not in sys.path:
 
 import numpy as np
 
+from opendbc.car.lateral import ISO_LATERAL_ACCEL
+
+# ISO_LATERAL_ACCEL hoisted to module scope (2026-07-27, accel guard rework
+# below) alongside HOLD_AY_BP/hold_factor — accel_guard_threshold() needs it
+# at import time and must be independently testable like hold_factor is.
+# Value (3.0 m/s², from opendbc.car.lateral) and the half-ISO design intent
+# are unchanged from the original in-function import; see the ISO 11270
+# comfort-guard comment block in on_lat_controller_init for the full guard
+# design (jerk side is untouched — still a κ-indexed table there).
+
 # Hold gate, lateral-acceleration-dependent (2026-07-27, route 3ca seg 23).
 # Whether "drain to zero and let stiction hold" is safe on-target depends on
 # self-aligning torque (SAT), which scales as v²·κ — NOT on κ alone. The
@@ -64,6 +74,36 @@ def hold_factor(v_ego, kappa_des_abs):
   testable without constructing the controller.
   """
   return float(np.interp(v_ego * v_ego * kappa_des_abs, HOLD_AY_BP, [0.0, 1.0]))
+
+
+# ISO 11270 accel cancel-guard threshold, referenced to COMMANDED lateral
+# accel (2026-07-27, route 3ce evidence — see the ISO 11270 comfort-guard
+# comment block in on_lat_controller_init for the full history and rationale
+# this replaces). Overshoot = MEASURED a_y meaningfully beyond what was
+# actually commanded, not an absolute κ-indexed level:
+#   - ACCEL_GUARD_FLOOR (1.5 m/s²): preserves the 2026-05-22 near-straight
+#     tightening — even a tiny commanded a_y still cancels well below ISO.
+#   - ACCEL_GUARD_RATIO / ACCEL_GUARD_MARGIN: fires only once measured
+#     exceeds commanded by 25% plus 0.2 m/s² of absolute headroom — normal
+#     tracking noise (+-15-20%) on the overshoot side no longer trips it.
+#   - min(ISO_LATERAL_ACCEL, ...): ISO 3.0 m/s² stays the absolute ceiling
+#     regardless of how large the commanded a_y is.
+# Pure function of commanded |a_y_des| — no state — directly testable like
+# hold_factor().
+ACCEL_GUARD_FLOOR = 1.5      # m/s² — small-a_y tightened floor (2026-05-22, route 326 class)
+ACCEL_GUARD_RATIO = 1.25     # fire only when measured exceeds commanded by 25%...
+ACCEL_GUARD_MARGIN = 0.2     # ...plus 0.2 m/s² absolute headroom
+
+
+def accel_guard_threshold(a_y_des_abs):
+  """ISO accel cancel-guard threshold (m/s²), relative to commanded a_y.
+
+  Pure function of |a_y_des| — no state — directly testable without
+  constructing the controller. See the module-level comment above for
+  the ACCEL_GUARD_* rationale.
+  """
+  return min(ISO_LATERAL_ACCEL, max(ACCEL_GUARD_FLOOR,
+                                    ACCEL_GUARD_RATIO * a_y_des_abs + ACCEL_GUARD_MARGIN))
 
 
 def on_lat_controller_init(result, lac, CP):
@@ -150,7 +190,7 @@ def on_lat_controller_init(result, lac, CP):
   from cereal import log
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
-  from opendbc.car.lateral import ISO_LATERAL_ACCEL, ISO_LATERAL_JERK
+  from opendbc.car.lateral import ISO_LATERAL_JERK
 
   # Decision cadence & CAN-rate spreading — both subscribe to model_action_t
   # per tick, sized to one half of the model's action horizon so exactly two
@@ -278,12 +318,8 @@ def on_lat_controller_init(result, lac, CP):
   # where the old 0.0012–0.0021 rad tolerance ate 44% of the anchor's command.
   HOLD_BAND = 0.001        # rad of front-wheel-angle error treated as on-target
 
-  # ISO 11270 comfort guard, κ-dependent. At small κ (near-straight), tighter
-  # half-ISO; ramps up to full ISO at tight curves (where larger accel/jerk
-  # are part of normal driving).
-  #   ISO_LATERAL_ACCEL = 3.0 m/s²    →  BMW_LATERAL_ACCEL [1.5..3.0]
-  #   ISO_LATERAL_JERK  = 5.0 m/s³    →  BMW_LATERAL_JERK  [1.5..5.0]
-  # Cancel the ramp when either exceeded, drain torque to 0
+  # ISO 11270 comfort guard. Cancel the ramp when either the accel or jerk
+  # side is exceeded, drain torque to 0:
   #   |a_y_meas| > BMW_LATERAL_ACCEL — current loading already at limit;
   #     don't push deeper. Uses κ_meas (measured outcome).
   #   |jerk_pred| > BMW_LATERAL_JERK — predicted jerk = v²·(κ_des−κ_meas)/T
@@ -296,15 +332,38 @@ def on_lat_controller_init(result, lac, CP):
   #     still on the wrong side, jerk_pred = 4.8 m/s³ → would have
   #     cancelled the counter-torque ramp that produced the 15.7 m/s³
   #     measured jerk.
+  #
+  # ACCEL side (2026-07-27): BMW_LATERAL_ACCEL is now accel_guard_threshold()
+  # (module scope, near HOLD_AY_BP) referenced to the COMMANDED lateral accel
+  # v²·|κ_des|, not this κ-indexed table. Route 3ce (segs 15/26/31) showed
+  # curves whose commanded a_y sat within ~5% of the old κ-interpolated
+  # threshold getting cancel_accel'd by normal ±15–20% tracking noise on the
+  # overshoot side — a drain-rebuild hunting cycle at 54% zero-torque. The
+  # old table's slope (~200 over the [0.005, 0.01] κ leg) is a fixed
+  # curvature→threshold mapping; SAT and achievable a_y both scale with v²,
+  # so that mapping is outrun once v² ≥ ~210 (above ~14.5 m/s) and the margin
+  # between "commanded" and "threshold" collapses. Referencing the threshold
+  # to commanded a_y directly (with a ratio + absolute margin) keeps the
+  # guard's headroom proportional to what was actually asked for, at any
+  # speed. ISO_LATERAL_ACCEL (3.0) stays the absolute ceiling via min();
+  # ACCEL_GUARD_FLOOR (1.5) preserves the 2026-05-22 near-straight
+  # tightening below. See accel_guard_threshold()'s own comment for the
+  # full formula rationale.
+  #
+  # JERK side: UNCHANGED, still this κ-indexed LATERAL_CURVATURE /
+  # LATERAL_JERK_BP table — jerk_pred is already error-relative
+  # (v²·(κ_des−κ_meas)/T), so it wasn't cycling the way the accel guard was.
+  #
   # Bug fix 2026-05-22: LATERAL_CURVATURE second value was 0.05 (out of order),
   # which made np.interp non-monotonic — cancel guards were stuck at the small-κ
   # value (2.0) all the way through |κ|=0.02, then jumped discontinuously to ISO
   # at the boundary. Corrected to 0.005 so the table ramps as designed.
   # Small-κ thresholds also tightened 2.0 → 1.5 — at near-straight, brief
   # κ_des excursions or lateral disturbances should cancel the ramp earlier
-  # (more conservative on small-κ overshoot).
+  # (more conservative on small-κ overshoot). The jerk table keeps that
+  # history; the accel side carries the same 1.5 floor forward as
+  # ACCEL_GUARD_FLOOR (2026-07-27).
   LATERAL_CURVATURE = [0.001, 0.005, 0.01, 0.02]
-  LATERAL_ACCEL_BP = [1.5, 1.5, 2.5, ISO_LATERAL_ACCEL]
   LATERAL_JERK_BP = [1.5, 1.5, 3.0, ISO_LATERAL_JERK]
 
   # Rear-axle bicycle-model wheelbase (m). Used for κ ↔ δ conversion.
@@ -500,8 +559,10 @@ def on_lat_controller_init(result, lac, CP):
       overshooting = ((state['desired'] - state['measured']) * state['measured'] < 0
                       and abs(state['measured']) > KMEAS_SIGN_FLOOR)
       cancel_reason = None
-      BMW_LATERAL_ACCEL = float(np.interp(abs(state['desired']),
-                                          LATERAL_CURVATURE, LATERAL_ACCEL_BP))
+      # Accel guard referenced to COMMANDED a_y (2026-07-27) — see the
+      # accel_guard_threshold() comment (module scope) and the ISO 11270
+      # comfort-guard comment block above for the route 3ce rationale.
+      BMW_LATERAL_ACCEL = accel_guard_threshold(v * v * abs(state['desired']))
       BMW_LATERAL_JERK = float(np.interp(abs(state['desired']),
                                           LATERAL_CURVATURE, LATERAL_JERK_BP))
       if overshooting:
