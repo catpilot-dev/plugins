@@ -521,6 +521,44 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
   return DEFAULT_FALLBACK_SPEED
 
 
+# --- Lane-count-first speed-limit inference (2026-07-28, route 3d0) ----------
+# Route 3d0 segs 41–49 (elevated ring road, official 80): the OSM road_id flipped
+# 37 times in 8 min among stacked ways — trunk 80 / primary 60 / residential 50
+# / trunk_link 40, surface streets 0.2–13 m beneath the elevated way in 2D — while
+# the vision lane count sat rock-stable at 4. The offline tiles carry no
+# layer/bridge/altitude to disambiguate the stack, so OSM road-type inference is
+# pure noise on stacked/elevated geometry. Redesign: the vision lane count drives
+# the limit on ordinary roads; OSM is trusted ONLY for G/S expressways, where the
+# EXISTING promote mechanism (wayRef class x lane count via
+# infer_speed_from_road_type — G+≥3 lanes → 120, S+≥3 lanes → 100) is preserved
+# verbatim and made sticky for GS_STICKY_S to ride out momentary flips to a
+# stacked non-G/S way (the 100→80 transient).
+GS_STICKY_S = 30.0       # hold expressway classification this long after the
+                         # last G/S match
+LANE_COUNT_LIMIT_3 = 60  # 3 confident lanes → 60 km/h
+LANE_COUNT_LIMIT_4 = 80  # ≥4 confident lanes → 80 km/h
+
+
+def is_gs_expressway_ref(way_ref: str) -> bool:
+  """G/S expressway ref: 'G' or 'S' followed by a digit (G50, S20, ...)."""
+  return len(way_ref) >= 2 and way_ref[0] in ('G', 'S') and way_ref[1].isdigit()
+
+
+def lane_count_limit(lane_count: int) -> int:
+  """Speed limit from the confident vision lane count (non-expressway roads).
+
+  ≤2 lanes: vision can't tell a through road from a link/ramp, so the speed is
+  the EXISTING narrow-road sub-table, UNCHANGED — delegated verbatim to
+  infer_speed_from_road_type's lane-count shortcut (2 → 40, 1 → 30). 3 → 60,
+  ≥4 → 80. See the GS_* block above for the route-3d0 rationale.
+  """
+  if lane_count <= 2:
+    return infer_speed_from_road_type('', lane_count, 'city')
+  if lane_count == 3:
+    return LANE_COUNT_LIMIT_3
+  return LANE_COUNT_LIMIT_4
+
+
 class SpeedLimitMiddleware:
   def __init__(self):
     # livePose (2026-07-28): lightest single, vehicle-agnostic source of a
@@ -551,6 +589,12 @@ class SpeedLimitMiddleware:
     self.last_road_context: str = 'unknown'
     self.last_way_ref: str = ''
     self.last_osm_hwtype: str = ''     # OSM highway=* class from offline_hw tiles
+    # G/S expressway stickiness (2026-07-28, route 3d0): once a G/S match is
+    # seen, hold expressway classification (and its promote-derived limit) for
+    # GS_STICKY_S even if the instantaneous match flips to a stacked non-G/S way.
+    self._gs_last_seen_t: float = 0.0  # monotonic time of last G/S match
+    self._gs_limit_kph: int = 0        # promote-derived limit held during stickiness
+    self.inference_mode: str = 'lane_count'  # 'gs_osm' | 'lane_count'
     self.lane_count: int = 1
     self.lane_count_stable: int = 1
     self.lane_count_stable_since: float = 0.0
@@ -924,17 +968,45 @@ class SpeedLimitMiddleware:
     # --- Priority cascade ---
     yolo_speed = self.yolo_speed
 
-    # Urban expressways without a G/S highway ref (like 中环路, 北翟高架路) are classified
-    # as 'freeway' by mapd but their actual speed limit is trunk-class (80 km/h), not
-    # motorway-class (120 km/h). Treat them as 'city' for inference.
-    road_ctx_for_infer = self.last_road_context
-    if not self.last_way_ref and road_ctx_for_infer == 'freeway':
-      road_ctx_for_infer = 'city'
+    # --- Base speed-limit inference — lane-count-first (2026-07-28, route 3d0) ---
+    # OSM road-type inference is REMOVED for ordinary roads: on stacked/elevated
+    # geometry the matched way churns 37×/8min while the vision lane count is
+    # rock-stable, so the lane count drives the limit. OSM is trusted ONLY for
+    # G/S expressways, where the EXISTING promote mechanism
+    # (infer_speed_from_road_type — G/S ref × lane count) is preserved verbatim
+    # and made sticky. A way is in G/S mode iff its ref is 'G'/'S'+digit OR its
+    # OSM highway class is 'motorway'. G/S classification is sticky for
+    # GS_STICKY_S so a momentary flip to a stacked non-G/S way can't drop the
+    # expressway limit under the car (the 100→80 transient).
+    is_gs_now = (is_gs_expressway_ref(self.last_way_ref)
+                 or self.last_osm_hwtype == 'motorway')
+    if is_gs_now:
+      # Urban elevated expressways without a G/S ref (中环路, 北翟高架路) are tagged
+      # 'freeway' by mapd but are trunk-class (80), not motorway (120) — demote
+      # their context to 'city' for the promote, exactly as before.
+      road_ctx_for_infer = self.last_road_context
+      if not self.last_way_ref and road_ctx_for_infer == 'freeway':
+        road_ctx_for_infer = 'city'
+      self._gs_limit_kph = infer_speed_from_road_type(
+        self.last_highway_type, self.lane_count_stable, road_ctx_for_infer,
+        width_class=self.lane_width_class, osm_type=self.last_osm_hwtype,
+      )
+      self._gs_last_seen_t = now
 
-    inferred_speed = infer_speed_from_road_type(
-      self.last_highway_type, self.lane_count_stable, road_ctx_for_infer,
-      width_class=self.lane_width_class, osm_type=self.last_osm_hwtype,
-    )
+    gs_mode = (self._gs_last_seen_t > 0.0
+               and now - self._gs_last_seen_t <= GS_STICKY_S)
+
+    if gs_mode:
+      # Hold the last promote-derived limit through momentary non-G/S flips.
+      inferred_speed = self._gs_limit_kph
+      self.inference_mode = 'gs_osm'
+    else:
+      # Lane-count debounce is the EXISTING lane_count_stable directional
+      # hysteresis (up 1.5 s, down 2 s curving / 5 s straight) — the limit only
+      # moves after a lane-count change has held, so a momentary lane-prob dip
+      # can't flicker it.
+      inferred_speed = lane_count_limit(self.lane_count_stable)
+      self.inference_mode = 'lane_count'
 
     # Vision cap: when vision confidently sees ≤2 lanes, cap inferred speed.
     # Only apply when lane_count_stable < 3 — on confirmed multi-lane roads the
@@ -964,7 +1036,7 @@ class SpeedLimitMiddleware:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
     if react_active:
       candidates.append((react_cap_kph, 4, 0.7))  # reactiveLatAccel (safety class)
-    candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # roadTypeInference
+    candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # base inference (lane-count / gs_osm), source 2
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
 
@@ -1036,6 +1108,9 @@ class SpeedLimitMiddleware:
       'source': source,
       'confirmed': self.confirmed,
       'confidence': confidence,
+      # Base-inference mode: 'gs_osm' (G/S expressway promote, sticky) or
+      # 'lane_count' (vision lane-count table). Telemetry/observability only.
+      'inferenceMode': self.inference_mode,
       'yoloSpeed': yolo_speed,
       'inferredSpeed': inferred_speed,
       'highwayType': self.last_highway_type,

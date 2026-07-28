@@ -1453,6 +1453,244 @@ class TestReactiveCapIntegration:
 
 
 # ============================================================
+# Lane-count-first speed limits — OSM trusted only for G/S
+# expressways (route 3d0 elevated-road flicker, 2026-07-28)
+# ============================================================
+
+class TestLaneCountFirstInference:
+  """Non-G/S roads: the limit is driven by the vision lane count only (OSM
+  road-type churn among stacked/elevated ways is ignored). G/S expressways: the
+  EXISTING promote mechanism (wayRef class x lane count via
+  infer_speed_from_road_type), preserved verbatim and made sticky for
+  GS_STICKY_S."""
+
+  def _mw(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def _result(self, **kw):
+    base = {'wayRef': '', 'wayName': '', 'speedLimit': 0.0, 'lanes': 0,
+            'roadContext': 1, 'roadName': '', 'highwayType': '', 'distance': 5.0}
+    base.update(kw)
+    return base
+
+  def _published(self, mw):
+    return mw._sl_pub.send.call_args[0][0]
+
+  # --- pure helpers -----------------------------------------
+
+  def test_lane_count_limit_table(self, sld):
+    assert sld.lane_count_limit(1) == 30
+    assert sld.lane_count_limit(2) == 40
+    assert sld.lane_count_limit(3) == 60
+    assert sld.lane_count_limit(4) == 80
+    assert sld.lane_count_limit(6) == 80
+
+  def test_lane_count_limit_narrow_delegates_to_existing_subtable(self, sld):
+    # ≤2 lanes: keep the EXISTING narrow-road sub-table exactly — delegated
+    # verbatim to infer_speed_from_road_type's lane-count shortcut.
+    assert sld.lane_count_limit(2) == sld.infer_speed_from_road_type('', 2, 'city')
+    assert sld.lane_count_limit(1) == sld.infer_speed_from_road_type('', 1, 'city')
+
+  def test_is_gs_expressway_ref(self, sld):
+    assert sld.is_gs_expressway_ref('G50')
+    assert sld.is_gs_expressway_ref('S20')
+    assert sld.is_gs_expressway_ref('G2')
+    assert sld.is_gs_expressway_ref('S200')     # S + digit (task rule)
+    assert not sld.is_gs_expressway_ref('')
+    assert not sld.is_gs_expressway_ref('白城路')
+    assert not sld.is_gs_expressway_ref('G')     # no trailing digit
+    assert not sld.is_gs_expressway_ref('X5')
+
+  # --- Test 1: THE 3d0 regression scenario ------------------
+
+  def test_3d0_stacked_way_churn_limit_constant_80(self, sld):
+    """Lane count 4 stable while the matched-way identity churns among
+    trunk/primary/residential/trunk_link every tick (no G/S refs) → published
+    limit CONSTANT 80. The flicker is structurally impossible: the matched-way
+    identity no longer feeds the limit at all on non-G/S roads."""
+    mw = self._mw(sld)
+    mw.lane_count = 4
+    mw.lane_count_stable = 4                     # vision rock-stable at 4 lanes
+    stacked = [
+      {'roadName': 'trunk way',   'highwayType': 'trunk',       'roadContext': 0},
+      {'roadName': 'primary way', 'highwayType': 'primary',     'roadContext': 1},
+      {'roadName': 'res way',     'highwayType': 'residential', 'roadContext': 1},
+      {'roadName': 'link way',    'highwayType': 'trunk_link',  'roadContext': 1},
+    ]
+    limits, modes = [], []
+    for _ in range(3):                           # 12 way flips
+      for w in stacked:
+        mw._ingest_osm_result(self._result(**w))
+        mw.update()
+        limits.append(self._published(mw)['speedLimit'])
+        modes.append(self._published(mw)['inferenceMode'])
+    assert set(limits) == {80}, f'limit flickered under way churn: {limits}'
+    assert set(modes) == {'lane_count'}
+
+  # --- Test 2: G/S promote (existing mechanism, preserved) --
+
+  def test_gs_promote_g_road_120(self, sld):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    mw._ingest_osm_result(self._result(wayRef='G50', roadName='京沪高速',
+                                       roadContext=0, highwayType='motorway'))
+    mw.update()
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert pub['inferredSpeed'] == 120           # nonurban motorway multi (promote)
+
+  def test_gs_promote_g_road_3lane_still_120(self, sld):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    mw._ingest_osm_result(self._result(wayRef='G50', roadContext=0,
+                                       highwayType='motorway'))
+    mw.update()
+    assert self._published(mw)['inferredSpeed'] == 120
+
+  def test_gs_promote_s_road_100(self, sld):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    mw._ingest_osm_result(self._result(wayRef='S20', roadContext=0,
+                                       highwayType='trunk'))
+    mw.update()
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert pub['inferredSpeed'] == 100           # nonurban trunk multi (promote)
+
+  def test_gs_motorway_type_no_ref_enters_gs_mode(self, sld):
+    # osmHwType == 'motorway' (urban elevated, no ref) enters G/S mode; the
+    # limit is whatever the EXISTING promote mechanism yields for it (trunk-grade
+    # 80 for a 4-lane urban motorway — unchanged behavior, now just labeled).
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    mw._ingest_osm_result(self._result(highwayType='motorway', roadContext=1))
+    mw.update()
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert pub['inferredSpeed'] == sld.infer_speed_from_road_type(
+      '', 4, 'city', osm_type='motorway')
+
+  def test_gs_narrow_gates_promote(self, sld):
+    # A 2-lane G ramp is NOT promoted — the narrow-road shortcut still wins.
+    mw = self._mw(sld)
+    mw.lane_count_stable = 2
+    mw._ingest_osm_result(self._result(wayRef='G50', roadContext=0,
+                                       highwayType='motorway'))
+    mw.update()
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert pub['inferredSpeed'] == 40            # narrow shortcut, unchanged
+
+  # --- Test 3: G/S stickiness -------------------------------
+
+  def test_gs_stickiness_holds_then_reverts(self, sld, monkeypatch):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    clock = {'t': 1000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    # G50 seen → promote to 120
+    mw._ingest_osm_result(self._result(wayRef='G50', roadContext=0,
+                                       highwayType='motorway'))
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'
+    assert self._published(mw)['inferredSpeed'] == 120
+    # 10 s of stacked non-G/S matches → sticky holds expressway mode + limit
+    mw._ingest_osm_result(self._result(roadName='res', highwayType='residential'))
+    clock['t'] += 10.0
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'
+    assert self._published(mw)['inferredSpeed'] == 120   # held (not the 30 res value)
+    # 35 s total since the last G/S match → reverts to lane-count mode
+    clock['t'] += 25.0
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
+    assert self._published(mw)['inferredSpeed'] == 80    # lane_count(4)
+
+  # --- Test 4: lane-count transition debounce ---------------
+
+  def _straight_model(self, probs):
+    m = MagicMock()
+    m.laneLineProbs = list(probs)
+    n = 33
+    m.orientationRate.z = [0.0] * n              # straight → no curvature cap
+    m.velocity.x = [20.0] * n
+    m.position.x = [float(i * 3) for i in range(n)]
+    m.position.yStd = [0.1] * n
+    m.roadEdges = [MagicMock(y=[0.0] * 10) for _ in range(2)]
+    m.roadEdgeStds = [1.0, 1.0]                  # not near an edge → no boost
+    m.laneLines = [MagicMock(y=[0.0] * 10) for _ in range(4)]
+    return m
+
+  def _mw_model(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    holder = {'model': None}
+    sm = MagicMock()
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    sm.__getitem__ = MagicMock(
+      side_effect=lambda k: holder['model'] if k == 'modelV2' else MagicMock())
+    mw.sm = sm
+    return mw, holder
+
+  def test_lane_drop_4_to_3_debounced(self, sld, monkeypatch):
+    """4→3 lanes sustained → 80→60 after the (existing lane_count_stable)
+    debounce; a 1 s dip to 3 → no change."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 5000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    m4 = self._straight_model([0.6, 0.7, 0.7, 0.6])   # 4 visible lines
+    m3 = self._straight_model([0.6, 0.7, 0.7, 0.1])   # 3 visible lines
+    # establish a stable, locked 4-lane reading
+    holder['model'] = m4
+    mw.update()
+    mw.lane_count = 4
+    mw.lane_count_stable = 4
+    mw.lane_count_stable_since = clock['t']
+    mw.update()
+    assert self._published(mw)['inferredSpeed'] == 80
+
+    # vision now sees 3 lanes; a 1 s dip is below the 5 s (straight) demotion win
+    holder['model'] = m3
+    mw.update()                        # raw=3 != lane_count(4): lane_count=3, since=now
+    clock['t'] += 1.0
+    mw.update()                        # 1 s < 5 s → no commit
+    assert mw.lane_count_stable == 4
+    assert self._published(mw)['inferredSpeed'] == 80   # dip ignored
+
+    # sustain 3 lanes past the 5 s window → commit → limit follows to 60
+    clock['t'] += 5.1
+    mw.update()
+    assert mw.lane_count_stable == 3
+    assert self._published(mw)['inferredSpeed'] == 60
+
+  # --- source / telemetry -----------------------------------
+
+  def test_source_stays_road_type_inference_class(self, sld):
+    # The base-inference candidate keeps source==2 so planner_hook's hold-floor
+    # (SOURCE_ROAD_TYPE_INFERENCE) still recognizes it.
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    mw.update()
+    assert self._published(mw)['source'] == 2
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
+
+
+# ============================================================
 # plugin.json validation
 # ============================================================
 
