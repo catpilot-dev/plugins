@@ -1588,6 +1588,20 @@ class TestLaneCountFirstInference:
     assert pub['inferredSpeed'] == 80            # urban trunk-grade demote
     assert pub['inferredSpeed'] != 120
 
+  def test_gs_motorway_type_no_ref_freeway_context_still_demotes_to_80(self, sld):
+    # Re-review precision item: the ON-CAR elevated-expressway case is
+    # roadContext=0 (mapd tags elevated ways 'freeway'). The ref-less
+    # motorway demote must hold there too — 80 via the freeway-demote
+    # branch, NOT 100 via the motorway+freeway promote.
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    mw._ingest_osm_result(self._result(highwayType='motorway', roadContext=0))
+    mw.update()
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert pub['inferredSpeed'] == 80
+    assert pub['inferredSpeed'] not in (100, 120)
+
   def test_gs_narrow_ramp_immediate_release(self, sld):
     # lane_count_stable ≤ 2 while a G ref matches → immediate release to
     # lane-count mode (narrow ramp/exit), never a stale expressway limit
