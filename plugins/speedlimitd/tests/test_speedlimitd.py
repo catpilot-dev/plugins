@@ -1036,6 +1036,109 @@ class TestDistanceAwareCurveCap:
     model = self._uniform(kappa * v, v, 0.0)  # d=0 → no braking headroom
     assert sld.curvature_speed_cap(model, 1.5) == 30
 
+  # --- Test 8 (route 3d0 seg 60 apex fix): the sharpest PATH point always
+  #     sits at d>0, so the distance term (2·COMFORT_BRAKE·d_i) keeps the cap
+  #     above the derated target — the car never actually reaches it. The
+  #     driver's own measured curvature (kappa_meas), passed in as a virtual
+  #     d=0 apex point, delivers the derated target directly. (a) apex
+  #     delivery: no path curvature at all, so the virtual point alone binds.
+  def test_apex_virtual_point_delivers_derated_target(self, sld):
+    import math
+    kappa_meas = 0.02  # onset boundary — factor 1.0, no derate
+    model = self._uniform(0.0, 10.0, 50.0)  # yaw=0 everywhere: no path curvature
+    expected = round(math.sqrt(1.5 * 1.0 / kappa_meas) * 3.6)  # ~31
+    assert sld.curvature_speed_cap(model, 1.5, kappa_meas) == expected
+    assert expected > 30  # the virtual point is the binding (non-floored) one
+
+  # --- Test (b): derated target below the floor clamps to exactly 30, same
+  #     as any other point.
+  def test_apex_virtual_point_floored(self, sld):
+    kappa_meas = 0.03  # hairpin-class, derate applies
+    model = self._uniform(0.0, 10.0, 50.0)  # no path curvature
+    assert sld.curvature_speed_cap(model, 1.5, kappa_meas) == 30
+
+  # --- Test (d): below CURVE_GATE, the virtual point has no effect at all —
+  #     same result as not passing kappa_meas (None).
+  def test_apex_virtual_point_below_gate_no_effect(self, sld):
+    kappa_meas = 0.002  # below CURVE_GATE (0.003)
+    model = self._uniform(0.0, 10.0, 50.0)  # no path curvature either
+    assert sld.curvature_speed_cap(model, 1.5, kappa_meas) == 0
+    assert sld.curvature_speed_cap(model, 1.5, None) == 0
+
+  # --- Test (e): min semantics — a tighter PATH point must never be loosened
+  #     by a milder virtual apex point.
+  def test_apex_virtual_point_never_raises_cap(self, sld):
+    kappa_meas = 0.005  # looser than the path point below
+    model = self._uniform(0.30, 20.0, 0.0)  # κ_path=0.015, d=0 → 36 km/h
+    path_only = sld.curvature_speed_cap(model, 1.5, None)
+    with_virtual = sld.curvature_speed_cap(model, 1.5, kappa_meas)
+    assert with_virtual == path_only == 36
+
+
+class TestMeasuredCurvatureApexWiring:
+  """update() wires the SAME livePose plumbing the reactive cap already
+  consumes into curvature_speed_cap()'s kappa_meas virtual apex point — no
+  new subscription, no new staleness tracking (route 3d0 seg 60 apex fix)."""
+
+  def _model(self, yaw, vel, px_val, n=33):
+    m = MagicMock()
+    m.orientationRate.z = [yaw] * n
+    m.velocity.x = [vel] * n
+    m.position.x = [float(px_val)] * n
+    m.position.yStd = [0.1] * n
+    return m
+
+  def _mw(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  # --- Test (c): no livePose update this tick -> kappa_meas stays None ->
+  #     curvature_speed_cap sees no virtual apex point -> result is exactly
+  #     the path-only computation, unaffected by the apex-point feature.
+  def test_stale_livepose_no_virtual_point(self, sld):
+    mw = self._mw(sld)
+    model = self._model(0.30, 20.0, 0.0)  # κ_path=0.015, d=0 -> path-only 36 km/h
+    sm = MagicMock()
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    sm.__getitem__ = MagicMock(side_effect=lambda k: model if k == 'modelV2' else MagicMock())
+    mw.sm = sm
+    mw.update()
+    expected = sld.curvature_speed_cap(model, mw.curve_target_lat_accel, None)
+    assert mw.curvature_cap == expected == 36
+
+  def test_fresh_livepose_wires_virtual_point(self, sld):
+    """Sanity check the wiring the other direction: a fresh, valid livePose
+    reading with tight measured curvature DOES tighten self.curvature_cap
+    below the path-only value."""
+    mw = self._mw(sld)
+    model = self._model(0.0, 20.0, 50.0)  # no path curvature at all
+    lp = MagicMock()
+    lp.angularVelocityDevice.valid = True
+    lp.angularVelocityDevice.z = 0.6  # kappa_meas = 0.6 / max(10, 0.1) = 0.06 -> derated, floored
+    lp.velocityDevice.valid = True
+    lp.velocityDevice.x = 10.0
+    sm = MagicMock()
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': True}
+    sm.update = MagicMock()
+
+    def getitem(k):
+      if k == 'modelV2':
+        return model
+      if k == 'livePose':
+        return lp
+      return MagicMock()
+
+    sm.__getitem__ = MagicMock(side_effect=getitem)
+    mw.sm = sm
+    mw.update()
+    assert mw.curvature_cap == 30  # virtual apex point bound and floored
+
 
 class TestCurvatureCapEnforcementVsDisplay:
   """self.curvature_cap is the RAW enforcement value; only the published/

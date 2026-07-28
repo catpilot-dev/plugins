@@ -287,7 +287,7 @@ def _interp(x: float, xp: list, fp: list) -> float:
   return fp[-1]
 
 
-def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
+def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5, kappa_meas: float | None = None) -> int:
   """Cap speed based on predicted path curvature within reliable vision.
 
   Looks at the model's predicted yaw rate and velocity over a horizon
@@ -322,6 +322,14 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
   Callers that need a display-clean value must call snap_to_standard_speed()
   themselves at the point where the value is shown/published — see
   SpeedLimitMiddleware.update().
+
+  `kappa_meas` (route 3d0 seg 60 apex fix): the driver's OWN measured
+  curvature, |yaw_rate|/max(v_ego, 0.1) from the same livePose signal the
+  reactive cap already consumes, passed in only when that reading is fresh
+  and valid. When given and above CURVE_GATE it is folded in as a virtual
+  d=0 path point (no braking-headroom term — the apex itself is the most
+  confident path point there is) using the SAME derate interp and floor as
+  every other point, and only ever tightens the result (min semantics).
 
   Returns speed cap in km/h, or 0 if no meaningful constraint (including when
   the raw, unsnapped value is >= 100 km/h — the curve is far/mild enough that
@@ -373,7 +381,23 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
     v_now = math.sqrt(v_curve * v_curve + 2.0 * COMFORT_BRAKE * max(d_i, 0.0))
     cap_ms = v_now if cap_ms is None else min(cap_ms, v_now)
 
-  if cap_ms is None:  # no meaningfully-curved point within confident vision
+  # 2026-07-28 (route 3d0 seg 60 apex fix): the sharpest path point the model
+  # sees always sits at d>0, so the distance term (2·COMFORT_BRAKE·d_i) keeps
+  # inflating v_now above the derated target — the car never actually reaches
+  # the intended derated speed until the apex is basically behind the
+  # confidence horizon (seg 60: distance term held the cap ~4 km/h above the
+  # derated apex target — delivered ~31, intended ~27). The apex itself is
+  # the most confident path point there is: measured curvature delivers the
+  # derated target exactly where the model's cutting makes margin matter.
+  # Division of labor stays clean — this is still the vision/curve cap
+  # (target-a_y-based, floored 30); the reactive cap (2.5 m/s² threshold)
+  # remains the separate excursion backstop.
+  if kappa_meas is not None and kappa_meas > CURVE_GATE:
+    target_ay_meas = max_lat_accel * _interp(kappa_meas, [0.02, 0.035], [1.0, TIGHT_CURVE_FACTOR])
+    v_virtual = math.sqrt(target_ay_meas / kappa_meas)  # d=0 — no headroom term
+    cap_ms = v_virtual if cap_ms is None else min(cap_ms, v_virtual)
+
+  if cap_ms is None:  # no meaningfully-curved point and no virtual apex point
     return 0
 
   safe_speed_kph = cap_ms * 3.6
@@ -773,6 +797,40 @@ class SpeedLimitMiddleware:
 
       self._ingest_osm_result(result)
 
+    # --- Reactive measured-a_y cap + measured-curvature apex point (2026-07-28) ---
+    # Read ahead of the modelV2 block below so this tick's measured curvature
+    # is available to curvature_speed_cap() as a same-tick virtual apex point
+    # (route 3d0 seg 60 apex fix — see kappa_meas there). Runs every tick (not
+    # gated on modelV2) off the localizer's measured yaw. a_y_meas = v · yaw_rate;
+    # both from livePose (vehicle-agnostic, no steering ratio). Catches curves
+    # the proactive vision cap missed and plant amplification — the ISO
+    # 3.0 m/s² defense lives here (see __init__).
+    react_dt = min(max(now - self._react_last_t, 0.0), 1.0) if self._react_last_t else 0.2
+    self._react_last_t = now
+    a_y_meas = None
+    v_ego_meas = 0.0
+    kappa_meas = None  # |yaw_rate| / max(v_ego, 0.1) — reused below as the
+                        # curvature_speed_cap() virtual apex point; stays None
+                        # (no virtual point) unless livePose is fresh and valid
+                        # THIS tick — reusing the exact same freshness/validity
+                        # check as a_y_meas, no separate staleness tracking added.
+    livepose_updated = self.sm.updated.get('livePose', False)
+    if livepose_updated:
+      try:
+        lp = self.sm['livePose']
+        av = lp.angularVelocityDevice
+        vd = lp.velocityDevice
+        if getattr(av, 'valid', True) and getattr(vd, 'valid', True):
+          v_ego_meas = abs(float(vd.x))
+          a_y_meas = v_ego_meas * float(av.z)
+          kappa_meas = abs(float(av.z)) / max(v_ego_meas, 0.1)
+      except Exception:
+        a_y_meas = None
+        v_ego_meas = 0.0
+        kappa_meas = None
+    self._update_reactive_cap(a_y_meas, v_ego_meas, self.react_lat_accel_threshold,
+                              now, react_dt, livepose_updated)
+
     # --- Read lane data from vision model ---
     if self.sm.updated['modelV2']:
       model = self.sm['modelV2']
@@ -818,7 +876,7 @@ class SpeedLimitMiddleware:
       #   2) when the hold expires and raw cap stays low, step-relaxing up the
       #      standard ladder (60 → 80 → 100 → off) instead of snapping to 0.
       # Re-detection at any point during the relax walks back to the tighter cap.
-      raw_curv_cap = curvature_speed_cap(model, self.curve_target_lat_accel)
+      raw_curv_cap = curvature_speed_cap(model, self.curve_target_lat_accel, kappa_meas)
       if raw_curv_cap > 0 and (raw_curv_cap <= self.curvature_cap or self.curvature_cap == 0):
         # Curve actively detected (tighter, equal, or first) — apply and refresh hold
         self.curvature_cap = raw_curv_cap
@@ -841,30 +899,6 @@ class SpeedLimitMiddleware:
           else:
             self.curvature_cap = 0
             self._curvature_cap_relax_step_t = 0.0
-
-    # --- Reactive measured-a_y cap (2026-07-28 layer contract) ---
-    # Runs every tick (not gated on modelV2) off the localizer's measured yaw.
-    # a_y_meas = v · yaw_rate; both from livePose (vehicle-agnostic, no steering
-    # ratio). Catches curves the proactive vision cap missed and plant
-    # amplification — the ISO 3.0 m/s² defense now lives here (see __init__).
-    react_dt = min(max(now - self._react_last_t, 0.0), 1.0) if self._react_last_t else 0.2
-    self._react_last_t = now
-    a_y_meas = None
-    v_ego_meas = 0.0
-    livepose_updated = self.sm.updated.get('livePose', False)
-    if livepose_updated:
-      try:
-        lp = self.sm['livePose']
-        av = lp.angularVelocityDevice
-        vd = lp.velocityDevice
-        if getattr(av, 'valid', True) and getattr(vd, 'valid', True):
-          v_ego_meas = abs(float(vd.x))
-          a_y_meas = v_ego_meas * float(av.z)
-      except Exception:
-        a_y_meas = None
-        v_ego_meas = 0.0
-    self._update_reactive_cap(a_y_meas, v_ego_meas, self.react_lat_accel_threshold,
-                              now, react_dt, livepose_updated)
 
     # --- Lane width observation from lane_centering plugin ---
     # Smoothed (EMA) across 5 Hz drain so a single noisy frame can't swing
