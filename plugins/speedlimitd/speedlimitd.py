@@ -313,7 +313,19 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
   MapdCurveTargetLatAccel param by the middleware (default 1.5, clamped
   [1.0, 3.0]).
 
-  Returns speed cap in km/h, or 0 if no meaningful constraint.
+  The return value is the RAW ramp value (rounded to 1 km/h, floored at
+  30 km/h) — it is NOT snapped to a standard speed. Snapping the enforcement
+  value quantized the smooth distance ramp away in the gaps between standard
+  speeds (e.g. a real, tightening 92 km/h constraint snapped to 100 — which
+  reads as "no constraint yet" — and then cliffed straight to 80 once the
+  curve was almost on top of the car, instead of gently tightening 92 → 80).
+  Callers that need a display-clean value must call snap_to_standard_speed()
+  themselves at the point where the value is shown/published — see
+  SpeedLimitMiddleware.update().
+
+  Returns speed cap in km/h, or 0 if no meaningful constraint (including when
+  the raw, unsnapped value is >= 100 km/h — the curve is far/mild enough that
+  no slowdown is needed yet).
   """
   if not hasattr(model_msg, 'orientationRate') or not hasattr(model_msg, 'velocity'):
     return 0
@@ -345,7 +357,7 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
   # Per-point pass within both time AND distance bounds. d_i is position.x[i]
   # (forward distance along the path — adequate at ≤100 m, see note below).
   cap_ms = None
-  for i in range(5, min(31, len(yaw_rates), len(positions_x))):
+  for i in range(5, min(31, len(yaw_rates), len(positions_x), len(velocities))):
     d_i = positions_x[i]
     if d_i > conf_dist:
       break  # past confident vision — extrapolation noise
@@ -367,9 +379,14 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
   safe_speed_kph = cap_ms * 3.6
 
   if safe_speed_kph >= 100:
-    return 0  # curve far/mild enough that no slowdown is needed yet
+    return 0  # curve far/mild enough that no slowdown is needed yet — RAW check
 
-  return snap_to_standard_speed(int(safe_speed_kph))
+  # Enforcement floor: no real road curve constraint is below the lowest
+  # standard speed (30). This used to be provided incidentally by
+  # snap_to_standard_speed (30 is the nearest standard for anything below
+  # 35) — now that the return value is unsnapped, clamp explicitly.
+  CURVE_CAP_FLOOR_KPH = 30
+  return max(CURVE_CAP_FLOOR_KPH, round(safe_speed_kph))
 
 
 def vision_speed_cap(model_msg) -> int:
@@ -518,7 +535,8 @@ class SpeedLimitMiddleware:
     self.vision_cap: int = 0
     self.vision_cap_stable: int = 0
     self.vision_cap_stable_since: float = 0.0
-    self.curvature_cap: int = 0
+    self.curvature_cap: int = 0  # RAW enforcement value (unsnapped, see curvature_speed_cap);
+                                  # snapped to a standard speed only where displayed/published
     self._curvature_cap_hold_until: float = 0.0  # monotonic time to hold current cap
     self._curvature_cap_relax_step_t: float = 0.0  # last step time during relax phase
 
@@ -993,7 +1011,10 @@ class SpeedLimitMiddleware:
       'laneCount': self.lane_count_stable,
       'laneWidth': round(self.lane_width, 2),
       'laneWidthClass': self.lane_width_class,
-      'curvatureCap': self.curvature_cap,
+      # self.curvature_cap is the RAW enforcement value (unsnapped); the
+      # published/displayed cap is snapped to a standard speed at this one
+      # publish site, same as speedLimit.
+      'curvatureCap': snap_to_standard_speed(self.curvature_cap) if self.curvature_cap >= MIN_SPEED_LIMIT else 0,
       'safetyCapped': safety_capped,
       # Reactive measured-a_y cap telemetry (2026-07-28).
       'reactCapEngaged': self._react_cap_ms > 0.0,

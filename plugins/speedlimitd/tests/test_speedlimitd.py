@@ -912,7 +912,10 @@ class TestDistanceAwareCurveCap:
     kappa = 0.30 / 20.0  # 0.015 — below the 0.02 derate onset → factor 1.0
     model = self._uniform(0.30, 20.0, 0.0)  # all points at d=0
     v_curve = math.sqrt(1.5 / kappa)         # target_ay = 1.5 (no derate)
-    expected = sld.snap_to_standard_speed(int(v_curve * 3.6))
+    # Enforcement is the RAW (unsnapped) ramp value, rounded to 1 km/h —
+    # snapping to a standard speed is a display-only concern now (see
+    # TestCurvatureCapDisplaySnap / TestMidBandCurveOnset).
+    expected = round(v_curve * 3.6)
     assert sld.curvature_speed_cap(model, 1.5) == expected
 
   # --- Test 2: same curve at d=40 m → braking headroom raises the allowed
@@ -923,7 +926,7 @@ class TestDistanceAwareCurveCap:
     model = self._uniform(0.30, 20.0, 40.0)
     v_curve = math.sqrt(1.5 / kappa)                       # 10 m/s
     cap_now = math.sqrt(v_curve ** 2 + 2 * 0.8 * 40)       # sqrt(164) ≈ 12.8 m/s
-    assert sld.curvature_speed_cap(model, 1.5) == sld.snap_to_standard_speed(int(cap_now * 3.6))
+    assert sld.curvature_speed_cap(model, 1.5) == round(cap_now * 3.6)  # raw, unsnapped
     assert cap_now > v_curve                               # braking headroom
     result = sld.curvature_speed_cap(model, 1.5)
     assert 0 < result < 100                                # still a meaningful cap
@@ -965,11 +968,12 @@ class TestDistanceAwareCurveCap:
     factor = sld._interp(0.03, [0.02, 0.035], [1.0, 0.75])
     model = self._uniform(0.60, 20.0, 0.0)  # κ = 0.60/20 = 0.03
     v_curve = math.sqrt(1.5 * factor / 0.03)
-    assert sld.curvature_speed_cap(model, 1.5) == sld.snap_to_standard_speed(int(v_curve * 3.6))
+    # Raw ramp value (~23 km/h) is below the 30 km/h enforcement floor.
+    assert sld.curvature_speed_cap(model, 1.5) == max(30, round(v_curve * 3.6))
     # κ=0.02 exactly → factor 1.0 (no derate).
     model2 = self._uniform(0.40, 20.0, 0.0)  # κ = 0.02
     v_curve2 = math.sqrt(1.5 * 1.0 / 0.02)
-    assert sld.curvature_speed_cap(model2, 1.5) == sld.snap_to_standard_speed(int(v_curve2 * 3.6))
+    assert sld.curvature_speed_cap(model2, 1.5) == max(30, round(v_curve2 * 3.6))
 
   # --- Test 5: seg-61 regression. κ=0.026 at d=35, v=12.6 m/s (~45 km/h),
   #             target 1.5. The commanded cap must START the slowdown at that
@@ -989,6 +993,101 @@ class TestDistanceAwareCurveCap:
     factor = sld._interp(kappa, [0.02, 0.035], [1.0, 0.75])
     v_curve_kph = math.sqrt(1.5 * factor / kappa) * 3.6
     assert cap_kph > v_curve_kph          # braking headroom, not the old cliff
+
+  # --- Test 6 (review regression guard): mid-band onset must not be
+  #     quantized away by snap-to-standard. Before the fix, curvature_speed_cap
+  #     snapped its own return value, so a raw v_now sitting in the 80<->100
+  #     standard-speed gap (e.g. ~89-92 km/h) could round UP to 100 — which
+  #     downstream logic (self.curvature_cap held/compared as an already-
+  #     snapped number) could treat as if no meaningful constraint existed
+  #     yet, only to cliff straight to 80 once the curve was almost on top of
+  #     the car. The raw (unsnapped) value must show a real, gentle cap the
+  #     whole way in.
+  def test_mid_band_onset_not_quantized_away(self, sld):
+    import math
+    kappa = 0.0032  # just above CURVE_GATE (0.003); below 0.02 → no derate
+    v = 20.0
+    yaw = kappa * v
+    v_curve = math.sqrt(1.5 / kappa)  # ~77.9 km/h — the curve itself
+
+    caps = {d: sld.curvature_speed_cap(self._uniform(yaw, v, d), 1.5)
+            for d in (90, 60, 30, 0)}
+
+    # At d=90 (near the confidence boundary) the sqrt-ramp lands the raw cap
+    # in the 80<->100 gap — a real, gentle constraint, not suppressed to 0.
+    v_now_90 = math.sqrt(v_curve ** 2 + 2 * 0.8 * 90)
+    assert caps[90] == round(v_now_90 * 3.6)
+    assert 80 < caps[90] < 100
+
+    # Tightens monotonically (strictly) as the curve nears — no one-shot
+    # 100 -> 80 style cliff hiding inside the sequence.
+    assert caps[90] > caps[60] > caps[30] > caps[0]
+
+    # d=0 reduces to the raw (unsnapped) v_curve, per test_d0_equals_old_behavior.
+    assert caps[0] == round(v_curve * 3.6)
+
+  # --- Test 7 (review): the 30 km/h enforcement floor must be explicit now
+  #     that snap_to_standard_speed no longer incidentally provides it (30 is
+  #     the lowest standard speed, so any raw value below 35 used to land on
+  #     30 for free via nearest-snap).
+  def test_hairpin_floor_clamps_to_30(self, sld):
+    kappa = 0.03  # hairpin-class curvature
+    v = 20.0
+    model = self._uniform(kappa * v, v, 0.0)  # d=0 → no braking headroom
+    assert sld.curvature_speed_cap(model, 1.5) == 30
+
+
+class TestCurvatureCapEnforcementVsDisplay:
+  """self.curvature_cap is the RAW enforcement value; only the published/
+  displayed limit is snapped to a standard speed (review fix)."""
+
+  def _mw_for_update(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    # Controlled SubMaster: nothing updated this tick, model block skipped —
+    # lets us drive self.curvature_cap directly, same pattern as
+    # TestReactiveCapIntegration.
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def test_curvature_cap_display_snapped_enforcement_raw(self, sld):
+    mw = self._mw_for_update(sld)
+    # Road inference would allow well above the curvature cap so the curve
+    # cap is the binding (min()) candidate.
+    mw.lane_count_stable = 4
+    mw.last_road_context = 'freeway'
+    mw.last_way_ref = 'G2'
+    mw.last_highway_type = 'motorway'
+    mw.curvature_cap = 87   # raw enforcement value — NOT a standard speed
+    mw.update()
+    published = mw._sl_pub.send.call_args[0][0]
+
+    # Published/displayed values are always standard speeds...
+    assert published['curvatureCap'] == sld.snap_to_standard_speed(87)
+    assert published['curvatureCap'] in sld._STANDARD_SPEEDS
+    assert published['speedLimit'] in sld._STANDARD_SPEEDS
+    # ...and the curve cap is what's actually constraining the display,
+    # tighter than the 120 km/h the road inference alone would allow.
+    assert published['speedLimit'] <= sld.snap_to_standard_speed(87)
+    assert published['safetyCapped'] is True
+
+  def test_curvature_cap_zero_publishes_zero(self, sld):
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 4
+    mw.last_road_context = 'freeway'
+    mw.last_way_ref = 'G2'
+    mw.last_highway_type = 'motorway'
+    mw.curvature_cap = 0
+    mw.update()
+    published = mw._sl_pub.send.call_args[0][0]
+    assert published['curvatureCap'] == 0
 
 
 # ============================================================
