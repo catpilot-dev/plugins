@@ -10,6 +10,7 @@ Three-tier priority:
 """
 import math
 import os
+import re
 import time
 import tomllib
 import cereal.messaging as messaging
@@ -533,15 +534,34 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
 # infer_speed_from_road_type — G+≥3 lanes → 120, S+≥3 lanes → 100) is preserved
 # verbatim and made sticky for GS_STICKY_S to ride out momentary flips to a
 # stacked non-G/S way (the 100→80 transient).
-GS_STICKY_S = 30.0       # hold expressway classification this long after the
-                         # last G/S match
-LANE_COUNT_LIMIT_3 = 60  # 3 confident lanes → 60 km/h
-LANE_COUNT_LIMIT_4 = 80  # ≥4 confident lanes → 80 km/h
+GS_STICKY_S = 30.0          # absolute ceiling on the sticky expressway hold
+GS_RELEASE_CONT_S = 10.0    # release once non-G/S matches have been CONTINUOUS
+                            # this long — a genuine exit connector accumulates it
+                            # in one run; an alternating stacked flicker keeps
+                            # resetting it (stickiness preserved). Bounds a stale
+                            # 100/120 hold well under the 30 s ceiling (a wide
+                            # gentle exit must not defeat safety caps for 30 s).
+LANE_COUNT_LIMIT_3 = 60     # 3 confident lanes → 60 km/h
+LANE_COUNT_LIMIT_4 = 80     # ≥4 confident lanes → 80 km/h
+
+# China expressway ref grammar (国家高速 / 省级高速 numbering system):
+#   [GS]\d{1,2}  national/provincial expressway TRUNKS — G2, G15, S1, S20
+#   [GS]\d{4}    regional ring / spur expressways      — G1501 (Shenyang ring)
+#   [GS]\d{3}    ordinary guodao/shengdao SURFACE highways — G312, S203 — these
+#                are NOT controlled-access expressways (official ~80 km/h) and
+#                MUST route through lane-count mode, not the OSM promote. The
+#                3-digit exclusion is the whole point: it keeps the noisy OSM
+#                road-type path away from ordinary national/provincial roads.
+_GS_EXPRESSWAY_RE = re.compile(r'^[GS](\d{1,2}|\d{4})$')
 
 
 def is_gs_expressway_ref(way_ref: str) -> bool:
-  """G/S expressway ref: 'G' or 'S' followed by a digit (G50, S20, ...)."""
-  return len(way_ref) >= 2 and way_ref[0] in ('G', 'S') and way_ref[1].isdigit()
+  """True iff way_ref is a controlled-access G/S expressway ref (see grammar).
+
+  1–2 digit and 4-digit G/S refs are expressways; a 3-digit ref is an ordinary
+  guodao/shengdao surface highway and is deliberately excluded.
+  """
+  return bool(_GS_EXPRESSWAY_RE.match(way_ref))
 
 
 def lane_count_limit(lane_count: int) -> int:
@@ -594,6 +614,9 @@ class SpeedLimitMiddleware:
     # GS_STICKY_S even if the instantaneous match flips to a stacked non-G/S way.
     self._gs_last_seen_t: float = 0.0  # monotonic time of last G/S match
     self._gs_limit_kph: int = 0        # promote-derived limit held during stickiness
+    self._gs_absent_since: float | None = None  # start of the current continuous
+                                                 # non-G/S run (None ⇒ last match
+                                                 # was G/S)
     self.inference_mode: str = 'lane_count'  # 'gs_osm' | 'lane_count'
     self.lane_count: int = 1
     self.lane_count_stable: int = 1
@@ -784,15 +807,14 @@ class SpeedLimitMiddleware:
       elif result['roadContext'] == 1:
         self.last_road_context = 'city'
 
-      # Highway type from wayRef.
-      # G = national expressway (120 km/h), S1-S99 = provincial expressway (100 km/h).
-      # S100+ are provincial general roads, not expressways.
+      # Highway type from wayRef — ONLY true G/S expressways promote (same
+      # grammar as the gs_mode gate, see is_gs_expressway_ref): G expressway →
+      # motorway (120 km/h), S expressway → trunk (100 km/h). Ordinary 3-digit
+      # guodao/shengdao (G312, S203) classify as '' so gs_mode never sees them.
       road_id = result['roadName'] or way_ref
       hw = ''
-      if way_ref.startswith('G'):
-        hw = 'motorway'
-      elif way_ref.startswith('S') and len(way_ref[1:]) <= 2 and way_ref[1:].isdigit():
-        hw = 'trunk'
+      if is_gs_expressway_ref(way_ref):
+        hw = 'motorway' if way_ref[0] == 'G' else 'trunk'
       hw_rank = {'motorway': 4, 'trunk': 3}
       if road_id != self.last_road_id:
         self.last_road_id = road_id
@@ -992,9 +1014,25 @@ class SpeedLimitMiddleware:
         width_class=self.lane_width_class, osm_type=self.last_osm_hwtype,
       )
       self._gs_last_seen_t = now
+      self._gs_absent_since = None        # a G/S match resets the absence run
+    elif self._gs_last_seen_t > 0.0 and self._gs_absent_since is None:
+      self._gs_absent_since = now         # first non-G/S tick of a new run
 
-    gs_mode = (self._gs_last_seen_t > 0.0
-               and now - self._gs_last_seen_t <= GS_STICKY_S)
+    # Release the sticky expressway hold on ANY of:
+    #   - absolute ceiling (GS_STICKY_S) since the last G/S match;
+    #   - non-G/S matches CONTINUOUS for GS_RELEASE_CONT_S — a genuine exit
+    #     accumulates it in one run; an alternating stacked flicker keeps
+    #     resetting _gs_absent_since so it never accumulates (stickiness kept);
+    #   - a narrow section (lane_count_stable ≤ 2, already debounced): a ramp/
+    #     exit off the expressway must obey the narrow-road limit immediately,
+    #     never a stale 100/120.
+    gs_released = (
+        self._gs_last_seen_t == 0.0
+        or now - self._gs_last_seen_t > GS_STICKY_S
+        or (self._gs_absent_since is not None
+            and now - self._gs_absent_since >= GS_RELEASE_CONT_S)
+        or self.lane_count_stable <= 2)
+    gs_mode = not gs_released
 
     if gs_mode:
       # Hold the last promote-derived limit through momentary non-G/S flips.

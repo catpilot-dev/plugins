@@ -1502,13 +1502,21 @@ class TestLaneCountFirstInference:
     assert sld.lane_count_limit(1) == sld.infer_speed_from_road_type('', 1, 'city')
 
   def test_is_gs_expressway_ref(self, sld):
-    assert sld.is_gs_expressway_ref('G50')
-    assert sld.is_gs_expressway_ref('S20')
+    # 1–2 digit and 4-digit G/S refs are controlled-access expressways.
     assert sld.is_gs_expressway_ref('G2')
-    assert sld.is_gs_expressway_ref('S200')     # S + digit (task rule)
+    assert sld.is_gs_expressway_ref('G50')
+    assert sld.is_gs_expressway_ref('S1')
+    assert sld.is_gs_expressway_ref('S20')
+    assert sld.is_gs_expressway_ref('G1501')      # regional ring/spur (4-digit)
+    # 3-digit refs are ordinary guodao/shengdao SURFACE highways — NOT expressway.
+    assert not sld.is_gs_expressway_ref('G312')
+    assert not sld.is_gs_expressway_ref('S203')
+    assert not sld.is_gs_expressway_ref('G101')
+    # malformed / non-G-S.
     assert not sld.is_gs_expressway_ref('')
     assert not sld.is_gs_expressway_ref('白城路')
-    assert not sld.is_gs_expressway_ref('G')     # no trailing digit
+    assert not sld.is_gs_expressway_ref('G')       # no digits
+    assert not sld.is_gs_expressway_ref('G12345')  # 5-digit
     assert not sld.is_gs_expressway_ref('X5')
 
   # --- Test 1: THE 3d0 regression scenario ------------------
@@ -1567,29 +1575,31 @@ class TestLaneCountFirstInference:
     assert pub['inferenceMode'] == 'gs_osm'
     assert pub['inferredSpeed'] == 100           # nonurban trunk multi (promote)
 
-  def test_gs_motorway_type_no_ref_enters_gs_mode(self, sld):
-    # osmHwType == 'motorway' (urban elevated, no ref) enters G/S mode; the
-    # limit is whatever the EXISTING promote mechanism yields for it (trunk-grade
-    # 80 for a 4-lane urban motorway — unchanged behavior, now just labeled).
+  def test_gs_motorway_type_no_ref_demotes_to_80(self, sld):
+    # osmHwType == 'motorway' (urban elevated, no ref) enters G/S mode, but the
+    # EXISTING promote DEMOTES a ref-less motorway to trunk-grade 80 — NOT 120.
+    # Assert the demote path end-to-end (review gap e).
     mw = self._mw(sld)
     mw.lane_count_stable = 4
     mw._ingest_osm_result(self._result(highwayType='motorway', roadContext=1))
     mw.update()
     pub = self._published(mw)
     assert pub['inferenceMode'] == 'gs_osm'
-    assert pub['inferredSpeed'] == sld.infer_speed_from_road_type(
-      '', 4, 'city', osm_type='motorway')
+    assert pub['inferredSpeed'] == 80            # urban trunk-grade demote
+    assert pub['inferredSpeed'] != 120
 
-  def test_gs_narrow_gates_promote(self, sld):
-    # A 2-lane G ramp is NOT promoted — the narrow-road shortcut still wins.
+  def test_gs_narrow_ramp_immediate_release(self, sld):
+    # lane_count_stable ≤ 2 while a G ref matches → immediate release to
+    # lane-count mode (narrow ramp/exit), never a stale expressway limit
+    # (review gap b).
     mw = self._mw(sld)
     mw.lane_count_stable = 2
     mw._ingest_osm_result(self._result(wayRef='G50', roadContext=0,
                                        highwayType='motorway'))
     mw.update()
     pub = self._published(mw)
-    assert pub['inferenceMode'] == 'gs_osm'
-    assert pub['inferredSpeed'] == 40            # narrow shortcut, unchanged
+    assert pub['inferenceMode'] == 'lane_count'
+    assert pub['inferredSpeed'] == 40            # narrow-road limit, immediate
 
   # --- Test 3: G/S stickiness -------------------------------
 
@@ -1615,6 +1625,86 @@ class TestLaneCountFirstInference:
     mw.update()
     assert self._published(mw)['inferenceMode'] == 'lane_count'
     assert self._published(mw)['inferredSpeed'] == 80    # lane_count(4)
+
+  # --- review gap (a): exit connector, continuous absence releases at 10 s ---
+
+  def test_exit_ramp_continuous_absence_releases_at_10s(self, sld, monkeypatch):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3                    # wide connector — NOT narrow
+    clock = {'t': 2000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    # On a G expressway → promote (G ref → motorway → 120 even at 3 lanes).
+    mw._ingest_osm_result(self._result(wayRef='G50', roadContext=0,
+                                       highwayType='motorway'))
+    mw.update()
+    assert self._published(mw)['inferredSpeed'] == 120
+    # Continuous non-G/S connector matches from here on.
+    mw._ingest_osm_result(self._result(roadName='exit connector',
+                                       highwayType='primary'))
+    clock['t'] += 2.0
+    mw.update()                                 # absence run starts
+    clock['t'] += 6.0                           # 8 s continuous absence
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'   # < 10 s → still held
+    assert self._published(mw)['inferredSpeed'] == 120
+    clock['t'] += 4.0                           # 12 s absence, still < 30 s ceiling
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'lane_count'   # released at 10 s
+    assert self._published(mw)['inferredSpeed'] == 60            # lane_count(3)
+
+  # --- review gap (c): 3-digit guodao/shengdao → lane-count end-to-end ---
+
+  def test_guodao_3digit_ref_uses_lane_count(self, sld):
+    for ref in ('G312', 'S203', 'G101'):
+      mw = self._mw(sld)
+      mw.lane_count_stable = 4
+      mw._ingest_osm_result(self._result(wayRef=ref, roadName=ref,
+                                         roadContext=0, highwayType='trunk'))
+      mw.update()
+      pub = self._published(mw)
+      assert pub['inferenceMode'] == 'lane_count', ref
+      assert pub['inferredSpeed'] == 80, ref     # lane_count(4), not an OSM promote
+
+  # --- review gap (d1): stacked flicker WITH a real S-ref never releases ---
+
+  def test_stacked_flicker_with_sref_never_releases(self, sld, monkeypatch):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    clock = {'t': 3000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    # S20 (2-digit expressway) flickers in among stacked non-G/S ways every ~2 s;
+    # the longest continuous non-G/S run is 4 s (< GS_RELEASE_CONT_S).
+    seq = [
+      self._result(wayRef='S20', roadContext=0, highwayType='trunk'),
+      self._result(roadName='res', highwayType='residential'),
+      self._result(roadName='pri', highwayType='primary'),
+    ]
+    modes = []
+    for i in range(12):                         # 24 s of ticks
+      mw._ingest_osm_result(seq[i % 3])
+      mw.update()
+      modes.append(self._published(mw)['inferenceMode'])
+      clock['t'] += 2.0
+    assert set(modes) == {'gs_osm'}             # flicker never accumulates 10 s
+
+  # --- review gap (d2): stacked 3-digit refs never enter gs at all ---
+
+  def test_stacked_churn_3digit_refs_never_enter_gs(self, sld):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    seq = [
+      self._result(wayRef='G312', roadName='G312', roadContext=0, highwayType='trunk'),
+      self._result(wayRef='S203', roadName='S203', roadContext=0, highwayType='primary'),
+      self._result(roadName='res', highwayType='residential'),
+    ]
+    limits, modes = [], []
+    for i in range(9):
+      mw._ingest_osm_result(seq[i % 3])
+      mw.update()
+      limits.append(self._published(mw)['speedLimit'])
+      modes.append(self._published(mw)['inferenceMode'])
+    assert set(modes) == {'lane_count'}
+    assert set(limits) == {80}
 
   # --- Test 4: lane-count transition debounce ---------------
 
