@@ -254,8 +254,41 @@ def _parse_lat_accel(raw, default: float, lo: float, hi: float,
   return min(max(val, lo), hi)
 
 
+# --- Distance-aware curve approach + tight-curve a_y derating (route 3d0) ---
+COMFORT_BRAKE = 0.8  # m/s² — matches DCC's comfortable decel envelope so the
+                     # commanded speed profile is actually ACHIEVABLE. Route 3d0
+                     # seg 61: the first hairpin leg was entered at 44 km/h
+                     # against a 29 km/h cap because nothing planned the
+                     # deceleration POINT — DCC bleeds only ~1 m/s², so a
+                     # late-seen sharp curve arrives over-speed. v_now =
+                     # sqrt(v_curve² + 2·a·d) is the speed at which braking at
+                     # COMFORT_BRAKE over the remaining distance d still makes
+                     # the curve; the cap thus tightens as the curve nears
+                     # instead of issuing an un-followable one-shot drop.
+TIGHT_CURVE_FACTOR = 0.75  # a_y target derate at hairpin-class curvature. Route
+                           # 3d0 seg 60: even at the comfort target the model
+                           # cuts toward the inner line (gap 0.05 m at a correct
+                           # 32 km/h); a lower a_y target buys lateral margin and
+                           # driver reaction time. The inner-line cut itself is
+                           # model-level (0.11.2 is the yardstick) — this only
+                           # buys margin around it.
+
+
+def _interp(x: float, xp: list, fp: list) -> float:
+  """Clamped 1-D linear interpolation for a single scalar (no numpy dep)."""
+  if x <= xp[0]:
+    return fp[0]
+  if x >= xp[-1]:
+    return fp[-1]
+  for i in range(1, len(xp)):
+    if x < xp[i]:
+      t = (x - xp[i - 1]) / (xp[i] - xp[i - 1])
+      return fp[i - 1] + t * (fp[i] - fp[i - 1])
+  return fp[-1]
+
+
 def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
-  """Cap speed based on max predicted path curvature within reliable vision.
+  """Cap speed based on predicted path curvature within reliable vision.
 
   Looks at the model's predicted yaw rate and velocity over a horizon
   bounded by:
@@ -264,16 +297,21 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
   Whichever bound is tighter wins. Beyond the confidence boundary the
   model extrapolates 'straight ahead' and predictions are noise.
 
-  Computes max κ within that range and maps to a comfort-limited safe
-  speed. The target lateral acceleration is `max_lat_accel` (m/s²), wired
-  from the MapdCurveTargetLatAccel param by the middleware (default 1.5,
-  clamped [1.0, 3.0]) — previously hardcoded at 1.5 (2026-07-28: the layer
-  contract makes speedlimitd solely responsible for lateral accel via vEgo,
-  so this proactive target is now a tunable rather than a magic number).
+  Distance-aware approach (route 3d0): rather than mapping the single max κ
+  to a comfort speed, it makes a per-point pass over the confidence-gated
+  path. For each meaningfully-curved point i it computes the curve speed
+  there — v_curve_i = sqrt(target_ay_i / |κ_i|), with target_ay_i derated on
+  tight curvature (Change 2) — and the speed allowed NOW so a COMFORT_BRAKE
+  deceleration still bleeds down to it by the time the curve is reached:
+  v_now_i = sqrt(v_curve_i² + 2·COMFORT_BRAKE·d_i), d_i = position.x[i]. The
+  binding cap is the minimum v_now over points, so a near mild curve and a
+  far sharp curve compete on equal (achievable-profile) footing, and the cap
+  tightens as a curve nears. A point at d≈0 reduces to v_now = v_curve — the
+  original distance-less behaviour — exactly.
 
-  Replaced two separate functions (curvature_speed_cap looking at +5s
-  yaw rate and confidence_speed_cap sampling boundary κ) — both were
-  computing the same physical quantity (path curvature within vision).
+  The target lateral acceleration is `max_lat_accel` (m/s²), wired from the
+  MapdCurveTargetLatAccel param by the middleware (default 1.5, clamped
+  [1.0, 3.0]).
 
   Returns speed cap in km/h, or 0 if no meaningful constraint.
   """
@@ -301,26 +339,35 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
       conf_dist = min(MAX_VISION, positions_x[i])
       break
 
+  CURVE_GATE = 0.003  # negligible curvature (~330 m radius)
+
   # T_IDXS = 10 * (i/32)^2:  i=10 → 1.0s   i=22 → 4.7s   i=30 → 8.8s
-  # Iterate within both time AND distance bounds.
-  max_curvature = 0.0
+  # Per-point pass within both time AND distance bounds. d_i is position.x[i]
+  # (forward distance along the path — adequate at ≤100 m, see note below).
+  cap_ms = None
   for i in range(5, min(31, len(yaw_rates), len(positions_x))):
-    if positions_x[i] > conf_dist:
+    d_i = positions_x[i]
+    if d_i > conf_dist:
       break  # past confident vision — extrapolation noise
     v = max(velocities[i], 5.0)  # floor at 5 m/s to avoid division issues
-    curvature = abs(yaw_rates[i]) / v
-    max_curvature = max(max_curvature, curvature)
+    kappa = abs(yaw_rates[i]) / v
+    if kappa < CURVE_GATE:
+      continue  # this point is effectively straight
+    # Change 2 — derate the comfort a_y target on tight (hairpin) curvature.
+    target_ay = max_lat_accel * _interp(kappa, [0.02, 0.035], [1.0, TIGHT_CURVE_FACTOR])
+    v_curve = math.sqrt(target_ay / kappa)
+    # Change 1 — speed allowed now so COMFORT_BRAKE still makes the curve at
+    # d_i. d≈0 → v_now = v_curve (the original distance-less behaviour).
+    v_now = math.sqrt(v_curve * v_curve + 2.0 * COMFORT_BRAKE * max(d_i, 0.0))
+    cap_ms = v_now if cap_ms is None else min(cap_ms, v_now)
 
-  if max_curvature < 0.003:  # negligible curvature (~330m radius)
+  if cap_ms is None:  # no meaningfully-curved point within confident vision
     return 0
 
-  # v = sqrt(a_lat_max / curvature). max_lat_accel defaults to 1.5 m/s²
-  # (below the 3 m/s² EU envelope) to give the BMW DCC's −1 m/s² decel limit
-  # time to bleed speed before the curve; MapdCurveTargetLatAccel tunes it.
-  safe_speed_kph = ((max_lat_accel / max_curvature) ** 0.5) * 3.6
+  safe_speed_kph = cap_ms * 3.6
 
   if safe_speed_kph >= 100:
-    return 0  # no meaningful constraint
+    return 0  # curve far/mild enough that no slowdown is needed yet
 
   return snap_to_standard_speed(int(safe_speed_kph))
 

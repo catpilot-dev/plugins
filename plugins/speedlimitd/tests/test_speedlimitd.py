@@ -882,6 +882,116 @@ class TestCurveTargetLatAccelWiring:
 
 
 # ============================================================
+# Distance-aware curve braking + tight-curve a_y derating (route 3d0)
+# ============================================================
+
+class TestDistanceAwareCurveCap:
+  """curvature_speed_cap now plans the deceleration POINT: for each confident,
+  meaningfully-curved path point it computes the curve speed there (with a
+  tight-curve a_y derate) and the speed allowed NOW so a COMFORT_BRAKE decel
+  still makes the curve. The binding cap is the min over points."""
+  import math as _math
+
+  def _model(self, yaw, vel, px, ystd):
+    m = MagicMock()
+    m.orientationRate.z = list(yaw)
+    m.velocity.x = list(vel)
+    m.position.x = list(px)
+    m.position.yStd = list(ystd)
+    return m
+
+  def _uniform(self, yaw, vel, px_val, n=33):
+    """Constant curvature at a single forward distance px_val (all points)."""
+    return self._model([yaw] * n, [vel] * n, [float(px_val)] * n, [0.1] * n)
+
+  # --- Test 1: a point at d≈0 reduces exactly to the pre-change (distance-less)
+  #             law — v_now == v_curve. κ=0.015 keeps the derate factor at 1.0,
+  #             so this is bitwise-identical to the old sqrt(a_y/κ) behaviour.
+  def test_d0_equals_old_behavior(self, sld):
+    import math
+    kappa = 0.30 / 20.0  # 0.015 — below the 0.02 derate onset → factor 1.0
+    model = self._uniform(0.30, 20.0, 0.0)  # all points at d=0
+    v_curve = math.sqrt(1.5 / kappa)         # target_ay = 1.5 (no derate)
+    expected = sld.snap_to_standard_speed(int(v_curve * 3.6))
+    assert sld.curvature_speed_cap(model, 1.5) == expected
+
+  # --- Test 2: same curve at d=40 m → braking headroom raises the allowed
+  #             speed by the exact 2·a·d formula, but it is still a real cap.
+  def test_same_curve_at_40m(self, sld):
+    import math
+    kappa = 0.30 / 20.0  # 0.015, factor 1.0
+    model = self._uniform(0.30, 20.0, 40.0)
+    v_curve = math.sqrt(1.5 / kappa)                       # 10 m/s
+    cap_now = math.sqrt(v_curve ** 2 + 2 * 0.8 * 40)       # sqrt(164) ≈ 12.8 m/s
+    assert sld.curvature_speed_cap(model, 1.5) == sld.snap_to_standard_speed(int(cap_now * 3.6))
+    assert cap_now > v_curve                               # braking headroom
+    result = sld.curvature_speed_cap(model, 1.5)
+    assert 0 < result < 100                                # still a meaningful cap
+
+  # --- Test 3: two curves (mild near, sharp far). The min-over-points picks the
+  #             binding (sharp) one even though it is farther; moving it closer
+  #             tightens the cap monotonically.
+  def _two_curve(self, sharp_idx, sharp_yaw=0.80):
+    n = 33
+    yaw = [0.0] * n
+    yaw[6] = 0.20            # mild near curve at d=18: κ=0.010
+    if sharp_idx is not None:
+      yaw[sharp_idx] = sharp_yaw   # sharp curve: κ=0.040
+    vel = [20.0] * n
+    px = [float(i * 3) for i in range(n)]
+    return self._model(yaw, vel, px, [0.1] * n)
+
+  def test_two_curves_min_and_monotonic(self, sld):
+    mild_only = sld.curvature_speed_cap(self._two_curve(None), 1.5)
+    far = sld.curvature_speed_cap(self._two_curve(20), 1.5)   # sharp at d=60
+    near = sld.curvature_speed_cap(self._two_curve(10), 1.5)  # sharp at d=30
+    assert far < mild_only          # sharp curve binds below the mild near one
+    assert near < far               # closer sharp curve → tighter cap (monotone)
+    # Monotone as the sharp curve marches in from d=90 to d=15.
+    caps = [sld.curvature_speed_cap(self._two_curve(idx), 1.5) for idx in (30, 25, 20, 15, 10, 5)]
+    assert all(b <= a for a, b in zip(caps, caps[1:]))
+
+  # --- Test 4: tight-curve a_y derate. interp over [0.02, 0.035]→[1.0, 0.75].
+  def test_derate_interp_boundaries(self, sld):
+    assert sld._interp(0.02, [0.02, 0.035], [1.0, 0.75]) == 1.0    # onset boundary
+    assert sld._interp(0.015, [0.02, 0.035], [1.0, 0.75]) == 1.0   # clamped below
+    assert sld._interp(0.035, [0.02, 0.035], [1.0, 0.75]) == 0.75  # full derate
+    f03 = sld._interp(0.03, [0.02, 0.035], [1.0, 0.75])
+    assert 0.75 < f03 < 1.0                                        # mid-range
+
+  def test_derate_applied_in_cap(self, sld):
+    import math
+    # κ=0.03 at d=0 → cap uses the derated target (factor ≈ 0.833).
+    factor = sld._interp(0.03, [0.02, 0.035], [1.0, 0.75])
+    model = self._uniform(0.60, 20.0, 0.0)  # κ = 0.60/20 = 0.03
+    v_curve = math.sqrt(1.5 * factor / 0.03)
+    assert sld.curvature_speed_cap(model, 1.5) == sld.snap_to_standard_speed(int(v_curve * 3.6))
+    # κ=0.02 exactly → factor 1.0 (no derate).
+    model2 = self._uniform(0.40, 20.0, 0.0)  # κ = 0.02
+    v_curve2 = math.sqrt(1.5 * 1.0 / 0.02)
+    assert sld.curvature_speed_cap(model2, 1.5) == sld.snap_to_standard_speed(int(v_curve2 * 3.6))
+
+  # --- Test 5: seg-61 regression. κ=0.026 at d=35, v=12.6 m/s (~45 km/h),
+  #             target 1.5. The commanded cap must START the slowdown at that
+  #             distance (cap < current speed) while sitting ABOVE v_curve — a
+  #             braking ramp, not the old distance-less cliff to v_curve.
+  def test_seg61_starts_slowdown_at_distance(self, sld):
+    import math
+    v = 12.6
+    kappa = 0.026
+    n = 33
+    yaw = [0.0] * n
+    yaw[7] = kappa * v         # curve at index 7
+    px = [float(i * 5) for i in range(n)]   # index 7 → d = 35 m
+    model = self._model(yaw, [v] * n, px, [0.1] * n)
+    cap_kph = sld.curvature_speed_cap(model, 1.5)
+    assert 0 < cap_kph < v * 3.6          # slowdown commanded 35 m out (~45 km/h)
+    factor = sld._interp(kappa, [0.02, 0.035], [1.0, 0.75])
+    v_curve_kph = math.sqrt(1.5 * factor / kappa) * 3.6
+    assert cap_kph > v_curve_kph          # braking headroom, not the old cliff
+
+
+# ============================================================
 # Change 2 — reactive measured-a_y cap
 # ============================================================
 
