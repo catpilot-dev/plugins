@@ -256,7 +256,9 @@ def on_lat_controller_init(result, lac, CP):
   # never apply excessive steering torque abruptly. 0.10 frac = 1.2 Nm per
   # 300 ms ≈ 4 Nm/s max slew (panda wire limit is 10 Nm/s). Full authority
   # builds in ~1.5 s instead of 0.3 s — accepted: speedlimitd slows for
-  # curves and the P-law reverses the moment the plant overshoots κ_des
+  # curves and the P-law reverses its TARGET the moment the plant overshoots
+  # κ_des (the executed unwind is STEP_MAX-rate-limited — deliberately slower
+  # than the removed drain, which is what ran the car wide; see §7)
   # (tracking back to the command). First knob to revisit if curve entries
   # ever feel late.
   #

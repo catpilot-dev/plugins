@@ -91,7 +91,7 @@ class CarInterface(CarInterfaceBase):
     # 0.4 → liveDelay = 0.6 s. This propagates to (a) modeld's lat_action_t ≈
     # 0.65 s — model samples κ_des at a further-ahead point, providing indirect
     # smoothing of vision-only wobble — and (b) register.py's model_action_t,
-    # which subscribes to lat_delay so the jerk_pred horizon stays aligned with
+    # which subscribes to lat_delay so the model_action_t horizon stays aligned with
     # where the model targets κ.
     ret.steerActuatorDelay = 0.4
     ret.steerLimitTimer = 0.4

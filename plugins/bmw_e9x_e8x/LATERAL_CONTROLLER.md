@@ -34,7 +34,10 @@ This document is the canonical reference for the lateral controller registered b
 >
 > **What still bounds the lateral command** (all of these track *toward* the
 > commanded κ, none abandon it):
-> 1. **P-law reversal on overshoot** — the moment the plant turns past `κ_des`,
+> 1. **P-law reversal on overshoot** (target reverses immediately; the executed
+>    unwind is STEP_MAX-rate-limited — slower than the removed drain by design;
+>    the fast drain is what ran the car wide in the field record) — the moment
+>    the plant turns past `κ_des`,
 >    `δ_err` flips sign and the P-term commands torque the other way. Tracking
 >    back to the command *is* the overshoot correction; no separate guard needed.
 > 2. **`STEP_MAX`** — per-decision torque step cap (speed-scaled 0.10→0.05),
@@ -697,3 +700,10 @@ Key metrics to compute per route:
 Reference baselines (field-verified, 2026-05):
 - Route 31c: lane offset rms 0.33 m, filter reduction 59% — the "nearly perfect" baseline
 - Routes 32a / 32d: 0 flagged LC events out of 39 LCs, filter reduction 65-66%, cancel_accel essentially eliminated — current stable operating point
+
+> **Design law (user, 2026-07-28): the lateral controller never gives up in
+> curves.** A last-resort measured-a_y backstop (fire only >3.0 m/s² sustained
+> with into-turn torque) was recommended by the removal review and DECLINED —
+> the review's analysis is preserved in the project records should a future
+> incident reopen the question. a_y responsibility rests entirely with
+> speedlimitd's curve capping + panda torque bounds + driver supervision.
