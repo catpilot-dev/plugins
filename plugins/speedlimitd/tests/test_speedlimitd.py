@@ -625,6 +625,14 @@ class TestPlannerHook:
     sm = self._sm(lead_status=True, lead_vLead=60 / 3.6)
     assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == pytest.approx(40 / 3.6, abs=0.1)
 
+  def test_reactive_cap_survives_fast_lead(self, hook):
+    """The reactive measured-a_y cap publishes as source 4 / safetyCapped, so
+    it is in the same protected class as the proactive curve cap — a faster
+    lead can never lift it (a fast lead doesn't make a real curve less tight)."""
+    self._sl(hook, 50, source=4, safety=True)   # reactive cap → 50 km/h
+    sm = self._sm(lead_status=True, lead_vLead=90 / 3.6)  # lead way over limit
+    assert hook.on_v_cruise(100 / 3.6, 25.0, sm) == pytest.approx(50 / 3.6, abs=0.1)
+
   # universal gas suspend -----------------------------------
 
   def test_gas_suspends_inferred(self, hook):
@@ -779,6 +787,219 @@ class TestPlannerHook:
       r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
       clk.tick(0.2)
     assert r >= 100 / 3.6 - 0.2                      # held at current speed
+
+
+# ============================================================
+# Change 1 — MapdCurveTargetLatAccel param wiring
+# ============================================================
+
+class TestLatAccelParamParse:
+  """_parse_lat_accel: unset/0/non-finite handling + clamping."""
+
+  def test_curve_unset_defaults(self, sld):
+    assert sld._parse_lat_accel('', 1.5, 1.0, 3.0) == 1.5
+
+  def test_curve_zero_defaults(self, sld):
+    # 0 is treated as unset for the curve target (default 1.5).
+    assert sld._parse_lat_accel('0', 1.5, 1.0, 3.0) == 1.5
+    assert sld._parse_lat_accel('0.0', 1.5, 1.0, 3.0) == 1.5
+
+  def test_curve_unparseable_defaults(self, sld):
+    assert sld._parse_lat_accel('abc', 1.5, 1.0, 3.0) == 1.5
+    assert sld._parse_lat_accel(None, 1.5, 1.0, 3.0) == 1.5
+
+  def test_curve_non_finite_defaults(self, sld):
+    assert sld._parse_lat_accel('inf', 1.5, 1.0, 3.0) == 1.5
+    assert sld._parse_lat_accel('nan', 1.5, 1.0, 3.0) == 1.5
+
+  def test_curve_real_value_passes(self, sld):
+    assert sld._parse_lat_accel('2.0', 1.5, 1.0, 3.0) == 2.0
+
+  def test_curve_clamps_low(self, sld):
+    assert sld._parse_lat_accel('0.5', 1.5, 1.0, 3.0) == 1.0
+
+  def test_curve_clamps_high(self, sld):
+    assert sld._parse_lat_accel('5', 1.5, 1.0, 3.0) == 3.0
+
+  def test_react_zero_disables(self, sld):
+    # For the reactive threshold, 0 means OFF (not default).
+    assert sld._parse_lat_accel('0', 2.5, 1.8, 3.0, zero_disables=True) == 0.0
+
+  def test_react_unset_defaults(self, sld):
+    assert sld._parse_lat_accel('', 2.5, 1.8, 3.0, zero_disables=True) == 2.5
+
+  def test_react_clamps(self, sld):
+    assert sld._parse_lat_accel('1.0', 2.5, 1.8, 3.0, zero_disables=True) == 1.8
+    assert sld._parse_lat_accel('9', 2.5, 1.8, 3.0, zero_disables=True) == 3.0
+
+
+class TestCurveTargetLatAccelWiring:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _curve_model(self, sld):
+    """A model with a fixed moderate curvature within confident vision."""
+    m = MagicMock()
+    n = 33
+    # Constant yaw rate + velocity → constant curvature κ = yaw/v.
+    # yaw=0.30 rad/s, v=20 m/s → κ=0.015 (radius ~67 m).
+    m.orientationRate.z = [0.30] * n
+    m.velocity.x = [20.0] * n
+    m.position.x = [float(i * 3) for i in range(n)]  # 0..96 m, within 100 m
+    m.position.yStd = [0.1] * n                        # high confidence throughout
+    return m
+
+  def test_higher_lat_accel_raises_cap(self, sld):
+    model = self._curve_model(sld)
+    low = sld.curvature_speed_cap(model, 1.5)
+    high = sld.curvature_speed_cap(model, 3.0)
+    # Higher allowed a_y → higher safe speed for the same curvature.
+    assert high > low > 0
+
+  def test_default_matches_hardcoded_15(self, sld):
+    model = self._curve_model(sld)
+    assert sld.curvature_speed_cap(model) == sld.curvature_speed_cap(model, 1.5)
+
+  def test_read_params_wires_curve_target(self, sld, monkeypatch):
+    import config
+    monkeypatch.setattr(config, 'read_plugin_param',
+                        lambda pid, key, default='': '2.5' if key == 'MapdCurveTargetLatAccel' else '')
+    mw = self._make_middleware(sld)
+    mw._read_params()
+    assert mw.curve_target_lat_accel == 2.5
+
+  def test_read_params_defaults_on_missing(self, sld, monkeypatch):
+    import config
+    monkeypatch.setattr(config, 'read_plugin_param', lambda pid, key, default='': '')
+    mw = self._make_middleware(sld)
+    mw._read_params()
+    assert mw.curve_target_lat_accel == 1.5
+    assert mw.react_lat_accel_threshold == 2.5
+
+
+# ============================================================
+# Change 2 — reactive measured-a_y cap
+# ============================================================
+
+class TestReactiveLatAccelCap:
+  def _mw(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _drive(self, mw, a_y, v_ego, thr, t0, duration, dt=0.1):
+    """Feed a constant a_y for `duration`s starting at monotonic t0."""
+    import math
+    t = t0
+    end = t0 + duration - 1e-9
+    last = mw._react_cap_ms
+    while t <= end:
+      last = mw._update_reactive_cap(a_y, v_ego, thr, t, dt)
+      t += dt
+    return last
+
+  def test_engages_after_half_second_sustained(self, sld):
+    import math
+    mw = self._mw(sld)
+    mw._ay_filt = 2.6            # pre-warm the low-pass to the sustained value
+    v_ego, thr = 20.0, 2.5
+    # 0.4 s over threshold → not engaged yet
+    self._drive(mw, 2.6, v_ego, thr, 100.0, 0.4)
+    assert mw._react_cap_ms == 0.0
+    # cross 0.5 s → engages (0.5 s more, comfortably past the debounce)
+    self._drive(mw, 2.6, v_ego, thr, 100.5, 0.5)
+    assert mw._react_cap_ms > 0.0
+    expected = v_ego * math.sqrt(thr / 2.6) - 1.0
+    assert mw._react_cap_ms == pytest.approx(expected, abs=0.3)
+
+  def test_no_engage_on_transient(self, sld):
+    mw = self._mw(sld)
+    mw._ay_filt = 2.6
+    # A 0.4 s spike never reaches the 0.5 s engage debounce.
+    self._drive(mw, 2.6, 20.0, 2.5, 100.0, 0.4)
+    assert mw._react_cap_ms == 0.0
+
+  def test_monotonic_down_while_engaged(self, sld):
+    mw = self._mw(sld)
+    mw._ay_filt = 2.6
+    v_ego, thr = 20.0, 2.5
+    self._drive(mw, 2.6, v_ego, thr, 100.0, 0.8)   # engage
+    engaged = mw._react_cap_ms
+    assert engaged > 0.0
+    # a_y eases (but stays cornering) → cap must NOT rise
+    mw._ay_filt = 2.55
+    cap_after_ease = self._drive(mw, 2.55, v_ego, thr, 101.0, 0.4)
+    assert cap_after_ease <= engaged + 1e-6
+    # a_y sharpens → cap must drop
+    mw._ay_filt = 3.2
+    cap_after_sharpen = self._drive(mw, 3.2, v_ego, thr, 102.0, 0.4)
+    assert cap_after_sharpen < cap_after_ease
+
+  def test_release_ramps_up_after_quiet(self, sld):
+    mw = self._mw(sld)
+    mw._ay_filt = 2.6
+    v_ego, thr = 20.0, 2.5
+    self._drive(mw, 2.6, v_ego, thr, 100.0, 0.8)   # engage
+    engaged = mw._react_cap_ms
+    # a_y drops well below threshold-0.3; needs 2 s quiet before release ramp
+    self._drive(mw, 2.0, v_ego, thr, 101.0, 1.9)   # quiet, but < 2 s
+    assert mw._react_cap_ms == pytest.approx(engaged, abs=1e-6)  # still held
+    # continue past 2 s quiet → ramps up
+    self._drive(mw, 2.0, v_ego, thr, 102.9, 0.6)
+    assert mw._react_cap_ms > engaged or mw._react_cap_ms == 0.0
+    # ramp all the way → disengages (reaches v_ego)
+    self._drive(mw, 2.0, v_ego, thr, 103.5, 3.0)
+    assert mw._react_cap_ms == 0.0
+
+  def test_disabled_when_threshold_zero(self, sld):
+    mw = self._mw(sld)
+    mw._ay_filt = 3.5   # way over any threshold
+    cap = self._drive(mw, 3.5, 20.0, 0.0, 100.0, 2.0)  # threshold 0 → disabled
+    assert cap == 0.0
+    assert mw._react_cap_ms == 0.0
+
+
+class TestReactiveCapIntegration:
+  """Reactive cap flows through update() into the published speedLimitState as a
+  protected safety-class source (source 4, safetyCapped True)."""
+
+  def _mw_for_update(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    # Controlled SubMaster: nothing updated this tick, model block skipped.
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def test_reactive_cap_publishes_source4_safety(self, sld):
+    mw = self._mw_for_update(sld)
+    # Road inference would allow 120 (motorway/freeway) so the reactive cap wins.
+    mw.lane_count_stable = 4
+    mw.last_road_context = 'freeway'
+    mw.last_way_ref = 'G2'
+    mw.last_highway_type = 'motorway'
+    # Simulate an engaged reactive cap at ~60 km/h (16.67 m/s).
+    mw._react_cap_ms = 60.0 / 3.6
+    mw.react_lat_accel_threshold = 2.5
+    mw.update()
+    published = mw._sl_pub.send.call_args[0][0]
+    assert published['reactCapEngaged'] is True
+    assert published['source'] == 4
+    assert published['safetyCapped'] is True
+    assert published['reactCap'] == pytest.approx(60.0, abs=0.1)
+    assert published['speedLimit'] <= 60
 
 
 # ============================================================

@@ -8,6 +8,7 @@ Three-tier priority:
   2. mapd suggestedSpeed (comprehensive: visionCurveSpeed + speed limit + road type)
   3. Vision-inferred speed (lane count + road type, own fallback when mapd has no data)
 """
+import math
 import os
 import time
 import tomllib
@@ -202,7 +203,48 @@ def infer_lane_count(model_msg) -> int:
   return base_count
 
 
-def curvature_speed_cap(model_msg) -> int:
+# --- Lateral-acceleration params (2026-07-28 layer contract) ---------------
+# speedlimitd owns lateral acceleration via vEgo. Two knobs, both read from the
+# persisted plugin param store (same store mapd_runner uses) and parsed as a raw
+# m/s² value per the README contract:
+#   MapdCurveTargetLatAccel — proactive vision-curve target a_y (default 1.5)
+#   MapdReactLatAccel       — reactive measured-a_y threshold (default 2.5, 0=off)
+CURVE_LAT_ACCEL_DEFAULT = 1.5
+CURVE_LAT_ACCEL_MIN = 1.0
+CURVE_LAT_ACCEL_MAX = 3.0
+REACT_LAT_ACCEL_DEFAULT = 2.5
+REACT_LAT_ACCEL_MIN = 1.8
+REACT_LAT_ACCEL_MAX = 3.0
+
+# Reactive measured-a_y cap tuning.
+REACT_TAU = 0.3            # s — low-pass time constant on measured a_y
+REACT_ENGAGE_S = 0.5      # s — |a_y| must exceed threshold this long to engage
+REACT_QUIET_S = 2.0       # s — |a_y| must stay quiet this long before release
+REACT_QUIET_MARGIN = 0.3  # m/s² — release deadband below threshold
+REACT_HYST_MS = 1.0       # m/s — extra reduction below the sqrt() cap
+REACT_RELEASE_RATE = 1.0  # m/s per s — cap ramp-up rate during release
+
+
+def _parse_lat_accel(raw, default: float, lo: float, hi: float,
+                     zero_disables: bool = False) -> float:
+  """Parse a lateral-accel param string into a clamped m/s² value.
+
+  Unset (''), unparseable, or non-finite → `default`. A literal 0 → `default`
+  unless `zero_disables` (then 0.0, meaning the feature is off). Otherwise the
+  value is clamped to [lo, hi].
+  """
+  try:
+    val = float(raw)
+  except (TypeError, ValueError):
+    return default
+  if not math.isfinite(val):
+    return default
+  if val == 0.0:
+    return 0.0 if zero_disables else default
+  return min(max(val, lo), hi)
+
+
+def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5) -> int:
   """Cap speed based on max predicted path curvature within reliable vision.
 
   Looks at the model's predicted yaw rate and velocity over a horizon
@@ -213,7 +255,11 @@ def curvature_speed_cap(model_msg) -> int:
   model extrapolates 'straight ahead' and predictions are noise.
 
   Computes max κ within that range and maps to a comfort-limited safe
-  speed (MAX_LAT_ACCEL = 1.5 m/s², below the EU/UN-R79 3 m/s² envelope).
+  speed. The target lateral acceleration is `max_lat_accel` (m/s²), wired
+  from the MapdCurveTargetLatAccel param by the middleware (default 1.5,
+  clamped [1.0, 3.0]) — previously hardcoded at 1.5 (2026-07-28: the layer
+  contract makes speedlimitd solely responsible for lateral accel via vEgo,
+  so this proactive target is now a tunable rather than a magic number).
 
   Replaced two separate functions (curvature_speed_cap looking at +5s
   yaw rate and confidence_speed_cap sampling boundary κ) — both were
@@ -258,11 +304,10 @@ def curvature_speed_cap(model_msg) -> int:
   if max_curvature < 0.003:  # negligible curvature (~330m radius)
     return 0
 
-  # v = sqrt(a_lat_max / curvature). Use 1.5 m/s² (below the 3 m/s² EU
-  # envelope) to give the BMW DCC's −1 m/s² decel limit time to bleed
-  # speed before the curve.
-  MAX_LAT_ACCEL = 1.5
-  safe_speed_kph = ((MAX_LAT_ACCEL / max_curvature) ** 0.5) * 3.6
+  # v = sqrt(a_lat_max / curvature). max_lat_accel defaults to 1.5 m/s²
+  # (below the 3 m/s² EU envelope) to give the BMW DCC's −1 m/s² decel limit
+  # time to bleed speed before the curve; MapdCurveTargetLatAccel tunes it.
+  safe_speed_kph = ((max_lat_accel / max_curvature) ** 0.5) * 3.6
 
   if safe_speed_kph >= 100:
     return 0  # no meaningful constraint
@@ -380,7 +425,11 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
 
 class SpeedLimitMiddleware:
   def __init__(self):
-    self.sm = messaging.SubMaster(['modelV2', 'gpsLocationExternal'])
+    # livePose (2026-07-28): lightest single, vehicle-agnostic source of a
+    # measured lateral accel — forward speed (velocityDevice.x) and yaw rate
+    # (angularVelocityDevice.z) both come from the localizer, no car sensor or
+    # steering ratio involved. a_y_meas = v · yaw_rate.
+    self.sm = messaging.SubMaster(['modelV2', 'gpsLocationExternal', 'livePose'])
     from openpilot.selfdrive.plugins.plugin_bus import PluginPub
     self._sl_pub = PluginPub('speedLimitState')
 
@@ -415,6 +464,25 @@ class SpeedLimitMiddleware:
     self.curvature_cap: int = 0
     self._curvature_cap_hold_until: float = 0.0  # monotonic time to hold current cap
     self._curvature_cap_relax_step_t: float = 0.0  # last step time during relax phase
+
+    # Lateral-accel params (2026-07-28 layer contract). Read at startup and
+    # refreshed periodically so a UI change takes effect without a restart.
+    self.curve_target_lat_accel: float = CURVE_LAT_ACCEL_DEFAULT
+    self.react_lat_accel_threshold: float = REACT_LAT_ACCEL_DEFAULT
+    self._params_last_read_t: float = 0.0
+    self._read_params()
+
+    # Reactive measured-a_y cap state (2026-07-28). A_y ownership is
+    # longitudinal: proactive vision capping (curvature_speed_cap) can't see
+    # late-appearing curves or plant amplification (route seg-15 measured
+    # 3.6 m/s² where vision had capped nothing), and the BMW lateral controller
+    # no longer ISO-cancels in curves — so the ISO 3.0 m/s² defense lives HERE
+    # now, as a reactive backstop on the *measured* lateral accel.
+    self._ay_filt: float = 0.0            # low-pass |a_y_meas| (m/s²)
+    self._react_cap_ms: float = 0.0       # engaged reactive cap (m/s), 0 = off
+    self._react_over_since: float | None = None   # |a_y| first exceeded threshold
+    self._react_quiet_since: float | None = None  # |a_y| first went quiet
+    self._react_last_t: float = 0.0       # monotonic time of last reactive tick
 
     # Gradual speed limit transition — step through standard speeds one level
     # at a time instead of jumping directly (e.g. 80 → 60 → 50 → 40).
@@ -453,6 +521,86 @@ class SpeedLimitMiddleware:
     self.yolo_speed: int = 0
     self.yolo_last_seen: float = 0.0
     self.yolo_timeout: float = 120.0  # seconds before YOLO detection expires
+
+  def _read_params(self):
+    """Refresh lateral-accel params from the persisted plugin store.
+
+    Uses the same store mapd_runner reads (config.read_plugin_param, env-
+    overridable). Values are interpreted as raw m/s² per the README contract.
+    Import is lazy + guarded so a missing config module just keeps the current
+    (default) values rather than crashing the daemon.
+    """
+    try:
+      from config import read_plugin_param
+    except Exception:
+      return
+    self.curve_target_lat_accel = _parse_lat_accel(
+      read_plugin_param('speedlimitd', 'MapdCurveTargetLatAccel', ''),
+      CURVE_LAT_ACCEL_DEFAULT, CURVE_LAT_ACCEL_MIN, CURVE_LAT_ACCEL_MAX)
+    self.react_lat_accel_threshold = _parse_lat_accel(
+      read_plugin_param('speedlimitd', 'MapdReactLatAccel', ''),
+      REACT_LAT_ACCEL_DEFAULT, REACT_LAT_ACCEL_MIN, REACT_LAT_ACCEL_MAX,
+      zero_disables=True)
+
+  def _update_reactive_cap(self, a_y_meas, v_ego: float, threshold: float,
+                           now: float, dt: float) -> float:
+    """Reactive measured-a_y speed cap (2026-07-28 layer contract).
+
+    Low-passes |a_y_meas| (~0.3 s). When it exceeds `threshold` continuously
+    for REACT_ENGAGE_S, engages a cap v_react = v_ego·sqrt(threshold/|a_y|)
+    minus a 1 m/s hysteresis margin. While engaged the cap may only move DOWN
+    or hold — it never chases a_y upward. Release ramps the cap back up at
+    REACT_RELEASE_RATE once |a_y| < threshold−REACT_QUIET_MARGIN for
+    REACT_QUIET_S. `threshold <= 0` disables the feature entirely.
+
+    State lives on self; returns the current cap (m/s, 0 = disengaged). Kept a
+    pure function of its inputs so it is unit-testable without livePose msgs.
+    """
+    if a_y_meas is not None and math.isfinite(a_y_meas):
+      mag = abs(a_y_meas)
+      alpha = dt / (REACT_TAU + dt) if dt > 0.0 else 1.0
+      self._ay_filt += (mag - self._ay_filt) * alpha
+    ay = self._ay_filt
+
+    if threshold <= 0.0:  # disabled
+      self._react_cap_ms = 0.0
+      self._react_over_since = None
+      self._react_quiet_since = None
+      return 0.0
+
+    # Engage debounce (over threshold) and release debounce (quiet).
+    if ay > threshold:
+      if self._react_over_since is None:
+        self._react_over_since = now
+    else:
+      self._react_over_since = None
+    if ay < threshold - REACT_QUIET_MARGIN:
+      if self._react_quiet_since is None:
+        self._react_quiet_since = now
+    else:
+      self._react_quiet_since = None
+
+    if self._react_cap_ms <= 0.0:
+      # Not engaged — engage after sustained over-threshold.
+      if (self._react_over_since is not None
+          and now - self._react_over_since >= REACT_ENGAGE_S
+          and ay > 0.0 and v_ego > 0.0):
+        v_react = v_ego * math.sqrt(threshold / ay) - REACT_HYST_MS
+        self._react_cap_ms = max(v_react, 0.0)
+    else:
+      # Engaged.
+      if (self._react_quiet_since is not None
+          and now - self._react_quiet_since >= REACT_QUIET_S):
+        # Sustained quiet — ramp the cap back up, disengage once it no longer
+        # constrains (reaches current speed).
+        self._react_cap_ms += REACT_RELEASE_RATE * dt
+        if self._react_cap_ms >= max(v_ego, 0.0):
+          self._react_cap_ms = 0.0
+      elif ay > 0.0 and v_ego > 0.0:
+        # Still cornering (or not quiet long enough): monotonic-down / hold.
+        v_react = v_ego * math.sqrt(threshold / ay) - REACT_HYST_MS
+        self._react_cap_ms = min(self._react_cap_ms, max(v_react, 0.0))
+    return self._react_cap_ms
 
   def _ingest_osm_result(self, result: dict | None):
     """Update road identity state from an OSM tile query result.
@@ -497,6 +645,11 @@ class SpeedLimitMiddleware:
     self.sm.update(0)
 
     now = time.monotonic()
+
+    # --- Refresh lateral-accel params (5 s cadence, UI-change friendly) ---
+    if now - self._params_last_read_t >= 5.0:
+      self._params_last_read_t = now
+      self._read_params()
 
     # --- Auto-detect country from GPS ---
     if self.sm.updated.get('gpsLocationExternal', False):
@@ -569,7 +722,7 @@ class SpeedLimitMiddleware:
       #   2) when the hold expires and raw cap stays low, step-relaxing up the
       #      standard ladder (60 → 80 → 100 → off) instead of snapping to 0.
       # Re-detection at any point during the relax walks back to the tighter cap.
-      raw_curv_cap = curvature_speed_cap(model)
+      raw_curv_cap = curvature_speed_cap(model, self.curve_target_lat_accel)
       if raw_curv_cap > 0 and (raw_curv_cap <= self.curvature_cap or self.curvature_cap == 0):
         # Curve actively detected (tighter, equal, or first) — apply and refresh hold
         self.curvature_cap = raw_curv_cap
@@ -592,6 +745,29 @@ class SpeedLimitMiddleware:
           else:
             self.curvature_cap = 0
             self._curvature_cap_relax_step_t = 0.0
+
+    # --- Reactive measured-a_y cap (2026-07-28 layer contract) ---
+    # Runs every tick (not gated on modelV2) off the localizer's measured yaw.
+    # a_y_meas = v · yaw_rate; both from livePose (vehicle-agnostic, no steering
+    # ratio). Catches curves the proactive vision cap missed and plant
+    # amplification — the ISO 3.0 m/s² defense now lives here (see __init__).
+    react_dt = min(max(now - self._react_last_t, 0.0), 1.0) if self._react_last_t else 0.2
+    self._react_last_t = now
+    a_y_meas = None
+    v_ego_meas = 0.0
+    if self.sm.updated.get('livePose', False):
+      try:
+        lp = self.sm['livePose']
+        av = lp.angularVelocityDevice
+        vd = lp.velocityDevice
+        if getattr(av, 'valid', True) and getattr(vd, 'valid', True):
+          v_ego_meas = abs(float(vd.x))
+          a_y_meas = v_ego_meas * float(av.z)
+      except Exception:
+        a_y_meas = None
+        v_ego_meas = 0.0
+    self._update_reactive_cap(a_y_meas, v_ego_meas, self.react_lat_accel_threshold,
+                              now, react_dt)
 
     # --- Lane width observation from lane_centering plugin ---
     # Smoothed (EMA) across 5 Hz drain so a single noisy frame can't swing
@@ -641,12 +817,22 @@ class SpeedLimitMiddleware:
     # OSM maxSpeed is unreliable in China — use OSM only for road context,
     # highway classification (G/S ref), and road name.
 
+    # Reactive measured-a_y cap (2026-07-28): enters the SAME min() path as the
+    # proactive curve cap, as a safety-class source (source 4). That inheritance
+    # is deliberate — planner_hook's gas-override suspends it and, crucially, its
+    # lead-override protection (route 2fd) does NOT bypass safety-class caps, so
+    # a faster lead can never lift the reactive curve cap.
+    react_cap_kph = self._react_cap_ms * 3.6 if self._react_cap_ms > 0.0 else 0.0
+    react_active = react_cap_kph >= MIN_SPEED_LIMIT
+
     # Take minimum across all available sources — most conservative valid reading wins.
     candidates = []
     if yolo_speed >= MIN_SPEED_LIMIT:
       candidates.append((float(yolo_speed), 1, 0.8))    # yoloDetection
     if self.curvature_cap >= MIN_SPEED_LIMIT:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
+    if react_active:
+      candidates.append((react_cap_kph, 4, 0.7))  # reactiveLatAccel (safety class)
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # roadTypeInference
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
@@ -666,19 +852,28 @@ class SpeedLimitMiddleware:
         self._last_step_time = now
 
     # Safety cap override — clamp displayed limit immediately (bypass gradual
-    # transition) so a tightening curve cap takes effect without lag.
+    # transition) so a tightening curve cap takes effect without lag. Both the
+    # proactive curve cap and the reactive measured-a_y cap are safety-critical.
     if self.curvature_cap >= MIN_SPEED_LIMIT:
       cap_snapped = snap_to_standard_speed(self.curvature_cap)
       if cap_snapped < self._displayed_speed_limit:
         self._displayed_speed_limit = cap_snapped
+    if react_active:
+      react_snapped = snap_to_standard_speed(int(react_cap_kph))
+      if react_snapped < self._displayed_speed_limit:
+        self._displayed_speed_limit = react_snapped
 
-    # safetyCapped: True whenever the curve cap is the active (lowest) source
-    # OR is at/below the displayed limit (i.e., the limit IS being constrained
-    # by a safety cap, regardless of gradual-transition state). planner_hook
-    # uses this to skip the +15% comfort offset on curve approaches.
+    # safetyCapped: True whenever a safety cap (proactive curve OR reactive
+    # measured-a_y) is the active (lowest) source OR is at/below the displayed
+    # limit (i.e., the limit IS being constrained by a safety cap, regardless of
+    # gradual-transition state). planner_hook uses this to skip the comfort
+    # offset AND to keep the cap in the lead-override-protected class.
     safety_capped = source == 4 or (
       self.curvature_cap >= MIN_SPEED_LIMIT
       and snap_to_standard_speed(self.curvature_cap) <= self._displayed_speed_limit
+    ) or (
+      react_active
+      and snap_to_standard_speed(int(react_cap_kph)) <= self._displayed_speed_limit
     )
 
     # --- Confirmation management ---
@@ -721,6 +916,10 @@ class SpeedLimitMiddleware:
       'laneWidthClass': self.lane_width_class,
       'curvatureCap': self.curvature_cap,
       'safetyCapped': safety_capped,
+      # Reactive measured-a_y cap telemetry (2026-07-28).
+      'reactCapEngaged': self._react_cap_ms > 0.0,
+      'reactCap': round(react_cap_kph, 1),          # km/h, 0 = disengaged
+      'reactLatAccel': round(self._ay_filt, 2),     # measured filtered |a_y| (m/s²)
     })
 
 

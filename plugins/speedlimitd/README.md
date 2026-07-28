@@ -36,6 +36,15 @@ When vision confidently detects a narrow road (both inner lane lines > 0.6 confi
 
 Only applied on secondary roads and below (not highways).
 
+### Lateral-acceleration ownership (2026-07-28 layer contract)
+
+speedlimitd is solely responsible for lateral acceleration via `vEgo`. Two mechanisms defend the comfort/ISO envelope:
+
+- **Proactive curve cap** (`curvature_speed_cap`): caps speed from the model's predicted path curvature within confident vision. The target lateral acceleration is `MapdCurveTargetLatAccel` (m/s², default 1.5, clamped [1.0, 3.0]).
+- **Reactive measured-a_y cap**: a backstop on the *measured* lateral accel (`a_y = vEgo · yawRate`, from `livePose`, low-passed ~0.3 s). Proactive capping cannot see late-appearing curves or plant amplification (one recorded curve measured 3.6 m/s² where vision had capped nothing). When `|a_y|` exceeds `MapdReactLatAccel` (m/s², default 2.5, clamp [1.8, 3.0], 0 disables) continuously for 0.5 s it engages a cap `v = vEgo·sqrt(threshold/|a_y|) − 1 m/s`; while engaged the cap only moves down or holds, and releases by ramping back up (~1 m/s per second) after 2 s of quiet. The ISO 3.0 m/s² defense now lives here.
+
+Both feed the same `min()` combination as a safety-class source: they inherit the driver-gas suspend and are in the lead-override-protected class (a faster lead never lifts a curve cap). Telemetry: `reactCapEngaged`, `reactCap` (km/h), `reactLatAccel` (measured m/s²).
+
 ### Per-country speed tables
 
 TOML files in `speed_tables/`, auto-detected from GPS coordinates:
@@ -81,7 +90,10 @@ Vienna-style speed limit sign on the onroad HUD:
 | mapdOut | subscribe | 20 Hz |
 | modelV2 | subscribe | 20 Hz |
 | gpsLocationExternal | subscribe | 1 Hz |
+| livePose | subscribe | 20 Hz |
 | speedLimitState | publish | 5 Hz |
+
+`livePose` is the (lightest, vehicle-agnostic) source of measured lateral accel — forward speed and yaw rate both come from the localizer, no car sensor or steering ratio.
 
 ## Params
 
@@ -89,4 +101,5 @@ Vienna-style speed limit sign on the onroad HUD:
 |-------|-------------|
 | ShowSpeedLimitSign | Show speed limit sign on HUD |
 | MapdSpeedLimitControlEnabled | Enable conditional speed control |
-| MapdCurveTargetLatAccel | Target lateral acceleration in curves (m/s²) |
+| MapdCurveTargetLatAccel | Proactive curve-cap target lateral acceleration (m/s², default 1.5, clamp [1.0, 3.0]) |
+| MapdReactLatAccel | Reactive measured-a_y cap threshold (m/s², default 2.5, clamp [1.8, 3.0], 0 disables) |
