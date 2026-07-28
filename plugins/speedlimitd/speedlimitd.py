@@ -223,7 +223,7 @@ REACT_QUIET_S = 2.0       # s — |a_y| must stay quiet this long before release
 REACT_QUIET_MARGIN = 0.3  # m/s² — release deadband below threshold
 REACT_HYST_MS = 1.0       # m/s — extra reduction below the sqrt() cap
 REACT_RELEASE_RATE = 1.0  # m/s per s — cap ramp-up rate during release
-REACT_MIN_SPEED = 8.0     # m/s (~29 km/h) — below this the cap defers to the
+REACT_MIN_SPEED = 30.0 / 3.6     # m/s (~29 km/h) — below this the cap defers to the
                           # driver: prevents ratchet-to-zero when measured a_y
                           # is speed-independent (banking, yaw bias, a
                           # tightening spiral) and kills parking-speed noise

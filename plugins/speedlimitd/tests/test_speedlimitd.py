@@ -1028,6 +1028,22 @@ class TestReactiveCapHardening:
       assert cap == 0.0
     assert mw._react_cap_ms == 0.0
 
+  def test_direct_sign_flip_no_dip_filter_stays_high(self, sld):
+    """Mechanism guard (abs-then-filter): a DIRECT +2.8 -> -2.8 flip with no
+    zero-dip must leave _ay_filt high throughout. A filter-then-abs
+    implementation would collapse the magnitude at the crossing and fail."""
+    mw = self._mw(sld)
+    t, dt = 500.0, 0.1
+    for _ in range(15):  # +2.8 for 1.5 s -> engage
+      mw._update_reactive_cap(2.8, 20.0, 2.5, t, dt)
+      t += dt
+    assert mw._react_cap_ms > 0.0
+    for _ in range(10):  # instant flip to -2.8, no dip
+      cap = mw._update_reactive_cap(-2.8, 20.0, 2.5, t, dt)
+      t += dt
+      assert mw._ay_filt > 2.5, 'abs-then-filter must not dip at the crossing'
+      assert cap >= sld.REACT_MIN_SPEED
+
   def test_sign_flip_persists_engagement(self, sld):
     """A signed a_y_meas (curve reverses direction) must not release the
     cap — only |a_y| matters, and a brief near-zero dip mid-flip must not
