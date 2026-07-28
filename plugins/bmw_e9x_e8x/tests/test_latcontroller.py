@@ -1,18 +1,26 @@
-"""Tests for the BMW lateral controller's ISO cancel-guard call site
-(on_lat_controller_init / update()) — as opposed to the pure module-scope
-helpers (hold_factor, accel_guard_threshold) already covered in
-test_hooks.py.
+"""Tests for the BMW lateral controller's update() call site
+(on_lat_controller_init / update()).
 
-2026-07-28 (route 3ce S-exit census): the shared `overshooting` predicate
-gates both cancel_accel and cancel_jerk, whose only action is draining
-torque to zero. That is remedial only when the current torque still feeds
-the measured turn — draining a torque that already opposes the measured
-curvature (i.e. an active unwind already in flight) resets the ramp toward
-0 every tick and locks out that unwind for the guard's drain window
-(1.6-1.9s observed on sharp leg exits with a_y_meas > 2). This module
-builds a minimal in-process harness to drive update() and prove the
-torque-direction gate at the call-site level, not just via the predicate
-formula in isolation.
+2026-07-28 — SAFETY ARCHITECTURE change (lateral never gives up in a turn).
+The ISO accel/jerk cancel machinery was removed: keeping lateral acceleration
+within comfort/ISO limits is speedlimitd's job (it caps vEgo for curves), and
+the lateral controller's contract is to track the commanded curvature, always.
+Draining torque mid-turn converted a comfort exceedance into a trajectory
+failure (car runs wide) — the incident record (routes 326, 385 seg27, 2ba
+1.29 m off-lane, 3ce hunting, 3cf seg15 firing 75% of a sharp curve) shows
+every cancel caused harm and none prevented any.
+
+These tests pin, at the update() call-site level:
+  - Formerly-cancelling conditions (overshoot + high measured a_y + into-turn
+    torque) now produce normal P-tracking: torque is commanded toward κ_des,
+    NOT drained to zero, and the action is never a cancel. (This test is RED
+    against the pre-removal controller — it cancel_accel'd instead of ramping.)
+  - The NON-cancel decision paths (ramp, hold_zero, hold_curve, relax_dwell)
+    still work unchanged.
+  - cancel_tol — which is NOT ISO machinery (it is HOLD_BAND boundary hygiene:
+    stop an in-flight push ramp once the error falls into the on-target band,
+    draining to the sign-guarded, capped hold, 0 on straights) — still fires
+    identically in its boundary case.
 
 Harness notes:
   - cereal.messaging is a MagicMock (test_helpers.install_all_mocks); we
@@ -21,16 +29,10 @@ Harness notes:
     instead of MagicMock auto-attributes.
   - `state` (the controller's per-tick dict) is a closure variable of the
     nested `update` function returned by on_lat_controller_init — there is
-    no public accessor. We reach it via update.__closure__ (the standard,
-    if unusual, way to introspect a closure cell), matching the "capture
-    via the state dict" fallback the plan anticipated. This lets tests
+    no public accessor. We reach it via update.__closure__. This lets tests
     seed state['torque'] directly (bypassing the ramp) to control the
     torque/measured sign relationship precisely, and read back
     state['action'] / state['target_frac'] afterward.
-  - accel_guard_threshold is a module-level free function; update()'s
-    closure resolves it via the module globals, so monkeypatching the
-    attribute on the loaded `bmw.latcontroller` module intercepts the
-    real call site (proves what update() actually calls it with).
 """
 import math
 import os
@@ -74,8 +76,8 @@ class FakeSubMaster:
 
 
 def _make_controller(monkeypatch, wheelbase=2.66):
-  """Load bmw.latcontroller fresh-ish and construct a controller instance
-  wired to a FakeSubMaster. Returns (lac, fake_sm, mod, state)."""
+  """Load bmw.latcontroller and construct a controller instance wired to a
+  FakeSubMaster. Returns (lac, fake_sm, mod, state)."""
   import cereal.messaging as messaging
   fake_sm = FakeSubMaster([])
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
@@ -110,137 +112,202 @@ def _call_update(lac, desired_curvature, lat_delay=0.2, v_ego=20.0, active=True)
   return lac.update(active, CS, None, None, False, desired_curvature, False, lat_delay)
 
 
+_CANCELS = ('cancel_accel', 'cancel_jerk')
+
+
 # ============================================================
-# (a) call-site wiring: accel_guard_threshold must be called with the
-# COMMANDED lateral accel v^2 * |kappa_des| -- not kappa_des alone, and
-# not the measured a_y (v^2 * kappa_meas).
+# (1) NEW — the SAFETY ARCHITECTURE change. Formerly-cancelling conditions now
+# produce normal P-tracking. Scenario: overshoot ((κ_des - κ_meas)·κ_meas < 0)
+# with high measured lateral accel (a_y_meas = v²·κ_meas ≈ 5.6 m/s², well past
+# any old ISO threshold) and into-turn torque (torque·κ_meas > 0). Kept just
+# below the deep-curve threshold (|κ_meas| < RELAX_DWELL_KAPPA) so the decision
+# is a plain ramp, not a relax_dwell bridge.
+#
+# Pre-removal controller: this cancel_accel'd and drained target_frac -> 0.
+# Post-removal: it tracks — torque is commanded toward κ_des (reduced from the
+# into-turn value, i.e. unwinding), NOT to zero, and action is never a cancel.
 # ============================================================
 
-class TestAccelGuardThresholdCallSite:
-  def test_called_with_commanded_a_y_not_kappa_or_measured_a_y(self, monkeypatch):
+class TestFormerlyCancellingNowTracks:
+  V = 25.0
+  DESIRED = 0.001      # κ_des collapsed near straight
+  MEASURED = 0.009     # κ_meas still turning -> a_y_meas ≈ 5.6, |κ| < deep-curve
+
+  def _prime(self, monkeypatch, desired, measured, torque):
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
-
-    v = 20.0
-    desired = 0.006
-    measured = 0.001  # deliberately different from desired so the three
-                       # candidate call-args (kappa, v^2*kappa, v^2*measured)
-                       # are all numerically distinct
-    _set_measured(fake_sm, v, measured)
-
-    calls = []
-    real_fn = mod.accel_guard_threshold
-
-    def spy(a_y_des_abs):
-      calls.append(a_y_des_abs)
-      return real_fn(a_y_des_abs)
-
-    monkeypatch.setattr(mod, 'accel_guard_threshold', spy)
-
-    _call_update(lac, desired, v_ego=v)
-
-    assert len(calls) == 1
-    expected = v * v * abs(desired)
-    assert calls[0] == pytest.approx(expected)
-    # Not called with kappa_des alone...
-    assert calls[0] != pytest.approx(abs(desired))
-    # ...and not with the measured a_y.
-    assert calls[0] != pytest.approx(v * v * abs(measured))
-
-
-# ============================================================
-# (b)/(c) torque-direction gate on the shared `overshooting` predicate
-# (2026-07-28, route 3ce S-exit census). Scenario mirrors a sharp leg
-# exit: measured kappa still deep in the turn (a_y_meas > 2) while
-# desired kappa has collapsed toward straight -- exactly the shape of
-# overshoot the guard is meant to see.
-# ============================================================
-
-class TestTorqueDirectionGate:
-  V = 15.0            # m/s
-  DESIRED = 0.001      # kappa_des collapsed near straight (leg exit)
-  MEASURED = 0.012     # kappa_meas still deep in the turn -> a_y_meas = 2.7
-
-  def _prime(self, monkeypatch, torque, tick_count):
-    lac, fake_sm, mod, state = _make_controller(monkeypatch)
-    _set_measured(fake_sm, self.V, self.MEASURED)
+    _set_measured(fake_sm, self.V, measured)
     state['torque'] = torque
-    # target_frac defaults to 0.0 at construction, which coincidentally
-    # equals the drain target -- prime it away from 0 (as a completed
-    # prior ramp would leave it) so the cancel path's re-arm guard
-    # (`if state['target_frac'] != unwind_target`) actually arms the
-    # drain ramp instead of seeing "already there".
-    state['target_frac'] = torque
+    state['target_frac'] = torque      # as a completed prior ramp would leave it
     state['ramp_frames'] = 0
     state['action'] = 'ramp'
-    state['tick_count'] = tick_count
+    state['tick_count'] = 999           # force the cadence decision to run
     return lac, state
 
-  def test_precondition_overshooting_and_above_threshold(self, monkeypatch):
-    """Sanity-check the scenario itself before testing the gate: plain
-    overshoot math and a_y_meas both land where expected."""
-    assert (self.DESIRED - self.MEASURED) * self.MEASURED < 0
-    a_y_meas = self.V * self.V * self.MEASURED
-    assert abs(a_y_meas) > 2.0
+  def test_precondition_is_overshoot_high_ay_into_turn(self, monkeypatch):
+    """Sanity-check the scenario is exactly the shape the old guard fired on."""
+    assert (self.DESIRED - self.MEASURED) * self.MEASURED < 0        # overshoot
+    assert self.V * self.V * self.MEASURED > 3.0                     # a_y past ISO
+    assert abs(self.MEASURED) < 0.010                                # not a deep curve
 
-  def test_into_turn_torque_cancels(self, monkeypatch):
-    """torque same sign as measured (still pushing into the turn) ->
-    cancel_accel fires and drains toward 0."""
-    lac, state = self._prime(monkeypatch, torque=0.5, tick_count=0)
+  def test_into_turn_torque_tracks_not_cancels(self, monkeypatch):
+    """torque same sign as measured (into-turn) + overshoot + high a_y:
+    used to cancel_accel and drain to 0. Now: normal ramp toward κ_des."""
+    torque = 0.5
+    lac, state = self._prime(monkeypatch, self.DESIRED, self.MEASURED, torque)
     _call_update(lac, self.DESIRED, v_ego=self.V)
-    assert state['action'] == 'cancel_accel'
-    assert state['target_frac'] == pytest.approx(0.0)
+    assert state['action'] not in _CANCELS
+    assert state['action'] == 'ramp'
+    # Commanded toward κ_des: reduced from the into-turn torque (unwinding)...
+    assert state['target_frac'] < torque
+    # ...but NOT drained to zero (the removed cancel behaviour).
+    assert state['target_frac'] > 0.0
     assert state['ramp_frames'] > 0
 
-  def test_counter_turn_torque_does_not_cancel(self, monkeypatch):
-    """torque opposite sign to measured (already actively unwinding) ->
-    guard must stay silent; the normal off-target decision path runs
-    instead (deep in a measured curve, this scenario also qualifies for
-    relax_dwell -- still the ordinary decision cadence, not an ISO
-    cancel). This is the route 3ce fix: previously this cancelled too,
-    locking out the active unwind for 1.6-1.9s."""
-    lac, state = self._prime(monkeypatch, torque=-0.3, tick_count=999)
+  def test_into_turn_torque_tracks_not_cancels_negative_kappa(self, monkeypatch):
+    """Mirror for a right-hand turn (all signs flipped)."""
+    torque = -0.5
+    lac, state = self._prime(monkeypatch, -self.DESIRED, -self.MEASURED, torque)
+    _call_update(lac, -self.DESIRED, v_ego=self.V)
+    assert state['action'] not in _CANCELS
+    assert state['action'] == 'ramp'
+    assert state['target_frac'] > torque      # reduced magnitude (unwinding)
+    assert state['target_frac'] < 0.0         # not drained to zero
+    assert state['ramp_frames'] > 0
+
+  def test_no_a_y_or_jerk_field_triggers_a_cancel_action(self, monkeypatch):
+    """a_y_meas / jerk_pred are still computed (telemetry), but nothing reads
+    them to make a control decision anymore. Even with an extreme measured a_y
+    the action never lands on a cancel."""
+    lac, state = self._prime(monkeypatch, self.DESIRED, 0.02, 0.6)  # a_y ≈ 12.5
     _call_update(lac, self.DESIRED, v_ego=self.V)
-    assert state['action'] not in ('cancel_accel', 'cancel_jerk')
-    assert state['action'] in ('ramp', 'relax_dwell')
+    assert state['action'] not in _CANCELS
+    # telemetry fields still populated for log analysis
+    assert state['a_y_meas'] == pytest.approx(self.V * self.V * 0.02)
 
-  def test_zero_torque_does_not_cancel(self, monkeypatch):
-    """No torque applied -> nothing feeds the turn -> guard stays silent."""
-    lac, state = self._prime(monkeypatch, torque=0.0, tick_count=999)
-    _call_update(lac, self.DESIRED, v_ego=self.V)
-    assert state['action'] not in ('cancel_accel', 'cancel_jerk')
 
-  # ---- mirror for negative-kappa (right-hand / opposite-sign) turns ----
+# ============================================================
+# (2) cancel_tol still fires, unchanged. NOT ISO machinery — it is HOLD_BAND
+# boundary hygiene: an in-flight PUSH ramp (action=='ramp', ramp_frames>0,
+# |target_frac| > FRICTION) whose error has fallen into the on-target band
+# (|δ_err| ≤ 1.2·HOLD_BAND) is stopped and drained to the sign-guarded, capped
+# hold (hold_f·torque) instead of continuing toward a stale push target.
+# ============================================================
 
-  def test_into_turn_torque_cancels_negative_kappa(self, monkeypatch):
+class TestCancelTolStillFires:
+  def test_boundary_case_drains_to_held(self, monkeypatch):
+    """κ_des ≈ κ_meas (δ_err ≈ 0, inside the band) mid push-ramp: cancel_tol
+    fires and re-arms the ramp toward the held value (hold_f·torque, capped),
+    NOT toward the stale push target and NOT to zero."""
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
-    _set_measured(fake_sm, self.V, -self.MEASURED)
-    state['torque'] = -0.5  # same sign as measured (-) -> into-turn
-    state['target_frac'] = -0.5
-    state['ramp_frames'] = 0
+    v = 20.0
+    kappa = 0.006          # δ_des = δ_meas -> δ_err ≈ 0, inside 1.2·HOLD_BAND
+    _set_measured(fake_sm, v, kappa)
+    state['torque'] = 0.4          # -> held = hold_f(=1.0)·0.4 = 0.4, under hold_cap
+    state['target_frac'] = 0.6     # stale in-flight push target (!= held, arms re-drain)
+    state['ramp_frames'] = 5       # a ramp still in flight
     state['action'] = 'ramp'
     state['tick_count'] = 0
-    _call_update(lac, -self.DESIRED, v_ego=self.V)
-    assert state['action'] == 'cancel_accel'
-    assert state['target_frac'] == pytest.approx(0.0)
+
+    _call_update(lac, kappa, v_ego=v)
+
+    assert state['action'] == 'cancel_tol'
+    assert state['target_frac'] == pytest.approx(0.4)   # drained to the hold, not 0.6, not 0
     assert state['ramp_frames'] > 0
 
-  def test_counter_turn_torque_does_not_cancel_negative_kappa(self, monkeypatch):
+  def test_cancel_tol_does_not_fire_off_target(self, monkeypatch):
+    """Well outside the on-target band, cancel_tol must NOT fire (it is not a
+    general drain — it only stops a ramp that already arrived)."""
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
-    _set_measured(fake_sm, self.V, -self.MEASURED)
-    state['torque'] = 0.3  # opposite sign to measured (-)
+    v = 20.0
+    _set_measured(fake_sm, v, 0.001)     # δ_err large vs κ_des below
+    state['torque'] = 0.2
+    state['target_frac'] = 0.3
+    state['ramp_frames'] = 5
+    state['action'] = 'ramp'
+    state['tick_count'] = 0
+    _call_update(lac, 0.010, v_ego=v)    # κ_des far from κ_meas
+    assert state['action'] != 'cancel_tol'
+
+
+# ============================================================
+# (3) NON-cancel decision paths still work (ramp / hold_zero / hold_curve /
+# relax_dwell). These pass on both the pre- and post-removal controller — they
+# exercise the paths the removal must leave untouched.
+# ============================================================
+
+class TestNonCancelPaths:
+  def test_off_target_ramps(self, monkeypatch):
+    """Under-tracking into a curve (no overshoot): normal push ramp."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    v = 20.0
+    _set_measured(fake_sm, v, 0.001)     # measured lagging
+    state['torque'] = 0.0
+    state['target_frac'] = 0.0
+    state['ramp_frames'] = 0
+    state['action'] = 'idle'
+    state['tick_count'] = 999
+    _call_update(lac, 0.008, v_ego=v)    # κ_des well ahead of κ_meas
+    assert state['action'] == 'ramp'
+    assert state['target_frac'] > 0.0    # pushing into the turn
+    assert state['ramp_frames'] > 0
+
+  def test_on_target_straight_holds_zero(self, monkeypatch):
+    """On-target with low commanded a_y (straight): drain to zero, stiction
+    holds."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    v = 20.0
+    _set_measured(fake_sm, v, 0.0)
+    state['torque'] = 0.0
+    state['target_frac'] = 0.0
+    state['ramp_frames'] = 0
+    state['action'] = 'idle'
+    state['tick_count'] = 999
+    _call_update(lac, 0.0, v_ego=v)
+    assert state['action'] == 'hold_zero'
+
+  def test_on_target_curve_holds_curve(self, monkeypatch):
+    """On-target in a curve with high commanded a_y: keep the standing torque
+    (hold_curve), not drain."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    v = 20.0
+    kappa = 0.006
+    _set_measured(fake_sm, v, kappa)
+    state['torque'] = 0.3
+    state['target_frac'] = 0.3
+    state['ramp_frames'] = 0
+    state['action'] = 'hold_curve'   # NOT 'ramp' -> cancel_tol gate stays shut
+    state['tick_count'] = 999
+    _call_update(lac, kappa, v_ego=v)
+    assert state['action'] == 'hold_curve'
+    assert state['target_frac'] == pytest.approx(0.3)
+
+  def test_counter_turn_torque_runs_normal_decision(self, monkeypatch):
+    """Deep in a measured curve with torque already opposing the turn (an
+    active unwind in flight): never a cancel. Deep + same-side κ_des qualifies
+    for the relax_dwell bridge — the ordinary decision cadence, not a drain.
+    (Pre-removal this scenario stayed silent too, because the overshoot gate
+    required into-turn torque; the removal does not change it.)"""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    v = 15.0
+    _set_measured(fake_sm, v, 0.012)     # deep curve
+    state['torque'] = -0.3               # opposite sign to measured -> unwinding
+    state['target_frac'] = -0.3
     state['ramp_frames'] = 0
     state['action'] = 'ramp'
     state['tick_count'] = 999
-    _call_update(lac, -self.DESIRED, v_ego=self.V)
-    assert state['action'] not in ('cancel_accel', 'cancel_jerk')
+    _call_update(lac, 0.001, v_ego=v)    # κ_des collapsed (leg exit)
+    assert state['action'] not in _CANCELS
     assert state['action'] in ('ramp', 'relax_dwell')
 
-  def test_zero_torque_does_not_cancel_negative_kappa(self, monkeypatch):
+  def test_zero_torque_runs_normal_decision(self, monkeypatch):
+    """No torque applied: never a cancel; normal off-target ramp."""
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
-    _set_measured(fake_sm, self.V, -self.MEASURED)
+    v = 15.0
+    _set_measured(fake_sm, v, 0.012)
     state['torque'] = 0.0
+    state['target_frac'] = 0.0
     state['ramp_frames'] = 0
     state['action'] = 'ramp'
     state['tick_count'] = 999
-    _call_update(lac, -self.DESIRED, v_ego=self.V)
-    assert state['action'] not in ('cancel_accel', 'cancel_jerk')
+    _call_update(lac, 0.001, v_ego=v)
+    assert state['action'] not in _CANCELS

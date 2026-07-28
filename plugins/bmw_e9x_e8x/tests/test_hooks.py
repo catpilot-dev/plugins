@@ -163,62 +163,13 @@ class TestHoldFactor:
 
 
 # ============================================================
-# accel_guard_threshold — ISO accel cancel guard referenced to COMMANDED
-# a_y (2026-07-27: moved off the kappa-indexed LATERAL_ACCEL_BP table; route
-# 3ce hunting fix — see module-level comment in latcontroller.py). Pure
-# function, module-level, no controller construction needed.
+# ISO accel/jerk cancel guard — REMOVED 2026-07-28 (lateral never gives up in
+# a turn; a_y is bounded at the system level by speedlimitd's curve-speed
+# capping). accel_guard_threshold() and the cancel machinery no longer exist,
+# so the TestAccelGuardThreshold suite that used to sit here was removed. The
+# no-cancel behaviour and the surviving cancel_tol boundary-hygiene path are
+# covered by tests/test_latcontroller.py.
 # ============================================================
-
-class TestAccelGuardThreshold:
-  def test_zero_commanded_is_floor(self, mock_deps):
-    from bmw.latcontroller import accel_guard_threshold
-    assert accel_guard_threshold(0.0) == pytest.approx(1.5)
-
-  def test_below_floor_stays_at_floor(self, mock_deps):
-    """1.0: ratio*a_y + margin = 1.45, below the 1.5 floor -> floor wins."""
-    from bmw.latcontroller import accel_guard_threshold
-    assert accel_guard_threshold(1.0) == pytest.approx(1.5)
-
-  def test_near_straight_tightening_preserved(self, mock_deps):
-    """Regression anchor: 0.3 m/s² commanded still floors at 1.5 (the
-    2026-05-22 near-straight tightening carries forward unchanged)."""
-    from bmw.latcontroller import accel_guard_threshold
-    assert accel_guard_threshold(0.3) == pytest.approx(1.5)
-
-  def test_ramps_above_floor(self, mock_deps):
-    """1.2: 1.25*1.2 + 0.2 = 1.7, above the floor -> ratio+margin formula."""
-    from bmw.latcontroller import accel_guard_threshold
-    assert accel_guard_threshold(1.2) == pytest.approx(1.7)
-
-  def test_3ce_seg26_point_exceeds_wobble_reach(self, mock_deps):
-    """route 3ce seg 26: commanded a_y 1.82 -> threshold ~2.475, clear of
-    +-15-20% measurement wobble on the overshoot side (must exceed 1.15x
-    commanded, the old table's margin collapsed to ~5% here)."""
-    from bmw.latcontroller import accel_guard_threshold
-    t = accel_guard_threshold(1.82)
-    assert t == pytest.approx(2.475)
-    assert t > 1.82 * 1.15
-
-  def test_3ce_seg15_point_caps_at_iso(self, mock_deps):
-    """route 3ce seg 15: commanded a_y 2.34 -> ratio+margin = 3.125, capped
-    at the ISO 3.0 m/s^2 absolute ceiling."""
-    from bmw.latcontroller import accel_guard_threshold
-    assert accel_guard_threshold(2.34) == pytest.approx(3.0)
-
-  def test_large_commanded_stays_capped_at_iso(self, mock_deps):
-    from bmw.latcontroller import accel_guard_threshold
-    assert accel_guard_threshold(10.0) == pytest.approx(3.0)
-
-  def test_monotone_non_decreasing(self, mock_deps):
-    from bmw.latcontroller import accel_guard_threshold
-    xs = [i * 0.05 for i in range(81)]  # 0.0 .. 4.0
-    vals = [accel_guard_threshold(x) for x in xs]
-    assert all(b >= a for a, b in zip(vals, vals[1:]))
-
-  def test_never_exceeds_iso_ceiling(self, mock_deps):
-    from bmw.latcontroller import accel_guard_threshold
-    xs = [i * 0.05 for i in range(81)]
-    assert all(accel_guard_threshold(x) <= 3.0 for x in xs)
 
 
 # ============================================================

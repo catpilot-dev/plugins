@@ -2,6 +2,61 @@
 
 This document is the canonical reference for the lateral controller registered by `bmw/latcontroller.py::on_lat_controller_init` (hook: `controls.lat_controller_init`). It describes **what** the controller does, **why** it's shaped this way for the BMW hydraulic rack, **how** the single-knob timing design propagates, and **what was tried and rejected**. Future maintainers should be able to retune without re-litigating the failed experiments.
 
+> **2026-07-28 — SAFETY ARCHITECTURE: the lateral controller never gives up in
+> a turn. The ISO 11270 cancel machinery was removed.** The controller's
+> contract is now singular: **track the commanded curvature, always.**
+>
+> **ISO 11270 is enforced at the SYSTEM level, not here.** Lateral acceleration
+> `a_y = v²·κ`; the only term the car can trim online without leaving the
+> commanded path is `v`. That is **speedlimitd's** job — it caps `vEgo` for
+> upcoming curves so the commanded `a_y` stays within comfort/ISO limits. The
+> lateral layer then faithfully tracks whatever curvature it is handed. This
+> is a clean separation of duties: **longitudinal owns `a_y` (via `v`),
+> lateral owns trajectory (via κ tracking).**
+>
+> **Why the in-controller cancel was net-harmful.** The removed guard drained
+> steering torque to zero mid-turn whenever measured `a_y` or predicted jerk
+> exceeded a threshold (gated on plant overshoot). Draining torque in a turn
+> does not reduce lateral acceleration in any useful way — with a hydraulic
+> rack that has no self-centering near center but strong self-aligning torque
+> (SAT) at angle, releasing torque lets SAT unwind the wheel and the car
+> **runs wide**, converting a comfort exceedance (transient, bounded) into a
+> **trajectory failure** (the car leaves its lane). The incident record is
+> unanimous — every cancel firing caused harm and none prevented any:
+>
+> | Route | What the cancel did |
+> |---|---|
+> | 326 | spurious cancels + torque churn, up to 114 `cancel_accel`/route pre-fix |
+> | 385 seg 27 | over-latch → `cancel_accel` dump → deep unwind limit cycle in a hairpin |
+> | 2ba seg 22 | zeroed torque while still **under**-tracking → car drifted **1.29 m** outside the lane |
+> | 3ce (segs 15/26/31) | drain-rebuild hunting cycle, 54% zero-torque occupancy in curves |
+> | 3cf seg 15 | cancel firing through ~75% of a single sharp curve |
+>
+> **What still bounds the lateral command** (all of these track *toward* the
+> commanded κ, none abandon it):
+> 1. **P-law reversal on overshoot** — the moment the plant turns past `κ_des`,
+>    `δ_err` flips sign and the P-term commands torque the other way. Tracking
+>    back to the command *is* the overshoot correction; no separate guard needed.
+> 2. **`STEP_MAX`** — per-decision torque step cap (speed-scaled 0.10→0.05),
+>    the jerk bound (~4 Nm/s max slew, halving to ~2 Nm/s at highway).
+> 3. **Panda `STEER_MAX`** — the hard actuator limit (12 Nm), enforced at the
+>    gateway.
+> 4. **Driver supervision** — hands-on, the ultimate authority.
+>
+> **What was removed from `bmw/latcontroller.py`:** `accel_guard_threshold()`,
+> `ACCEL_GUARD_FLOOR/RATIO/MARGIN`, `LATERAL_CURVATURE`, `LATERAL_JERK_BP`, the
+> `overshooting` predicate (incl. its torque-direction conjunct and
+> `KMEAS_SIGN_FLOOR`), `BMW_LATERAL_ACCEL`/`BMW_LATERAL_JERK`, the
+> `cancel_accel`/`cancel_jerk` branch and its drain, and the module-scope
+> `ISO_LATERAL_ACCEL`/`ISO_LATERAL_JERK` imports. **`cancel_tol` was kept** —
+> it is *not* ISO machinery but `HOLD_BAND` boundary hygiene (it stops an
+> in-flight push ramp once the error is on-target, draining to the
+> sign-guarded capped hold; it tracks the command tighter, it does not abandon
+> the turn). `a_y_meas` / `jerk_pred` are still computed but are **telemetry
+> only** now — nothing reads them for control. **§7 (ISO 11270 comfort guards)
+> below and every "ISO guard / cancel_accel / cancel_jerk" mention elsewhere in
+> this document are HISTORICAL as of this date.**
+>
 > **2026-07-03 — stiction special-casing removed.** All FRICTION-based command
 > shaping is gone: the `breakaway` ±FRICTION amplification, the `brake_zero`
 > one-shot reverse pulse, and the reverse-FRICTION pulses in `cancel_tol` and
@@ -246,7 +301,7 @@ The custom controller is a **plant-inversion design in front-wheel-angle (δ) sp
 target_nm = T_CAP_SLOPE_BASE · kappa_scale(|κ_des|) · v² · δ_err   # full error, no subtraction (Phase 2)
 ```
 
-When `|δ_err| ≤ HOLD_BAND` the cadence decision holds (target → 0 on straight, or holds the last target on a curve) and stiction keeps the rack in place. Outside `HOLD_BAND`, the controller ramps to `target_nm` over `spread_frames` CAN ticks. ISO comfort guards (cancel_jerk / cancel_accel) gated on **actual plant overshoot** brake the ramp if the plant runs past κ_des.
+When `|δ_err| ≤ HOLD_BAND` the cadence decision holds (target → 0 on straight, or holds the last target on a curve) and stiction keeps the rack in place. Outside `HOLD_BAND`, the controller ramps to `target_nm` over `spread_frames` CAN ticks. When the plant runs past κ_des, `δ_err` flips sign and `target_nm` reverses on its own — tracking back to the command *is* the overshoot correction. (The old ISO comfort-guard drain-to-0 was removed 2026-07-28; a_y is bounded by speedlimitd — see the SAFETY ARCHITECTURE note at the top and §7.)
 
 ---
 
@@ -330,11 +385,11 @@ delta_err_raw   = delta_des - delta_meas
         ▼
 state['delta_err'] = delta_err                 # raw, used by controller as-is
         │
-        ▼  ISO comfort guards (gated on actual overshoot)
-        │  overshooting = (κ_des - κ_meas) · κ_meas < 0
-        │  if overshooting and |a_y_meas| > BMW_LATERAL_ACCEL → cancel_accel
-        │  elif overshooting and |jerk_pred| > BMW_LATERAL_JERK → cancel_jerk
-        │  → target_frac drains to 0 (reverse-FRICTION pulse removed 2026-07-03)
+        ▼  a_y_meas / jerk_pred computed here — TELEMETRY ONLY since 2026-07-28.
+        │  (The ISO accel/jerk cancel guard that used to read them and drain
+        │   target_frac to 0 was REMOVED — a_y is bounded by speedlimitd; see
+        │   the SAFETY ARCHITECTURE note at the top and §7. cancel_tol, the
+        │   HOLD_BAND boundary-hygiene drain, survives and runs just below.)
         ▼
 Cadence decision (every action_cadence_ticks):
    if |delta_err| ≤ HOLD_BAND:
@@ -442,7 +497,18 @@ Higher-κ scale points (2.5 @ 0.01, 3.0 @ 0.02) unchanged so tight-curve trackin
 
 ---
 
-## 7. ISO 11270 comfort guards
+## 7. ISO 11270 comfort guards — HISTORICAL (removed 2026-07-28)
+
+> **This entire section is historical.** The in-controller ISO accel/jerk
+> cancel guard was removed on 2026-07-28 — see the SAFETY ARCHITECTURE note at
+> the top of this document. ISO 11270 lateral-acceleration limiting is now a
+> **system-level** responsibility of speedlimitd (curve-speed capping of
+> `vEgo`), not of the lateral controller, which tracks the commanded curvature
+> unconditionally. The code, constants (`accel_guard_threshold`,
+> `ACCEL_GUARD_*`, `LATERAL_CURVATURE`, `LATERAL_JERK_BP`,
+> `ISO_LATERAL_ACCEL/JERK`), and the `cancel_accel`/`cancel_jerk` actions
+> described below **no longer exist in `bmw/latcontroller.py`**. Kept for the
+> design history and the reasoning that led to the removal.
 
 ```python
 ISO_LATERAL_ACCEL = 3.0    # m/s²  (from opendbc.car.lateral)
@@ -482,12 +548,13 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | `hold_curve` | `|delta_err| ≤ HOLD_BAND`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
 | `ramp` | active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
 | `relax_dwell` | overshoot-side error in a measured deep curve, within the 1 s dwell — target bridges at current (capped) torque |
-| `cancel_tol` | error fell into the on-target band (1.2× `HOLD_BAND`) mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights) |
-| `cancel_accel` | overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` — drain to 0 |
-| `cancel_jerk` | overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` — drain to 0 |
-| `idle` | (2026-07-19) between cadence decisions after a transient label's ramp completed — expires ramp/relax_dwell/cancel_* so telemetry occupancy counts are honest; holds never expire (they re-fire each cadence) |
+| `cancel_tol` | error fell into the on-target band (1.2× `HOLD_BAND`) mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights). **NOT an ISO cancel** — HOLD_BAND boundary hygiene; the only `cancel_`-named action still present |
+| ~~`cancel_accel`~~ | **removed 2026-07-28** — was: overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` → drain to 0 |
+| ~~`cancel_jerk`~~ | **removed 2026-07-28** — was: overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` → drain to 0 |
+| `idle` | (2026-07-19) between cadence decisions after a transient label's ramp completed — expires ramp/relax_dwell/cancel_tol so telemetry occupancy counts are honest; holds never expire (they re-fire each cadence) |
 
 Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`. Added: `hold_curve`. Telemetry gains `hold_f`.
+Removed 2026-07-28 (SAFETY ARCHITECTURE, top of doc): `cancel_accel`, `cancel_jerk` — the lateral controller no longer abandons a turn; `a_y` is bounded by speedlimitd.
 
 ---
 
@@ -578,12 +645,8 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - Increase `T_CAP_SCALE_BP[1]` or `T_CAP_SCALE_BP[2]` (currently 2.5, 3.0 at `|κ| = 0.01, 0.02`).
 - **Don't** increase `T_CAP_SCALE_BP[0]` past 1.0 — that's where route 326's over-correction lived (was 1.5, now back to 1.0).
 
-### If cancel events feel too frequent on moderate curves:
-- Loosen `LATERAL_ACCEL_BP` / `LATERAL_JERK_BP` at the moderate-κ breakpoints (currently 2.5 / 3.0 at `|κ|=0.01`).
-- Don't loosen the small-κ values (1.5) — they're the brake against small-amplitude overshoot.
-
-### If unwind pulses are felt too often (controller pushes back too easily):
-- Loosen `BMW_LATERAL_JERK_BP[0]` / `BMW_LATERAL_ACCEL_BP[0]` (currently 1.5). Cancel guards will fire less often at small κ. But verify no spurious overshoot crept in.
+### If lateral acceleration feels too high in curves:
+- This is **no longer a lateral-controller tuning problem** (2026-07-28). The lateral controller tracks the commanded curvature and does not limit `a_y`. Lower the curve-speed target in **speedlimitd** (curve-speed capping) — it owns `vEgo`, hence `a_y = v²·κ`. Recipes for the old in-controller ISO cancel guard (`LATERAL_ACCEL_BP` / `LATERAL_JERK_BP` / `BMW_LATERAL_*`) are obsolete; that machinery was removed.
 
 ---
 
@@ -597,7 +660,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | Plant horizon block | inside update | `model_action_t`, cadence/spread computed from `lat_delay` |
 | Hold-cap / hold-floor block | inside update | `hold_cap` (HOLD_CAP_DRIFT_M reference), `held_target`, sign-guard |
 | HOLD_BAND on-target check | inside update | Fixed stiction hold-retrigger threshold (no deadzone; § 5) |
-| ISO guards | inside update | Overshoot-gated cancel_jerk / cancel_accel |
+| cancel_tol | inside update | HOLD_BAND boundary hygiene — stops an in-flight push ramp on-target (the ISO overshoot-gated cancel_jerk / cancel_accel that used to sit here was removed 2026-07-28) |
 | Cadence decision | inside update | hold_zero / hold_curve / ramp / target_nm formula |
 | Ramp application | inside update | Per-CAN-tick torque ramp |
 | Telemetry publish | inside update | `bmw_lat_control` topic via plugin_bus |
@@ -627,7 +690,7 @@ ev = list(log.Event.read_multiple_bytes(zstandard.ZstdDecompressor().decompress(
 Key metrics to compute per route:
 - **Reference-smoothing efficacy** (Phase 2: this now lives in `lane_keeping`, not `latcontroller`): compare `kappa_in` vs `kappa_ref` sign-flips per second from the `lane_keeping` telemetry topic — `delta_err_raw` no longer exists in `bmw_lat_control` telemetry, since the box filter it fed was deleted from this controller.
 - **Lane offset**: from `modelV2.laneLines[1].y[0]` and `modelV2.laneLines[2].y[0]` averaged. RMS should be 0.30-0.45 m on healthy drives.
-- **cancel_jerk / cancel_accel counts**: per lane change (should be < ~10 / LC each)
+- **cancel_jerk / cancel_accel counts**: removed 2026-07-28 (no ISO cancel) — these actions no longer exist in telemetry. `cancel_tol` (boundary hygiene) still appears and is expected; it is not an abandonment of the turn.
 - **`de_at_end_raw`**: δ_err at the moment laneChangeState flips back to `off`. Should be < 0.3° on healthy LCs.
 - **`post_tq_max`**: peak `|output·STEER_MAX|` in the 1.5 s after each LC end. Should be < 2-3 Nm.
 

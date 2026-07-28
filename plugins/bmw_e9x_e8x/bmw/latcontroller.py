@@ -28,15 +28,26 @@ if _PLUGIN_DIR not in sys.path:
 
 import numpy as np
 
-from opendbc.car.lateral import ISO_LATERAL_ACCEL
-
-# ISO_LATERAL_ACCEL hoisted to module scope (2026-07-27, accel guard rework
-# below) alongside HOLD_AY_BP/hold_factor — accel_guard_threshold() needs it
-# at import time and must be independently testable like hold_factor is.
-# Value (3.0 m/s², from opendbc.car.lateral) and the half-ISO design intent
-# are unchanged from the original in-function import; see the ISO 11270
-# comfort-guard comment block in on_lat_controller_init for the full guard
-# design (jerk side is untouched — still a κ-indexed table there).
+# SAFETY ARCHITECTURE (2026-07-28): the lateral controller NEVER gives up in a
+# turn — its contract is to track the commanded curvature, always. Keeping
+# lateral acceleration within ISO 11270 / comfort limits is handled at the
+# SYSTEM level by speedlimitd, which caps vEgo for curves (a_y = v²·κ, so it
+# owns the v² factor). Draining torque mid-turn to respect an a_y ceiling here
+# converted a comfort exceedance into a trajectory failure — the car ran wide.
+# The ISO accel/jerk cancel machinery that used to live in this file
+# (accel_guard_threshold, ACCEL_GUARD_*, the overshoot gate, cancel_accel /
+# cancel_jerk drains, ISO_LATERAL_ACCEL/JERK) was removed on this date. The
+# incident record shows every cancel firing caused harm and none prevented any:
+#   route 326                — spurious cancels, torque churn per lane change
+#   route 385 seg 27         — over-latch → cancel_accel dump → deep unwind cycle
+#   route 2ba seg 22         — cancel zeroed torque under-tracking → 1.29 m off-lane
+#   route 3ce (segs 15/26/31) — drain-rebuild hunting, 54% zero-torque in curves
+#   route 3cf seg 15         — cancel firing through 75% of a sharp curve
+# Remaining lateral bounds, all of which track-toward-command rather than
+# abandon it: the P-law naturally REVERSES on overshoot (tracking back to the
+# commanded κ IS the correction), the STEP_MAX per-decision jerk bound, the
+# panda STEER_MAX hard limit, and driver supervision. a_y is not this layer's
+# concern; it belongs to speedlimitd's curve-speed capping.
 
 # Hold gate, lateral-acceleration-dependent (2026-07-27, route 3ca seg 23).
 # Whether "drain to zero and let stiction hold" is safe on-target depends on
@@ -74,36 +85,6 @@ def hold_factor(v_ego, kappa_des_abs):
   testable without constructing the controller.
   """
   return float(np.interp(v_ego * v_ego * kappa_des_abs, HOLD_AY_BP, [0.0, 1.0]))
-
-
-# ISO 11270 accel cancel-guard threshold, referenced to COMMANDED lateral
-# accel (2026-07-27, route 3ce evidence — see the ISO 11270 comfort-guard
-# comment block in on_lat_controller_init for the full history and rationale
-# this replaces). Overshoot = MEASURED a_y meaningfully beyond what was
-# actually commanded, not an absolute κ-indexed level:
-#   - ACCEL_GUARD_FLOOR (1.5 m/s²): preserves the 2026-05-22 near-straight
-#     tightening — even a tiny commanded a_y still cancels well below ISO.
-#   - ACCEL_GUARD_RATIO / ACCEL_GUARD_MARGIN: fires only once measured
-#     exceeds commanded by 25% plus 0.2 m/s² of absolute headroom — normal
-#     tracking noise (+-15-20%) on the overshoot side no longer trips it.
-#   - min(ISO_LATERAL_ACCEL, ...): ISO 3.0 m/s² stays the absolute ceiling
-#     regardless of how large the commanded a_y is.
-# Pure function of commanded |a_y_des| — no state — directly testable like
-# hold_factor().
-ACCEL_GUARD_FLOOR = 1.5      # m/s² — small-a_y tightened floor (2026-05-22, route 326 class)
-ACCEL_GUARD_RATIO = 1.25     # fire only when measured exceeds commanded by 25%...
-ACCEL_GUARD_MARGIN = 0.2     # ...plus 0.2 m/s² absolute headroom
-
-
-def accel_guard_threshold(a_y_des_abs):
-  """ISO accel cancel-guard threshold (m/s²), relative to commanded a_y.
-
-  Pure function of |a_y_des| — no state — directly testable without
-  constructing the controller. See the module-level comment above for
-  the ACCEL_GUARD_* rationale.
-  """
-  return min(ISO_LATERAL_ACCEL, max(ACCEL_GUARD_FLOOR,
-                                    ACCEL_GUARD_RATIO * a_y_des_abs + ACCEL_GUARD_MARGIN))
 
 
 def on_lat_controller_init(result, lac, CP):
@@ -155,24 +136,32 @@ def on_lat_controller_init(result, lac, CP):
   per CAN frame for spread_frames frames; panda enforces wire-rate.
   (spread_frames = round((model_action_t/2)/DT_CAN_TICK), per-tick dynamic.)
 
-  ISO 11270 half-comfort guard (every livePose tick): cancel ramping if
-  |a_y_meas| > 1.5 m/s² OR predicted jerk |v²·(κ_des−κ_meas)/0.5| > 2.5 m/s³,
-  AND only when plant has actually overshot ((κ_des−κ_meas)·κ_meas < 0).
-  Under-tracking (plant lagging in a hard curve) is left to the controller
-  to chase. When cancel fires, drain the ramp to 0 — with torque relaxed,
-  tire aligning forces unwind the wheel (at guard-firing angles aligning
-  torque exceeds rack stiction; route 380/384 evidence).
+  SAFETY ARCHITECTURE (2026-07-28): this controller NEVER abandons a turn.
+  There is no ISO accel/jerk cancel here — that machinery was removed. Keeping
+  lateral acceleration within ISO 11270 / comfort limits is a SYSTEM-level
+  responsibility owned by speedlimitd, which caps vEgo for curves (a_y = v²·κ).
+  Draining torque mid-turn to respect an a_y ceiling turned a comfort
+  exceedance into a trajectory failure (the car ran wide); see the module-level
+  SAFETY ARCHITECTURE note for the incident list (326, 385 seg27, 2ba 1.29 m
+  off-lane, 3ce hunting, 3cf seg15) that proves every cancel was net-harmful.
+  The remaining bounds all keep tracking the command rather than give up: the
+  P-law naturally REVERSES on overshoot (tracking back to κ_des IS the
+  correction), STEP_MAX bounds per-decision jerk, panda STEER_MAX is the hard
+  limit, and the driver supervises. a_y_meas / jerk_pred are still computed but
+  are telemetry-only now — nothing reads them to make a control decision.
 
   Relax-dwell (2026-07-12): in a measured deep curve (|κ_meas| > 0.010),
   an overshoot-side error must persist 1.0 s before the relax path may
   command below current torque — bridges modelV2's transient mid-turn κ_des
-  dips (the "gives up mid-way" mechanism, route 3a0 seg 8). ISO cancels
-  bypass the dwell; κ_des sign flips (S-curves) abort it instantly.
+  dips (the "gives up mid-way" mechanism, route 3a0 seg 8). κ_des sign flips
+  (S-curves) abort it instantly.
 
-  cancel_tol (every livePose tick): if |δ_err| drops into the on-target
-  band (1.2 × HOLD_BAND) mid push-ramp, drain torque to the sign-guarded,
-  capped hold (0 on straights). Without this, the in-flight ramp keeps
-  pushing toward a stale target until the next 250 ms cadence notices.
+  cancel_tol (every livePose tick) — NOT ISO machinery, it is HOLD_BAND
+  boundary hygiene: if |δ_err| drops into the on-target band (1.2 × HOLD_BAND)
+  mid push-ramp, drain torque to the sign-guarded, capped hold (0 on
+  straights). This tracks the command more tightly, it does not abandon it —
+  without it the in-flight ramp keeps pushing toward a stale target until the
+  next 250 ms cadence notices.
 
   2026-07-03 simplification: all stiction special-casing removed (breakaway
   ±FRICTION amplification, brake_zero reverse pulse, cancel reverse-FRICTION
@@ -190,14 +179,14 @@ def on_lat_controller_init(result, lac, CP):
   from cereal import log
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
-  from opendbc.car.lateral import ISO_LATERAL_JERK
 
   # Decision cadence & CAN-rate spreading — both subscribe to model_action_t
   # per tick, sized to one half of the model's action horizon so exactly two
   # decision-and-ramp cycles fit within one horizon. This keeps the
   # controller's correction bandwidth matched to the model's planning
-  # bandwidth: when CP.steerActuatorDelay changes, all three (cadence,
-  # ramp, jerk_pred horizon) move together — no parallel-constant drift.
+  # bandwidth: when CP.steerActuatorDelay changes, both (cadence, ramp) move
+  # together — no parallel-constant drift. (model_action_t also sets the
+  # jerk_pred telemetry horizon; jerk_pred no longer gates anything.)
   #
   #   action_cadence_ticks = round( (model_action_t / 2) / DT_LIVEPOSE )
   #   spread_frames        = round( (model_action_t / 2) / DT_CAN_TICK  )
@@ -206,8 +195,8 @@ def on_lat_controller_init(result, lac, CP):
   # No internal rate cap — panda enforces wire-rate (STEER_DELTA_UP =
   # 0.1 Nm/frame). For typical deltas (≤ 2.5 Nm), ramp_step ≤ 0.1 Nm/frame
   # and demand tracks rack reality. For large transients, panda clips and
-  # state['torque'] briefly leads the rack — accepted; cancel logic still
-  # produces correct intent.
+  # state['torque'] briefly leads the rack — accepted; the controller keeps
+  # tracking the command and catches up.
   #
   # Computed inside update() from model_action_t — see action_cadence_ticks
   # / spread_frames below. Fallbacks here are used only for state-init at
@@ -236,9 +225,9 @@ def on_lat_controller_init(result, lac, CP):
   # Plant prediction horizon — sourced per-tick from controlsd's lat_delay
   # (= liveDelay.lateralDelay + LAT_SMOOTH_SECONDS) and matched to where
   # modeld samples κ_des: lat_action_t = lat_delay + DT_MDL (modeld.py:391).
-  # Used by jerk_pred (the ISO-jerk overshoot guard) and by the hold-cap's
-  # fixed-reference drift formula (HOLD_CAP_DRIFT_M block below) — same
-  # horizon for both.
+  # Used by the hold-cap's fixed-reference drift formula (HOLD_CAP_DRIFT_M
+  # block below) and by the jerk_pred telemetry (log-only since 2026-07-28;
+  # no longer an overshoot guard).
   #
   # For BMW: lagd never converges (it correlates on latcontrol_torque
   # telemetry that our front-wheel-angle plant-inversion controller doesn't
@@ -267,8 +256,9 @@ def on_lat_controller_init(result, lac, CP):
   # never apply excessive steering torque abruptly. 0.10 frac = 1.2 Nm per
   # 300 ms ≈ 4 Nm/s max slew (panda wire limit is 10 Nm/s). Full authority
   # builds in ~1.5 s instead of 0.3 s — accepted: speedlimitd slows for
-  # curves and the ISO guards still cancel overshoot instantly. First knob
-  # to revisit if curve entries ever feel late.
+  # curves and the P-law reverses the moment the plant overshoots κ_des
+  # (tracking back to the command). First knob to revisit if curve entries
+  # ever feel late.
   #
   # 2026-07-09 (route 39b seg 18, user safety call): SPEED-SCALED. A slight
   # highway left showed sudden back-and-forth wheel motion; aggressive
@@ -285,11 +275,6 @@ def on_lat_controller_init(result, lac, CP):
   STEP_MAX_V  = [15.0, 28.0]     # vEgo breakpoints (m/s)
   STEP_MAX_BP = [0.10, 0.05]     # per-decision torque step cap (frac)
 
-  # κ_meas magnitude below which its SIGN is yaw-rate noise (route 39b
-  # seg 18 observed ±0.0002 at 30 m/s). The ISO overshoot gate requires
-  # |κ_meas| above this floor — see the overshooting comment in update().
-  KMEAS_SIGN_FLOOR = 0.0005
-
   # Relax-dwell (2026-07-12, route 3a0 seg 8): in a measured deep curve, an
   # overshoot-side error must persist this long before the relax path may
   # command below current torque — bridges modelV2's transient mid-turn
@@ -302,8 +287,8 @@ def on_lat_controller_init(result, lac, CP):
   # special-casing removed — the pulses were churn, not correction; the
   # straight-line wobble they targeted is modelV2 vision noise, now handled
   # upstream by lane_keeping since Phase 2, 2026-07-22). Retained only as
-  # the cancel_tol guard threshold: ramps below this can't move the rack,
-  # so there is nothing to cancel.
+  # the cancel_tol boundary-hygiene threshold: ramps below this can't move
+  # the rack, so there is nothing to stop.
   FRICTION = 0.05
 
   # Stiction hold trigger (Phase 2, 2026-07-22). Replaces the DRIFT_M kinematic
@@ -318,53 +303,17 @@ def on_lat_controller_init(result, lac, CP):
   # where the old 0.0012–0.0021 rad tolerance ate 44% of the anchor's command.
   HOLD_BAND = 0.001        # rad of front-wheel-angle error treated as on-target
 
-  # ISO 11270 comfort guard. Cancel the ramp when either the accel or jerk
-  # side is exceeded, drain torque to 0:
-  #   |a_y_meas| > BMW_LATERAL_ACCEL — current loading already at limit;
-  #     don't push deeper. Uses κ_meas (measured outcome).
-  #   |jerk_pred| > BMW_LATERAL_JERK — predicted jerk = v²·(κ_des−κ_meas)/T
-  #     using model_action_t (= lat_delay + DT_MDL, sourced per-tick from
-  #     liveDelay) as the prediction horizon — matches modeld's lat_action_t
-  #     so we predict jerk over the exact horizon the model targets κ over.
-  #     Predictive — catches ringing setup
-  #     ~100 ms before it appears in κ_meas. Validated against route 2b8
-  #     seg 14: at t=848.5s during overshoot, κ_des reversed while κ_meas
-  #     still on the wrong side, jerk_pred = 4.8 m/s³ → would have
-  #     cancelled the counter-torque ramp that produced the 15.7 m/s³
-  #     measured jerk.
-  #
-  # ACCEL side (2026-07-27): BMW_LATERAL_ACCEL is now accel_guard_threshold()
-  # (module scope, near HOLD_AY_BP) referenced to the COMMANDED lateral accel
-  # v²·|κ_des|, not this κ-indexed table. Route 3ce (segs 15/26/31) showed
-  # curves whose commanded a_y sat within ~5% of the old κ-interpolated
-  # threshold getting cancel_accel'd by normal ±15–20% tracking noise on the
-  # overshoot side — a drain-rebuild hunting cycle at 54% zero-torque. The
-  # old table's slope (~200 over the [0.005, 0.01] κ leg) is a fixed
-  # curvature→threshold mapping; SAT and achievable a_y both scale with v²,
-  # so that mapping is outrun once v² ≥ ~210 (above ~14.5 m/s) and the margin
-  # between "commanded" and "threshold" collapses. Referencing the threshold
-  # to commanded a_y directly (with a ratio + absolute margin) keeps the
-  # guard's headroom proportional to what was actually asked for, at any
-  # speed. ISO_LATERAL_ACCEL (3.0) stays the absolute ceiling via min();
-  # ACCEL_GUARD_FLOOR (1.5) preserves the 2026-05-22 near-straight
-  # tightening below. See accel_guard_threshold()'s own comment for the
-  # full formula rationale.
-  #
-  # JERK side: UNCHANGED, still this κ-indexed LATERAL_CURVATURE /
-  # LATERAL_JERK_BP table — jerk_pred is already error-relative
-  # (v²·(κ_des−κ_meas)/T), so it wasn't cycling the way the accel guard was.
-  #
-  # Bug fix 2026-05-22: LATERAL_CURVATURE second value was 0.05 (out of order),
-  # which made np.interp non-monotonic — cancel guards were stuck at the small-κ
-  # value (2.0) all the way through |κ|=0.02, then jumped discontinuously to ISO
-  # at the boundary. Corrected to 0.005 so the table ramps as designed.
-  # Small-κ thresholds also tightened 2.0 → 1.5 — at near-straight, brief
-  # κ_des excursions or lateral disturbances should cancel the ramp earlier
-  # (more conservative on small-κ overshoot). The jerk table keeps that
-  # history; the accel side carries the same 1.5 floor forward as
-  # ACCEL_GUARD_FLOOR (2026-07-27).
-  LATERAL_CURVATURE = [0.001, 0.005, 0.01, 0.02]
-  LATERAL_JERK_BP = [1.5, 1.5, 3.0, ISO_LATERAL_JERK]
+  # SAFETY ARCHITECTURE (2026-07-28): NO ISO accel/jerk cancel guard. It used
+  # to live here (a κ-indexed BMW_LATERAL_JERK table + a commanded-a_y
+  # accel_guard_threshold, both gated on an `overshooting` predicate, draining
+  # torque to 0 when they fired). All of it was removed: bounding lateral
+  # acceleration is speedlimitd's job at the system level (it caps vEgo for
+  # curves — a_y = v²·κ). This controller's contract is to track the commanded
+  # curvature and never abandon a turn. See the module-level SAFETY
+  # ARCHITECTURE note (top of file) and the docstring for the incident record
+  # (326, 385 seg27, 2ba 1.29 m off-lane, 3ce hunting, 3cf seg15) showing the
+  # drains were net-harmful. a_y_meas / jerk_pred are still computed in update()
+  # for telemetry / log analysis, but nothing reads them for control.
 
   # Rear-axle bicycle-model wheelbase (m). Used for κ ↔ δ conversion.
   L = float(CP.wheelbase)
@@ -377,7 +326,8 @@ def on_lat_controller_init(result, lac, CP):
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
-    'action': 'init',          # debug: hold_zero / hold_curve / ramp / relax_dwell / cancel_tol / cancel_accel / cancel_jerk / idle
+    'action': 'init',          # debug: hold_zero / hold_curve / ramp / relax_dwell / cancel_tol / idle
+    #                            (cancel_accel / cancel_jerk removed 2026-07-28 — no ISO cancel)
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad), what controller acts on
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
@@ -426,8 +376,8 @@ def on_lat_controller_init(result, lac, CP):
       # output at the system level: the `lane_keeping` plugin low-passes
       # modelV2 κ_des upstream (`KAPPA_FILTER_TAU`, currently 0.15 s) before
       # this controller ever sees it. So `state['desired']` — and everything
-      # downstream that reads it (`kappa_scale`, `hold_f`, `t_cap`, `jerk_pred`,
-      # and the ISO overshoot gate) — sees that smoothed reference, not raw
+      # downstream that reads it (`kappa_scale`, `hold_f`, `t_cap`, and the
+      # `jerk_pred` telemetry) — sees that smoothed reference, not raw
       # modelV2 output. Keeping this controller filter-free means no held bias
       # here (the drift failure mode of the prior κ_des-hysteresis attempt);
       # noise-induced lag is now `lane_keeping`'s to own, per its position loop.
@@ -485,8 +435,9 @@ def on_lat_controller_init(result, lac, CP):
       #     63 vs 38 deg/s subsequent rate bursts).
       #   - magnitude cap: anything above what P would command while "almost
       #     on-target" is arrival momentum, not holding torque (seg 27
-      #     latched 0.588 where steady SAT ≈ 0.15 → cancel_accel dump →
-      #     deep unwind cycle).
+      #     latched 0.588 where steady SAT ≈ 0.15 → then-present ISO
+      #     cancel_accel dumped it → deep unwind cycle; the cap keeps the
+      #     latch from building in the first place, and outlives that cancel).
       # 2026-07-04: the cap was DECOUPLED from the kinematic DRIFT_M deadzone
       # that existed at the time. It was originally slope·kappa_scale·v²·
       # tolerance, but when the κ-widened DRIFT_M was reverted (deadzone back
@@ -516,8 +467,10 @@ def on_lat_controller_init(result, lac, CP):
       # for RELAX_DWELL_TICKS before the relax path may command below the
       # current (capped) torque. Gates on MEASURED κ (steady through the
       # dips), requires κ_des still same-side (S-curve sign flips abort
-      # instantly), and torque above breakaway. ISO guards are untouched —
-      # genuine measured overshoot (a_y/jerk) still cancels immediately.
+      # instantly), and torque above breakaway. (Historically an ISO overshoot
+      # cancel could interrupt the dwell; that machinery was removed 2026-07-28
+      # — the dwell now runs uninterrupted, and genuine overshoot is corrected
+      # by the P-law reversing as it tracks back to κ_des.)
       # True exits (κ_des drops and stays) proceed after the dwell: cost is
       # ≤1 s of extra curvature (~0.2 m lateral at 9 m/s).
       deep_relax = (abs(state['measured']) > RELAX_DWELL_KAPPA
@@ -527,83 +480,31 @@ def on_lat_controller_init(result, lac, CP):
       state['relax_ticks'] = state['relax_ticks'] + 1 if deep_relax else 0
       dwelling = 0 < state['relax_ticks'] <= RELAX_DWELL_TICKS
 
-      # ISO 11270 half-comfort guard, gated on plant overshoot. Fires only
-      # when (κ_des − κ_meas)·κ_meas < 0 — i.e., plant has turned more than
-      # the planner asked for (or to the wrong side of zero). During
-      # legitimate under-tracking (plant lagging κ_des in a hard curve),
-      # the guard stays silent so the controller can keep tracking. Route
-      # 2ba seg 22 evidence: a_y_meas crept above 1.5 during chassis catch-
-      # up while still under-tracking (κ_meas < κ_des); the un-gated guard
-      # zeroed step_remaining, the controller couldn't apply torque, and
-      # the car drifted 1.29 m outside the lane.
-      #
-      # When overshoot is real, drain τ toward 0 (reverse-FRICTION unwind
-      # pulse removed 2026-07-03): with torque relaxed, tire aligning forces
-      # return the wheel — at the angles where these guards fire, aligning
-      # torque exceeds rack stiction (route 380/384 evidence). No active
-      # counter-push, so the cancel can't create the seg-14 ringing pattern
-      # in reverse.
+      # a_y_meas / jerk_pred: TELEMETRY ONLY since 2026-07-28. The ISO accel/
+      # jerk cancel guard that used to read these (the `overshooting` predicate
+      # + accel_guard_threshold + the drain-to-0) was removed — a_y is bounded
+      # at the system level by speedlimitd's curve-speed capping, and this
+      # controller never abandons a turn (see the SAFETY ARCHITECTURE notes at
+      # module scope and in the docstring). We still compute them for log
+      # analysis / field-health telemetry; nothing here reads them for control.
       a_y_meas = v * v * state['measured']
       jerk_pred = v * v * (state['desired'] - state['measured']) / model_action_t
       state['a_y_meas'] = a_y_meas
       state['jerk_pred'] = jerk_pred
-      # 2026-07-09 (route 39b seg 18): overshoot requires |κ_meas| above the
-      # yaw-noise floor — near zero the SIGN of κ_meas is pure noise
-      # (±0.0002 observed), so the wrong-side test degenerated: a gentle
-      # highway-left build was repeatedly cancel_jerk'd at κ_meas = +0.0002
-      # ("wrong side" by noise) while the car was under-turning. The error
-      # then grew until a late, big correction swung the wheel back and
-      # forth at 108 km/h. Below the floor the guard stays silent — the
-      # step-capped push (≤ 0.7 m/s³ actual jerk at highway) is already
-      # gentler than the guard's own threshold.
-      # 2026-07-28 (route 3ce S-exit census): drain only torque that feeds
-      # the measured turn; counter-turn or zero torque is already the
-      # remedy — draining it locks out the active unwind (route 3ce S-exit
-      # census: 2 silent 1.6-1.9 s drain-lockouts on sharp leg exits). Mid-
-      # curve overshoot with into-turn torque cancels exactly as before.
-      overshooting = ((state['desired'] - state['measured']) * state['measured'] < 0
-                      and abs(state['measured']) > KMEAS_SIGN_FLOOR
-                      and state['torque'] * state['measured'] > 0.0)
-      cancel_reason = None
-      # Accel guard referenced to COMMANDED a_y (2026-07-27) — see the
-      # accel_guard_threshold() comment (module scope) and the ISO 11270
-      # comfort-guard comment block above for the route 3ce rationale.
-      BMW_LATERAL_ACCEL = accel_guard_threshold(v * v * abs(state['desired']))
-      BMW_LATERAL_JERK = float(np.interp(abs(state['desired']),
-                                          LATERAL_CURVATURE, LATERAL_JERK_BP))
-      if overshooting:
-        if abs(a_y_meas) > BMW_LATERAL_ACCEL:
-          cancel_reason = 'cancel_accel'
-        elif abs(jerk_pred) > BMW_LATERAL_JERK:
-          cancel_reason = 'cancel_jerk'
-      if cancel_reason:
-        # Cancel preempts the cadence decision this tick — reset window so
-        # the next plant-inversion decision is one full cycle after the drain.
-        # Drain to 0 (reverse-FRICTION unwind pulse removed 2026-07-03 with
-        # the rest of the stiction special-casing): torque relaxes and tire
-        # aligning forces return the wheel — at the angles where the
-        # overshoot guards fire, aligning torque exceeds rack stiction
-        # (route 380/384 evidence). Only re-arm the ramp if the target
-        # changed, so continuous overshoot doesn't restart the drain window
-        # every tick (exponential-decay bug guarded against as before).
-        unwind_target = 0.0
-        if state['target_frac'] != unwind_target:
-          state['target_frac'] = unwind_target
-          state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
-          state['ramp_frames'] = spread_frames
-        state['action'] = cancel_reason
-        state['tick_count'] = 0
-      elif (state['action'] == 'ramp' and abs(delta_err) <= 1.2*HOLD_BAND
+
+      if (state['action'] == 'ramp' and abs(delta_err) <= 1.2*HOLD_BAND
             and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION):
-        # Success-band cancel: error fell into the on-target band (1.2x
-        # HOLD_BAND) while a PUSH ramp is still in flight. Without this,
-        # the ramp keeps driving torque toward a stale target until the
-        # next 250 ms cadence.
+        # cancel_tol — HOLD_BAND boundary hygiene, NOT an ISO cancel (this is
+        # the only "cancel_"-named path left; it tracks the command tighter, it
+        # does not abandon the turn). Error fell into the on-target band (1.2x
+        # HOLD_BAND) while a PUSH ramp is still in flight. Without this, the
+        # ramp keeps driving torque toward a stale target until the next 250 ms
+        # cadence.
         # Gated on action=='ramp' (route 385 review, 2026-07-03): hold
         # ramps also set ramp_frames, and un-gated this branch fired on
         # them every in-band tick — pinning tick_count (cadence stretched
         # 300→550 ms) and flooding telemetry with phantom cancel_tol
-        # (~10 of 11 in-curve ticks), corrupting the cancel_* field-health
+        # (~10 of 11 in-curve ticks), corrupting the action field-health
         # metric. Gating also removes the float-equality re-arm fragility
         # in the blend region. Drain to the sign-guarded, capped hold
         # (0 on straights; ≈steady SAT in curves — "stop the ramp, keep
@@ -620,13 +521,13 @@ def on_lat_controller_init(result, lac, CP):
         # Expire transient action labels once their ramp completes (parked
         # fix, folded in 2026-07-19): between cadence decisions the label
         # used to persist after the ramp finished, so naive telemetry
-        # occupancy counts over-attributed ramp/cancel states (transition-
+        # occupancy counts over-attributed ramp/relax states (transition-
         # level counting was the workaround). Holds keep their label — they
         # re-fire every cadence and their occupancy IS meaningful. The
         # cancel_tol gate is unaffected: it requires ramp_frames > 0, and
         # in-flight ramps (ramp_frames > 0) never expire here.
         if state['ramp_frames'] == 0 and state['action'] in (
-            'ramp', 'relax_dwell', 'cancel_tol', 'cancel_accel', 'cancel_jerk'):
+            'ramp', 'relax_dwell', 'cancel_tol'):
           state['action'] = 'idle'
 
       if state['tick_count'] >= action_cadence_ticks:
@@ -698,7 +599,8 @@ def on_lat_controller_init(result, lac, CP):
           # dwell window, an overshoot-side reference dip may NOT command
           # below the current (capped) torque — keep the curve and wait the
           # dip out. Persisting overshoot (> dwell) falls through to the
-          # normal relax staircase; ISO cancels bypass this entirely.
+          # normal relax staircase (the ISO cancel that used to bypass this
+          # is gone as of 2026-07-28).
           if dwelling:
             target_frac = math.copysign(min(abs(state['torque']), hold_cap), state['torque'])
             state['action'] = 'relax_dwell'
@@ -708,9 +610,10 @@ def on_lat_controller_init(result, lac, CP):
           # re-measure and step again. Never apply excessive torque
           # abruptly: seg 27 showed single decisions swinging Δ0.69 frac
           # (8.3 Nm) which drove 150 deg/s wheel bursts and the
-          # over-latch → cancel_accel dump → deep-unwind cycle. Max slew
-          # is now ~0.33 frac/s (~4 Nm/s); ISO guards still cancel
-          # overshoot instantly, speedlimitd handles curve-entry speed.
+          # over-latch → (then-present ISO) cancel_accel dump → deep-unwind
+          # cycle — the step cap prevents the over-latch at the source. Max
+          # slew is now ~0.33 frac/s (~4 Nm/s); the P-law reverses on
+          # overshoot, speedlimitd handles curve-entry speed (a_y bound).
           step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
           step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
           target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
