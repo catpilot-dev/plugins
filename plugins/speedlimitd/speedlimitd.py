@@ -223,6 +223,16 @@ REACT_QUIET_S = 2.0       # s — |a_y| must stay quiet this long before release
 REACT_QUIET_MARGIN = 0.3  # m/s² — release deadband below threshold
 REACT_HYST_MS = 1.0       # m/s — extra reduction below the sqrt() cap
 REACT_RELEASE_RATE = 1.0  # m/s per s — cap ramp-up rate during release
+REACT_MIN_SPEED = 8.0     # m/s (~29 km/h) — below this the cap defers to the
+                          # driver: prevents ratchet-to-zero when measured a_y
+                          # is speed-independent (banking, yaw bias, a
+                          # tightening spiral) and kills parking-speed noise
+                          # engagement.
+REACT_LIVEPOSE_STALE_S = 1.0  # s — no livePose update for longer than this
+                               # while engaged forces the release ramp: a
+                               # stalled localizer must not latch a speed cap
+                               # indefinitely. Held-slow is safe briefly; an
+                               # unbounded latch is not.
 
 
 def _parse_lat_accel(raw, default: float, lo: float, hi: float,
@@ -483,6 +493,7 @@ class SpeedLimitMiddleware:
     self._react_over_since: float | None = None   # |a_y| first exceeded threshold
     self._react_quiet_since: float | None = None  # |a_y| first went quiet
     self._react_last_t: float = 0.0       # monotonic time of last reactive tick
+    self._react_livepose_last_t: float = 0.0  # monotonic time livePose last updated
 
     # Gradual speed limit transition — step through standard speeds one level
     # at a time instead of jumping directly (e.g. 80 → 60 → 50 → 40).
@@ -543,19 +554,30 @@ class SpeedLimitMiddleware:
       zero_disables=True)
 
   def _update_reactive_cap(self, a_y_meas, v_ego: float, threshold: float,
-                           now: float, dt: float) -> float:
+                           now: float, dt: float,
+                           livepose_updated: bool = True) -> float:
     """Reactive measured-a_y speed cap (2026-07-28 layer contract).
 
     Low-passes |a_y_meas| (~0.3 s). When it exceeds `threshold` continuously
-    for REACT_ENGAGE_S, engages a cap v_react = v_ego·sqrt(threshold/|a_y|)
-    minus a 1 m/s hysteresis margin. While engaged the cap may only move DOWN
-    or hold — it never chases a_y upward. Release ramps the cap back up at
-    REACT_RELEASE_RATE once |a_y| < threshold−REACT_QUIET_MARGIN for
-    REACT_QUIET_S. `threshold <= 0` disables the feature entirely.
+    for REACT_ENGAGE_S (and v_ego is at least REACT_MIN_SPEED), engages a cap
+    v_react = v_ego·sqrt(threshold/|a_y|) minus a 1 m/s hysteresis margin.
+    While engaged the cap may only move DOWN or hold — it never chases a_y
+    upward — and is floored at REACT_MIN_SPEED (below that the cap defers to
+    the driver rather than ratcheting toward zero; see the constant comment).
+    Release ramps the cap back up at REACT_RELEASE_RATE once
+    |a_y| < threshold−REACT_QUIET_MARGIN for REACT_QUIET_S, or immediately if
+    livePose has gone stale (no update for REACT_LIVEPOSE_STALE_S) while
+    engaged — a stalled localizer must not latch a cap indefinitely.
+    `threshold <= 0` disables the feature entirely.
 
     State lives on self; returns the current cap (m/s, 0 = disengaged). Kept a
-    pure function of its inputs so it is unit-testable without livePose msgs.
+    pure function of its inputs so it is unit-testable without livePose msgs;
+    `livepose_updated` defaults True so existing pure-function callers/tests
+    are unaffected.
     """
+    if livepose_updated:
+      self._react_livepose_last_t = now
+
     if a_y_meas is not None and math.isfinite(a_y_meas):
       mag = abs(a_y_meas)
       alpha = dt / (REACT_TAU + dt) if dt > 0.0 else 1.0
@@ -580,26 +602,35 @@ class SpeedLimitMiddleware:
     else:
       self._react_quiet_since = None
 
+    # A livePose that has stopped updating while a cap is latched must not be
+    # allowed to hold that cap forever — force the release path immediately.
+    stale = (self._react_cap_ms > 0.0
+             and self._react_livepose_last_t > 0.0
+             and now - self._react_livepose_last_t > REACT_LIVEPOSE_STALE_S)
+
     if self._react_cap_ms <= 0.0:
-      # Not engaged — engage after sustained over-threshold.
+      # Not engaged — engage after sustained over-threshold, but never below
+      # REACT_MIN_SPEED: at parking-lot speeds the driver, not this cap,
+      # should be in charge.
       if (self._react_over_since is not None
           and now - self._react_over_since >= REACT_ENGAGE_S
-          and ay > 0.0 and v_ego > 0.0):
+          and ay > 0.0 and v_ego >= REACT_MIN_SPEED):
         v_react = v_ego * math.sqrt(threshold / ay) - REACT_HYST_MS
-        self._react_cap_ms = max(v_react, 0.0)
+        self._react_cap_ms = max(v_react, REACT_MIN_SPEED)
     else:
       # Engaged.
-      if (self._react_quiet_since is not None
+      if stale or (self._react_quiet_since is not None
           and now - self._react_quiet_since >= REACT_QUIET_S):
-        # Sustained quiet — ramp the cap back up, disengage once it no longer
-        # constrains (reaches current speed).
+        # Sustained quiet, or a stale localizer — ramp the cap back up,
+        # disengage once it no longer constrains (reaches current speed).
         self._react_cap_ms += REACT_RELEASE_RATE * dt
         if self._react_cap_ms >= max(v_ego, 0.0):
           self._react_cap_ms = 0.0
       elif ay > 0.0 and v_ego > 0.0:
-        # Still cornering (or not quiet long enough): monotonic-down / hold.
+        # Still cornering (or not quiet long enough): monotonic-down / hold,
+        # floored at REACT_MIN_SPEED while engaged.
         v_react = v_ego * math.sqrt(threshold / ay) - REACT_HYST_MS
-        self._react_cap_ms = min(self._react_cap_ms, max(v_react, 0.0))
+        self._react_cap_ms = min(self._react_cap_ms, max(v_react, REACT_MIN_SPEED))
     return self._react_cap_ms
 
   def _ingest_osm_result(self, result: dict | None):
@@ -755,7 +786,8 @@ class SpeedLimitMiddleware:
     self._react_last_t = now
     a_y_meas = None
     v_ego_meas = 0.0
-    if self.sm.updated.get('livePose', False):
+    livepose_updated = self.sm.updated.get('livePose', False)
+    if livepose_updated:
       try:
         lp = self.sm['livePose']
         av = lp.angularVelocityDevice
@@ -767,7 +799,7 @@ class SpeedLimitMiddleware:
         a_y_meas = None
         v_ego_meas = 0.0
     self._update_reactive_cap(a_y_meas, v_ego_meas, self.react_lat_accel_threshold,
-                              now, react_dt)
+                              now, react_dt, livepose_updated)
 
     # --- Lane width observation from lane_centering plugin ---
     # Smoothed (EMA) across 5 Hz drain so a single noisy frame can't swing

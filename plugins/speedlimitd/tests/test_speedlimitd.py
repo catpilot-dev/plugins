@@ -965,6 +965,128 @@ class TestReactiveLatAccelCap:
     assert mw._react_cap_ms == 0.0
 
 
+# ============================================================
+# Change 3 — reactive cap hardening (speed floor, stale-pose release)
+# ============================================================
+
+class TestReactiveCapHardening:
+  """Speed floor + stale-livePose release. Unlike TestReactiveLatAccelCap,
+  these drive the *real* low-pass filter from a cold start (no pre-set
+  `_ay_filt`) to exercise the engage/ratchet/release transients end-to-end."""
+
+  def _mw(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def test_closed_loop_convergence_fixed_radius_curve(self, sld):
+    """Fixed-radius curve: a_y = kappa * v**2. As the cap ratchets the cap
+    down, the (rate-limited — a real car can't teleport to the cap) speed
+    follows it down, which lowers a_y in turn. The closed loop should settle
+    near the analytic fixed point sqrt(threshold/kappa) - hyst, and never
+    below REACT_MIN_SPEED."""
+    import math
+    mw = self._mw(sld)
+    kappa, thr = 0.0116, 2.5
+    v, t, dt = 15.5, 100.0, 0.1
+    MAX_DECEL = 1.0  # m/s^2 — bounded braking response, not an instant snap
+    for _ in range(32):
+      a_y = kappa * v * v
+      cap = mw._update_reactive_cap(a_y, v, thr, t, dt)
+      if cap > 0.0:
+        v = max(cap, v - MAX_DECEL * dt)
+      t += dt
+    target = math.sqrt(thr / kappa) - 1.0  # ~13.68 (REACT_HYST_MS = 1.0)
+    assert mw._react_cap_ms >= sld.REACT_MIN_SPEED
+    assert mw._react_cap_ms == pytest.approx(target, abs=1.0)
+
+  def test_ratchet_guard_stops_at_min_speed(self, sld):
+    """a_y held constant (speed-independent — banking/yaw-bias/tightening
+    spiral) while v_ego tracks the cap down: the ratchet must stop exactly
+    at REACT_MIN_SPEED, never below."""
+    mw = self._mw(sld)
+    v, thr, t, dt = 20.0, 2.5, 200.0, 0.1
+    for _ in range(120):
+      cap = mw._update_reactive_cap(2.6, v, thr, t, dt)
+      if cap > 0.0:
+        v = max(cap, 0.0)
+      t += dt
+    assert mw._react_cap_ms == sld.REACT_MIN_SPEED
+
+  def test_no_engage_below_floor(self, sld):
+    """v_ego below REACT_MIN_SPEED must never engage the cap, no matter how
+    long a_y stays over threshold — at parking-lot speed the driver is in
+    charge, not this cap."""
+    mw = self._mw(sld)
+    t, dt = 300.0, 0.1
+    cap = 0.0
+    for _ in range(20):  # 2 s, well past REACT_ENGAGE_S
+      cap = mw._update_reactive_cap(3.0, 6.0, 2.5, t, dt)
+      t += dt
+      assert cap == 0.0
+    assert mw._react_cap_ms == 0.0
+
+  def test_sign_flip_persists_engagement(self, sld):
+    """A signed a_y_meas (curve reverses direction) must not release the
+    cap — only |a_y| matters, and a brief near-zero dip mid-flip must not
+    accumulate the full REACT_QUIET_S."""
+    mw = self._mw(sld)
+    t, dt = 400.0, 0.1
+    for _ in range(15):  # +2.8 for 1.5 s -> engage
+      mw._update_reactive_cap(2.8, 20.0, 2.5, t, dt)
+      t += dt
+    engaged = mw._react_cap_ms
+    assert engaged > 0.0
+    for _ in range(3):  # dip near 0 for 0.3 s (short of REACT_QUIET_S)
+      cap = mw._update_reactive_cap(0.0, 20.0, 2.5, t, dt)
+      t += dt
+      assert cap > 0.0
+    for _ in range(15):  # flip to -2.8 for 1.5 s
+      cap = mw._update_reactive_cap(-2.8, 20.0, 2.5, t, dt)
+      t += dt
+      assert cap >= sld.REACT_MIN_SPEED, 'released across the sign flip'
+
+  def test_noise_bounce_resets_quiet_timer_then_clean_releases(self, sld):
+    """Pins EXISTING behavior (pre-dates this change; must stay green): a_y
+    bouncing across the quiet line (threshold - REACT_QUIET_MARGIN = 2.2)
+    keeps resetting the quiet timer — no release — until it goes clean, at
+    which point the release ramp begins."""
+    mw = self._mw(sld)
+    t, dt = 500.0, 0.1
+    for _ in range(30):  # engage
+      mw._update_reactive_cap(2.6, 20.0, 2.5, t, dt)
+      t += dt
+    engaged = mw._react_cap_ms
+    assert engaged > 0.0
+    for i in range(40):  # 4 s of 2.3 <-> 2.1 straddling the 2.2 quiet line
+      val = 2.3 if (i % 4) < 2 else 2.1
+      mw._update_reactive_cap(val, 20.0, 2.5, t, dt)
+      t += dt
+    assert mw._react_cap_ms == engaged  # noise never released it
+    for _ in range(30):  # clean 2.0, well below the quiet line, sustained
+      mw._update_reactive_cap(2.0, 20.0, 2.5, t, dt)
+      t += dt
+    assert mw._react_cap_ms > engaged  # release ramp under way
+
+  def test_stale_livepose_forces_release(self, sld):
+    """A livePose that stops updating while the cap is latched must not be
+    allowed to hold it forever. This mirrors the real call site: on a stale
+    tick a_y_meas is None and v_ego is 0.0 (nothing to measure)."""
+    mw = self._mw(sld)
+    t, dt = 600.0, 0.1
+    for _ in range(20):  # engage, livePose "updating" every tick
+      mw._update_reactive_cap(2.8, 20.0, 2.5, t, dt, True)
+      t += dt
+    engaged = mw._react_cap_ms
+    assert engaged > 0.0
+    for _ in range(15):  # 1.5 s with no livePose update — must not crash
+      mw._update_reactive_cap(None, 0.0, 2.5, t, dt, False)
+      t += dt
+    assert mw._react_cap_ms == 0.0  # stale localizer -> forced release
+
+
 class TestReactiveCapIntegration:
   """Reactive cap flows through update() into the published speedLimitState as a
   protected safety-class source (source 4, safetyCapped True)."""
