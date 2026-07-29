@@ -1,49 +1,65 @@
-# Driver-Side Lane Keeping
+# Driver-Side Lane Keeping (AC Wander Damper)
 
-Standalone plugin on `controls.curvature_correction`. AC STABILIZER: damps
-the wander of the driver-side wheel-to-line gap around the model's own chosen
-line (the line itself is conceded — a slow DC tracker follows it); hard floors
-at 0.3/1.5 m remain absolute. Also conditions the model curvature reference
-(low-pass). When no confident driver-side line is present the position
-correction is off (smoothing always runs).
+Standalone plugin on `controls.curvature_correction`. Damps the sub-Hz
+lane wander of the e2e driving model — one of openpilot e2e's three known
+issues (curve cutting, sub-Hz oscillation, curve blindness; this plugin
+addresses the second) — without ever fighting the model for position.
 
-Design spec: `docs/superpowers/specs/2026-07-23-ac-stabilizer-design.md`
-(supersedes the 2026-07-22 positioner spec and the predictive-deadband §7 trim).
-Control core: `anchor.py` (pure, unit-tested). Hook + telemetry: `register.py`.
-Params: files in `data/` (see `_load_config` in `register.py`).
+How it works, in one paragraph: the wheel-to-line gap on the driver side
+is measured (plan-based prediction at `v · 1.5 · lat_delay`, bias-cancelling
+by construction) and split into DC and AC. The DC — where the model chooses
+to place the car — is **conceded** via a slow tracker (`LaneKeepDcTau`,
+field-proven 5 s): the model closes its own position loop through the
+camera with unbounded authority, so every sustained output-side push loses
+(field result, routes 3c1/3c3/3c5). The AC — the wander around that line —
+is damped through a bounded, rate-limited pure-pursuit curvature bias.
+Near the line an **asymmetric gate** (`LaneKeepAsymGap`, 0.6 m) suppresses
+corrections *toward* the line so recoveries are never opposed. The damper
+core is width-independent (the constant half-width cancels in the DC/AC
+split); only the asym threshold consumes `LaneKeepHalfWidth`, making the
+plugin vehicle-agnostic in one parameter.
 
-## Calibration trim
+The model curvature reference is also lightly conditioned (0.15 s low-pass,
+frame-jitter only — sub-Hz content deliberately passes; filtering it would
+add group delay to curve entries). With no confident driver-side line the
+position correction is off; the smoothing always runs.
 
-A slow perception-side DC bias (`calib_trim.py`), separate from the
-position-anchor above: it nudges modeld's `calib_bias` yaw by a few tenths of
-a degree to correct sustained wheel-to-line gap error at the source, instead
-of steering against it every frame. `CalibTrimMode=0` (off) by default —
-zero effect until explicitly armed.
+## Configuration
 
-- **Mode 0 (off, default):** `delta` slews to 0. No-op.
-- **Mode 1 (fixed):** slews `delta` toward `CalibTrimFixedDeg` (clamped to
-  ±`CalibTrimMaxDeg`), ungated — used for the sign/gain identification drive.
-- **Mode 2 (closed-loop):** integrates `delta` to hold the driver-side gap in
-  `[CalibTrimGapLo, CalibTrimGapHi]`; requires `CalibTrimYawSign` to be
-  measured (±1) or it behaves as mode 0. Gated on a trusted line, no lane
-  change, and `v_ego ≥ 5 m/s`; decays after 5 s continuously in-band.
+Params are files in `data/` (full list: `_load_config` in `register.py`),
+read at process start except the live toggle:
 
-All transitions are rate-limited by `CalibTrimSlewDegS` (0.02°/s default —
-~15-25 s to take hold; this is deliberately not a fast fix). Params live in
-`data/` (see `_load_trim_config` in `register.py`); `delta` is written to
-`data/CalibTrimYawDeg` at 1 Hz and read back by modeld via the
-`modeld.calib_bias` hook — that reader path is intentionally import-free
-(pure float file read, clamped to a hand-kept default independent of
-`calib_trim.py`).
+| param | field-proven value | note |
+|---|---|---|
+| `LaneKeepEnable` | 1 | **live** (~1 s): the Driving-panel toggle; gates only the position correction, never the smoothing |
+| `LaneKeepDriverSide` | left | China |
+| `LaneKeepDcTau` | 5 | concession time constant (s); code default 20 |
+| `LaneKeepAsymGap` | 0.6 (default) | never-oppose-recovery threshold (m); 0 = symmetric |
+| `LaneKeepGapHardLo` / `Hi` | **−99 / 99 (floors disabled)** | code defaults 0.3/1.5; field testing showed the floors' sustained push turns brief line touches into pinned stalemates (3c3: 34 s holds vs model-alone 2.8 s) — leave disabled |
 
-Trim params (`CalibTrim*`) are read at process start (`_load_trim_config`
-runs once, on first `on_curvature_correction` call, when `_trim` is
-lazily constructed) — changing them requires an offroad restart to take
-effect. `LaneKeepEnable=0` (the Driving-panel toggle) is the one LIVE
-off-switch: it is re-read every ~1 s and retires an active trim by
-slewing `delta` to zero within ~40 s (0.8° max / 0.02°/s), same as any
-other disable.
+UX: green ring on the emblem button while anchored; the Driving-panel
+"Lane Keeping" toggle is the single source of control. Enforced plugin
+(`.enforced`): the BMW lateral controller's simplified tracker depends on
+the smoothed reference, so full removal (`.disabled`) is coupled to
+reverting that controller.
 
-Design spec: `docs/superpowers/specs/2026-07-25-calibration-trim-design.md`.
-Deployment (identification drive, mode 2 enable) is gated on explicit user
-go per spec §9 — implementing and testing this does not deploy it.
+## Design history
+
+Specs in `docs/superpowers/specs/`, newest governs:
+`2026-07-23-ac-stabilizer-design.md` (+ its 2026-07-27 asymmetric-damping
+addendum) supersedes the predictive-deadband and 2026-07-22 positioner
+specs. The arc — absolute band → predictive deadband → integral trim →
+AC/DC stabilizer → floors removed → asymmetric gate — is traceable through
+the supersession banners; the one-line summary is that every mechanism
+which held an *opinion about position* was removed after losing to the
+model in the field, and what remains is a pure damper.
+
+## Calibration trim (retired)
+
+`calib_trim.py` and its `modeld.calib_bias` reader remain in the tree but
+are inert: `CalibTrimMode=0` by default, and the modeld-side call sites
+were never deployed (archived on the catpilot `calib-trim-parked` branch,
+2026-07-29). It was a perception-side DC lever designed to move the
+model's chosen line by biasing the calibration yaw — built and reviewed,
+then retired when the hard-floor removal dissolved the problem it
+targeted. Design record: `2026-07-25-calibration-trim-design.md`.
