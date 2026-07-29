@@ -13,6 +13,8 @@ Color thresholds match the COD dashboard:
 """
 import os
 import pyray as rl
+from openpilot.system.ui.lib.application import FontWeight
+from fonts import get_font, measure
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -31,21 +33,20 @@ COLOR_CRITICAL = rl.Color(239, 68, 68, 220)  # #ef4444
 # Module-level state (lazy init)
 _ui_state = None
 _font = None
-_measure = None
 _temp_sub = None
 _cached_coolant = 0.0
 _cached_oil = 0.0
 
 
 def _ensure_init():
-  global _ui_state, _font, _measure
+  global _ui_state, _font
   if _font is None:
+    font = get_font(FontWeight.SEMI_BOLD)
+    if font is None:
+      return  # fonts not ready yet — retry next frame
     from openpilot.selfdrive.ui.ui_state import ui_state
-    from openpilot.system.ui.lib.application import gui_app, FontWeight
-    from openpilot.system.ui.lib.text_measure import measure_text_cached
     _ui_state = ui_state
-    _font = gui_app.font(FontWeight.SEMI_BOLD)
-    _measure = measure_text_cached
+    _font = font
 
 
 def _is_enabled():
@@ -116,8 +117,8 @@ def on_render_overlay(default, content_rect):
   oil_text = f"{oil_disp:.0f}{unit}"
 
   # Position: right-aligned at bottom-right corner, stacked (coolant above oil)
-  coolant_size = _measure(_font, coolant_text, FONT_SIZE)
-  oil_size = _measure(_font, oil_text, FONT_SIZE)
+  coolant_size = measure(_font, coolant_text, FONT_SIZE)
+  oil_size = measure(_font, oil_text, FONT_SIZE)
   max_w = max(coolant_size.x, oil_size.x)
   total_h = LINE_HEIGHT + oil_size.y
   pad = 12

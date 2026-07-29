@@ -66,13 +66,17 @@ def calc_checksum_cruise(work_data: bytearray):  # 0x194 this checksum is specia
   return calc_checksum_8bit(work_data, 0)
 
 
-def create_accel_command(packer, action: CruiseStalk, bus: int, cnt):
+def create_accel_command(packer, action, bus: int, cnt):
+    # action=None sends an idle frame (no action bit set), used for trailing
+    # counter-overwrite frames after a commanding burst ends — keeps our
+    # counter dominant on PT-CAN until SZL's natural counter has caught up.
     values = {
         "setMe_0xFC": 0xFC,
         "requests_0xF": 0xF,
         "Counter_0x194": cnt % 0xF  # counts from 0 to 14
         }
-    values[action.value] = 1
+    if action is not None:
+      values[action.value] = 1
 
     dat = packer.make_can_msg("CruiseControlStalk", bus, values)[1]
     values["Checksum_0x194"] = calc_checksum_cruise(dat)

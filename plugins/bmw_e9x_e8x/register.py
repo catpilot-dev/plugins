@@ -87,25 +87,17 @@ def _register_interfaces():
 _register_interfaces()
 
 
-def on_state_subscriptions(services):
-  """Hook callback: add liveTorqueParameters and liveDelay to UI SubMaster."""
-  for svc in ('liveTorqueParameters', 'liveDelay'):
-    if svc not in services:
-      services.append(svc)
-  return services
-
-
-def on_torqued_allowed_cars(allowed_cars):
-  """Hook callback: add BMW to torqued's live torque learning allowlist."""
-  if 'bmw' not in allowed_cars:
-    allowed_cars.append('bmw')
-  return allowed_cars
-
-
 def on_post_actuators(default, actuators, CS, long_plan):
-  """Hook callback: inject vTarget from longitudinal planner into actuators.speed."""
-  if len(long_plan.speeds):
-    actuators.speed = long_plan.speeds[0]
+  """Hook callback: inject vTarget from longitudinal planner into actuators.speed.
+
+  long_plan.vTarget is the trajectory speed at action_t (longitudinalActuatorDelay
+  + DT_MDL), time-aligned with long_plan.aTarget. Both come from the same
+  get_accel_from_plan call in the planner. Using vTarget (instead of speeds[0],
+  which is the MPC's filtered initial state and can drift above v_ego after
+  sustained +accel intent) makes carcontroller's v_error gate consistent with
+  the slope encoded in aTarget.
+  """
+  actuators.speed = long_plan.vTarget
   return None
 
 
@@ -116,12 +108,8 @@ def on_cruise_initialized(result, v_cruise_helper, CS):
   for BMW because engagement is a state transition (not a resume button press).
   This restores the user's last-adjusted ceiling within the same onroad session.
   """
-  try:
-    with open(os.path.join(_PLUGIN_DIR, 'data', 'CruiseCeilingMemory')) as f:
-      if f.read().strip() == '0':
-        return result
-  except (FileNotFoundError, OSError):
-    pass  # default: enabled
+  if _read_param('CruiseCeilingMemory') == '0':
+    return result
 
   if 30 <= v_cruise_helper.v_cruise_kph_last <= 145:
     v_cruise_helper.v_cruise_kph = v_cruise_helper.v_cruise_kph_last
@@ -144,80 +132,12 @@ def _write_param(key, value):
     f.write(value)
 
 
-_torque_cache = {"btn": "INACTIVE", "desc": "Online torque learning from driving data.", "t": 0.0}
-
-def _torque_update():
-  import time
-  now = time.monotonic()
-  if now - _torque_cache["t"] < 10.0:
-    return
-  _torque_cache["t"] = now
-  try:
-    from openpilot.selfdrive.ui.ui_state import ui_state
-    sm = ui_state.sm
-    if sm.recv_frame.get('liveTorqueParameters', 0) > 0:
-      lt = sm['liveTorqueParameters']
-      _torque_cache["btn"] = "ACTIVE" if lt.useParams and lt.liveValid else "INACTIVE"
-      _torque_cache["desc"] = f"{lt.calPerc}% | F={lt.latAccelFactorFiltered:.2f} f={lt.frictionCoefficientFiltered:.3f}"
-  except Exception:
-    pass
-
-def _torque_button_text():
-  _torque_update()
-  return _torque_cache["btn"]
-
-def _torque_desc():
-  _torque_update()
-  return _torque_cache["desc"]
-
-
-_delay_cache = {"btn": "INACTIVE", "desc": "Online lateral delay estimation from steering response.", "t": 0.0}
-
-def _delay_update():
-  import time
-  now = time.monotonic()
-  if now - _delay_cache["t"] < 10.0:
-    return
-  _delay_cache["t"] = now
-  try:
-    from openpilot.selfdrive.ui.ui_state import ui_state
-    sm = ui_state.sm
-    if sm.recv_frame.get('liveDelay', 0) > 0:
-      ld = sm['liveDelay']
-      _delay_cache["btn"] = "ACTIVE" if str(ld.status).split('.')[-1] == 'applied' else "INACTIVE"
-      _delay_cache["desc"] = f"{ld.calPerc}% | {ld.lateralDelay:.2f}s"
-  except Exception:
-    pass
-
-def _delay_button_text():
-  _delay_update()
-  return _delay_cache["btn"]
-
-def _delay_desc():
-  _delay_update()
-  return _delay_cache["desc"]
-
-
 def on_vehicle_settings(items, CP):
   """Hook callback: populate Vehicle panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
     return items
 
-  from openpilot.system.ui.widgets.list_view import toggle_item, button_item
-
-  items.append(toggle_item(
-    "Cruise Speed Memory",
-    "Remember cruise speed ceiling across disengage/re-engage within the same drive.",
-    _read_param('CruiseCeilingMemory') != '0',
-    callback=lambda state: _write_param('CruiseCeilingMemory', '1' if state else '0'),
-  ))
-
-  items.append(toggle_item(
-    "Consecutive Lane Changes",
-    "Press steering button during an active lane change to chain the next one immediately for fluid multi-lane merges.",
-    _read_param('ConsecutiveLaneChange') != '0',
-    callback=lambda state: _write_param('ConsecutiveLaneChange', '1' if state else '0'),
-  ))
+  from openpilot.system.ui.widgets.list_view import toggle_item
 
   items.append(toggle_item(
     "Temperature Overlay",
@@ -233,91 +153,17 @@ def on_vehicle_settings(items, CP):
     enabled=False,
   ))
 
-  items.append(button_item(
-    "Live Torque",
-    _torque_button_text,
-    _torque_desc,
-    enabled=False,
-  ))
-
-  items.append(button_item(
-    "Lateral Delay",
-    _delay_button_text,
-    _delay_desc,
-    enabled=False,
-  ))
-
   return items
 
 
-# --- Consecutive lane change state (per-process, used by desire hooks) ---
-
-class _ConsecutiveLCState:
-  prev_steering_button = False
-  consecutive_requested = False
-  desire_gap = 0
-
-_clc = _ConsecutiveLCState()
-
-
-def _is_consecutive_enabled():
-  return _read_param('ConsecutiveLaneChange') != '0'
-
-
-def on_pre_lane_change(result, dh, carstate):
-  """Handle desire gap countdown before state machine runs."""
-  if not _is_consecutive_enabled():
-    return result
-
-  if _clc.desire_gap > 0:
-    _clc.desire_gap -= 1
-    if _clc.desire_gap == 0:
-      from cereal import log
-      dh.lane_change_state = log.LaneChangeState.laneChangeStarting
-      dh.lane_change_ll_prob = 1.0
-      dh.lane_change_timer = 0.0
-      _clc.consecutive_requested = False
-  return result
-
-
-def on_post_lane_change(result, dh, carstate, one_blinker, below_lane_change_speed, lane_change_prob):
-  """Detect consecutive lane change triggers after state machine."""
-  if not _is_consecutive_enabled():
-    _clc.prev_steering_button = False
-    return result
-
-  from cereal import log
-
-  # BMW uses VoiceControl button (steeringPressed) but not gas pedal for consecutive trigger
-  steering_button = carstate.steeringPressed and not carstate.gasPressed
-  rising_edge = steering_button and not _clc.prev_steering_button
-  _clc.prev_steering_button = steering_button
-
-  if dh.lane_change_state in (log.LaneChangeState.off, log.LaneChangeState.preLaneChange):
-    _clc.consecutive_requested = False
-    _clc.desire_gap = 0
-
-  elif dh.lane_change_state == log.LaneChangeState.laneChangeStarting:
-    # Only count a press as consecutive when the lane change is already committed (ll_prob < 0.5,
-    # i.e. >0.25s in). The initiating press fires at ll_prob=1.0 and must NOT be counted —
-    # otherwise it immediately schedules a second lane change the user never requested.
-    if rising_edge and one_blinker and dh.lane_change_ll_prob < 0.5:
-      _clc.consecutive_requested = True
-    # Re-trigger as soon as car is committed (ll_prob faded ~0.5s) — skip waiting for model
-    if _clc.consecutive_requested and one_blinker and not below_lane_change_speed \
-        and dh.lane_change_ll_prob < 0.01:
-      _clc.desire_gap = 1
-
-  elif dh.lane_change_state == log.LaneChangeState.laneChangeFinishing:
-    if rising_edge and one_blinker and not below_lane_change_speed:
-      _clc.desire_gap = 1
-
-  return result
-
-
-def on_desire_post_update(desire, lane_change_state, lane_change_direction, carstate):
-  """Override desire to none during consecutive gap frame for model rising edge."""
-  if _clc.desire_gap > 0:
-    from cereal import log
-    return log.Desire.none
-  return desire
+def on_health_check(acc, **kwargs):
+  try:
+    from opendbc.car.car_helpers import interfaces
+    from bmw.values import CAR
+    registered = CAR.BMW_E90 in interfaces or str(CAR.BMW_E90) in interfaces
+  except Exception:
+    registered = False
+  result = {"status": "ok" if registered else "warning", "interfaces_registered": registered}
+  if not registered:
+    result["warnings"] = ["BMW interfaces not registered in opendbc"]
+  return {**acc, "bmw-e9x-e8x": result}

@@ -1,4 +1,4 @@
-"""Tests for BMW plugin hook handlers — interface registration, cruise ceiling, consecutive lane changes."""
+"""Tests for BMW plugin hook handlers — interface registration, cruise ceiling."""
 import os
 import sys
 import pytest
@@ -27,19 +27,6 @@ def param_dir(tmp_path, monkeypatch):
   data_dir.mkdir()
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(tmp_path))
   return data_dir
-
-
-@pytest.fixture
-def reset_clc():
-  """Reset consecutive lane change state between tests."""
-  import register
-  register._clc.prev_steering_button = False
-  register._clc.consecutive_requested = False
-  register._clc.desire_gap = 0
-  yield
-  register._clc.prev_steering_button = False
-  register._clc.consecutive_requested = False
-  register._clc.desire_gap = 0
 
 
 # ============================================================
@@ -91,6 +78,101 @@ class TestRegisterInterfaces:
 
 
 # ============================================================
+# Lateral controller module (split out of register.py 2026-07-03)
+# ============================================================
+
+class TestLateralControllerModule:
+  def test_module_exposes_hook(self, mock_deps):
+    """bmw/latcontroller.py loads the way the registry loads it (file-level, and exposes the hook target
+    canonical name) and exposes the hook plugin.json points at."""
+    import importlib.util
+    path = os.path.join(_PLUGIN_DIR, 'bmw', 'latcontroller.py')
+    spec = importlib.util.spec_from_file_location('plugins.bmw_e9x_e8x.bmw.latcontroller', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert callable(mod.on_lat_controller_init)
+
+  def test_plugin_json_points_at_module(self):
+    import json
+    with open(os.path.join(_PLUGIN_DIR, 'plugin.json')) as f:
+      hooks = json.load(f)['hooks']
+    lat = hooks['controls.lat_controller_init']
+    assert lat['module'] == 'bmw.latcontroller'
+    assert lat['function'] == 'on_lat_controller_init'
+
+
+# ============================================================
+# hold_factor — curvature hold gate (2026-07-27: moved from |kappa_des| to
+# commanded lateral accel v²·|kappa_des|; route 3ca seg 23 hunting fix).
+# Pure function, module-level, no controller construction needed.
+# ============================================================
+
+class TestHoldFactor:
+  def test_3ca_seg23_mild_fast_curve_now_holds(self, mock_deps):
+    """19.4 m/s, kappa 0.0033 -> a_y 1.25: above HOLD_AY_BP[1], full hold.
+    This is the case that was broken under the old kappa-only gate
+    (HOLD_KAPPA_BP[0] = 0.004 > 0.0033 -> hold_f was 0 -> drain -> hunting)."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(19.4, 0.0033) == 1.0
+
+  def test_tight_slow_curve_holds(self, mock_deps):
+    """9.0 m/s, kappa 0.012 -> a_y 0.972: at/above HOLD_AY_BP[1], full hold
+    (route 380/384 hairpin fix operating point)."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(9.0, 0.012) == 1.0
+
+  def test_reference_mild_curve_still_drains(self, mock_deps):
+    """12.4 m/s, kappa 0.0023 -> a_y 0.354: below HOLD_AY_BP[0], drains to 0
+    (the reference case that damps fine with drain — must stay drained)."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(12.4, 0.0023) == 0.0
+
+  def test_fast_straight_drains(self, mock_deps):
+    """19.4 m/s, kappa 0.0008 -> a_y 0.301: near-straight at highway speed,
+    below HOLD_AY_BP[0], drains to 0."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(19.4, 0.0008) == 0.0
+
+  def test_parking_speed_tight_kappa_drains(self, mock_deps):
+    """3.0 m/s, kappa 0.05 -> a_y 0.45: tight kappa but parking-speed slow,
+    SAT far below stiction -> drains to 0 despite the large kappa. This is
+    the case a kappa-only gate would get wrong in the other direction."""
+    from bmw.latcontroller import hold_factor
+    assert hold_factor(3.0, 0.05) == 0.0
+
+  def test_transition_sliver_is_partial(self):
+    """14.0 m/s, kappa 0.0035 -> a_y 0.686: strictly inside (HOLD_AY_BP[0],
+    HOLD_AY_BP[1]) -> partial hold factor, neither 0 nor 1."""
+    from bmw.latcontroller import hold_factor
+    f = hold_factor(14.0, 0.0035)
+    assert 0.0 < f < 1.0
+    # a_y = 14.0**2 * 0.0035 = 0.686; interp over [0.5, 0.9] -> (0.686-0.5)/0.4
+    assert f == pytest.approx((14.0 * 14.0 * 0.0035 - 0.5) / 0.4, abs=1e-9)
+
+  def test_boundary_bp0_is_zero(self):
+    from bmw.latcontroller import hold_factor, HOLD_AY_BP
+    v = 10.0
+    kappa = HOLD_AY_BP[0] / (v * v)
+    assert hold_factor(v, kappa) == pytest.approx(0.0)
+
+  def test_boundary_bp1_is_one(self):
+    from bmw.latcontroller import hold_factor, HOLD_AY_BP
+    v = 10.0
+    kappa = HOLD_AY_BP[1] / (v * v)
+    assert hold_factor(v, kappa) == pytest.approx(1.0)
+
+
+# ============================================================
+# ISO accel/jerk cancel guard — REMOVED 2026-07-28 (lateral never gives up in
+# a turn; a_y is bounded at the system level by speedlimitd's curve-speed
+# capping). accel_guard_threshold() and the cancel machinery no longer exist,
+# so the TestAccelGuardThreshold suite that used to sit here was removed. The
+# no-cancel behaviour and the surviving cancel_tol boundary-hygiene path are
+# covered by tests/test_latcontroller.py.
+# ============================================================
+
+
+# ============================================================
 # Cruise Ceiling Memory
 # ============================================================
 
@@ -128,229 +210,3 @@ class TestCruiseCeilingMemory:
     helper = SimpleNamespace(v_cruise_kph=105, v_cruise_kph_last=80, v_cruise_cluster_kph=105)
     register.on_cruise_initialized(None, helper, None)
     assert helper.v_cruise_kph == 80
-
-
-# ============================================================
-# Consecutive Lane Change — Pre Lane Change Hook
-# ============================================================
-
-class TestPreLaneChange:
-  def test_gap_countdown_resets_state(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-
-    dh = SimpleNamespace(
-      lane_change_state=log.LaneChangeState.laneChangeFinishing,
-      lane_change_ll_prob=0.5,
-      lane_change_timer=3.0,
-    )
-    register._clc.desire_gap = 1
-
-    register.on_pre_lane_change(None, dh, None)
-
-    assert register._clc.desire_gap == 0
-    assert dh.lane_change_state == log.LaneChangeState.laneChangeStarting
-    assert dh.lane_change_ll_prob == 1.0
-    assert dh.lane_change_timer == 0.0
-    assert register._clc.consecutive_requested is False
-
-  def test_gap_no_action_when_zero(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-
-    dh = SimpleNamespace(
-      lane_change_state=log.LaneChangeState.laneChangeStarting,
-      lane_change_ll_prob=0.8,
-      lane_change_timer=1.0,
-    )
-
-    register.on_pre_lane_change(None, dh, None)
-    assert dh.lane_change_state == log.LaneChangeState.laneChangeStarting
-    assert dh.lane_change_ll_prob == 0.8
-
-  def test_disabled_skips_gap(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('0')
-
-    dh = SimpleNamespace(
-      lane_change_state=log.LaneChangeState.laneChangeFinishing,
-      lane_change_ll_prob=0.5,
-      lane_change_timer=3.0,
-    )
-    register._clc.desire_gap = 1
-
-    register.on_pre_lane_change(None, dh, None)
-    # Gap should NOT be processed when disabled
-    assert register._clc.desire_gap == 1
-    assert dh.lane_change_state == log.LaneChangeState.laneChangeFinishing
-
-
-# ============================================================
-# Consecutive Lane Change — Post Lane Change Hook
-# ============================================================
-
-class TestPostLaneChange:
-  def test_button_press_during_starting_sets_requested(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-
-    cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
-    # ll_prob=0.4 < 0.5 threshold: press counts as consecutive (not the initiating press)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.4)
-
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.5)
-    assert register._clc.consecutive_requested is True
-    assert register._clc.desire_gap == 0  # ll_prob not faded yet
-
-  def test_consecutive_triggers_when_committed(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-    register._clc.consecutive_requested = True
-    register._clc.prev_steering_button = True  # button already held
-
-    cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.005)
-
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.01)
-    assert register._clc.desire_gap == 1
-
-  def test_no_trigger_when_ll_prob_not_faded(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-    register._clc.consecutive_requested = True
-
-    cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.5)
-
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.5)
-    assert register._clc.desire_gap == 0
-
-  def test_button_during_finishing_triggers_gap(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-
-    cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeFinishing, lane_change_ll_prob=0.8)
-
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.01)
-    assert register._clc.desire_gap == 1
-
-  def test_gas_pedal_does_not_trigger(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-
-    cs = SimpleNamespace(steeringPressed=True, gasPressed=True)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.005)
-
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.01)
-    assert register._clc.consecutive_requested is False
-
-  def test_resets_on_off_state(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-    register._clc.consecutive_requested = True
-    register._clc.desire_gap = 1
-
-    cs = SimpleNamespace(steeringPressed=False, gasPressed=False)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.off, lane_change_ll_prob=1.0)
-
-    register.on_post_lane_change(None, dh, cs, one_blinker=False, below_lane_change_speed=False, lane_change_prob=0.0)
-    assert register._clc.consecutive_requested is False
-    assert register._clc.desire_gap == 0
-
-  def test_below_speed_blocks_finishing_trigger(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-
-    cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeFinishing, lane_change_ll_prob=0.8)
-
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=True, lane_change_prob=0.01)
-    assert register._clc.desire_gap == 0
-
-  def test_disabled_resets_button_state(self, param_dir, reset_clc):
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('0')
-    register._clc.prev_steering_button = True
-
-    cs = SimpleNamespace(steeringPressed=False, gasPressed=False)
-    dh = SimpleNamespace(lane_change_state=log.LaneChangeState.laneChangeStarting, lane_change_ll_prob=0.5)
-
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.5)
-    assert register._clc.prev_steering_button is False
-
-
-# ============================================================
-# Consecutive Lane Change — Desire Override
-# ============================================================
-
-class TestDesirePostUpdate:
-  def test_overrides_during_gap(self, reset_clc):
-    from cereal import log
-    import register
-    register._clc.desire_gap = 1
-
-    result = register.on_desire_post_update(log.Desire.laneChangeLeft, None, None, None)
-    assert result == log.Desire.none
-
-  def test_passes_through_normally(self, reset_clc):
-    from cereal import log
-    import register
-
-    result = register.on_desire_post_update(log.Desire.laneChangeRight, None, None, None)
-    assert result == log.Desire.laneChangeRight
-
-
-# ============================================================
-# Full Consecutive Lane Change Sequence
-# ============================================================
-
-class TestConsecutiveSequence:
-  def test_full_double_lane_change(self, param_dir, reset_clc):
-    """Simulate: first LC active → button press → ll_prob fades → gap → re-trigger."""
-    from cereal import log
-    import register
-    (param_dir / 'ConsecutiveLaneChange').write_text('1')
-
-    dh = SimpleNamespace(
-      lane_change_state=log.LaneChangeState.laneChangeStarting,
-      lane_change_ll_prob=0.3,
-      lane_change_timer=0.2,
-    )
-
-    # Step 1: Button press during laneChangeStarting (rising edge)
-    cs = SimpleNamespace(steeringPressed=True, gasPressed=False)
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.5)
-    assert register._clc.consecutive_requested is True
-    assert register._clc.desire_gap == 0  # ll_prob still > 0.01
-
-    # Step 2: ll_prob fades below threshold
-    dh.lane_change_ll_prob = 0.005
-    register.on_post_lane_change(None, dh, cs, one_blinker=True, below_lane_change_speed=False, lane_change_prob=0.01)
-    assert register._clc.desire_gap == 1
-
-    # Step 3: Desire override during gap frame
-    desire = register.on_desire_post_update(log.Desire.laneChangeLeft, None, None, None)
-    assert desire == log.Desire.none
-
-    # Step 4: Pre-hook on next frame — gap countdown resets state
-    register.on_pre_lane_change(None, dh, cs)
-    assert dh.lane_change_state == log.LaneChangeState.laneChangeStarting
-    assert dh.lane_change_ll_prob == 1.0
-    assert dh.lane_change_timer == 0.0
-    assert register._clc.desire_gap == 0
-
-    # Step 5: Desire no longer overridden
-    desire = register.on_desire_post_update(log.Desire.laneChangeLeft, None, None, None)
-    assert desire == log.Desire.laneChangeLeft

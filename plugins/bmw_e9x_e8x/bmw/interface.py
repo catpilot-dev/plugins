@@ -84,12 +84,27 @@ class CarInterface(CarInterfaceBase):
     ret.safetyConfigs[0].safetyParam = 0
 
     ret.steerControlType = structs.CarParams.SteerControlType.torque
-    ret.steerActuatorDelay = 0.2
+    # BMW-specific: lagd never converges for our curvature/front-wheel-angle
+    # controller (lagd correlates on latcontrol_torque telemetry that our
+    # plant-inversion path doesn't produce), so liveDelay.lateralDelay is
+    # permanently pinned at initial_lag = steerActuatorDelay + 0.2 (lagd.py:181).
+    # 0.4 → liveDelay = 0.6 s. This propagates to (a) modeld's lat_action_t ≈
+    # 0.65 s — model samples κ_des at a further-ahead point, providing indirect
+    # smoothing of vision-only wobble — and (b) register.py's model_action_t,
+    # which subscribes to lat_delay so the model_action_t horizon stays aligned with
+    # where the model targets κ.
+    ret.steerActuatorDelay = 0.4
     ret.steerLimitTimer = 0.4
 
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning, steering_angle_deadzone_deg=0.0)
 
-    ret.longitudinalActuatorDelay = 0.3
+    # DCC stalk-emulation pipeline (publish → v_error gate → pulse cadence →
+    # DCC integrates cadence → internal brake controller) has a measured
+    # aTarget→aEgo lag of ~0.7s (route 311, 13 decel windows). Set the delay
+    # so action_t (= this + DT_MDL) compensates it. Variable in practice
+    # (0s in-burst, up to ~1.9s fresh) so this is a conservative central
+    # value — re-measure and iterate, don't chase the worst case.
+    ret.longitudinalActuatorDelay = 0.7
 
     ret.centerToFront = ret.wheelbase * 0.44
 
