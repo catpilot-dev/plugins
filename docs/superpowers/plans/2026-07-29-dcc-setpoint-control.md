@@ -649,9 +649,19 @@ ssh c3 'cd /data/plugins && GIT_SSL_NO_VERIFY=1 git fetch origin dev && git rese
 ```
 Expected: install.sh reports success and writes `.needs_restart`; plugind applies it offroad.
 
+- [ ] **Step 1b: Read DTCs before the drive (BLOCKING)**
+
+Record the stored fault codes, **checking 5ECE specifically**, before moving. Reason: `CMD_INTERVAL = SINGLE_INTERVAL` means every ±5 command is now a 20 Hz burst, and the Phase-1 study recorded **zero** `plus5 single` / `minus5 single` bursts — that command×cadence pair has never been transmitted to this DCC. Cadence-inertness was measured for ±1 only. This is also the subsystem whose failure mode is DTC 5ECE, where project memory says not to tune without on-car verification.
+
 - [ ] **Step 2: Drive and record**
 
-Cover low (~30 km/h), mid (~60–80), and high (~100+) speed, including at least one lead-car follow and one free-flow acceleration to set speed. Note the route ID.
+Cover low (~30 km/h), mid (~60–80), and high (~100+) speed, including at least one lead-car follow, one free-flow acceleration to set speed, and **deliberate low-speed braking around 30–40 km/h** (the map's weakest region).
+
+**Brief the driver on two expected behaviour changes before they set off**, so neither is misread as a fault:
+1. **The cluster set-speed will visibly dive ~10–15 km/h below actual speed on any meaningful braking, then climb back on release.** The old law moved the setpoint only to `v_target` (~4 km/h below); the new law commands `v_ego + gap_required`, a much larger excursion. This is intended and is the safe direction on disengagement — but it is a large, visible change.
+2. **At 30–40 km/h under braking, expect HARSHNESS, not sluggishness.** The three flat-extrapolated cells understate the car's real low-speed deceleration (raw measured ≈ −1.32/−1.36/−1.06 vs shipped −1.00/−0.87/−0.70), and inverting an understated gain commands too large a negative gap. A request of −0.6 m/s² there may deliver ≈ −0.8. Report harshness immediately.
+
+Note also that the findings' phrase "strictly more conservative than the current behaviour" holds only on the **acceleration** side; on the deceleration side the new law commands a materially larger gap than the old one.
 
 - [ ] **Step 3: Measure tracking against the baseline**
 
@@ -661,6 +671,8 @@ $PY fetch_routes.py --route <new-route-date>
 $PY extract.py
 ```
 Then compare the tracking error `aEgo − aTarget` distribution against a pre-change route. **Success criterion:** median |aEgo − aTarget| is lower than baseline and no new oscillation appears (check that the sign of `aEgo − aTarget` does not alternate at a fixed period — that would be the lag-driven overshoot the findings flagged).
+
+**Also required (BLOCKING):** re-read DTCs and confirm 5ECE has not appeared, and verify from the rlog that **±5 bursts at 20 Hz are actually accepted** — that each moves `cruiseState.speed` by 5 km/h in the commanded direction, at roughly the ~98 % acceptance rate the ±5-hold rows showed in Phase 1. A rejected ±5 would otherwise surface only as vague sluggishness in the tracking-error comparison. Note the new law also uses `minus5` far more often than before: from the measured steady-state gap it now fires at roughly `aTarget ≲ −0.4 m/s²`, versus the old `DECEL_STEP5_THRESHOLD` of 0.9.
 
 - [ ] **Step 4: Report and gate**
 
