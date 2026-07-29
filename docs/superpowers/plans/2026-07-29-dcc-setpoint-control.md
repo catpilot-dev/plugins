@@ -28,10 +28,12 @@
 | `tools/dcc_study/fit_map.py` (new) | Offline: fit + monotonise the response table, emit `bmw/dcc_map_table.py`. Not shipped to the car. |
 | `tools/dcc_study/tests/test_fit_map.py` (new) | Covers monotonisation and table emission on synthetic input. |
 | `bmw/dcc_map_table.py` (new, generated) | Pure data: `GAP_BPS`, `V_BPS`, `A_TABLE`. Regenerable, reviewed as code. |
-| `bmw/dcc_map.py` (new) | `expected_accel(gap, v)` and `gap_for_accel(a_target, v)` — the inversion, plus the authority clamp. |
-| `bmw/carcontroller.py` (modify) | Replace the threshold ladder with the setpoint-error law; delete 4 dead constants. |
-| `tests/test_dcc_map.py` (new) | Inversion round-trip, clamping, monotonicity. |
-| `tests/test_carcontroller_longitudinal.py` (new) | Command selection + safety invariants. |
+| `bmw/dcc_map.py` (new) | The inversion (`expected_accel`, `gap_for_accel`, `accel_envelope`) **and** the pure decision function `select_cruise_command`. |
+| `bmw/carcontroller.py` (modify) | Call `select_cruise_command`; delete 4 dead constants. |
+| `tests/test_dcc_map.py` (new) | Inversion round-trip, clamping, monotonicity, **and all command-selection behaviour**. |
+| `tests/test_carcontroller_wiring.py` (new) | Constants deleted/added and the call site is wired. |
+
+**Why the decision function lives in `dcc_map.py`, not `carcontroller.py`:** `opendbc` is not installed on the dev machine, and `carcontroller.py` imports it on line 1, so anything importable only through `carcontroller` cannot be unit-tested without the `make_opendbc_mocks` fixture dance. `bmw/__init__.py` is empty and `dcc_map.py` has no opendbc dependency, so the decision logic is directly importable and testable. It also belongs there on the merits — it is pure arithmetic over the map it inverts, with no CAN or controller state.
 
 ---
 
@@ -270,6 +272,8 @@ git commit -m "bmw: fit and generate the DCC gap-to-accel response table"
   - `expected_accel(gap: float, v_ego: float) -> float` — bilinear interp, clamped at the table edges.
   - `gap_for_accel(a_target: float, v_ego: float) -> float` — inverse; clamps `a_target` into the achievable envelope for that speed, then interpolates gap. Never returns a gap outside `[GAP_BPS[0], GAP_BPS[-1]]`.
   - `accel_envelope(v_ego: float) -> tuple[float, float]` — `(a_min, a_max)` achievable at that speed.
+  - `select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint) -> str | None` — the decision function; returns `'plus1'`/`'plus5'`/`'minus1'`/`'minus5'` or `None`.
+  - `SETPOINT_DEADBAND_KPH = 1.0`, `MS_TO_KPH = 3.6` (local literal — this module must not import `opendbc`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -331,6 +335,74 @@ def test_envelope_is_ordered():
   for v in V_BPS:
     lo, hi = accel_envelope(v)
     assert lo < hi
+
+
+# ---- command selection ----
+
+def cmd(a_target, v_ego, setpoint, v_target, min_setpoint=5.0):
+  return select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint)
+
+
+def test_deadband_emits_nothing():
+  v, a = 20.0, 0.0
+  sp = v + gap_for_accel(a, v)
+  assert cmd(a, v, sp, v_target=v + 5.0) is None
+
+
+def test_accel_request_below_target_emits_plus():
+  v = 20.0
+  assert cmd(+0.3, v, setpoint=v, v_target=v + 5.0) in ("plus1", "plus5")
+
+
+def test_large_setpoint_error_uses_step5():
+  v = 20.0
+  _, a_max = accel_envelope(v)
+  assert cmd(a_max, v, setpoint=v, v_target=v + 10.0) == "plus5"
+
+
+def test_small_setpoint_error_uses_step1():
+  v = 20.0
+  sp = v + gap_for_accel(0.0, v) - (2.0 / 3.6)   # 2 km/h short -> one tick
+  assert cmd(0.0, v, setpoint=sp, v_target=v + 10.0) == "plus1"
+
+
+def test_setpoint_never_commanded_above_v_target():
+  v, v_target = 20.0, 20.5
+  assert cmd(+0.5, v, setpoint=v_target, v_target=v_target) is None
+
+
+def test_decel_request_emits_minus():
+  v = 25.0
+  assert cmd(-0.5, v, setpoint=v, v_target=v - 5.0, min_setpoint=5.0) in ("minus1", "minus5")
+
+
+def test_beyond_authority_saturates_not_escalates():
+  v = 20.0
+  _, a_max = accel_envelope(v)
+  assert cmd(a_max + 5.0, v, v, v + 20.0) == cmd(a_max, v, v, v + 20.0)
+
+
+def test_commanded_setpoint_never_goes_below_min():
+  """The desired-setpoint clamp is what protects min cruise speed.
+
+  A minus tick moves 1 or 5 km/h and is only emitted when at least that much
+  error exists above the floor, so it can never carry the setpoint under it.
+  """
+  v, min_sp = 10.0, 8.0
+  for excess_kph in (0.2, 0.9, 1.5, 4.0, 6.0, 12.0):
+    sp = min_sp + excess_kph / 3.6
+    out = cmd(-1.0, v, setpoint=sp, v_target=0.0, min_setpoint=min_sp)
+    if out is None:
+      continue
+    step_kph = 5.0 if out == "minus5" else 1.0
+    assert sp - step_kph / 3.6 >= min_sp - 1e-9, \
+        f"{out} from setpoint {sp:.3f} would cross the {min_sp} m/s floor"
+```
+
+Update the test module's import line to:
+```python
+from bmw.dcc_map import (expected_accel, gap_for_accel, accel_envelope,
+                         select_cruise_command)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -390,6 +462,34 @@ def gap_for_accel(a_target, v_ego):
   """Setpoint gap (m/s) that produces a_target, clamped to what DCC can do."""
   col = _column(v_ego)
   return _interp(_clamp(a_target, col[0], col[-1]), col, GAP_BPS)
+
+
+def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
+  """Which stalk command closes the gap between the current DCC setpoint and
+  where the measured map says it should be. Returns a CruiseStalk member name
+  or None.
+
+  Open-loop on the map: measured aEgo is deliberately not an input.
+  """
+  desired = v_ego + gap_for_accel(a_target, v_ego)
+  desired = min(desired, v_target)        # never target above the planner's speed
+  desired = max(desired, min_setpoint)    # never strand the car below min cruise
+  err_kph = (desired - setpoint) * MS_TO_KPH
+
+  if abs(err_kph) < SETPOINT_DEADBAND_KPH:
+    return None
+  if err_kph > 0:
+    return 'plus5' if err_kph >= 5.0 else 'plus1'
+  # No separate min-speed headroom check is needed: `desired` is already floored
+  # at min_setpoint, so a tick is only emitted when at least that step of error
+  # exists above the floor, and it can never carry the setpoint under it.
+  return 'minus5' if -err_kph >= 5.0 else 'minus1'
+```
+
+The module header constants (above `_clamp`):
+```python
+MS_TO_KPH = 3.6                # local literal: this module must not import opendbc
+SETPOINT_DEADBAND_KPH = 1.0    # below one tick there is nothing to send
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -410,99 +510,80 @@ git commit -m "bmw: DCC response map with clamped inversion"
 
 **Files:**
 - Modify: `plugins/bmw_e9x_e8x/bmw/carcontroller.py` (constants block ~lines 40–51; command-selection block ~lines 171–191)
-- Test: `plugins/bmw_e9x_e8x/tests/test_carcontroller_longitudinal.py`
+- Test: `plugins/bmw_e9x_e8x/tests/test_carcontroller_wiring.py`
 
 **Interfaces:**
-- Consumes: `bmw.dcc_map.gap_for_accel`.
+- Consumes: `bmw.dcc_map.select_cruise_command` (Task 2 — all decision behaviour is already tested there).
 - Produces: no new public API — behavioural change inside `CarController.update`.
+
+**Scope note:** the decision logic and its 8 behavioural tests belong to Task 2. This task only deletes the dead constants and wires the call site. Full integration is verified on-car in Task 4; do not attempt to instantiate `CarController` in a unit test (it needs a real `CANPacker` and DBC).
 
 **Deletions** (all four are proven dead by the study): `ACCEL_HOLD_THRESHOLD`, `DECEL_HOLD_THRESHOLD` (cadence is inert), `ACCEL_STEP5_THRESHOLD`, `DECEL_STEP5_THRESHOLD` (superseded by the tick arithmetic). Replace the stale "DCC Calibration" comment block with a pointer to the findings doc.
 
-**New constants:**
+**New constants** (`SETPOINT_DEADBAND_KPH` is re-exported from `dcc_map` so the controller and the decision function can never disagree about it):
 ```python
 CMD_INTERVAL = SINGLE_INTERVAL   # cadence is inert (study §3/§5); 20 Hz halves bus load
-SETPOINT_DEADBAND_KPH = 1.0      # below one tick there is nothing to send
 ```
 
 - [ ] **Step 1: Write the failing test**
 
-`tests/test_carcontroller_longitudinal.py` — tests the decision function directly so no CAN stack is needed:
+`tests/test_carcontroller_wiring.py` — `carcontroller` imports `opendbc`, which is NOT installed on the dev machine, so this file must follow the existing house pattern from `test_bmw.py`: add the plugin dir to `sys.path`, install the opendbc mocks via an `autouse` fixture, and import `bmw.carcontroller` **inside** the test bodies (never at module level).
 
 ```python
+import os
+import sys
+
 import pytest
 
-from bmw.dcc_map import gap_for_accel, accel_envelope
-from bmw.carcontroller import select_cruise_command, SETPOINT_DEADBAND_KPH
+_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PLUGIN_DIR not in sys.path:
+  sys.path.insert(0, _PLUGIN_DIR)
+
+from test_helpers import make_opendbc_mocks
 
 
-def cmd(a_target, v_ego, setpoint, v_target, min_setpoint=5.0):
-  return select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint)
+@pytest.fixture(autouse=True)
+def mock_opendbc(monkeypatch):
+  for mod_name, mod_mock in make_opendbc_mocks().items():
+    monkeypatch.setitem(sys.modules, mod_name, mod_mock)
 
 
-def test_deadband_emits_nothing():
-  # setpoint already where the map wants it
-  v, a = 20.0, 0.0
-  sp = v + gap_for_accel(a, v)
-  assert cmd(a, v, sp, v_target=v + 5.0) is None
+def _cc(mock_opendbc):
+  import importlib
+  import bmw.carcontroller as mod
+  importlib.reload(mod)
+  return mod
 
 
-def test_accel_request_below_target_emits_plus():
-  v = 20.0
-  out = cmd(+0.3, v, setpoint=v, v_target=v + 5.0)
-  assert out in ("plus1", "plus5")
+DEAD = ("ACCEL_HOLD_THRESHOLD", "DECEL_HOLD_THRESHOLD",
+        "ACCEL_STEP5_THRESHOLD", "DECEL_STEP5_THRESHOLD")
 
 
-def test_large_setpoint_error_uses_step5():
-  v = 20.0
-  # ask for the most the car can do, from a setpoint sitting at vEgo
-  _, a_max = accel_envelope(v)
-  assert cmd(a_max, v, setpoint=v, v_target=v + 10.0) == "plus5"
+@pytest.mark.parametrize("name", DEAD)
+def test_dead_thresholds_are_gone(mock_opendbc, name):
+  assert not hasattr(_cc(mock_opendbc), name), \
+      f"{name} is superseded by the setpoint-error law and must be deleted"
 
 
-def test_small_setpoint_error_uses_step1():
-  v = 20.0
-  sp = v + gap_for_accel(0.0, v) - (2.0 / 3.6)   # 2 km/h short -> one-ish tick
-  out = cmd(0.0, v, setpoint=sp, v_target=v + 10.0)
-  assert out == "plus1"
+def test_new_constants_present(mock_opendbc):
+  mod = _cc(mock_opendbc)
+  assert mod.CMD_INTERVAL == mod.SINGLE_INTERVAL   # cadence is inert
+  assert mod.SETPOINT_DEADBAND_KPH == 1.0
 
 
-def test_setpoint_never_commanded_above_v_target():
-  v, v_target = 20.0, 20.5
-  # map wants a big gap, but v_target is only 0.5 m/s above vEgo
-  out = cmd(+0.5, v, setpoint=v_target, v_target=v_target)
-  assert out is None, "already at v_target — must not push the setpoint higher"
+def test_decision_function_is_wired_in(mock_opendbc):
+  mod = _cc(mock_opendbc)
+  from bmw.dcc_map import select_cruise_command
+  assert mod.select_cruise_command is select_cruise_command
 
 
-def test_commanded_setpoint_never_goes_below_min():
-  """The desired-setpoint clamp is what protects min cruise speed.
-
-  Sweep a decel request from just above the floor and check the command can
-  never carry the setpoint under it: a minus tick moves 1 or 5 km/h, and it is
-  only emitted when at least that much error exists above the floor.
-  """
-  v, min_sp = 10.0, 8.0
-  for excess_kph in (0.2, 0.9, 1.5, 4.0, 6.0, 12.0):
-    sp = min_sp + excess_kph / 3.6
-    out = cmd(-1.0, v, setpoint=sp, v_target=0.0, min_setpoint=min_sp)
-    if out is None:
-      continue
-    step_kph = 5.0 if out == "minus5" else 1.0
-    assert sp - step_kph / 3.6 >= min_sp - 1e-9, \
-        f"{out} from setpoint {sp:.3f} would cross the {min_sp} m/s floor"
-
-
-def test_decel_request_emits_minus():
-  v = 25.0
-  out = cmd(-0.5, v, setpoint=v, v_target=v - 5.0, min_setpoint=5.0)
-  assert out in ("minus1", "minus5")
-
-
-def test_beyond_authority_saturates_not_escalates():
-  v = 20.0
-  _, a_max = accel_envelope(v)
-  far = cmd(a_max + 5.0, v, setpoint=v, v_target=v + 20.0)
-  at_max = cmd(a_max, v, setpoint=v, v_target=v + 20.0)
-  assert far == at_max, "requesting beyond authority must not change the command"
+def test_safety_machinery_survives(mock_opendbc):
+  """The burst/counter-overwrite and entry-deadzone machinery must not be
+  collateral damage of the rewrite."""
+  mod = _cc(mock_opendbc)
+  for name in ("V_ERROR_DEADZONE", "HOLD_INTERVAL", "SINGLE_INTERVAL",
+               "PRE_TICK_LEAD", "BURST_LIVE_WINDOW", "CRUISE_STALK_IDLE_TICK_STOCK"):
+    assert hasattr(mod, name), f"{name} was removed but is still required"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -522,32 +603,13 @@ Replace the constants block (the lines from `# DCC command selection thresholds`
 # at v_target, and emit the ticks still owed.
 V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — deadzone for entry and burst cancellation
 CMD_INTERVAL = SINGLE_INTERVAL # cadence is inert; 20 Hz halves bus load
-SETPOINT_DEADBAND_KPH = 1.0    # below one tick there is nothing to send
 ```
 
-Add the module-level decision function (above `class CarController`):
-
+Add to the imports (the decision function is pure and lives with the map it inverts):
 ```python
-def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
-  """Which stalk command closes the gap between the setpoint and where the
-  measured DCC map says it should be. Returns a CruiseStalk name or None.
-
-  Open-loop on the map: measured aEgo is deliberately not an input.
-  """
-  desired = v_ego + gap_for_accel(a_target, v_ego)
-  desired = min(desired, v_target)          # never target above the planner's speed
-  desired = max(desired, min_setpoint)      # never strand the car below min cruise
-  err_kph = (desired - setpoint) * CV.MS_TO_KPH
-
-  if abs(err_kph) < SETPOINT_DEADBAND_KPH:
-    return None
-  if err_kph > 0:
-    return 'plus5' if err_kph >= 5.0 else 'plus1'
-  # No separate min-speed headroom check is needed: `desired` is already floored
-  # at min_setpoint, so a tick is only emitted when at least that step of error
-  # exists above the floor, and it can never carry the setpoint under it.
-  return 'minus5' if -err_kph >= 5.0 else 'minus1'
+from bmw.dcc_map import select_cruise_command, SETPOINT_DEADBAND_KPH  # noqa: F401
 ```
+`SETPOINT_DEADBAND_KPH` is imported (not redefined) so the controller and the decision function cannot drift apart; the `noqa` is because the controller itself does not reference it — the wiring test asserts it is present.
 
 Replace the command-selection body inside `update` (the `if v_error > V_ERROR_DEADZONE ...` / `elif v_error < -V_ERROR_DEADZONE ...` branches) with:
 
@@ -560,18 +622,16 @@ Replace the command-selection body inside `update` (the `if v_error > V_ERROR_DE
             cruise_cmd(getattr(CruiseStalk, cmd_name), CMD_INTERVAL)
 ```
 
-Add `from bmw.dcc_map import gap_for_accel` to the imports.
-
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `PYTHONPATH=. uv run pytest plugins/bmw_e9x_e8x/tests/ -v`
-Expected: the 8 new longitudinal tests pass **and** every pre-existing BMW test still passes. If any pre-existing test referenced a deleted threshold constant, update that test to the new law rather than re-adding the constant — and say so in the commit body.
+Expected: the 7 new wiring tests pass **and** every pre-existing BMW test still passes. If any pre-existing test referenced a deleted threshold constant, update that test to the new law rather than re-adding the constant — and say so in the commit body.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add plugins/bmw_e9x_e8x/bmw/carcontroller.py \
-        plugins/bmw_e9x_e8x/tests/test_carcontroller_longitudinal.py
+        plugins/bmw_e9x_e8x/tests/test_carcontroller_wiring.py
 git commit -m "bmw: drive DCC by setpoint error from the measured response map"
 ```
 
