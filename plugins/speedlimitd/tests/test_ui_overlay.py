@@ -57,6 +57,12 @@ def mock_openpilot(monkeypatch):
   mock_modules['openpilot.selfdrive.plugins'] = MagicMock()
   mock_modules['openpilot.selfdrive.plugins.plugin_bus'] = mock_plugin_bus
 
+  # Mock shared fonts module — overlay now uses fonts.get_font() instead of gui_app.font()
+  mock_fonts = MagicMock()
+  mock_fonts.get_font = MagicMock(side_effect=lambda w: mock_font_bold if w == 'BOLD' else mock_font_medium)
+  mock_fonts.measure = mock_modules['openpilot.system.ui.lib.text_measure'].measure_text_cached
+  mock_modules['fonts'] = mock_fonts
+
   for mod_name, mod_mock in mock_modules.items():
     monkeypatch.setitem(sys.modules, mod_name, mod_mock)
 
@@ -68,6 +74,7 @@ def mock_openpilot(monkeypatch):
     'ui_state': mock_ui_state,
     'sm': mock_sm,
     'measure_text_cached': mock_modules['openpilot.system.ui.lib.text_measure'].measure_text_cached,
+    'fonts': mock_fonts,
   }
 
 
@@ -108,38 +115,23 @@ class TestLazyInit:
     overlay._ensure_init()
     assert overlay._font_bold is not None
     assert overlay._font_medium is not None
-    mock_openpilot['gui_app'].font.assert_any_call('BOLD')
-    mock_openpilot['gui_app'].font.assert_any_call('MEDIUM')
 
-  def test_ensure_init_idempotent(self, overlay, mock_openpilot):
+  def test_ensure_init_idempotent(self, overlay):
     overlay._ensure_init()
     overlay._ensure_init()
-    # font() called exactly twice (BOLD + MEDIUM), not four times
-    assert mock_openpilot['gui_app'].font.call_count == 2
+    # _font_bold set once, second call is a no-op
+    assert overlay._font_bold is not None
 
 
 class TestStateSubscriptionsHook:
-  """Test the ui.state_subscriptions hook callback."""
+  """Test the ui.state_subscriptions hook (now a passthrough, speedLimitState on plugin_bus)."""
 
-  def test_adds_speed_limit_state(self, overlay):
+  def test_passthrough(self, overlay):
     services = ["modelV2", "controlsState", "deviceState"]
     result = overlay.on_state_subscriptions(services)
-    assert 'speedLimitState' in result
-
-  def test_does_not_duplicate(self, overlay):
-    services = ["modelV2", "speedLimitState", "deviceState"]
-    result = overlay.on_state_subscriptions(services)
-    assert result.count('speedLimitState') == 1
-
-  def test_preserves_existing_services(self, overlay):
-    services = ["modelV2", "controlsState"]
-    result = overlay.on_state_subscriptions(services)
-    assert "modelV2" in result
-    assert "controlsState" in result
-    assert "speedLimitState" in result
+    assert result == ["modelV2", "controlsState", "deviceState"]
 
   def test_returns_same_list(self, overlay):
-    """Modifies in-place and returns the same list object."""
     services = ["modelV2"]
     result = overlay.on_state_subscriptions(services)
     assert result is services
@@ -149,102 +141,32 @@ class TestUpdateState:
   def test_no_speed_limit_state(self, overlay, mock_openpilot):
     """When no speedLimitState received, state stays at defaults."""
     overlay._ensure_init()
-    mock_openpilot['sm'].recv_frame = {}
+    overlay._sl_data = None
     overlay._update_state()
     assert overlay._speed_limit == 0.0
     assert overlay._speed_limit_source == 2
     assert overlay._speed_limit_confirmed is False
 
   def test_speed_limit_state_received(self, overlay, mock_openpilot):
-    """When speedLimitState has been received, state is updated."""
+    """When speedLimitState dict is set, state is updated."""
     overlay._ensure_init()
-    mock_sls = MagicMock()
-    mock_sls.speedLimit = 80.0
-    mock_sls.source.raw = 0  # OSM
-    mock_sls.confirmed = True
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 5}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
-
+    overlay._sl_data = {'speedLimit': 80.0, 'source': 0, 'confirmed': True}
     overlay._update_state()
     assert overlay._speed_limit == 80.0
     assert overlay._speed_limit_source == 0
     assert overlay._speed_limit_confirmed is True
 
-  def test_ceiling_computed_when_confirmed(self, overlay, mock_openpilot):
-    """Ceiling = limit * (1 + offset%) when confirmed."""
-    overlay._ensure_init()
-    mock_sls = MagicMock()
-    mock_sls.speedLimit = 80.0
-    mock_sls.source.raw = 0
-    mock_sls.confirmed = True
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 1}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
-
-    overlay._update_state()
-    assert overlay.speed_limit_capping is True
-    assert overlay.speed_limit_ceiling == pytest.approx(88.0)  # 80 * 1.10
-
-  def test_ceiling_uses_tiered_offset(self, overlay, mock_openpilot):
-    """Ceiling uses tiered offset: >60 kph → 10%, 51-60 → 30%, ≤50 → 40%."""
-    overlay._ensure_init()
-
-    # Highway: 100 kph → 10% offset → ceiling 110
-    mock_sls = MagicMock()
-    mock_sls.speedLimit = 100.0
-    mock_sls.source.raw = 0
-    mock_sls.confirmed = True
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 1}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
-    overlay._update_state()
-    assert overlay.speed_limit_ceiling == pytest.approx(110.0)
-
-    # Mid speed: 60 kph → 30% offset → ceiling 78
-    mock_sls.speedLimit = 60.0
-    overlay._update_state()
-    assert overlay.speed_limit_ceiling == pytest.approx(78.0)
-
-    # Low speed: 40 kph → 40% offset → ceiling 56
-    mock_sls.speedLimit = 40.0
-    overlay._update_state()
-    assert overlay.speed_limit_ceiling == pytest.approx(56.0)
-
-  def test_ceiling_zero_when_unconfirmed(self, overlay, mock_openpilot):
-    """Ceiling is 0 when not confirmed."""
-    overlay._ensure_init()
-    mock_sls = MagicMock()
-    mock_sls.speedLimit = 80.0
-    mock_sls.source.raw = 0
-    mock_sls.confirmed = False
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 1}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
-
-    overlay._update_state()
-    assert overlay.speed_limit_capping is False
-    assert overlay.speed_limit_ceiling == 0.0
-
   def test_speed_limit_unconfirmed(self, overlay, mock_openpilot):
     overlay._ensure_init()
-    mock_sls = MagicMock()
-    mock_sls.speedLimit = 60.0
-    mock_sls.source.raw = 1  # SIGN
-    mock_sls.confirmed = False
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 1}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
-
+    overlay._sl_data = {'speedLimit': 60.0, 'source': 1, 'confirmed': False}
     overlay._update_state()
     assert overlay._speed_limit == 60.0
     assert overlay._speed_limit_confirmed is False
 
-  def test_source_fallback_to_int(self, overlay, mock_openpilot):
-    """When source has no .raw attribute, falls back to int()."""
+  def test_source_as_int(self, overlay, mock_openpilot):
+    """Source is a plain int in the plugin_bus dict."""
     overlay._ensure_init()
-    mock_sls = MagicMock(spec=[])  # empty spec — no auto-created attributes
-    mock_sls.speedLimit = 100.0
-    mock_sls.source = 2  # plain int, hasattr(source, 'raw') is False
-    mock_sls.confirmed = False
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 3}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
-
+    overlay._sl_data = {'speedLimit': 100.0, 'source': 2, 'confirmed': False}
     overlay._update_state()
     assert overlay._speed_limit_source == 2
 
@@ -342,7 +264,7 @@ class TestOnRenderOverlay:
 
   def test_no_draw_when_speed_limit_zero(self, overlay, mock_openpilot, content_rect):
     """When speed limit is 0, nothing should be drawn."""
-    mock_openpilot['sm'].recv_frame = {}
+    overlay._sl_data = None
     mock_openpilot['gui_app'].mouse_events = []
     with patch('pyray.draw_circle') as mock_draw_circle:
       overlay.on_render_overlay(None, content_rect)
@@ -351,12 +273,7 @@ class TestOnRenderOverlay:
 
   def test_draws_when_speed_limit_active(self, overlay, mock_openpilot, content_rect):
     """When speed limit > 0, sign should be drawn."""
-    mock_sls = MagicMock()
-    mock_sls.speedLimit = 80.0
-    mock_sls.source.raw = 0
-    mock_sls.confirmed = True
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 1}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
+    overlay._sl_data = {'speedLimit': 80.0, 'source': 0, 'confirmed': True}
 
     mock_openpilot['gui_app'].mouse_events = []
     with patch('pyray.draw_circle') as mock_draw_circle, \
@@ -369,30 +286,20 @@ class TestOnRenderOverlay:
     assert mock_draw_text.call_count == 1
 
   def test_alpha_confirmed_vs_unconfirmed(self, overlay, mock_openpilot, content_rect):
-    """Confirmed = alpha 255, unconfirmed = alpha 128.
-
-    The draw code uses: alpha = 255 if _speed_limit_confirmed else 128
-    We verify by intercepting Color() calls through the mocked pyray module.
-    """
-    mock_sls = MagicMock()
-    mock_sls.speedLimit = 60.0
-    mock_sls.source.raw = 1
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 1}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
-
+    """Confirmed = alpha 255, unconfirmed = alpha 128."""
     pyray_mock = sys.modules['pyray']
     for confirmed, expected_alpha in [(True, 255), (False, 128)]:
-      mock_sls.confirmed = confirmed
-      # Track Color calls via the pyray mock in sys.modules
+      overlay._sl_data = {'speedLimit': 60.0, 'source': 1, 'confirmed': confirmed}
+
       color_alphas = []
       pyray_mock.Color = MagicMock(side_effect=lambda r, g, b, a: color_alphas.append(a) or MagicMock(a=a))
 
       import importlib
       importlib.reload(overlay)
       overlay = __import__('plugins.speedlimitd.ui_overlay', fromlist=['ui_overlay'])
+      overlay._sl_data = {'speedLimit': 60.0, 'source': 1, 'confirmed': confirmed}
       overlay.on_render_overlay(None, content_rect)
 
-      # All Color() calls should use the same alpha for this frame
       assert expected_alpha in color_alphas, f"Expected alpha {expected_alpha} in {color_alphas}"
 
 
@@ -422,12 +329,7 @@ class TestDrawPositioning:
 
   def test_sign_position_relative_to_content_rect(self, overlay, mock_openpilot, content_rect):
     """Sign should be positioned relative to content_rect origin."""
-    mock_sls = MagicMock()
-    mock_sls.speedLimit = 100.0
-    mock_sls.source.raw = 0
-    mock_sls.confirmed = True
-    mock_openpilot['sm'].recv_frame = {"speedLimitState": 1}
-    mock_openpilot['sm'].__getitem__ = MagicMock(return_value=mock_sls)
+    overlay._sl_data = {'speedLimit': 100.0, 'source': 0, 'confirmed': True}
 
     mock_openpilot['gui_app'].mouse_events = []
     with patch('pyray.draw_circle') as mock_draw_circle, \

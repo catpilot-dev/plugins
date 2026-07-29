@@ -1,31 +1,14 @@
 {
   "id": "speedlimitd",
   "name": "Speed Limit Daemon",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "hybrid",
-  "author": "c3pilot",
-  "description": "Speed limit middleware: fuses OSM maxspeed, YOLO detection, and road-type inference into speedLimitState. Enforces confirmed speed limits via cruise speed reduction.",
+  "author": "catpilot",
+  "description": "Speed limit middleware: fuses OSM maxspeed, YOLO detection, and road-type inference into speedLimitState via plugin_bus. Enforces confirmed speed limits via cruise speed reduction.",
   "min_openpilot": "0.10.0",
-  "max_openpilot": "0.10.99",
-  "dependencies": ["mapd"],
-  "cereal": {
-    "slots": {
-      "0": {
-        "struct_name": "SpeedLimitState",
-        "event_field": "speedLimitState",
-        "schema_file": "cereal/slot0.capnp"
-      }
-    }
-  },
-  "services": {
-    "speedLimitState": [true, 1.0, 1]
-  },
+  "max_openpilot": "0.11.99",
+  "dependencies": [],
   "hooks": {
-    "planner.subscriptions": {
-      "module": "planner_hook",
-      "function": "on_planner_subscriptions",
-      "priority": 50
-    },
     "planner.v_cruise": {
       "module": "planner_hook",
       "function": "on_v_cruise",
@@ -41,9 +24,9 @@
       "function": "on_render_overlay",
       "priority": 50
     },
-    "ui.state_subscriptions": {
-      "module": "ui_overlay",
-      "function": "on_state_subscriptions",
+    "device.health_check": {
+      "module": "planner_hook",
+      "function": "on_health_check",
       "priority": 50
     }
   },
@@ -52,7 +35,7 @@
       "name": "speedlimitd",
       "module": "speedlimitd",
       "condition": "only_onroad",
-      "requires": {"services": ["mapdOut"], "timeout": 1000}
+      "requires": {}
     }
   ],
   "params": {
@@ -61,22 +44,6 @@
       "default": true,
       "label": "Show Speed Limit Sign",
       "desc": "Display speed limit sign on HUD"
-    },
-    "MapdSpeedLimitControlEnabled": {
-      "type": "bool",
-      "default": false,
-      "label": "Conditional Speed Control",
-      "desc": "Limit cruise speed to detected speed limit when confirmed",
-      "requiresPlugin": "mapd"
-    },
-    "MapdCurveTargetLatAccel": {
-      "type": "pills",
-      "default": 0,
-      "label": "Curve Comfort",
-      "desc": "Target lateral acceleration in curves (m/s\u00b2)",
-      "options": ["1.5", "2.0", "2.5", "3.0"],
-      "dependsOn": "MapdSpeedLimitControlEnabled",
-      "onroad": true
     }
   }
 }

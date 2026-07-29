@@ -1,0 +1,22 @@
+[project]
+name = "sign-vision"
+version = "0.1.0"
+description = "Offline PoC: 2-stage (detect + classify) Chinese speed-limit sign reading from recorded C3 footage"
+requires-python = ">=3.11"
+dependencies = [
+  "ultralytics>=8.3",
+  "onnxruntime",
+  "opencv-python",
+  "av",
+  "numpy",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["../../../.."]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["pytest"]
