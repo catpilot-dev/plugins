@@ -1,3 +1,5 @@
+import time
+
 from openpilot.common.constants import CV
 
 # Lead vehicle override: if lead is traveling above the speed limit,
@@ -16,6 +18,20 @@ LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
 # docs/superpowers/specs/2026-07-10-speedlimitd-driver-intent-enforcement-design.md
 SOURCE_ROAD_TYPE_INFERENCE = 2  # _sl_data['source'] value for inferred limits
 
+# Large inferred-drop gate (route 3d1 seg 29). The lane-count-first inference is
+# steadier than the old OSM flicker, so a spurious low read now persists long
+# enough to *enforce*: an inferred lane-count=40 limit at v_ego 85 km/h commanded
+# a real 85->45 hard slowdown on an unnamed road (road_id='' => no baseline floor
+# today). Fix: an INFERRED limit whose enforcement would require a large
+# deceleration must persist continuously before it lowers v_cruise. Display is
+# unaffected (the driver sees the number immediately). Reference is v_ego (the
+# decel magnitude ~ v_ego - limit), NOT the previous limit. This gate NEVER
+# applies to safety caps (source==4 / safetyCapped -- the a_y layer must slow
+# promptly), manual/confirmed limits (the driver's explicit choice), or small
+# drops (< LARGE_DROP_KPH below v_ego -- enforced immediately as before).
+LARGE_DROP_KPH = 20.0     # a limit this far below v_ego is a "large drop" (hard brake)
+LARGE_DROP_GATE_S = 3.0   # inferred large drop must persist this long before it enforces
+
 _sl_sub = None
 _sl_data = None
 
@@ -23,6 +39,10 @@ _sl_data = None
 _baseline_ms = None   # inferred running-max target on the current road (floor)
 _gas_floor_ms = None  # driver-override hold floor (all sources), set post gas
 _road_id = ''         # last non-empty OSM road identity
+
+# Large inferred-drop gate state.
+_large_drop_target_ms = None  # pending large-drop candidate target (m/s), for observability
+_large_drop_since = None      # monotonic time the large drop first appeared continuously
 
 
 def _get_sl_data():
@@ -85,13 +105,16 @@ def _gas_pressed(sm) -> bool:
 
 def _reset_all():
   """Clear the floors (road identity is kept across brief invalid limits)."""
-  global _baseline_ms, _gas_floor_ms
+  global _baseline_ms, _gas_floor_ms, _large_drop_target_ms, _large_drop_since
   _baseline_ms = None
   _gas_floor_ms = None
+  # No confirmed limit => no pending large-drop candidate.
+  _large_drop_target_ms = None
+  _large_drop_since = None
 
 
 def on_v_cruise(v_cruise, v_ego, sm):
-  global _baseline_ms, _gas_floor_ms, _road_id
+  global _baseline_ms, _gas_floor_ms, _road_id, _large_drop_target_ms, _large_drop_since
   _get_sl_data()  # update from plugin bus
   if _sl_data is None:
     _reset_all()
@@ -110,6 +133,25 @@ def on_v_cruise(v_cruise, v_ego, sm):
 
   offset_pct = 0 if safety_capped else _effective_offset_percent(speed_limit)
   target_ms = speed_limit * (1 + offset_pct / 100.0) * CV.KPH_TO_MS
+
+  # Large inferred-drop gate. Track, continuously, whether an INFERRED limit sits
+  # >= LARGE_DROP_KPH below v_ego (a hard-brake candidate). Updated every cycle
+  # (before the gas/floor logic) so the persistence timer is truly continuous;
+  # the road_id is deliberately NOT consulted here (unnamed-road/road_id churn is
+  # exactly the case this gate covers -- a persistent large drop must still be
+  # able to enforce despite churn). Reset the timer the moment the drop is no
+  # longer large (limit rose back above the v_ego - LARGE_DROP line) so a
+  # transient vision glitch never brakes.
+  large_drop = inferred and (v_ego * CV.MS_TO_KPH - speed_limit) >= LARGE_DROP_KPH
+  if large_drop:
+    if _large_drop_since is None:
+      _large_drop_since = time.monotonic()
+    _large_drop_target_ms = target_ms
+    drop_gated = (time.monotonic() - _large_drop_since) < LARGE_DROP_GATE_S
+  else:
+    _large_drop_since = None
+    _large_drop_target_ms = None
+    drop_gated = False
 
   # New (non-empty) road: drop carried floors. A transient empty road_id (OSM
   # tile gap on the same road) is NOT a change.
@@ -144,6 +186,20 @@ def on_v_cruise(v_cruise, v_ego, sm):
   floors = [f for f in (baseline_floor, _gas_floor_ms) if f is not None]
   effective_floor = max(floors) if floors else None
   floored_target = target_ms if effective_floor is None else max(target_ms, effective_floor)
+
+  # Withhold a not-yet-persisted large inferred drop. This is an ADDITIONAL gate
+  # layered on the inferred path; it never fires for safety caps, manual limits,
+  # or small drops (drop_gated is False for those). Honor any existing floor
+  # (gas hold / named-road baseline continuity) so those keep capping, but do NOT
+  # let the unproven large drop itself lower v_cruise. On an unnamed road there is
+  # no baseline floor (road_id='' => effective_floor is None), which is precisely
+  # the seg-29 case the existing floor misses: hold v_cruise unchanged. Once the
+  # drop persists LARGE_DROP_GATE_S (drop_gated flips False), enforcement falls
+  # through to the normal cap below and the floor lowers as usual.
+  if drop_gated:
+    if effective_floor is not None and effective_floor < v_cruise:
+      return effective_floor
+    return v_cruise
 
   # Fast lead suggests a non-safety confirmed limit is wrong — skip. Not for
   # inferred limits (the baseline floor handles those), safety caps (a fast lead

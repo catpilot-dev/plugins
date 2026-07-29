@@ -765,15 +765,91 @@ class TestPlannerHook:
 
   # baseline floor requires a road identity ------------------
 
-  def test_empty_road_id_disables_baseline_hold(self, hook):
-    """No OSM identity (road_id='') → baseline hold invalid → the inferred/vision
-    cap is enforced immediately (route 3a1 unnamed motorway_link ramp)."""
+  def test_empty_road_id_disables_baseline_hold(self, hook, monkeypatch):
+    """No OSM identity (road_id='') → baseline hold invalid, so the inferred cap
+    is not held by a road-continuity floor. CONTRACT CHANGE (route 3d1 seg 29):
+    a *large* inferred drop on an unnamed road is now withheld by the large-drop
+    gate for LARGE_DROP_GATE_S before it enforces (was: immediate). The baseline
+    is still never built without an identity."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
     self._sl(hook, 100, source=2, road='')          # unnamed way
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     self._sl(hook, 40, source=2, road='')           # vision cap → 40, still unnamed
-    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    r_gated = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     assert hook._baseline_ms is None                # baseline not built without identity
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # enforced immediately, not held
+    assert r_gated == pytest.approx(120 / 3.6)      # withheld (large drop, not yet persisted)
+    t[0] += hook.LARGE_DROP_GATE_S + 0.1            # persist past the gate
+    r_enf = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    assert r_enf == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # now enforced
+
+  # large inferred-drop gate (route 3d1 seg 29) -------------
+
+  def test_large_inferred_drop_gated_then_enforces(self, hook, monkeypatch):
+    """THE seg-29 case: inferred (source 2, not safety) 40 while v_ego 85 kph on
+    an unnamed road. For the first LARGE_DROP_GATE_S the enforcement is withheld
+    (v_cruise unchanged); once it persists continuously the floor lowers."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    v_cruise, v_ego = 100 / 3.6, 85 / 3.6
+    self._sl(hook, 40, source=2, road='')           # inferred large drop (85→40)
+    # Withheld across the whole pre-persist window.
+    for dt in (0.0, 1.0, 2.9):
+      t[0] = 1000.0 + dt
+      r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
+      assert r == pytest.approx(v_cruise), f"should withhold at t+{dt}"
+    # Persisted ≥ gate → enforces (offset applies, non-safety).
+    t[0] = 1000.0 + hook.LARGE_DROP_GATE_S + 0.05
+    r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # cap now enforced
+
+  def test_large_inferred_drop_transient_glitch_never_enforces(self, hook, monkeypatch):
+    """A 2 s large-drop glitch that then recovers (limit rises back above the
+    v_ego − LARGE_DROP line) never lowers v_cruise toward the low value and
+    resets the timer — a transient vision glitch never brakes."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    v_cruise, v_ego = 100 / 3.6, 85 / 3.6
+    self._sl(hook, 40, source=2, road='')           # spurious low read
+    for dt in (0.0, 1.0, 2.0):
+      t[0] = 1000.0 + dt
+      r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
+      assert r == pytest.approx(v_cruise)           # withheld, never braked to 40
+    # Limit recovers before the 3 s gate elapses.
+    self._sl(hook, 80, source=2, road='')           # 85−80 = 5 kph < LARGE_DROP_KPH
+    t[0] = 1000.0 + 2.1
+    r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
+    assert hook._large_drop_since is None           # timer reset
+    assert r > 40 * 1.15 / 3.6 + 1.0                # never enforced the spurious 40
+    assert r == pytest.approx(80 * 1.10 / 3.6, abs=0.1)   # enforces recovered 80 (10% tier)
+
+  def test_safety_cap_large_drop_not_gated(self, hook, monkeypatch):
+    """A safety cap (source 4 / safetyCapped) of 40 at v_ego 85 is NEVER gated —
+    the a_y safety layer must slow the car promptly."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    self._sl(hook, 40, source=4, safety=True, road='A')
+    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
+    assert r == pytest.approx(40 / 3.6, abs=0.1)    # immediate, no offset, no gate
+
+  def test_manual_confirmed_large_drop_not_gated(self, hook, monkeypatch):
+    """A non-inferred confirmed limit (the driver's explicit choice) of 40 at
+    v_ego 85 enforces immediately — the gate only touches inferred limits."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    self._sl(hook, 40, source=1, road='A')          # non-inferred (source != 2)
+    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # immediate
+
+  def test_small_inferred_drop_not_gated(self, hook, monkeypatch):
+    """An inferred drop smaller than LARGE_DROP_KPH (70 at v_ego 85 → 15 kph)
+    enforces immediately, exactly as before the gate."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    self._sl(hook, 70, source=2, road='')
+    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
+    assert hook._large_drop_since is None           # not a large drop, gate inert
+    assert r == pytest.approx(70 * 1.15 / 3.6, abs=0.1)   # immediate
 
   def test_named_road_id_keeps_baseline_hold(self, hook, monkeypatch):
     """With a road identity, spurious same-road drops are still held (unchanged)."""
