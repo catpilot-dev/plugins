@@ -33,15 +33,19 @@ LARGE_DROP_KPH = 20.0     # a limit this far below v_ego is a "large drop" (hard
 LARGE_DROP_GATE_S = 3.0   # inferred large drop must persist this long before it enforces
 
 # Narrow-band lane-count limits are DISPLAY-ONLY (route 3d1 seg 29). speedlimitd
-# publishes a ≤2-confident-lane inferred limit (40/30) for DISPLAY but flags it
-# laneCountNarrow=True. Lane count is a poor predictor of a LOW limit -- a 2-lane
+# publishes a ≤2-confident-lane inferred limit (40/30) for DISPLAY (speedLimit)
+# but EXCLUDES it from the enforcement view (enforcedSpeedLimit / enforcedSource /
+# enforcedSafetyCapped). Lane count is a poor predictor of a LOW limit -- a 2-lane
 # road is anywhere from a 40 link to an 80 rural highway -- so a narrow read must
 # never command a hard slowdown (seg 29: a ≤2-lane read → 40 on a wide 85 km/h
-# road, SUSTAINED 13.4 s; the 3 s large-drop gate only delayed it). This is a
-# permanent exclusion from the enforcement path, complementary to (not a weakening
-# of) the large-drop gate above: everything else stays enforcing -- ≥3-lane limits
-# (60/80, informative wide→faster), G/S expressway promotes, safety caps
-# (source 4), and manual/confirmed limits.
+# road, SUSTAINED 13.4 s; the 3 s large-drop gate only delayed it). Crucially the
+# exclusion is done UPSTREAM in the min(), not by flagging the winner: if a curve
+# cap sits ABOVE the narrow guess (cap 50, guess 40) the 40 still wins DISPLAY but
+# enforcedSpeedLimit=50, so the curve still enforces (a flag-based display-only
+# skip would have suppressed it -- review Critical). This hook therefore reads the
+# enforced* fields for all enforcement decisions; everything else stays enforcing
+# -- ≥3-lane limits (60/80), G/S promotes, safety caps, manual/confirmed. When a
+# bare narrow guess is the only reading, enforcedSpeedLimit=0 (no constraint).
 
 _sl_sub = None
 _sl_data = None
@@ -132,27 +136,18 @@ def on_v_cruise(v_cruise, v_ego, sm):
     return v_cruise
 
   confirmed = _sl_data.get('confirmed', False)
-  speed_limit = _sl_data.get('speedLimit', 0)
+  # Enforce on the ENFORCED view (narrow-band lane guesses excluded upstream), not
+  # the display speedLimit. Fall back to the display fields for older speedlimitd
+  # messages that predate the split (defensive across a rolling deploy).
+  speed_limit = _sl_data.get('enforcedSpeedLimit', _sl_data.get('speedLimit', 0))
   if not (confirmed and speed_limit > 0):
     _reset_all()
     return v_cruise
 
-  safety_capped = _sl_data.get('safetyCapped', True)
-  source = _sl_data.get('source')
+  safety_capped = _sl_data.get('enforcedSafetyCapped', _sl_data.get('safetyCapped', True))
+  source = _sl_data.get('enforcedSource', _sl_data.get('source'))
   road_id = _sl_data.get('roadName') or _sl_data.get('wayRef') or ''
   inferred = (source == SOURCE_ROAD_TYPE_INFERENCE and not safety_capped)
-
-  # Display-only guard (route 3d1 seg 29). A narrow-band lane-count guess is
-  # published for display but must never lower v_cruise. It is inherently
-  # source==2 / not-safety-capped (see speedlimitd.lane_count_narrow), so this
-  # never touches safety caps, YOLO signs, or manual/confirmed limits. Drop any
-  # carried inferred floor / large-drop candidate so nothing stale re-enforces
-  # when the road later widens; road identity is left intact for change detection.
-  if inferred and _sl_data.get('laneCountNarrow', False):
-    _baseline_ms = None
-    _large_drop_target_ms = None
-    _large_drop_since = None
-    return v_cruise
 
   offset_pct = 0 if safety_capped else _effective_offset_percent(speed_limit)
   target_ms = speed_limit * (1 + offset_pct / 100.0) * CV.KPH_TO_MS

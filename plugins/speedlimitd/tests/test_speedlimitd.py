@@ -566,10 +566,22 @@ class TestPlannerHook:
     return sm
 
   def _sl(self, hook, speed_limit, source=1, safety=False, confirmed=True, road='A',
-          narrow=False):
+          narrow=False, enforced=None, enforced_source=None, enforced_safety=None):
+    # Models speedlimitd's display/enforce split. Off the narrow path the enforced
+    # view mirrors the display fields (default). A narrow-band display limit with
+    # no coincident cap enforces nothing (enforcedSpeedLimit=0); pass enforced=* to
+    # model a coincident safety cap sitting above the narrow guess.
+    if enforced is None:
+      enforced = 0 if narrow else speed_limit
+    if enforced_source is None:
+      enforced_source = 0 if narrow else source
+    if enforced_safety is None:
+      enforced_safety = False if narrow else safety
     hook._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit,
                      'safetyCapped': safety, 'source': source,
-                     'roadName': road, 'wayRef': '', 'laneCountNarrow': narrow}
+                     'roadName': road, 'wayRef': '', 'laneCountNarrow': narrow,
+                     'enforcedSpeedLimit': enforced, 'enforcedSource': enforced_source,
+                     'enforcedSafetyCapped': enforced_safety}
 
   def _clock(self, monkeypatch, hook, t0=1000.0):
     # planner_hook no longer uses a clock (enforcement is immediate — DCC shapes
@@ -926,23 +938,28 @@ class TestPlannerHook:
     assert r < 130 / 3.6
     assert r == pytest.approx(100 * 1.10 / 3.6, abs=0.1)
 
-  def test_safety_cap_enforces_regardless_of_narrow_flag(self, hook, monkeypatch):
-    """A safety cap (source 4) enforces immediately even if the narrow flag were
-    set — display-only requires source==2, so the a_y layer is never suppressed."""
+  def test_narrow_band_coincident_curve_cap_enforces_the_cap(self, hook, monkeypatch):
+    """review Critical (planner side): the driver SEES the narrow 40 (display), but
+    a coincident curve cap ABOVE it (enforcedSpeedLimit=50, source 4) is what the
+    planner enforces — the car slows to 50 for the curve, it does NOT go display-
+    only and coast through at 85."""
     t = [1000.0]
     monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    self._sl(hook, 40, source=4, safety=True, road='A', narrow=True)
+    self._sl(hook, 40, source=2, road='', narrow=True,
+             enforced=50, enforced_source=4, enforced_safety=True)
     r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
-    assert r == pytest.approx(40 / 3.6, abs=0.1)         # immediate, no offset
+    assert r == pytest.approx(50 / 3.6, abs=0.1)         # curve cap enforced (no offset)
+    assert r < 85 / 3.6                                  # definitely slowed for the curve
 
-  def test_manual_confirmed_enforces_regardless_of_narrow_flag(self, hook, monkeypatch):
-    """A non-inferred confirmed limit (source 1, driver's explicit choice) enforces
-    even if narrow=True — display-only only excludes source==2 lane guesses."""
+  def test_narrow_band_coincident_reactive_cap_enforces_the_cap(self, hook, monkeypatch):
+    """Same as above for a reactive measured-a_y cap sitting above the narrow
+    guess: display 40, enforced 55 (source 4) → planner enforces 55."""
     t = [1000.0]
     monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    self._sl(hook, 40, source=1, road='A', narrow=True)
+    self._sl(hook, 40, source=2, road='', narrow=True,
+             enforced=55, enforced_source=4, enforced_safety=True)
     r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
+    assert r == pytest.approx(55 / 3.6, abs=0.1)
 
 
 # ============================================================
@@ -2044,6 +2061,65 @@ class TestNarrowBandDisplayFlag:
     assert pub['source'] == 4
     assert pub['safetyCapped'] is True
     assert pub['laneCountNarrow'] is False
+    # Enforcement mirrors display here (the safety cap already won the min).
+    assert pub['enforcedSpeedLimit'] == 30
+    assert pub['enforcedSource'] == 4
+    assert pub['enforcedSafetyCapped'] is True
+
+  # --- review Critical: a curve cap ABOVE the narrow guess must still enforce ---
+
+  def test_critical_curve_above_narrow_display40_enforce50(self, sld):
+    """THE review Critical: at 2 lanes the base guess is 40; a curvature cap sits
+    ABOVE it at raw 50 (snaps to 50). The 40 wins the DISPLAY min (shown to the
+    driver), but the narrow guess is EXCLUDED from the enforcement min, so the 50
+    curve cap is what enforces — the car still slows for the curve. (Under the
+    old flag-only mechanism the whole reading went display-only and the 50 curve
+    cap never enforced — the Critical bug.)"""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 2
+    mw.curvature_cap = 50                  # raw curve cap ABOVE the narrow 40
+    mw.update()
+    pub = self._published(mw)
+    # Display: the narrow guess is still shown.
+    assert pub['speedLimit'] == 40
+    assert pub['source'] == 2
+    assert pub['safetyCapped'] is False
+    assert pub['laneCountNarrow'] is True
+    # Enforcement: the narrow guess is excluded, so the curve cap enforces.
+    assert pub['enforcedSpeedLimit'] == 50
+    assert pub['enforcedSource'] == 4
+    assert pub['enforcedSafetyCapped'] is True
+
+  def test_tie_curve_equals_narrow_curve_enforces(self, sld):
+    """Exact tie: curve cap == narrow guess (both 40) at 2 lanes. The curve
+    candidate is ordered before the base, so it wins BOTH display and enforcement
+    as a safety cap — source 4, safety-capped."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 2
+    mw.curvature_cap = 40
+    mw.update()
+    pub = self._published(mw)
+    assert pub['speedLimit'] == 40
+    assert pub['source'] == 4               # curve wins the tie (ordered first)
+    assert pub['laneCountNarrow'] is False
+    assert pub['enforcedSpeedLimit'] == 40
+    assert pub['enforcedSource'] == 4
+    assert pub['enforcedSafetyCapped'] is True
+
+  def test_reactive_above_narrow_enforces_reactive(self, sld):
+    """A reactive measured-a_y cap ABOVE the narrow guess (react ~55, narrow 40)
+    is excluded-from-min the same way: display 40, enforced = the reactive cap."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 2
+    mw._react_cap_ms = 55.0 / 3.6           # engaged reactive cap above the narrow 40
+    mw.react_lat_accel_threshold = 2.5
+    mw.update()
+    pub = self._published(mw)
+    assert pub['speedLimit'] == 40
+    assert pub['laneCountNarrow'] is True
+    assert pub['enforcedSpeedLimit'] == sld.snap_to_standard_speed(55)
+    assert pub['enforcedSource'] == 4
+    assert pub['enforcedSafetyCapped'] is True
 
 
 # ============================================================

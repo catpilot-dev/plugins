@@ -1074,8 +1074,11 @@ class SpeedLimitMiddleware:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
     if react_active:
       candidates.append((react_cap_kph, 4, 0.7))  # reactiveLatAccel (safety class)
-    candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # base inference (lane-count / gs_osm), source 2
+    base_candidate = (float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2))  # base inference (lane-count / gs_osm), source 2
+    candidates.append(base_candidate)  # always appended LAST
 
+    # DISPLAY: the most conservative reading across ALL sources — a narrow-band
+    # lane guess IS still shown to the driver.
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
 
     # --- Gradual speed limit transition ---
@@ -1117,19 +1120,47 @@ class SpeedLimitMiddleware:
       and snap_to_standard_speed(int(react_cap_kph)) <= self._displayed_speed_limit
     )
 
-    # laneCountNarrow (route 3d1 seg 29): True iff the PUBLISHED limit is a
-    # narrow-band lane-count guess — the base inference won the min() (source 2),
-    # it came from vision lane-count mode, and the confident lane count is ≤ 2
-    # (the lane_count_limit narrow sub-table → 40/30). Lane count is a poor
-    # predictor of a LOW limit (a 2-lane road is anywhere from a 40 link to an 80
-    # rural highway), so this reading is published for DISPLAY but must NOT
-    # enforce — planner_hook excludes it from the enforcement path. It is False
-    # whenever something else binds the displayed limit (a safety cap / YOLO won
-    # the min), on ≥3-lane roads (60/80, informative), and on G/S promotes
-    # (gs_mode requires ≥3 lanes). Telemetry: distinguishes displayed-not-enforced
-    # in rlogs.
+    # laneCountNarrow (route 3d1 seg 29): True iff the PUBLISHED (display) limit is
+    # a narrow-band lane-count guess — the base inference won the display min()
+    # (source 2), from vision lane-count mode, at a confident lane count ≤ 2 (the
+    # lane_count_limit narrow sub-table → 40/30). Lane count is a poor predictor of
+    # a LOW limit (a 2-lane road is anywhere from a 40 link to an 80 rural
+    # highway), so this reading is DISPLAY-ONLY. Telemetry: distinguishes
+    # displayed-not-enforced in rlogs. It is False whenever something else binds
+    # the displayed limit (a safety cap / YOLO won the min), on ≥3-lane roads
+    # (60/80, informative), and on G/S promotes (gs_mode requires ≥3 lanes).
     lane_count_narrow = (source == 2 and self.inference_mode == 'lane_count'
                          and self.lane_count_stable <= 2)
+
+    # ENFORCEMENT (route 3d1 seg 29 review Critical): the narrow-band lane guess
+    # must be EXCLUDED from the enforcement min — not merely flagged. If it were
+    # only flagged and a coincident safety cap sat ABOVE it (curve cap 50, narrow
+    # guess 40), the 40 would win the display min, a flag-based planner would treat
+    # the whole reading as display-only, and the 50 curve cap would never enforce —
+    # the car would enter the curve with no slowdown. So we publish a SEPARATE
+    # enforced limit that omits the narrow candidate.
+    #
+    # When lane_count_narrow is False the enforced value is byte-for-byte the
+    # display value (source/safetyCapped included) — zero behaviour change off the
+    # narrow path. When it is True the narrow base was the display winner (thus the
+    # global min); the remaining candidates are safety caps / YOLO — none of which
+    # use the gradual display ramp — or nothing at all, in which case the enforced
+    # limit is the no-constraint sentinel 0 (planner enforces nothing).
+    if lane_count_narrow:
+      enforce_candidates = candidates[:-1]  # every source except the narrow base
+      if enforce_candidates:
+        enf_speed, enf_source, _ = min(enforce_candidates, key=lambda x: x[0])
+        enforced_speed_limit = snap_to_standard_speed(int(enf_speed))
+        enforced_source = enf_source
+        enforced_safety_capped = enf_source == 4
+      else:
+        enforced_speed_limit = 0            # no-constraint sentinel
+        enforced_source = 0
+        enforced_safety_capped = False
+    else:
+      enforced_speed_limit = self._displayed_speed_limit
+      enforced_source = source
+      enforced_safety_capped = safety_capped
 
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
@@ -1178,8 +1209,16 @@ class SpeedLimitMiddleware:
       'curvatureCap': snap_to_standard_speed(self.curvature_cap) if self.curvature_cap >= MIN_SPEED_LIMIT else 0,
       'safetyCapped': safety_capped,
       # Narrow-band lane-count guess: displayed but NOT enforced (route 3d1 seg
-      # 29). planner_hook excludes it from the enforcement path; see above.
+      # 29). Telemetry — distinguishes displayed-not-enforced in rlogs.
       'laneCountNarrow': lane_count_narrow,
+      # Enforcement view (route 3d1 seg 29 review Critical): the narrow-band lane
+      # guess is excluded from these — planner_hook's floor/min/large-drop gate
+      # operate on THESE, not the display speedLimit/source/safetyCapped. Equal to
+      # the display values off the narrow path; enforcedSpeedLimit==0 means "no
+      # constraint to enforce" (a bare narrow guess enforces nothing).
+      'enforcedSpeedLimit': enforced_speed_limit,
+      'enforcedSource': enforced_source,
+      'enforcedSafetyCapped': enforced_safety_capped,
       # Reactive measured-a_y cap telemetry (2026-07-28).
       'reactCapEngaged': self._react_cap_ms > 0.0,
       'reactCap': round(react_cap_kph, 1),          # km/h, 0 = disengaged
