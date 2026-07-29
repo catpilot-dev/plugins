@@ -6,6 +6,7 @@ from bmw.values import CarControllerParams, CanBus, BmwFlags, CruiseSettings
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.can import CANPacker
 from opendbc.car.common.conversions import Conversions as CV
+from bmw.dcc_map import select_cruise_command, SETPOINT_DEADBAND_KPH  # noqa: F401
 
 
 # DO NOT CHANGE: Cruise control step size
@@ -37,18 +38,13 @@ SINGLE_INTERVAL = 0.050       # 20 Hz — single-press cadence
 PRE_TICK_LEAD = 0.015         # lead window 15 ms — wide enough to catch ≥1 OP cycle (10 ms) with phase jitter
 BURST_LIVE_WINDOW = 0.5       # s — burst considered "live" until this long without TX
 
-# DCC command selection thresholds
+# DCC command selection.
+# The car's acceleration tracks the setpoint gap, not the command or the TX
+# cadence — see docs/superpowers/specs/2026-07-29-dcc-response-findings.md.
+# We invert the measured map to get the gap we need, cap the resulting setpoint
+# at v_target, and emit the ticks still owed.
 V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — deadzone for entry and burst cancellation
-ACCEL_HOLD_THRESHOLD = 0.2     # m/s² — use HOLD_INTERVAL above this, SINGLE_INTERVAL below
-ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — use +5 above this, +1 below (midpoint of 0.4–1.2)
-DECEL_HOLD_THRESHOLD = 0.4
-DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint of 0.6–1.2)
-
-# DCC Calibration
-# PLUS1 + HOLD = +0.4 m/s²
-# PLUS5 + HOLD = +1.2 m/s²
-# MINUS1 + HOLD = -0.6 m/s²
-# MINUS5 + HOLD = -1.2 m/s²
+CMD_INTERVAL = SINGLE_INTERVAL # cadence is inert; 20 Hz halves bus load
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
@@ -175,20 +171,11 @@ class CarController(CarControllerBase):
         if CS.out.gasPressed:
           cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL)
         else:
-          setpoint_error = v_target - CS.out.cruiseState.speed
-
-          if v_error > V_ERROR_DEADZONE and accel > 0 and setpoint_error > 0:
-            cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
-            interval = HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL
-            cruise_cmd(cmd, interval)
-
-          elif v_error < -V_ERROR_DEADZONE and accel < 0 and setpoint_error < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
-            headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
-            cmd = CruiseStalk.minus5 if -accel >= DECEL_STEP5_THRESHOLD else CruiseStalk.minus1
-            interval = HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL
-            step = 5 if cmd == CruiseStalk.minus5 else 1
-            if headroom_kmh >= step:
-              cruise_cmd(cmd, interval)
+          cmd_name = select_cruise_command(accel, v_current,
+                                           CS.out.cruiseState.speed, v_target,
+                                           self.min_cruise_setpoint)
+          if cmd_name is not None and abs(v_error) > V_ERROR_DEADZONE:
+            cruise_cmd(getattr(CruiseStalk, cmd_name), CMD_INTERVAL)
 
     # Trailing counter overwrite. If commanding stopped (or is briefly idle in
     # a deadzone) but the burst is still live, keep transmitting at the burst's
