@@ -8,7 +8,7 @@ if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
 from bmw.dcc_map import (expected_accel, gap_for_accel, accel_envelope,
-                         select_cruise_command)
+                         select_cruise_command, MS_TO_KPH)
 from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 
@@ -232,3 +232,76 @@ def test_floor_never_causes_accel_above_v_target():
           assert result not in ("plus1", "plus5"), \
               f"floor override: a_target={a_target}, v_ego={v_ego}, setpoint={setpoint:.2f}, " \
               f"v_target={v_target}, min_sp={min_sp} -> {result}"
+
+
+def test_floor_never_pushes_setpoint_past_v_target_when_setpoint_at_or_below_it():
+  """Second hole in the planner-intent guard alone: when v_target < min_setpoint
+  and the current setpoint sits at or below v_target, desired_raw == v_target
+  (min() picks v_target), so `desired_raw < setpoint` is False and does not
+  fire — yet `desired` is still floored up to min_setpoint, which is above
+  v_target, so a plus tick was emitted and drove the setpoint above v_target.
+  This is exactly the case the original `desired > v_target` guard protected,
+  and it is not implied by `desired_raw < setpoint`. Both guards are required.
+  """
+  assert cmd(-0.5, 15.0, 7.0, 8.0, 9.72) is None    # setpoint 7.00 < v_target 8.0
+  assert cmd(-0.5, 15.0, 8.0, 8.0, 9.72) is None    # setpoint == v_target 8.0 (equality edge)
+
+
+def test_full_invariant_sweep_plus_and_minus_and_planner_intent():
+  """Brute-force sweep over a, v_ego, setpoint, v_target, min_setpoint, checking
+  every one of select_cruise_command's core safety invariants on every emitted
+  command:
+
+    1. A plus tick must never land the setpoint above v_target if the current
+       setpoint started at or below v_target.
+    2. A minus tick must never land the setpoint below min_setpoint if the
+       current setpoint started at or above min_setpoint.
+    3. A plus must never be emitted when desired_raw (the planner's actual
+       ask, before the floor clamp) is below the current setpoint.
+
+  This is the grid that would have caught both the original min-speed-floor
+  bug and the second hole where the `desired > v_target` guard was wrongly
+  deleted — so it is deliberately exhaustive rather than minimal.
+  """
+  a_targets = [-1.5, -1.0, -0.5, -0.1, 0.0, 0.2, 0.5]
+  v_egos = [6.0, 9.0, 11.0, 15.0, 20.0, 28.0]
+  setpoints = [8.0, 9.2, 10.0, 12.0, 15.0, 20.0, 25.0]
+  v_targets = [4.0, 8.0, 10.5, 15.0, 22.0, 30.0]
+  min_setpoints = [5.0, 9.72]
+
+  violations = []
+  checked = 0
+  for a_target in a_targets:
+    for v_ego in v_egos:
+      for setpoint in setpoints:
+        for v_target in v_targets:
+          for min_sp in min_setpoints:
+            checked += 1
+            result = cmd(a_target, v_ego, setpoint, v_target, min_sp)
+            if result is None:
+              continue
+            step_kph = 5.0 if result in ("plus5", "minus5") else 1.0
+            step_ms = step_kph / MS_TO_KPH
+
+            if result in ("plus1", "plus5"):
+              new_setpoint = setpoint + step_ms
+              # Invariant 1: never land above v_target if we started at or below it.
+              if setpoint <= v_target and new_setpoint > v_target + 1e-9:
+                violations.append(
+                    ("v_target ceiling breached", a_target, v_ego, setpoint, v_target, min_sp, result))
+              # Invariant 3: desired_raw is the planner's own ask; a plus must
+              # never fire when that ask is already below the current setpoint.
+              desired_raw = min(v_ego + gap_for_accel(a_target, v_ego), v_target)
+              if desired_raw < setpoint - 1e-9:
+                violations.append(
+                    ("planner-intent guard breached", a_target, v_ego, setpoint, v_target, min_sp, result))
+
+            elif result in ("minus1", "minus5"):
+              new_setpoint = setpoint - step_ms
+              # Invariant 2: never land below min_setpoint if we started at or above it.
+              if setpoint >= min_sp and new_setpoint < min_sp - 1e-9:
+                violations.append(
+                    ("min_setpoint floor breached", a_target, v_ego, setpoint, v_target, min_sp, result))
+
+  assert checked == len(a_targets) * len(v_egos) * len(setpoints) * len(v_targets) * len(min_setpoints)
+  assert not violations, f"{len(violations)} invariant violation(s), first few: {violations[:5]}"

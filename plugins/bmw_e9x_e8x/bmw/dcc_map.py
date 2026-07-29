@@ -71,10 +71,16 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
 
   if abs(err_kph) < SETPOINT_DEADBAND_KPH:
     return None
-  # The min-speed floor may hold the setpoint up, but it must never RAISE it:
-  # desired_raw is what the planner actually asked for, so if that is already
-  # below the current setpoint an upward tick would fight the planner.
-  if err_kph > 0 and desired_raw < setpoint:
+  # The min-speed floor may hold the setpoint up, but it must never RAISE it
+  # past either of two ceilings — neither guard below implies the other:
+  #  - desired_raw < setpoint: the planner has already asked for something
+  #    lower than what's currently commanded, so an upward tick would fight it.
+  #  - desired > v_target: the floor has pushed the commanded setpoint past
+  #    the planner's target speed (this happens when v_target < min_setpoint
+  #    and the current setpoint is already at or below v_target, so
+  #    desired_raw == v_target is not < setpoint, yet the floor clamp still
+  #    lifts `desired` above v_target).
+  if err_kph > 0 and (desired_raw < setpoint or desired > v_target):
     return None
   if err_kph > 0:
     return 'plus5' if err_kph >= 5.0 else 'plus1'
