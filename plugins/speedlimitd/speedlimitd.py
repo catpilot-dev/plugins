@@ -1117,6 +1117,20 @@ class SpeedLimitMiddleware:
       and snap_to_standard_speed(int(react_cap_kph)) <= self._displayed_speed_limit
     )
 
+    # laneCountNarrow (route 3d1 seg 29): True iff the PUBLISHED limit is a
+    # narrow-band lane-count guess — the base inference won the min() (source 2),
+    # it came from vision lane-count mode, and the confident lane count is ≤ 2
+    # (the lane_count_limit narrow sub-table → 40/30). Lane count is a poor
+    # predictor of a LOW limit (a 2-lane road is anywhere from a 40 link to an 80
+    # rural highway), so this reading is published for DISPLAY but must NOT
+    # enforce — planner_hook excludes it from the enforcement path. It is False
+    # whenever something else binds the displayed limit (a safety cap / YOLO won
+    # the min), on ≥3-lane roads (60/80, informative), and on G/S promotes
+    # (gs_mode requires ≥3 lanes). Telemetry: distinguishes displayed-not-enforced
+    # in rlogs.
+    lane_count_narrow = (source == 2 and self.inference_mode == 'lane_count'
+                         and self.lane_count_stable <= 2)
+
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
     # Confirmed state is sticky — only changes on explicit user toggle.
@@ -1163,6 +1177,9 @@ class SpeedLimitMiddleware:
       # publish site, same as speedLimit.
       'curvatureCap': snap_to_standard_speed(self.curvature_cap) if self.curvature_cap >= MIN_SPEED_LIMIT else 0,
       'safetyCapped': safety_capped,
+      # Narrow-band lane-count guess: displayed but NOT enforced (route 3d1 seg
+      # 29). planner_hook excludes it from the enforcement path; see above.
+      'laneCountNarrow': lane_count_narrow,
       # Reactive measured-a_y cap telemetry (2026-07-28).
       'reactCapEngaged': self._react_cap_ms > 0.0,
       'reactCap': round(react_cap_kph, 1),          # km/h, 0 = disengaged

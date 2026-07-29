@@ -565,10 +565,11 @@ class TestPlannerHook:
     sm.__getitem__ = MagicMock(side_effect=getitem)
     return sm
 
-  def _sl(self, hook, speed_limit, source=1, safety=False, confirmed=True, road='A'):
+  def _sl(self, hook, speed_limit, source=1, safety=False, confirmed=True, road='A',
+          narrow=False):
     hook._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit,
                      'safetyCapped': safety, 'source': source,
-                     'roadName': road, 'wayRef': ''}
+                     'roadName': road, 'wayRef': '', 'laneCountNarrow': narrow}
 
   def _clock(self, monkeypatch, hook, t0=1000.0):
     # planner_hook no longer uses a clock (enforcement is immediate — DCC shapes
@@ -863,6 +864,85 @@ class TestPlannerHook:
       r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
       clk.tick(0.2)
     assert r >= 100 / 3.6 - 0.2                      # held at current speed
+
+  # narrow-band lane-count limits are DISPLAY-ONLY (route 3d1 seg 29) --------
+
+  def test_narrow_band_never_enforces(self, hook, monkeypatch):
+    """THE seg-29 fix: an inferred ≤2-lane guess (40) at v_ego 85 on a wide road
+    is DISPLAY-ONLY — planner_hook never lowers v_cruise for it. Lane count is a
+    poor predictor of a LOW limit, so a narrow read must not command a brake."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    v_cruise, v_ego = 100 / 3.6, 85 / 3.6
+    self._sl(hook, 40, source=2, road='', narrow=True)   # narrow-band lane guess
+    r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
+    assert r == pytest.approx(v_cruise)                  # v_cruise unchanged (no brake)
+    assert hook._baseline_ms is None                     # no floor built from a narrow read
+    assert hook._large_drop_since is None                # large-drop gate never armed
+
+  def test_narrow_band_never_enforces_when_sustained(self, hook, monkeypatch):
+    """Sustained (13.4 s in seg 29) narrow-band read: still never enforces —
+    unlike the large-drop gate, this is not a delay, it is a permanent exclusion
+    from the enforcement path."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    v_cruise, v_ego = 100 / 3.6, 85 / 3.6
+    self._sl(hook, 40, source=2, road='', narrow=True)
+    for dt in (0.0, 3.5, 13.4, 30.0):                    # well past LARGE_DROP_GATE_S
+      t[0] = 1000.0 + dt
+      r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
+      assert r == pytest.approx(v_cruise), f"enforced a narrow guess at t+{dt}"
+
+  def test_narrow_band_named_road_still_never_enforces(self, hook, monkeypatch):
+    """Even with a road identity, a narrow-band read builds no baseline hold and
+    never lowers v_cruise (the display-only rule is independent of road_id)."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    self._sl(hook, 40, source=2, road='某路', narrow=True)
+    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
+    assert r == pytest.approx(100 / 3.6)
+    assert hook._baseline_ms is None
+
+  def test_three_lane_inferred_still_enforces(self, hook):
+    """≥3-lane lane-count limits are informative (wide→faster) and KEEP enforcing:
+    a 3-lane → 60 inferred limit lowers v_cruise as before (narrow=False)."""
+    self._sl(hook, 60, source=2, road='A', narrow=False)
+    r = hook.on_v_cruise(100 / 3.6, 100 / 3.6, self._sm())
+    assert r < 100 / 3.6                                  # enforced (lowered)
+    assert r == pytest.approx(60 * 1.15 / 3.6, abs=0.1)
+
+  def test_four_lane_inferred_still_enforces(self, hook):
+    """4-lane → 80 inferred limit still enforces (narrow=False)."""
+    self._sl(hook, 80, source=2, road='A', narrow=False)
+    r = hook.on_v_cruise(120 / 3.6, 120 / 3.6, self._sm())
+    assert r < 120 / 3.6
+    assert r == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
+
+  def test_gs_promote_still_enforces(self, hook):
+    """G/S expressway promote (S20 → 100, gs_osm, source 2, narrow=False) enforces
+    normally — the display-only rule only touches narrow-band lane guesses."""
+    self._sl(hook, 100, source=2, road='S20', narrow=False)
+    r = hook.on_v_cruise(130 / 3.6, 130 / 3.6, self._sm())
+    assert r < 130 / 3.6
+    assert r == pytest.approx(100 * 1.10 / 3.6, abs=0.1)
+
+  def test_safety_cap_enforces_regardless_of_narrow_flag(self, hook, monkeypatch):
+    """A safety cap (source 4) enforces immediately even if the narrow flag were
+    set — display-only requires source==2, so the a_y layer is never suppressed."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    self._sl(hook, 40, source=4, safety=True, road='A', narrow=True)
+    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
+    assert r == pytest.approx(40 / 3.6, abs=0.1)         # immediate, no offset
+
+  def test_manual_confirmed_enforces_regardless_of_narrow_flag(self, hook, monkeypatch):
+    """A non-inferred confirmed limit (source 1, driver's explicit choice) enforces
+    even if narrow=True — display-only only excludes source==2 lane guesses."""
+    t = [1000.0]
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+    self._sl(hook, 40, source=1, road='A', narrow=True)
+    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
 
 
 # ============================================================
@@ -1868,6 +1948,102 @@ class TestLaneCountFirstInference:
     mw.update()
     assert self._published(mw)['source'] == 2
     assert self._published(mw)['inferenceMode'] == 'lane_count'
+
+
+# ============================================================
+# Narrow-band lane-count limits are DISPLAY-ONLY (route 3d1 seg 29)
+# ============================================================
+
+class TestNarrowBandDisplayFlag:
+  """speedlimitd still PUBLISHES a ≤2-lane inferred limit for display (the driver
+  sees 40/30), but marks it laneCountNarrow=True so planner_hook excludes it from
+  enforcement. ≥3-lane limits and G/S promotes stay laneCountNarrow=False."""
+
+  def _mw(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def _result(self, **kw):
+    base = {'wayRef': '', 'wayName': '', 'speedLimit': 0.0, 'lanes': 0,
+            'roadContext': 1, 'roadName': '', 'highwayType': '', 'distance': 5.0}
+    base.update(kw)
+    return base
+
+  def _published(self, mw):
+    return mw._sl_pub.send.call_args[0][0]
+
+  def test_seg29_two_lane_displayed_but_flagged_narrow(self, sld):
+    """THE seg-29 case: non-G/S, 2 confident lanes → 40 is PUBLISHED for display
+    (speedLimit==40, source 2, not safety-capped) but flagged laneCountNarrow so
+    it never enforces."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 2
+    mw.update()
+    pub = self._published(mw)
+    assert pub['speedLimit'] == 40          # driver still SEES 40
+    assert pub['inferredSpeed'] == 40
+    assert pub['source'] == 2
+    assert pub['safetyCapped'] is False
+    assert pub['laneCountNarrow'] is True   # ...but excluded from enforcement
+    assert pub['inferenceMode'] == 'lane_count'
+
+  def test_one_lane_displayed_but_flagged_narrow(self, sld):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 1
+    mw.update()
+    pub = self._published(mw)
+    assert pub['speedLimit'] == 30
+    assert pub['laneCountNarrow'] is True
+
+  def test_three_lane_not_narrow(self, sld):
+    """3-lane → 60 is informative (wide→faster), enforcing: laneCountNarrow False."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    mw.update()
+    pub = self._published(mw)
+    assert pub['speedLimit'] == 60
+    assert pub['laneCountNarrow'] is False
+
+  def test_four_lane_not_narrow(self, sld):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    mw.update()
+    pub = self._published(mw)
+    assert pub['speedLimit'] == 80
+    assert pub['laneCountNarrow'] is False
+
+  def test_gs_promote_not_narrow(self, sld):
+    """G/S expressway promote is never narrow-band (gs_mode requires ≥3 lanes)."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    mw._ingest_osm_result(self._result(wayRef='S20', roadContext=0,
+                                       highwayType='trunk'))
+    mw.update()
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert pub['laneCountNarrow'] is False
+
+  def test_curve_cap_binds_not_narrow_even_at_two_lanes(self, sld):
+    """When a safety curve cap is the binding source (source 4) the displayed
+    limit is the cap, not the narrow guess, so laneCountNarrow is False — the flag
+    describes the PUBLISHED limit, and the safety cap must enforce."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 2               # base inference would be narrow 40
+    mw.curvature_cap = 30                  # raw curve cap binds lower, source 4
+    mw.update()
+    pub = self._published(mw)
+    assert pub['source'] == 4
+    assert pub['safetyCapped'] is True
+    assert pub['laneCountNarrow'] is False
 
 
 # ============================================================
