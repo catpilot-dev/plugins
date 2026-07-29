@@ -38,12 +38,32 @@ def speed_bin(v_mps):
   return int(v_mps * 3.6 // 10) * 10
 
 
-def _bin_medians(rows):
+def pitch_bias(rows):
+  """Constant offset in the recorded pitch channel.
+
+  `livePose.orientationNED.y` is the *device* pitch in NED: it carries the
+  windshield-mount tilt plus the calibration/attitude offset (~-6.5 deg on this
+  car), so an absolute |pitch| < PITCH_FLAT test rejects every burst. Road grade
+  is the deviation from that offset; over a large multi-route sample the true
+  grade distribution is ~centred on zero, so the median is the offset.
+  """
+  p = [r["pitch_rad"] for r in rows if not math.isnan(r["pitch_rad"])]
+  return float(np.median(p)) if p else 0.0
+
+
+def is_flat(row, bias):
+  return not math.isnan(row["pitch_rad"]) and \
+      abs(row["pitch_rad"] - bias) < PITCH_FLAT
+
+
+def _bin_medians(rows, bias=0.0):
   """(cmd, cadence, speed_bin) -> median delta_a, flat-pitch rows only."""
   groups = defaultdict(list)
   for r in rows:
-    if not math.isnan(r["pitch_rad"]) and abs(r["pitch_rad"]) < PITCH_FLAT:
-      groups[(r["cmd"], r["cadence"], speed_bin(r["v_start_mps"]))].append(delta_a(r))
+    d = delta_a(r)
+    if math.isnan(d) or not is_flat(r, bias):
+      continue   # NaN: burst at a segment edge, no pre-burst baseline window
+    groups[(r["cmd"], r["cadence"], speed_bin(r["v_start_mps"]))].append(d)
   return {k: float(np.median(v)) for k, v in groups.items()}
 
 
@@ -51,7 +71,9 @@ def generate(csv_path, out_dir):
   rows = load_bursts(csv_path)
   out_dir = Path(out_dir)
   out_dir.mkdir(parents=True, exist_ok=True)
-  medians = _bin_medians(rows)
+  bias = pitch_bias(rows)
+  medians = _bin_medians(rows, bias)
+  n_flat = sum(is_flat(r, bias) for r in rows)
 
   # response vs speed, one panel per command
   fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
@@ -79,12 +101,12 @@ def generate(csv_path, out_dir):
     xs, ys = [], []
     for r in rows:
       key = (r["cmd"], r["cadence"], speed_bin(r["v_start_mps"]))
-      if key in medians and not math.isnan(r[field]):
-        xs.append(r[field])
+      if key in medians and not math.isnan(r[field]) and not math.isnan(delta_a(r)):
+        xs.append(r[field] - bias if field == "pitch_rad" else r[field])
         ys.append(delta_a(r) - medians[key])
     ax.scatter(xs, ys, s=12, alpha=0.4)
     ax.axhline(0, color="k", lw=0.5)
-    ax.set_xlabel(field)
+    ax.set_xlabel(field + " (bias-removed)" if field == "pitch_rad" else field)
     ax.set_ylabel("Δaccel residual vs bin median (m/s²)")
     ax.grid(alpha=0.3)
     fig.savefig(out_dir / fname, dpi=120)
@@ -92,6 +114,9 @@ def generate(csv_path, out_dir):
 
   # summary tables
   lines = ["DCC response study summary", "=" * 40, "",
+           f"{len(rows)} clean bursts; pitch-channel bias {bias:+.4f} rad "
+           f"({math.degrees(bias):+.2f} deg), {n_flat} bursts within "
+           f"+/-{PITCH_FLAT} rad of it (flat-pitch set used for medians).", "",
            "Coverage (bursts per cmd x cadence x 10 km/h speed bin):"]
   bins = sorted({speed_bin(r["v_start_mps"]) for r in rows})
   lines.append(f"{'cmd':8s}{'cadence':8s}" + "".join(f"{b:>7d}" for b in bins))
