@@ -2,11 +2,11 @@
   "id": "bus_logger",
   "name": "Plugin Bus Logger",
   "version": "1.0.0",
-  "type": "process",
-  "author": "c3pilot",
+  "type": "hybrid",
+  "author": "catpilot",
   "description": "Logs all plugin bus messages to cereal for rlog capture and debugging.",
   "min_openpilot": "0.10.0",
-  "max_openpilot": "0.10.99",
+  "max_openpilot": "0.11.99",
   "cereal": {
     "slots": {
       "1": {
@@ -18,6 +18,13 @@
   },
   "services": {
     "pluginBusLog": [true, 5.0, 1]
+  },
+  "hooks": {
+    "device.health_check": {
+      "module": "hook",
+      "function": "on_health_check",
+      "priority": 50
+    }
   },
   "processes": [
     {

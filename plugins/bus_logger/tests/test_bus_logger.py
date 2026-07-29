@@ -69,8 +69,8 @@ class TestPluginJson:
   def test_id(self):
     assert self.cfg["id"] == "bus_logger"
 
-  def test_type_is_process(self):
-    assert self.cfg["type"] == "process"
+  def test_type_is_hybrid(self):
+    assert self.cfg["type"] == "hybrid"
 
   def test_service_definition(self):
     svc = self.cfg["services"]["pluginBusLog"]
