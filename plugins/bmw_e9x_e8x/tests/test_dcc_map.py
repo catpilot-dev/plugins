@@ -124,3 +124,62 @@ def test_commanded_setpoint_never_goes_below_min():
     step_kph = 5.0 if out == "minus5" else 1.0
     assert sp - step_kph / 3.6 >= min_sp - 1e-9, \
         f"{out} from setpoint {sp:.3f} would cross the {min_sp} m/s floor"
+
+
+# ---- safety regression tests ----
+
+def test_conflict_setpoint_below_floor_blocks_accel():
+  """When v_target < min_setpoint and decel is requested, the min-speed floor
+  must not trigger an ACCELERATION command.
+
+  Regression: with naive clamp(desired, min_setpoint) after clamp(desired, v_target),
+  desired could be pushed above v_target, causing acceleration when both the
+  planner and the controller ask for decel. This is a hard safety violation:
+  it overrides the planner while the car is descending, leaving an unsafe
+  target if openpilot disengages.
+  """
+  # Simulates: v_ego=10 m/s, setpoint=8.9 m/s, v_target=4.0 m/s (near stop),
+  # min_setpoint=9.72 m/s (35 km/h cruise floor), a_target=-0.8 m/s^2 (decel requested).
+  # The brief's code would return 'plus1' here.
+  assert cmd(-0.8, 10.0, 8.9, 4.0, 9.72) is None
+
+
+def test_conflict_setpoint_above_floor_allows_decel():
+  """When v_target < min_setpoint but setpoint is still above the floor,
+  deceleration toward the floor must still work.
+  """
+  # Simulates: same scenario but setpoint=13.0 m/s is still above floor.
+  # This should allow a decel command toward the floor.
+  assert cmd(-0.8, 13.9, 13.0, 4.0, 9.72) == "minus5"
+
+
+def test_nan_guards():
+  """NaN in any argument must return None, not propagate through interpolation."""
+  import math
+  v, sp, vt, min_sp = 20.0, 20.0, 25.0, 5.0
+  assert cmd(math.nan, v, sp, vt, min_sp) is None
+  assert cmd(0.0, math.nan, sp, vt, min_sp) is None
+  assert cmd(0.0, v, math.nan, vt, min_sp) is None
+  assert cmd(0.0, v, sp, math.nan, min_sp) is None
+  assert cmd(0.0, v, sp, vt, math.nan) is None
+
+
+def test_floor_never_causes_accel_above_v_target():
+  """Invariant: when v_target < min_setpoint, never emit 'plus1' or 'plus5'.
+
+  The min-speed floor is an availability concern, not a safety override.
+  When the planner's target is below the floor, we may need to hold the floor
+  (for deceleration toward it), but we must never raise the setpoint above
+  what the planner asked for.
+  """
+  min_sp = 9.72  # 35 km/h cruise floor
+  for v_ego in [8.0, 10.0, 15.0, 20.0]:
+    for v_target in [0.0, 2.0, 4.0, 5.0]:
+      if v_target >= min_sp:
+        continue  # not testing this case
+      for a_target in [-2.0, -1.0, -0.5, 0.0, 0.5]:
+        for setpoint in [min_sp - 0.5, min_sp, min_sp + 0.5, min_sp + 1.0]:
+          result = cmd(a_target, v_ego, setpoint, v_target, min_sp)
+          assert result not in ("plus1", "plus5"), \
+              f"floor override: a_target={a_target}, v_ego={v_ego}, setpoint={setpoint:.2f}, " \
+              f"v_target={v_target}, min_sp={min_sp} -> {result}"

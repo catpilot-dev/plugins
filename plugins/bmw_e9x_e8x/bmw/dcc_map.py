@@ -7,6 +7,8 @@ requested acceleration into the gap that delivers it.
 
 Open-loop by design: nothing here consumes measured aEgo.
 """
+import math
+
 from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 MS_TO_KPH = 3.6                # local literal: this module must not import opendbc
@@ -59,12 +61,22 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
 
   Open-loop on the map: measured aEgo is deliberately not an input.
   """
+  # Guard against NaN inputs
+  if any(math.isnan(x) for x in [a_target, v_ego, setpoint, v_target, min_setpoint]):
+    return None
+
   desired = v_ego + gap_for_accel(a_target, v_ego)
   desired = min(desired, v_target)        # never target above the planner's speed
   desired = max(desired, min_setpoint)    # never strand the car below min cruise
   err_kph = (desired - setpoint) * MS_TO_KPH
 
   if abs(err_kph) < SETPOINT_DEADBAND_KPH:
+    return None
+  # The min-speed floor can push `desired` back above what the planner asked
+  # for (v_target < min_setpoint, e.g. decelerating toward a stop). Honour the
+  # floor for decel, but never let it become an ACCELERATION command — that
+  # would fight the planner and leave an unsafe target if openpilot dropped out.
+  if desired > v_target and err_kph > 0:
     return None
   if err_kph > 0:
     return 'plus5' if err_kph >= 5.0 else 'plus1'
