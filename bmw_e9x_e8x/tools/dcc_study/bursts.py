@@ -79,3 +79,96 @@ def is_contaminated(burst, seg):
     if len(seg["tx_t"]) == 0 or np.min(np.abs(seg["tx_t"] - rt)) > HUMAN_MATCH_S:
       return True
   return False
+
+
+def _mean_in(t, y, lo, hi):
+  m = (t >= lo) & (t < hi)
+  return float(np.mean(y[m])) if np.any(m) else float("nan")
+
+
+def measure(burst, seg):
+  cs_t, aEgo = seg["cs_t"], seg["aEgo"]
+  t0, t1 = burst.t_start, burst.t_end
+  sign = 1.0 if CMD_STEP[burst.cmd] > 0 else -1.0
+
+  burst.a_baseline = _mean_in(cs_t, aEgo, t0 - PAD_PRE, t0)
+  burst.v_start = float(np.interp(t0, cs_t, seg["vEgo"]))
+  burst.setpoint_gap = float(np.interp(t0 - 0.1, cs_t, seg["setpoint"])) - burst.v_start
+
+  win = (cs_t >= t0) & (cs_t <= t1 + PAD_POST)
+  delta = (aEgo[win] - burst.a_baseline) * sign          # response, positive = "as commanded"
+  if len(delta):
+    burst.peak_delta_a = float(np.max(delta)) * sign
+  if burst.duration >= STEADY_MIN_DUR:
+    steady = _mean_in(cs_t, aEgo, t0 + STEADY_SKIP, t1) - burst.a_baseline
+    burst.steady_delta_a = steady
+    target = abs(steady) * 0.63
+    tw = cs_t[win]
+    reached = np.nonzero(delta >= target)[0] if not np.isnan(steady) else []
+    if len(reached):
+      burst.rise_time = float(tw[reached[0]] - t0)
+
+  sp0 = np.interp(t0 - 0.1, cs_t, seg["setpoint"])
+  sp1 = np.interp(t1 + 0.5, cs_t, seg["setpoint"])
+  burst.ticks_accepted = int(round((sp1 - sp0) * 3.6 / CMD_STEP[burst.cmd]))
+
+  if len(seg["pose_t"]):
+    burst.pitch_mean = _mean_in(seg["pose_t"], seg["pitch"], t0 - PAD_PRE, t1 + PAD_POST)
+  return burst
+
+
+CSV_FIELDS = ("route", "segment", "t_start", "duration_s", "cmd", "cadence",
+              "n_frames", "v_start_mps", "setpoint_gap_mps", "pitch_rad",
+              "a_baseline", "peak_delta_a", "steady_delta_a", "rise_time_s",
+              "ticks_accepted")
+
+
+def burst_row(burst, route, segment):
+  return {"route": route, "segment": segment, "t_start": round(burst.t_start, 3),
+          "duration_s": round(burst.duration, 3), "cmd": burst.cmd,
+          "cadence": burst.cadence, "n_frames": burst.n_frames,
+          "v_start_mps": round(burst.v_start, 3),
+          "setpoint_gap_mps": round(burst.setpoint_gap, 3),
+          "pitch_rad": round(burst.pitch_mean, 5),
+          "a_baseline": round(burst.a_baseline, 4),
+          "peak_delta_a": round(burst.peak_delta_a, 4),
+          "steady_delta_a": round(burst.steady_delta_a, 4),
+          "rise_time_s": round(burst.rise_time, 3),
+          "ticks_accepted": burst.ticks_accepted}
+
+
+def write_csv(rows, path):
+  with open(path, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+    w.writeheader()
+    w.writerows(rows)
+
+
+def main():
+  p = argparse.ArgumentParser()
+  p.add_argument("--extracted", default=EXTRACTED_DIR, type=Path)
+  args = p.parse_args()
+
+  PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+  rows, kept, dropped = [], 0, 0
+  for npz in sorted(args.extracted.glob("*.npz")):
+    seg = dict(np.load(npz))
+    route, _, segment = npz.stem.rpartition("--")
+    for i, b in enumerate(find_bursts(seg)):
+      if is_contaminated(b, seg):
+        dropped += 1
+        continue
+      measure(b, seg)
+      rows.append(burst_row(b, route, segment))
+      win = (seg["cs_t"] >= b.t_start - PAD_PRE) & (seg["cs_t"] <= b.t_end + PAD_POST)
+      np.savez_compressed(PROFILES_DIR / f"{npz.stem}--{i}.npz",
+                          t=seg["cs_t"][win] - b.t_start, aEgo=seg["aEgo"][win])
+      kept += 1
+  if not rows:
+    sys.exit("no clean bursts found — check extraction output")
+  write_csv(rows, DATA_DIR / "bursts.csv")
+  print(f"{kept} bursts kept, {dropped} contaminated -> {DATA_DIR / 'bursts.csv'}")
+
+
+if __name__ == "__main__":
+  main()
