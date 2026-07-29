@@ -304,6 +304,56 @@ the current behaviour, and it degrades to exactly today's behaviour whenever
 `aTarget` is large. It also inherits the existing `setpoint_error > 0` guard
 rather than fighting it.
 
+### Can the stalk actually track `aTarget`? Yes — and the rate limit picks the command
+
+The stalk moves the setpoint in 1 or 5 km/h ticks at DCC's own ~2.5–4.5 ticks/s,
+so there is a hard ceiling on how fast `aEgo` can be steered. Measured plant
+gain over 666 k samples in the responsive band (gap 0.2…2.0 m/s):
+**d(aEgo)/d(gap) ≈ 0.313 m/s² per m/s of gap.** Converting tick rate to
+acceleration rate, against how fast the planner's `aTarget` actually moves
+(157 segments, 49 k samples):
+
+| | d(aEgo)/dt ceiling |
+|---|---:|
+| `±1` @ 2.5–4.5 ticks/s | **0.22 – 0.39 m/s³** |
+| `±5` @ 2.5–4.5 ticks/s | **1.09 – 1.96 m/s³** |
+
+| `aTarget` rate of change | p50 | p90 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| \|d(aTarget)/dt\| (m/s³) | 0.075 | 0.256 | 0.353 | 0.778 |
+
+**`±1` alone covers the planner's demand up to about the 90th percentile; `±5`
+covers beyond the 99th.** Tracking is feasible, and this is the honest,
+non-arbitrary reason to keep both commands: they are *slew-rate* selections, not
+acceleration selections.
+
+### The resulting control law
+
+Everything above collapses into one quantity — the setpoint error in km/h, which
+is literally the number of ticks still owed:
+
+    gap_required   = f⁻¹(aTarget, vEgo)                      # invert the steady-state map
+    setpoint_des   = min(vEgo + gap_required, v_target)      # never above v_target
+    err_kph        = (setpoint_des − cruiseState.speed) * 3.6
+
+    |err_kph| ≥ 5  → plus5 / minus5      (need to move ≥ 5 km/h)
+    |err_kph| ≥ 1  → plus1 / minus1
+    otherwise      → no command (deadband)
+
+This replaces **both** hand-tuned ladders. `ACCEL_STEP5_THRESHOLD` /
+`DECEL_STEP5_THRESHOLD` become "is at least one 5 km/h tick owed", which is not a
+tuned constant but an arithmetic fact. `ACCEL_HOLD_THRESHOLD` /
+`DECEL_HOLD_THRESHOLD` disappear entirely, since cadence is inert (§3, §5).
+
+**Known remaining unknown:** `f` is a *steady-state* map. DCC's transient lag
+between a gap change and the resulting acceleration was not measured, and it adds
+phase that this open-loop inversion does not compensate. The margin is
+comfortable — `aTarget` moves at 0.075 m/s³ median against a `±1` ceiling of
+0.22–0.39 — but a first on-car run should watch for lag-driven overshoot before
+the deadband is tightened. Note also that measured `aEgo` is far noisier than
+`aTarget` (p50 rate 0.72 vs 0.075 m/s³), so `aEgo` must not be used as a
+tracking error signal; that would be approach C, which the data does not support.
+
 **Two constraints B′ must respect** (added at controller review, not from the
 run itself):
 
