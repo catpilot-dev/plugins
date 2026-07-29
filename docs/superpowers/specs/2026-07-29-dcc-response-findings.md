@@ -257,6 +257,53 @@ contradicted on two of three axes by the data:
 - Keep hysteresis as sketched — the crossovers move to gap thresholds but the
   hunting risk is unchanged.
 
+### The gap is already known — and that exposes what B′ is really for
+
+`v_target` (`actuators.speed`) was not in the Phase-1 extraction, so this was
+re-measured directly from 14 segments of route `2026-07-29--09-00-20`
+(46 347 engaged clean samples):
+
+| quantity | corr with `aEgo` |
+|---|---:|
+| actual gap (`cruiseState.speed − vEgo`) | **+0.826** |
+| commanded gap (`v_target − vEgo`) | +0.699 |
+| `aTarget` (`actuators.accel`) | +0.618 |
+
+Both gaps are already available in `carcontroller.py` today with zero new
+plumbing — `v_target` as `actuators.speed`, the actual setpoint as
+`CS.out.cruiseState.speed`. The actual gap is the better predictor and is the
+causal one, so the map should be keyed on it; the commanded gap is the useful
+*bound* (see below).
+
+**The two gaps nearly coincide, and that is the finding.**
+median(`v_target − cruiseState.speed`) = **−0.048 m/s**, |difference| < 0.2 m/s
+in 61 % of samples and < 0.5 m/s in 83 %; even while actively demanding
+acceleration (`gap_cmd > 1.0`) the median offset is only +0.084 m/s. The
+existing controller already slews the setpoint onto `v_target` and keeps it
+there.
+
+The consequence is uncomfortable but clarifying: **today the achieved
+acceleration is essentially determined by `v_target` alone.** Because the
+setpoint converges on `v_target` within ~0.05 m/s, the gap — and therefore the
+accel — is fixed by the speed request, and the `aTarget` threshold ladder only
+changes how fast that convergence happens. That is why `aTarget` correlates
+worst of the three with what the car actually does. openpilot currently has
+very little authority over the longitudinal *profile*, only over the
+destination speed.
+
+So B′ is not "compute a setpoint" — the setpoint already goes to the right
+place. **B′ is deliberately holding the setpoint _short_ of `v_target` when the
+full gap would produce more acceleration than `aTarget` wants:**
+
+    gap_required = f⁻¹(aTarget, vEgo)
+    setpoint_cmd = min(vEgo + gap_required, v_target)     # never above v_target
+
+The `min` is the whole safety story. B′ only ever commands a setpoint at or
+below what today's code would reach, so it is strictly more conservative than
+the current behaviour, and it degrades to exactly today's behaviour whenever
+`aTarget` is large. It also inherits the existing `setpoint_error > 0` guard
+rather than fighting it.
+
 **Two constraints B′ must respect** (added at controller review, not from the
 run itself):
 
