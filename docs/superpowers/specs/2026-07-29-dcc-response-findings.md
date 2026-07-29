@@ -427,7 +427,15 @@ residual_vs_setpoint_gap, residual_vs_pitch}.png`
 | 2026-07-24--18-20-04 | 157 | | | |
 
 Every route on the device with `engagement_pct ≥ 1` was used; older routes report
-no engagement metric (rlogs aged out) and were skipped.
+no engagement metric and were skipped. **Caveat on that skip:** COD computes
+`engagement_pct` only opportunistically (when a route's events are already
+cached from being opened in the Connect UI), and nothing backfills it, so a
+missing metric means "never computed" — which is *not* the same as "not
+engaged". Some skipped older routes may have contained usable bursts. This does
+not threaten the conclusions (the newest-13-only re-analysis in §Routes gives
+the same curve), but the sample is "routes with a cached engagement metric",
+not "all engaged routes". `fetch_routes.py` currently logs both cases
+identically; distinguishing them is a known follow-up.
 
 The three pre-2026-07-21 routes (2026-07-09 ×2 and 2026-07-05, 2451 bursts / 34 %
 of the sample) predate three weeks of controller changes. Re-running the §4
