@@ -49,11 +49,12 @@ def tracker_module(tmp_path, monkeypatch, mock_openpilot):
 
 class MockSM(dict):
   def __init__(self, v_ego=0.0, enabled=False, gps_updated=False, gps_lat=0.0, gps_lng=0.0, gps_flags=0,
-               device_state_updated=True):
+               device_state_updated=True, gps_ts_ms=0):
     super().__init__({
       'carState': SimpleNamespace(vEgo=v_ego),
       'selfdriveState': SimpleNamespace(enabled=enabled),
-      'gpsLocationExternal': SimpleNamespace(flags=gps_flags, latitude=gps_lat, longitude=gps_lng),
+      'gpsLocationExternal': SimpleNamespace(flags=gps_flags, latitude=gps_lat, longitude=gps_lng,
+                                              unixTimestampMillis=gps_ts_ms),
     })
     self.updated = {'gpsLocationExternal': gps_updated, 'deviceState': device_state_updated}
 
@@ -108,6 +109,7 @@ class TestDriveTracker:
     t.tick(sm)
 
     assert t._engaged_s > 0
+    assert t._engaged_m == pytest.approx(5.0, abs=0.5)  # 10 m/s * 0.5s
 
   def test_tick_not_engaged(self, tracker_module):
     t = tracker_module.DriveTracker()
@@ -118,6 +120,7 @@ class TestDriveTracker:
     t.tick(sm)
 
     assert t._engaged_s == 0.0
+    assert t._engaged_m == 0.0
 
   def test_tick_captures_gps(self, tracker_module):
     t = tracker_module.DriveTracker()
@@ -147,6 +150,41 @@ class TestDriveTracker:
 
     assert t._start_lat == 39.9  # unchanged
     assert t._end_lat == 40.0    # updated
+
+  def test_gps_time_captured_on_first_fix(self, tracker_module):
+    t = tracker_module.DriveTracker()
+    t._reset()
+
+    sm = make_sm(v_ego=10.0, gps_updated=True, gps_lat=39.9, gps_lng=116.4, gps_flags=1,
+                  gps_ts_ms=1_000_000_000)
+    ready_tick(t)
+    t.tick(sm)
+
+    assert t._gps_time == pytest.approx(1_000_000.0)
+
+  def test_gps_time_first_fix_not_overwritten(self, tracker_module):
+    t = tracker_module.DriveTracker()
+    t._reset()
+
+    # First fix
+    sm = make_sm(v_ego=10.0, gps_updated=True, gps_lat=39.9, gps_lng=116.4, gps_flags=1,
+                  gps_ts_ms=1_000_000_000)
+    ready_tick(t)
+    t.tick(sm)
+
+    # Second fix, different timestamp — must not overwrite the first
+    sm = make_sm(v_ego=10.0, gps_updated=True, gps_lat=40.0, gps_lng=116.5, gps_flags=1,
+                  gps_ts_ms=2_000_000_000)
+    ready_tick(t)
+    t.tick(sm)
+
+    assert t._gps_time == pytest.approx(1_000_000.0)
+
+  def test_gps_time_unset_without_fix(self, tracker_module):
+    t = tracker_module.DriveTracker()
+    t._reset()
+
+    assert t._gps_time == 0.0
 
   def test_gps_no_fix_ignored(self, tracker_module):
     t = tracker_module.DriveTracker()
@@ -185,6 +223,7 @@ class TestDriveTracker:
     t._duration_s = 120.0
     t._distance_m = 5000.0
     t._engaged_s = 100.0
+    t._engaged_m = 4000.0
     t._has_gps = True
     t._start_lat = 39.9
     t._start_lng = 116.4
@@ -198,6 +237,7 @@ class TestDriveTracker:
     assert data['duration_s'] == 120.0
     assert data['distance_m'] == 5000.0
     assert data['engaged_s'] == 100.0
+    assert data['engaged_m'] == 4000.0
     assert data['has_gps'] is True
     assert data['start_lat'] == 39.9
     assert data['end_lat'] == 40.0
@@ -239,11 +279,13 @@ class TestDriveTracker:
     t._distance_m = 500.0
     t._duration_s = 30.0
     t._engaged_s = 20.0
+    t._engaged_m = 400.0
 
     s = t.summary
     assert s['distance_m'] == 500.0
     assert s['duration_s'] == 30.0
     assert s['engaged_s'] == 20.0
+    assert s['engaged_m'] == 400.0
 
   def test_summary_returns_none_when_inactive(self, tracker_module):
     t = tracker_module.DriveTracker()
@@ -305,6 +347,79 @@ class TestDriveTracker:
     assert len(data['trace']) == 3
     assert data['trace'][0] == [39.9, 116.4]
 
+  def test_save_preserves_previous_trace_when_no_gps(self, tracker_module):
+    """Drive with no GPS lock keeps previous drive's trace in the saved file."""
+    # Write a previous drive with a GPS trace
+    prev = {
+      'version': 1, 'has_gps': True,
+      'trace': [[39.9, 116.4], [39.91, 116.41]],
+      'start_lat': 39.9, 'start_lng': 116.4,
+      'end_lat': 39.91, 'end_lng': 116.41,
+      'duration_s': 60.0, 'distance_m': 500.0, 'engaged_s': 30.0,
+    }
+    with open(tracker_module._last_drive_file, 'w') as f:
+      json.dump(prev, f)
+
+    # New drive: sufficient length but no GPS
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 50.0
+    t._distance_m = 800.0
+    t._has_gps = False
+    t._trace = []
+    t._save()
+
+    data = json.loads(open(tracker_module._last_drive_file).read())
+    # New drive stats should be saved
+    assert data['duration_s'] == 50.0
+    assert data['distance_m'] == 800.0
+    # GPS trace carried over from previous drive
+    assert data['has_gps'] is True
+    assert len(data['trace']) == 2
+    assert data['start_lat'] == 39.9
+    assert data['end_lat'] == 39.91
+
+  def test_save_includes_gps_time_when_captured(self, tracker_module, monkeypatch):
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 60.0
+    t._distance_m = 1000.0
+    t._gps_time = 1_000_000.123
+
+    posted = {}
+    monkeypatch.setattr(t, '_post_stats', lambda data: posted.update(data))
+
+    t._save()
+
+    assert posted['gps_time'] == pytest.approx(1_000_000.123)
+
+  def test_save_gps_time_none_when_no_fix(self, tracker_module, monkeypatch):
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 60.0
+    t._distance_m = 1000.0
+
+    posted = {}
+    monkeypatch.setattr(t, '_post_stats', lambda data: posted.update(data))
+
+    t._save()
+
+    assert posted['gps_time'] is None
+
+  def test_save_no_gps_no_previous_trace(self, tracker_module):
+    """Drive with no GPS and no previous drive: trace stays empty."""
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 50.0
+    t._distance_m = 800.0
+    t._has_gps = False
+    t._trace = []
+    t._save()
+
+    data = json.loads(open(tracker_module._last_drive_file).read())
+    assert data['has_gps'] is False
+    assert data['trace'] == []
+
 
 # ============================================================
 # get_last_drive
@@ -324,3 +439,223 @@ class TestGetLastDrive:
     with open(tracker_module._last_drive_file, 'w') as f:
       f.write('garbage{{{')
     assert tracker_module.get_last_drive() is None
+
+
+# ============================================================
+# _resolve_route_id / _post_stats (COD drive-stats POST)
+# ============================================================
+
+class TestResolveRouteId:
+  def test_strips_segment_suffix_of_newest_dir(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    names = ['00000385--6e363981a3--6', '00000385--6e363981a3--7', '00000385--6e363981a3--8']
+    for i, name in enumerate(names):
+      p = root / name
+      p.mkdir()
+      # force strictly increasing mtimes so the last one created is unambiguously newest
+      mtime = time.time() + i
+      os.utime(p, (mtime, mtime))
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    assert mod._resolve_route_id() == '00000385--6e363981a3'
+
+  def test_none_when_empty(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    assert mod._resolve_route_id() is None
+
+  def test_none_when_root_missing(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    missing = tmp_path / 'does_not_exist'
+    monkeypatch.setattr(mod, '_log_root', lambda: str(missing))
+
+    assert mod._resolve_route_id() is None
+
+  def test_falls_back_to_dir_name_without_segment_suffix(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / 'not_a_route_dir').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    assert mod._resolve_route_id() == 'not_a_route_dir'
+
+
+class FakeThread:
+  """Records construction args and runs target synchronously on start()."""
+  instances = []
+
+  def __init__(self, target=None, daemon=None):
+    self.target = target
+    self.daemon = daemon
+    FakeThread.instances.append(self)
+
+  def start(self):
+    self.started = True
+    self.target()
+
+
+class TestPostStats:
+  def test_posts_expected_url_and_payload(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / '00000385--6e363981a3--8').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    mock_urlopen = MagicMock()
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', mock_urlopen)
+
+    t = mod.DriveTracker()
+    data = {'distance_m': 1000.0, 'duration_s': 60.0, 'engaged_m': 900.0, 'engaged_s': 55.0}
+    t._post_stats(data)
+
+    assert len(FakeThread.instances) == 1
+    th = FakeThread.instances[0]
+    assert th.daemon is True
+    assert getattr(th, 'started', False) is True
+
+    assert mock_urlopen.called
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == 'http://localhost/v1/route/00000385--6e363981a3/drive_stats'
+    assert req.get_method() == 'POST'
+    assert req.get_header('Content-type') == 'application/json'
+    body = json.loads(req.data.decode())
+    assert body == data
+
+  def test_payload_includes_gps_time_when_present(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / '00000385--6e363981a3--8').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    mock_urlopen = MagicMock()
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', mock_urlopen)
+
+    t = mod.DriveTracker()
+    data = {'distance_m': 1000.0, 'duration_s': 60.0, 'engaged_m': 900.0, 'engaged_s': 55.0,
+            'gps_time': 1_000_000.0}
+    t._post_stats(data)
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data.decode())
+    assert body['gps_time'] == 1_000_000.0
+
+  def test_payload_omits_gps_time_when_absent(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / '00000385--6e363981a3--8').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    mock_urlopen = MagicMock()
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', mock_urlopen)
+
+    t = mod.DriveTracker()
+    data = {'distance_m': 1000.0, 'duration_s': 60.0, 'engaged_m': 900.0, 'engaged_s': 55.0,
+            'gps_time': None}
+    t._post_stats(data)
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data.decode())
+    assert 'gps_time' not in body
+
+  def test_noop_when_no_route_id(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()  # empty -> no route id
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+
+    t = mod.DriveTracker()
+    t._post_stats({'distance_m': 1.0, 'duration_s': 1.0, 'engaged_m': 1.0, 'engaged_s': 1.0})
+
+    assert FakeThread.instances == []
+
+  def test_swallows_network_errors(self, tracker_module, tmp_path, monkeypatch):
+    mod = tracker_module
+    root = tmp_path / 'realdata'
+    root.mkdir()
+    (root / '00000385--6e363981a3--8').mkdir()
+    monkeypatch.setattr(mod, '_log_root', lambda: str(root))
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', MagicMock(side_effect=OSError('boom')))
+
+    t = mod.DriveTracker()
+    # Must not raise even though the network call fails inside the (synchronously-run) thread target.
+    t._post_stats({'distance_m': 1.0, 'duration_s': 1.0, 'engaged_m': 1.0, 'engaged_s': 1.0})
+
+  def test_swallows_non_oserror_from_log_root(self, tracker_module, monkeypatch):
+    """The best-effort boundary lives in _post_stats: a non-OSError raised by
+    _log_root (e.g. ImportError when openpilot isn't importable) must NOT
+    propagate out and must NOT attempt a POST. _resolve_route_id only catches
+    OSError, so this proves _post_stats' own guard is what swallows it.
+    """
+    mod = tracker_module
+
+    def boom():
+      raise ImportError('openpilot not available')
+    monkeypatch.setattr(mod, '_log_root', boom)
+
+    FakeThread.instances = []
+    monkeypatch.setattr(mod.threading, 'Thread', FakeThread)
+    mock_urlopen = MagicMock()
+    mock_request = MagicMock()
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', mock_urlopen)
+    monkeypatch.setattr(mod.urllib.request, 'Request', mock_request)
+
+    t = mod.DriveTracker()
+    # Must not raise despite the non-OSError from _log_root.
+    t._post_stats({'distance_m': 1.0, 'duration_s': 1.0, 'engaged_m': 1.0, 'engaged_s': 1.0})
+
+    assert FakeThread.instances == []
+    assert not mock_urlopen.called
+    assert not mock_request.called
+
+
+class TestSavePostsStats:
+  def test_save_calls_post_stats_with_summary_fields(self, tracker_module, monkeypatch):
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 60.0
+    t._distance_m = 1000.0
+    t._engaged_s = 50.0
+    t._engaged_m = 900.0
+
+    posted = {}
+    monkeypatch.setattr(t, '_post_stats', lambda data: posted.update(data))
+
+    t._save()
+
+    assert posted['distance_m'] == 1000.0
+    assert posted['duration_s'] == 60.0
+    assert posted['engaged_s'] == 50.0
+    assert posted['engaged_m'] == 900.0
+
+  def test_save_skips_post_stats_for_short_drive(self, tracker_module, monkeypatch):
+    t = tracker_module.DriveTracker()
+    t._reset()
+    t._duration_s = 3.0  # below MIN threshold -> _save returns early
+
+    called = []
+    monkeypatch.setattr(t, '_post_stats', lambda data: called.append(data))
+
+    t._save()
+
+    assert called == []
