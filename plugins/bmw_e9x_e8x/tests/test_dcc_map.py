@@ -164,6 +164,55 @@ def test_nan_guards():
   assert cmd(0.0, v, sp, vt, math.nan) is None
 
 
+def test_inf_guard():
+  """Infinity in any argument must also return None (finiteness guard, not just NaN)."""
+  v, sp, vt, min_sp = 20.0, 20.0, 25.0, 5.0
+  assert cmd(float('inf'), v, sp, vt, min_sp) is None
+  assert cmd(float('-inf'), v, sp, vt, min_sp) is None
+
+
+def test_floor_never_raises_setpoint_when_desired_raw_is_below_it():
+  """The min-speed floor may hold the setpoint up but must never RAISE it above
+  what the planner actually asked for (desired_raw).
+
+  Regression: v_target >= min_setpoint but v_ego + gap_for_accel(...) <
+  min_setpoint (i.e. desired_raw < min_setpoint). The old guard
+  `desired > v_target and err_kph > 0` never fired here because desired was
+  clamped to <= v_target, yet the min_setpoint floor still pushed `desired`
+  above the current setpoint, emitting an upward tick while a_target was
+  negative — fighting a planner that is actively decelerating.
+  """
+  assert cmd(-1.0, 11.0, 9.17, 10.5, 9.72) is None
+
+
+def test_floor_raise_invariant_sweep():
+  """Invariant sweep over the grid where v_target >= min_setpoint but the raw
+  desired setpoint (v_ego + gap_for_accel(...), before the floor clamp) sits
+  below min_setpoint — i.e. the floor is actually engaging. Within that grid,
+  whenever a_target < 0 and desired_raw < setpoint, no plus command may ever
+  be emitted: the floor must hold the setpoint, never raise it against a
+  planner that is asking for less than what's already commanded.
+  """
+  min_sp = 9.72  # 35 km/h cruise floor
+  checked = 0
+  for v_ego in [8.0, 8.5, 9.0, 9.5, 10.0, 11.0, 12.0]:
+    for v_target in [min_sp, min_sp + 0.5, min_sp + 2.0, min_sp + 5.0]:
+      for a_target in [-3.0, -2.0, -1.0, -0.5, -0.1]:
+        desired_raw = min(v_ego + gap_for_accel(a_target, v_ego), v_target)
+        if desired_raw >= min_sp:
+          continue  # floor isn't actually engaging on this grid point
+        for setpoint in [min_sp - 0.5, min_sp, min_sp + 0.5, min_sp + 1.0, min_sp + 2.0]:
+          if not (a_target < 0 and desired_raw < setpoint):
+            continue  # outside the invariant's precondition
+          checked += 1
+          result = cmd(a_target, v_ego, setpoint, v_target, min_sp)
+          assert result not in ("plus1", "plus5"), \
+              f"floor raised setpoint against planner: a_target={a_target}, " \
+              f"v_ego={v_ego}, setpoint={setpoint:.2f}, v_target={v_target}, " \
+              f"desired_raw={desired_raw:.3f} < setpoint={setpoint:.2f} -> {result}"
+  assert checked > 0, "sweep grid produced no cases matching the invariant precondition"
+
+
 def test_floor_never_causes_accel_above_v_target():
   """Invariant: when v_target < min_setpoint, never emit 'plus1' or 'plus5'.
 

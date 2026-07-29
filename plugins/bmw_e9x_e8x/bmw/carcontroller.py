@@ -33,7 +33,9 @@ CRUISE_STALK_IDLE_TICK_STOCK = 0.2
 # At burst end, DCC accepts SZL's resumption only if (1 + M − K) mod 15 ∈ [1,7]
 # where M = slots overwritten, K = total frames. Until that holds, keep
 # transmitting (with neutral act=0 if openpilot has stopped commanding).
-HOLD_INTERVAL = 0.025         # 40 Hz — used when commanded accel ≥ ACCEL_HOLD_THRESHOLD
+HOLD_INTERVAL = 0.025         # 40 Hz — retained for reference only; the setpoint-error
+                              # law always transmits at SINGLE_INTERVAL (cadence was
+                              # measured to have no effect on DCC's response)
 SINGLE_INTERVAL = 0.050       # 20 Hz — single-press cadence
 PRE_TICK_LEAD = 0.015         # lead window 15 ms — wide enough to catch ≥1 OP cycle (10 ms) with phase jitter
 BURST_LIVE_WINDOW = 0.5       # s — burst considered "live" until this long without TX
@@ -171,9 +173,9 @@ class CarController(CarControllerBase):
         if CS.out.gasPressed:
           cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL)
         else:
-          cmd_name = select_cruise_command(accel, v_current,
-                                           CS.out.cruiseState.speed, v_target,
-                                           self.min_cruise_setpoint)
+          cmd_name = select_cruise_command(a_target=accel, v_ego=v_current,
+                                           setpoint=CS.out.cruiseState.speed, v_target=v_target,
+                                           min_setpoint=self.min_cruise_setpoint)
           if cmd_name is not None and abs(v_error) > V_ERROR_DEADZONE:
             cruise_cmd(getattr(CruiseStalk, cmd_name), CMD_INTERVAL)
 

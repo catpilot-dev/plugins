@@ -61,22 +61,20 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
 
   Open-loop on the map: measured aEgo is deliberately not an input.
   """
-  # Guard against NaN inputs
-  if any(math.isnan(x) for x in [a_target, v_ego, setpoint, v_target, min_setpoint]):
+  # Guard against non-finite inputs (NaN or +/-inf)
+  if any(not math.isfinite(x) for x in [a_target, v_ego, setpoint, v_target, min_setpoint]):
     return None
 
-  desired = v_ego + gap_for_accel(a_target, v_ego)
-  desired = min(desired, v_target)        # never target above the planner's speed
-  desired = max(desired, min_setpoint)    # never strand the car below min cruise
+  desired_raw = min(v_ego + gap_for_accel(a_target, v_ego), v_target)
+  desired = max(desired_raw, min_setpoint)
   err_kph = (desired - setpoint) * MS_TO_KPH
 
   if abs(err_kph) < SETPOINT_DEADBAND_KPH:
     return None
-  # The min-speed floor can push `desired` back above what the planner asked
-  # for (v_target < min_setpoint, e.g. decelerating toward a stop). Honour the
-  # floor for decel, but never let it become an ACCELERATION command — that
-  # would fight the planner and leave an unsafe target if openpilot dropped out.
-  if desired > v_target and err_kph > 0:
+  # The min-speed floor may hold the setpoint up, but it must never RAISE it:
+  # desired_raw is what the planner actually asked for, so if that is already
+  # below the current setpoint an upward tick would fight the planner.
+  if err_kph > 0 and desired_raw < setpoint:
     return None
   if err_kph > 0:
     return 'plus5' if err_kph >= 5.0 else 'plus1'
