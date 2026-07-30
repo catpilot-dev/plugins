@@ -271,9 +271,27 @@ def test_gate_suppresses_plus_inside_deadzone():
   assert cmd(0.3, 20.0, 18.0, 20.1, 5.0) is None
 
 
-def test_gate_suppresses_minus_inside_deadzone():
-  """v_error is inside the deadzone even though err_kph < 0 and a_target < 0."""
-  assert cmd(-0.3, 20.0, 22.0, 19.9, 5.0) is None
+def test_gate_now_allows_minus_inside_old_symmetric_deadzone():
+  """Behaviour change: v_error = -0.1 (v_target=19.9, v_ego=20.0) sits inside
+  the OLD symmetric deadzone [-V_ERROR_DEADZONE, +V_ERROR_DEADZONE], so this
+  used to be suppressed. The gate is now asymmetric -- braking only requires
+  v_error < +V_ERROR_DEADZONE, which -0.1 satisfies -- so a minus must fire."""
+  assert cmd(-0.3, 20.0, 22.0, 19.9, 5.0) == 'minus5'
+
+
+def test_gate_plus_still_requires_strict_positive_deadzone():
+  """The plus branch is unchanged: a small-positive v_error (0 < v_error <
+  V_ERROR_DEADZONE) must still suppress a raise even with a_target > 0 and
+  err_kph > 0."""
+  assert cmd(0.5, 20.0, 18.0, 20.1, 5.0) is None
+
+
+def test_gate_minus_allowed_with_small_positive_v_error():
+  """New asymmetric behaviour: a small-positive v_error (0 < v_error <
+  V_ERROR_DEADZONE) must still allow a brake when a_target < 0 and the
+  setpoint error clearly calls for it (err_kph <= -1)."""
+  result = cmd(-0.5, 20.0, 22.0, 20.1, 5.0)
+  assert result in ("minus1", "minus5")
 
 
 def test_gate_suppresses_plus_when_a_target_disagrees():
@@ -292,7 +310,8 @@ def test_gate_conjunction_sweep():
   """Sweep a grid of (a_target, v_ego, setpoint, v_target, min_setpoint) and
   assert the direction gate's conjunction holds on every emitted command:
   every plus has v_error > V_ERROR_DEADZONE and a_target > 0; every minus has
-  v_error < -V_ERROR_DEADZONE and a_target < 0."""
+  v_error < V_ERROR_DEADZONE and a_target < 0 (the gate is asymmetric: both
+  branches pivot on the same +V_ERROR_DEADZONE threshold, favouring braking)."""
   a_targets = [-2.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0]
   v_egos = [6.0, 9.0, 11.0, 15.0, 20.0, 28.0]
   setpoints = [8.0, 9.2, 10.0, 12.0, 15.0, 20.0, 25.0]
@@ -316,7 +335,7 @@ def test_gate_conjunction_sweep():
               assert v_error > V_ERROR_DEADZONE and a_target > 0, \
                   f"plus emitted without agreement: v_error={v_error}, a_target={a_target}"
             else:
-              assert v_error < -V_ERROR_DEADZONE and a_target < 0, \
+              assert v_error < V_ERROR_DEADZONE and a_target < 0, \
                   f"minus emitted without agreement: v_error={v_error}, a_target={a_target}"
   assert checked == len(a_targets) * len(v_egos) * len(setpoints) * len(v_targets) * len(min_setpoints)
   assert emitted > 0, "sweep produced no emitted commands to check"

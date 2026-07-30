@@ -33,21 +33,27 @@ CRUISE_STALK_IDLE_TICK_STOCK = 0.2
 # At burst end, DCC accepts SZL's resumption only if (1 + M − K) mod 15 ∈ [1,7]
 # where M = slots overwritten, K = total frames. Until that holds, keep
 # transmitting (with neutral act=0 if openpilot has stopped commanding).
-HOLD_INTERVAL = 0.025         # 40 Hz — retained for reference only; the setpoint-error
-                              # law always transmits at SINGLE_INTERVAL (cadence was
-                              # measured to have no effect on DCC's response)
+HOLD_INTERVAL = 0.025         # 40 Hz — live again: selected by command magnitude
+                              # (+-5), not by an accel threshold like the
+                              # original controller used
 SINGLE_INTERVAL = 0.050       # 20 Hz — single-press cadence
 PRE_TICK_LEAD = 0.015         # lead window 15 ms — wide enough to catch ≥1 OP cycle (10 ms) with phase jitter
 BURST_LIVE_WINDOW = 0.5       # s — burst considered "live" until this long without TX
 
 # DCC command selection.
-# The car's acceleration tracks the setpoint gap, not the command or the TX
-# cadence — see docs/superpowers/specs/2026-07-29-dcc-response-findings.md.
-# We invert the measured map to get the gap we need, cap the resulting setpoint
-# at v_target, and emit the ticks still owed.
+# The car's acceleration tracks the setpoint gap, not the command — see
+# docs/superpowers/specs/2026-07-29-dcc-response-findings.md. We invert the
+# measured map to get the gap we need, cap the resulting setpoint at v_target,
+# and emit the ticks still owed.
 # V_ERROR_DEADZONE lives in dcc_map (single source of truth) — select_cruise_command's
 # direction gate already enforces it, so no separate check is needed at the call site.
-CMD_INTERVAL = SINGLE_INTERVAL # cadence is inert; 20 Hz halves bus load
+
+
+def _tx_interval(cmd_name):
+  # +-5 is accepted by DCC per transmitted frame, so its slew rate scales
+  # with TX cadence (measured 2.1x more setpoint ticks/sec at 40 Hz vs 20 Hz);
+  # +-1 is cadence-insensitive (measured ~unchanged), so it stays at 20 Hz.
+  return HOLD_INTERVAL if cmd_name.endswith("5") else SINGLE_INTERVAL
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
@@ -177,7 +183,7 @@ class CarController(CarControllerBase):
                                            setpoint=CS.out.cruiseState.speed, v_target=v_target,
                                            min_setpoint=self.min_cruise_setpoint)
           if cmd_name is not None:
-            cruise_cmd(getattr(CruiseStalk, cmd_name), CMD_INTERVAL)
+            cruise_cmd(getattr(CruiseStalk, cmd_name), _tx_interval(cmd_name))
 
     # Trailing counter overwrite. If commanding stopped (or is briefly idle in
     # a deadzone) but the burst is still live, keep transmitting at the burst's

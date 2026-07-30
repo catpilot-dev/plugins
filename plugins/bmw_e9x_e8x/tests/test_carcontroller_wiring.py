@@ -35,8 +35,22 @@ def test_dead_thresholds_are_gone(mock_opendbc, name):
 
 def test_new_constants_present(mock_opendbc):
   mod = _cc(mock_opendbc)
-  assert mod.CMD_INTERVAL == mod.SINGLE_INTERVAL   # cadence is inert
+  # CMD_INTERVAL is gone -- interval is now chosen per-command by _tx_interval.
+  assert not hasattr(mod, "CMD_INTERVAL")
+  assert mod.HOLD_INTERVAL == 0.025
+  assert mod.SINGLE_INTERVAL == 0.050
   assert mod.SETPOINT_DEADBAND_KPH == 1.0
+
+
+def test_tx_interval_selects_by_command_magnitude(mock_opendbc):
+  """+-5 commands must transmit at HOLD_INTERVAL (40 Hz; measured 2.1x more
+  setpoint ticks/sec than 20 Hz), +-1 commands at SINGLE_INTERVAL (20 Hz;
+  measured cadence-insensitive)."""
+  mod = _cc(mock_opendbc)
+  assert mod._tx_interval("plus5") == mod.HOLD_INTERVAL
+  assert mod._tx_interval("minus5") == mod.HOLD_INTERVAL
+  assert mod._tx_interval("plus1") == mod.SINGLE_INTERVAL
+  assert mod._tx_interval("minus1") == mod.SINGLE_INTERVAL
 
 
 def test_decision_function_is_wired_in(mock_opendbc):

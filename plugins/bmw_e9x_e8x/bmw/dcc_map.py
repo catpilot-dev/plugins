@@ -90,12 +90,22 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   # what the previous production controller did, and it's what keeps modelV2
   # noise (a_target reverses sign far more often than the speed error) from
   # manufacturing spurious commands.
+  #
+  # The two branches are deliberately asymmetric, both pivoting on the same
+  # +V_ERROR_DEADZONE threshold: acceleration requires the speed error to
+  # CLEARLY call for speeding up (v_error > V_ERROR_DEADZONE); braking only
+  # requires that it is NOT clearly calling for speeding up
+  # (v_error < V_ERROR_DEADZONE). Measurement showed the symmetric gate
+  # blocked 75.5% of wanted braking commands, leaving the setpoint at or
+  # above vEgo in 94% of those cases — the car physically cannot decelerate
+  # from there. Favouring braking is the safe direction: a wanted brake that
+  # gets suppressed is worse than one that fires slightly early.
   v_error = v_target - v_ego
   if err_kph > 0:
     if not (v_error > V_ERROR_DEADZONE and a_target > 0):
       return None
     return 'plus5' if err_kph >= 5.0 else 'plus1'
-  if not (v_error < -V_ERROR_DEADZONE and a_target < 0):
+  if not (v_error < V_ERROR_DEADZONE and a_target < 0):
     return None
   # No separate min-speed headroom check is needed: `desired` is already floored
   # at min_setpoint, so a tick is only emitted when at least that step of error
