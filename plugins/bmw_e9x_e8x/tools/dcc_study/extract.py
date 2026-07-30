@@ -11,7 +11,7 @@ from common import STALK_ADDR, ROUTES_DIR, EXTRACTED_DIR, decode_stalk
 CMDS = ("plus1", "plus5", "minus1", "minus5", "cancel", "resume", "cancel_lever_up")
 
 _KEYS = ("cs_t", "vEgo", "aEgo", "setpoint", "cruiseEnabled", "gas", "brake",
-         "ctrl_t", "aTarget", "ctrlEnabled",
+         "ctrl_t", "aTarget", "vTarget", "ctrlEnabled",
          "tx_t", "tx_cmd", "rx_t", "rx_cmd", "pose_t", "pitch")
 
 
@@ -38,6 +38,7 @@ def extract_segment(rlog_path):
       elif which == "carControl":
         out["ctrl_t"].append(t)
         out["aTarget"].append(evt.carControl.actuators.accel)
+        out["vTarget"].append(evt.carControl.actuators.speed)
         out["ctrlEnabled"].append(float(evt.carControl.enabled))
       elif which == "sendcan":
         for c in evt.sendcan:
@@ -62,6 +63,27 @@ def extract_segment(rlog_path):
           for k, v in out.items()}
 
 
+def needs_extract(dest):
+  """True when `dest` is absent, unreadable, or predates a key added to _KEYS.
+
+  Keys get added as the study needs new channels (vTarget, ...). Re-extracting
+  only the stale files keeps a schema change from silently leaving a mixed set
+  of .npz behind, which is far worse than the extra CPU.
+  """
+  if not dest.exists():
+    return True
+  try:
+    with np.load(dest) as npz:
+      missing = [k for k in _KEYS if k not in set(npz.files)]
+  except Exception as e:  # truncated/partial write from an interrupted run
+    print(f"WARNING: re-extracting unreadable {dest.name}: {e}", file=sys.stderr)
+    return True
+  if missing:
+    print(f"{dest.name}: re-extracting, missing {','.join(missing)}")
+    return True
+  return False
+
+
 def main():
   p = argparse.ArgumentParser()
   p.add_argument("--routes", default=ROUTES_DIR, type=Path)
@@ -74,7 +96,7 @@ def main():
     sys.exit(f"no rlog.zst under {args.routes} — run fetch_routes.py first")
   for rlog in rlogs:
     dest = args.out / (rlog.parent.name + ".npz")
-    if dest.exists():
+    if not needs_extract(dest):
       continue
     seg = extract_segment(rlog)
     if seg is not None:
