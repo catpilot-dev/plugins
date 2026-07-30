@@ -9,7 +9,7 @@ if _PLUGIN_DIR not in sys.path:
 
 from bmw.dcc_map import (expected_accel, gap_for_accel, accel_envelope,
                          select_cruise_command, MS_TO_KPH, V_ERROR_DEADZONE,
-                         ACCEL_TRIGGER_KPH, ACCEL_BRAKE_VETO)
+                         ACCEL_TRIGGER_KPH)
 from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 
@@ -206,7 +206,7 @@ def test_floor_raise_invariant_sweep():
   This invariant is specific to the braking/holding branch's floor logic
   (desired_raw only feeds the setpoint there). Grid points where v_error is
   large enough to route into the acceleration branch are skipped -- there,
-  a_target is only a coarse veto (below ACCEL_BRAKE_VETO), not the signal
+  a_target only has to agree in sign (a_target > 0), not the signal
   this invariant is about; the veto behaviour has its own dedicated tests.
   """
   min_sp = 9.72  # 35 km/h cruise floor
@@ -319,13 +319,12 @@ def test_gate_minus_allowed_with_small_positive_v_error():
 
 def test_gate_suppresses_plus_when_a_target_disagrees():
   """v_error is strongly positive, putting this in the acceleration branch.
-  a_target is mildly negative (-0.1) -- but that is exactly the noisy-model
-  regime the acceleration split is designed to ignore: only a_target below
-  ACCEL_BRAKE_VETO (-0.3) counts as a real braking request. A mild -0.1
-  reading must NOT block the raise (this is the old, now-fixed behaviour --
-  see test_real_world_sluggish_case and the brake-veto tests for the cases
-  that DO still block)."""
-  assert cmd(-0.1, 20.0, 18.0, 25.0, 5.0) == 'plus1'
+  a_target is mildly negative (-0.1) -- since the acceleration branch now
+  requires a_target > 0 outright (matching the previous production
+  controller's `accel > 0`), any non-positive reading blocks the raise,
+  regardless of magnitude. See test_real_world_sluggish_case_now_accelerates
+  for the barely-positive case that still fires."""
+  assert cmd(-0.1, 20.0, 18.0, 25.0, 5.0) is None
 
 
 def test_gate_suppresses_minus_when_a_target_disagrees():
@@ -343,10 +342,11 @@ def test_gate_conjunction_sweep():
   v_error < V_ERROR_DEADZONE and a_target < 0 (the gate is asymmetric: both
   branches pivot on the same +V_ERROR_DEADZONE threshold, favouring braking).
 
-  Acceleration branch (v_error*MS_TO_KPH > ACCEL_TRIGGER_KPH): the a_target>0
-  requirement no longer applies -- a_target only vetoes (must be >=
-  ACCEL_BRAKE_VETO) -- and only 'plus1' may ever be emitted, never 'plus5' or
-  a minus (v_error is by construction strongly positive there)."""
+  Acceleration branch (v_error*MS_TO_KPH > ACCEL_TRIGGER_KPH): a_target must
+  still be strictly positive (a_target > 0) -- the destination comes from
+  v_target, but a_target retains its sign veto -- and only 'plus1' may ever
+  be emitted, never 'plus5' or a minus (v_error is by construction strongly
+  positive there)."""
   a_targets = [-2.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0]
   v_egos = [6.0, 9.0, 11.0, 15.0, 20.0, 28.0]
   setpoints = [8.0, 9.2, 10.0, 12.0, 15.0, 20.0, 25.0]
@@ -369,7 +369,7 @@ def test_gate_conjunction_sweep():
             if v_error * MS_TO_KPH > ACCEL_TRIGGER_KPH:
               assert result == 'plus1', \
                   f"acceleration branch emitted {result}, expected plus1 only"
-              assert a_target >= ACCEL_BRAKE_VETO, \
+              assert a_target > 0, \
                   f"acceleration branch fired despite veto: a_target={a_target}"
             elif result in ("plus1", "plus5"):
               assert v_error > V_ERROR_DEADZONE and a_target > 0, \
@@ -463,16 +463,32 @@ def test_real_world_sluggish_case_now_accelerates():
 
 
 def test_brake_veto_blocks_acceleration():
-  """a_target below ACCEL_BRAKE_VETO means the model wants real braking, even
-  though v_error is clearly calling for acceleration -- conflicting signals
-  must coast (None), not fight the model."""
+  """a_target negative means the model does not agree with accelerating, even
+  though v_error is clearly calling for it -- conflicting signals must coast
+  (None), not fight the model."""
   assert cmd(-0.5, 20.0, 20.0, 30.0, 5.0) is None
 
 
-def test_brake_veto_boundary_just_above_still_accelerates():
-  """a_target just above ACCEL_BRAKE_VETO (-0.29 > -0.3) is not a real braking
-  request, so a large shortfall must still produce a raise."""
-  assert cmd(-0.29, 20.0, 20.0, 30.0, 5.0) == 'plus1'
+def test_brake_veto_boundary_just_below_zero_still_blocks():
+  """a_target just below zero (-0.29) is no longer close enough to a real
+  braking request to matter -- the gate is now a strict sign requirement
+  (a_target > 0), not a magnitude threshold, so even a mild negative reading
+  blocks the raise. This replaces the old -0.3 veto boundary, under which
+  -0.29 (being > -0.3) used to still accelerate."""
+  assert cmd(-0.29, 20.0, 20.0, 30.0, 5.0) is None
+
+
+def test_accel_veto_boundary_exactly_zero_blocks():
+  """a_target of exactly 0.0 no longer accelerates: the gate requires strict
+  positivity (a_target > 0), matching the previous production controller's
+  `accel > 0`. A large speed shortfall alone must not be enough."""
+  assert cmd(0.0, 20.0, 20.0, 30.0, 5.0) is None
+
+
+def test_accel_veto_boundary_barely_positive_still_accelerates():
+  """a_target barely positive (+0.01) still satisfies a_target > 0, so a
+  large speed shortfall must still produce a raise."""
+  assert cmd(0.01, 20.0, 20.0, 30.0, 5.0) == 'plus1'
 
 
 def test_acceleration_branch_deadband():

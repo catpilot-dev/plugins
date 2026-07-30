@@ -15,7 +15,6 @@ MS_TO_KPH = 3.6                # local literal: this module must not import open
 SETPOINT_DEADBAND_KPH = 1.0    # below one tick there is nothing to send
 V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — speed-error direction deadzone
 ACCEL_TRIGGER_KPH = 1.0        # speed shortfall that puts us in acceleration mode
-ACCEL_BRAKE_VETO = -0.3        # aTarget below this means the model wants real braking; do not accelerate
 
 
 def _clamp(x, lo, hi):
@@ -83,12 +82,19 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   v_error = v_target - v_ego
 
   if v_error * MS_TO_KPH > ACCEL_TRIGGER_KPH:
-    # ACCELERATION: trust the MPC's speed target for the destination; aTarget
-    # is used only as a veto (conflicting signals -> coast, don't fight the
-    # model), never for magnitude. Only ever 'plus1' -- never 'plus5' -- both
-    # because plus1 at 20 Hz gives smoother acceleration and because this
-    # branch may need to close a large gap gradually rather than in one jump.
-    if a_target < ACCEL_BRAKE_VETO:
+    # ACCELERATION: trust the MPC's speed target for the destination (aTarget
+    # is only ~0.13x the needed value here, per the module docstring, so it
+    # cannot supply the magnitude). aTarget still has to agree in SIGN before
+    # we accelerate -- the vision model retains its veto over a positive-sign
+    # command -- so a_target must be strictly positive, matching what the
+    # previous production controller required (`accel > 0`). Measured cost of
+    # this gate: 70.7% duty cycle on real data, blocked stretches median
+    # 0.31 s; since DCC accepts only ~3 ticks/s while we offer 20 commands/s,
+    # the climb rate is essentially unaffected. Only ever 'plus1' -- never
+    # 'plus5' -- both because plus1 at 20 Hz gives smoother acceleration and
+    # because this branch may need to close a large gap gradually rather than
+    # in one jump.
+    if a_target <= 0:
       return None
     err_kph = (v_target - setpoint) * MS_TO_KPH
     if err_kph < SETPOINT_DEADBAND_KPH:
