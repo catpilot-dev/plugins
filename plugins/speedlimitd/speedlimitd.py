@@ -544,6 +544,24 @@ GS_RELEASE_CONT_S = 10.0    # release once non-G/S matches have been CONTINUOUS
 LANE_COUNT_LIMIT_3 = 60     # 3 confident lanes → 60 km/h
 LANE_COUNT_LIMIT_4 = 80     # ≥4 confident lanes → 80 km/h
 
+# Noise-tolerant narrow-band (≤2 lane) confirmation (route 3d3 seg 16 / 3d1 seg 29).
+# A single directional debounce timer resets on ANY raw-count change, so on a
+# genuine 2-lane ramp with brief 3↔4 occlusion spikes the demotion window keeps
+# restarting and lane_count_stable never commits to 2 (seg 16: raw ≤2 for 24 s
+# continuous, never committed). Instead we integrate a LEAKY "time-in-narrow"
+# accumulator: it ADDS dt while raw ≤2 and bleeds back at NARROW_DECAY·dt while
+# raw ≥3 (asymmetric — narrow evidence sticks longer than a spike erases it),
+# clamped to [0, cap]. Reaching NARROW_CONFIRM_S commits lane_count_stable to the
+# sustained narrow value. A genuine ramp (raw ≤2 for seconds, occasional
+# single-frame occlusion blip) climbs to the threshold in ~3-4 s; a sub-3 s
+# transient dip (occlusion reads cluster at ~0.1 s, 95% of all ≤2 reads) never
+# reaches it and is rejected. 3 s cleanly separates the two classes (genuine
+# ramps run ≥4 s). Only the DEMOTION-into-narrow path uses this; promotion back
+# to ≥3 lanes and 3↔4 transitions keep the existing directional debounce.
+NARROW_CONFIRM_S = 3.0      # sustained (leaky) time-in-narrow before committing ≤2
+NARROW_ACCUM_CAP = 3.0      # accumulator clamp (== confirm threshold; no banking)
+NARROW_DECAY = 0.5          # bleed fraction of dt while raw ≥3 (occlusion spike)
+
 # China expressway ref grammar (国家高速 / 省级高速 numbering system):
 #   [GS]\d{1,2}  national/provincial expressway TRUNKS — G2, G15, S1, S20
 #   [GS]\d{4}    regional ring / spur expressways      — G1501 (Shenyang ring)
@@ -622,6 +640,10 @@ class SpeedLimitMiddleware:
     self.lane_count_stable: int = 1
     self.lane_count_stable_since: float = 0.0
     self.lane_count_locked: bool = False  # True once vision has a 2 s stable reading
+    # Leaky narrow-band (≤2) confirmation state (see NARROW_* constants).
+    self._narrow_accum: float = 0.0       # net time-in-narrow, seconds, [0, cap]
+    self._narrow_min_raw: int = 2         # sustained-narrow value to commit (1 or 2)
+    self._lane_last_t: float = 0.0        # last modelV2 tick time, for the accumulator dt
     self.lane_conf: float = 0.0           # smoothed lane line confidence (0.0–1.0)
     self.vision_cap: int = 0
     self.vision_cap_stable: int = 0
@@ -902,20 +924,44 @@ class SpeedLimitMiddleware:
       model = self.sm['modelV2']
       raw_lane_count = infer_lane_count(model)
 
-      # Adaptive demotion hysteresis based on predicted curvature.
-      # Straight road: drops are likely lane-change occlusion → 5s to filter.
-      # Curved road: road is genuinely narrowing → 2s for quick response.
+      # Per-tick dt for the leaky narrow-confirmation accumulator below. Clamp to
+      # guard a stalled tick; 0 on the first sample.
+      dt = min(max(now - self._lane_last_t, 0.0), 0.5) if self._lane_last_t > 0.0 else 0.0
+      self._lane_last_t = now
+
+      # Committing UP / between wide counts: the existing directional debounce.
+      # A steady raw reading commits after a stability window — 1.5 s going up, and
+      # the demotion window (2 s curving / 5 s straight) for wide→less-wide drops
+      # that stay ≥3. Demotion INTO the narrow band (≤2) is handled by the leaky
+      # accumulator below instead: a single debounce timer resets on any raw
+      # flicker and so never commits on a noisy 2-lane ramp (route 3d3 seg 16).
       curving = self.curvature_cap > 0  # curvature_speed_cap detected upcoming curve
       if raw_lane_count != self.lane_count:
         self.lane_count = raw_lane_count
         self.lane_count_stable_since = now
-      else:
+      elif raw_lane_count >= 3:
         going_down = raw_lane_count < self.lane_count_stable
         demotion_window = 2.0 if curving else 5.0
         stability_window = demotion_window if going_down else 1.5
         if now - self.lane_count_stable_since > stability_window:
           self.lane_count_stable = self.lane_count
           self.lane_count_locked = True
+
+      # Committing DOWN into the narrow band (≤2): leaky NARROW_CONFIRM_S confirmation
+      # (see NARROW_* constants). ADD dt while raw ≤2, bleed NARROW_DECAY·dt while
+      # raw ≥3, clamp [0, cap]. A genuine 2-lane ramp climbs to the threshold in
+      # ~3-4 s and commits (to the recent min raw seen while narrow, 1 or 2); a
+      # sub-3 s transient dip never reaches it. Once fully decayed the target resets.
+      if raw_lane_count <= 2:
+        self._narrow_accum = min(self._narrow_accum + dt, NARROW_ACCUM_CAP)
+        self._narrow_min_raw = min(self._narrow_min_raw, raw_lane_count)
+      else:
+        self._narrow_accum = max(self._narrow_accum - NARROW_DECAY * dt, 0.0)
+        if self._narrow_accum == 0.0:
+          self._narrow_min_raw = 2
+      if self._narrow_accum >= NARROW_CONFIRM_S:
+        self.lane_count_stable = self._narrow_min_raw
+        self.lane_count_locked = True
 
       # Lane line confidence: sum of all probs divided by line count.
       # Scales with both the number of visible lines and their individual strength.
@@ -1074,11 +1120,8 @@ class SpeedLimitMiddleware:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
     if react_active:
       candidates.append((react_cap_kph, 4, 0.7))  # reactiveLatAccel (safety class)
-    base_candidate = (float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2))  # base inference (lane-count / gs_osm), source 2
-    candidates.append(base_candidate)  # always appended LAST
+    candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # base inference (lane-count / gs_osm), source 2
 
-    # DISPLAY: the most conservative reading across ALL sources — a narrow-band
-    # lane guess IS still shown to the driver.
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
 
     # --- Gradual speed limit transition ---
@@ -1119,48 +1162,6 @@ class SpeedLimitMiddleware:
       react_active
       and snap_to_standard_speed(int(react_cap_kph)) <= self._displayed_speed_limit
     )
-
-    # laneCountNarrow (route 3d1 seg 29): True iff the PUBLISHED (display) limit is
-    # a narrow-band lane-count guess — the base inference won the display min()
-    # (source 2), from vision lane-count mode, at a confident lane count ≤ 2 (the
-    # lane_count_limit narrow sub-table → 40/30). Lane count is a poor predictor of
-    # a LOW limit (a 2-lane road is anywhere from a 40 link to an 80 rural
-    # highway), so this reading is DISPLAY-ONLY. Telemetry: distinguishes
-    # displayed-not-enforced in rlogs. It is False whenever something else binds
-    # the displayed limit (a safety cap / YOLO won the min), on ≥3-lane roads
-    # (60/80, informative), and on G/S promotes (gs_mode requires ≥3 lanes).
-    lane_count_narrow = (source == 2 and self.inference_mode == 'lane_count'
-                         and self.lane_count_stable <= 2)
-
-    # ENFORCEMENT (route 3d1 seg 29 review Critical): the narrow-band lane guess
-    # must be EXCLUDED from the enforcement min — not merely flagged. If it were
-    # only flagged and a coincident safety cap sat ABOVE it (curve cap 50, narrow
-    # guess 40), the 40 would win the display min, a flag-based planner would treat
-    # the whole reading as display-only, and the 50 curve cap would never enforce —
-    # the car would enter the curve with no slowdown. So we publish a SEPARATE
-    # enforced limit that omits the narrow candidate.
-    #
-    # When lane_count_narrow is False the enforced value is byte-for-byte the
-    # display value (source/safetyCapped included) — zero behaviour change off the
-    # narrow path. When it is True the narrow base was the display winner (thus the
-    # global min); the remaining candidates are safety caps / YOLO — none of which
-    # use the gradual display ramp — or nothing at all, in which case the enforced
-    # limit is the no-constraint sentinel 0 (planner enforces nothing).
-    if lane_count_narrow:
-      enforce_candidates = candidates[:-1]  # every source except the narrow base
-      if enforce_candidates:
-        enf_speed, enf_source, _ = min(enforce_candidates, key=lambda x: x[0])
-        enforced_speed_limit = snap_to_standard_speed(int(enf_speed))
-        enforced_source = enf_source
-        enforced_safety_capped = enf_source == 4
-      else:
-        enforced_speed_limit = 0            # no-constraint sentinel
-        enforced_source = 0
-        enforced_safety_capped = False
-    else:
-      enforced_speed_limit = self._displayed_speed_limit
-      enforced_source = source
-      enforced_safety_capped = safety_capped
 
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
@@ -1208,17 +1209,6 @@ class SpeedLimitMiddleware:
       # publish site, same as speedLimit.
       'curvatureCap': snap_to_standard_speed(self.curvature_cap) if self.curvature_cap >= MIN_SPEED_LIMIT else 0,
       'safetyCapped': safety_capped,
-      # Narrow-band lane-count guess: displayed but NOT enforced (route 3d1 seg
-      # 29). Telemetry — distinguishes displayed-not-enforced in rlogs.
-      'laneCountNarrow': lane_count_narrow,
-      # Enforcement view (route 3d1 seg 29 review Critical): the narrow-band lane
-      # guess is excluded from these — planner_hook's floor/min/large-drop gate
-      # operate on THESE, not the display speedLimit/source/safetyCapped. Equal to
-      # the display values off the narrow path; enforcedSpeedLimit==0 means "no
-      # constraint to enforce" (a bare narrow guess enforces nothing).
-      'enforcedSpeedLimit': enforced_speed_limit,
-      'enforcedSource': enforced_source,
-      'enforcedSafetyCapped': enforced_safety_capped,
       # Reactive measured-a_y cap telemetry (2026-07-28).
       'reactCapEngaged': self._react_cap_ms > 0.0,
       'reactCap': round(react_cap_kph, 1),          # km/h, 0 = disengaged

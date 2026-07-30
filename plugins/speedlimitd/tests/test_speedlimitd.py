@@ -565,23 +565,10 @@ class TestPlannerHook:
     sm.__getitem__ = MagicMock(side_effect=getitem)
     return sm
 
-  def _sl(self, hook, speed_limit, source=1, safety=False, confirmed=True, road='A',
-          narrow=False, enforced=None, enforced_source=None, enforced_safety=None):
-    # Models speedlimitd's display/enforce split. Off the narrow path the enforced
-    # view mirrors the display fields (default). A narrow-band display limit with
-    # no coincident cap enforces nothing (enforcedSpeedLimit=0); pass enforced=* to
-    # model a coincident safety cap sitting above the narrow guess.
-    if enforced is None:
-      enforced = 0 if narrow else speed_limit
-    if enforced_source is None:
-      enforced_source = 0 if narrow else source
-    if enforced_safety is None:
-      enforced_safety = False if narrow else safety
+  def _sl(self, hook, speed_limit, source=1, safety=False, confirmed=True, road='A'):
     hook._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit,
                      'safetyCapped': safety, 'source': source,
-                     'roadName': road, 'wayRef': '', 'laneCountNarrow': narrow,
-                     'enforcedSpeedLimit': enforced, 'enforcedSource': enforced_source,
-                     'enforcedSafetyCapped': enforced_safety}
+                     'roadName': road, 'wayRef': ''}
 
   def _clock(self, monkeypatch, hook, t0=1000.0):
     # planner_hook no longer uses a clock (enforcement is immediate — DCC shapes
@@ -610,6 +597,16 @@ class TestPlannerHook:
     """Limit < 80 kph uses 15% offset."""
     self._sl(hook, 40, source=1)
     assert hook.on_v_cruise(100 / 3.6, 20.0, self._sm()) == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
+
+  def test_inferred_lane_count_40_enforces_no_display_only(self, hook):
+    """route 3d3 seg 16 / 3d1 seg 29 regression removed: a genuine 2-lane ramp 40
+    (inferred, source 2, unnamed road, no coincident cap) ENFORCES immediately —
+    v_cruise is lowered. Under the reverted narrow-band display-only patch this
+    was suppressed (car coasted through at speed)."""
+    self._sl(hook, 40, source=2, road='')
+    r = hook.on_v_cruise(85 / 3.6, 85 / 3.6, self._sm())
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # enforced (offset applies)
+    assert r < 85 / 3.6                                   # v_cruise lowered
 
   def test_no_cap_if_already_below(self, hook):
     self._sl(hook, 120, source=1)
@@ -778,91 +775,15 @@ class TestPlannerHook:
 
   # baseline floor requires a road identity ------------------
 
-  def test_empty_road_id_disables_baseline_hold(self, hook, monkeypatch):
-    """No OSM identity (road_id='') → baseline hold invalid, so the inferred cap
-    is not held by a road-continuity floor. CONTRACT CHANGE (route 3d1 seg 29):
-    a *large* inferred drop on an unnamed road is now withheld by the large-drop
-    gate for LARGE_DROP_GATE_S before it enforces (was: immediate). The baseline
-    is still never built without an identity."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
+  def test_empty_road_id_disables_baseline_hold(self, hook):
+    """No OSM identity (road_id='') → baseline hold invalid → the inferred/vision
+    cap is enforced immediately (route 3a1 unnamed motorway_link ramp)."""
     self._sl(hook, 100, source=2, road='')          # unnamed way
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     self._sl(hook, 40, source=2, road='')           # vision cap → 40, still unnamed
-    r_gated = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     assert hook._baseline_ms is None                # baseline not built without identity
-    assert r_gated == pytest.approx(120 / 3.6)      # withheld (large drop, not yet persisted)
-    t[0] += hook.LARGE_DROP_GATE_S + 0.1            # persist past the gate
-    r_enf = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
-    assert r_enf == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # now enforced
-
-  # large inferred-drop gate (route 3d1 seg 29) -------------
-
-  def test_large_inferred_drop_gated_then_enforces(self, hook, monkeypatch):
-    """THE seg-29 case: inferred (source 2, not safety) 40 while v_ego 85 kph on
-    an unnamed road. For the first LARGE_DROP_GATE_S the enforcement is withheld
-    (v_cruise unchanged); once it persists continuously the floor lowers."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    v_cruise, v_ego = 100 / 3.6, 85 / 3.6
-    self._sl(hook, 40, source=2, road='')           # inferred large drop (85→40)
-    # Withheld across the whole pre-persist window.
-    for dt in (0.0, 1.0, 2.9):
-      t[0] = 1000.0 + dt
-      r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
-      assert r == pytest.approx(v_cruise), f"should withhold at t+{dt}"
-    # Persisted ≥ gate → enforces (offset applies, non-safety).
-    t[0] = 1000.0 + hook.LARGE_DROP_GATE_S + 0.05
-    r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # cap now enforced
-
-  def test_large_inferred_drop_transient_glitch_never_enforces(self, hook, monkeypatch):
-    """A 2 s large-drop glitch that then recovers (limit rises back above the
-    v_ego − LARGE_DROP line) never lowers v_cruise toward the low value and
-    resets the timer — a transient vision glitch never brakes."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    v_cruise, v_ego = 100 / 3.6, 85 / 3.6
-    self._sl(hook, 40, source=2, road='')           # spurious low read
-    for dt in (0.0, 1.0, 2.0):
-      t[0] = 1000.0 + dt
-      r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
-      assert r == pytest.approx(v_cruise)           # withheld, never braked to 40
-    # Limit recovers before the 3 s gate elapses.
-    self._sl(hook, 80, source=2, road='')           # 85−80 = 5 kph < LARGE_DROP_KPH
-    t[0] = 1000.0 + 2.1
-    r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
-    assert hook._large_drop_since is None           # timer reset
-    assert r > 40 * 1.15 / 3.6 + 1.0                # never enforced the spurious 40
-    assert r == pytest.approx(80 * 1.10 / 3.6, abs=0.1)   # enforces recovered 80 (10% tier)
-
-  def test_safety_cap_large_drop_not_gated(self, hook, monkeypatch):
-    """A safety cap (source 4 / safetyCapped) of 40 at v_ego 85 is NEVER gated —
-    the a_y safety layer must slow the car promptly."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    self._sl(hook, 40, source=4, safety=True, road='A')
-    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
-    assert r == pytest.approx(40 / 3.6, abs=0.1)    # immediate, no offset, no gate
-
-  def test_manual_confirmed_large_drop_not_gated(self, hook, monkeypatch):
-    """A non-inferred confirmed limit (the driver's explicit choice) of 40 at
-    v_ego 85 enforces immediately — the gate only touches inferred limits."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    self._sl(hook, 40, source=1, road='A')          # non-inferred (source != 2)
-    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # immediate
-
-  def test_small_inferred_drop_not_gated(self, hook, monkeypatch):
-    """An inferred drop smaller than LARGE_DROP_KPH (70 at v_ego 85 → 15 kph)
-    enforces immediately, exactly as before the gate."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    self._sl(hook, 70, source=2, road='')
-    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
-    assert hook._large_drop_since is None           # not a large drop, gate inert
-    assert r == pytest.approx(70 * 1.15 / 3.6, abs=0.1)   # immediate
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # enforced immediately, not held
 
   def test_named_road_id_keeps_baseline_hold(self, hook, monkeypatch):
     """With a road identity, spurious same-road drops are still held (unchanged)."""
@@ -876,90 +797,6 @@ class TestPlannerHook:
       r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
       clk.tick(0.2)
     assert r >= 100 / 3.6 - 0.2                      # held at current speed
-
-  # narrow-band lane-count limits are DISPLAY-ONLY (route 3d1 seg 29) --------
-
-  def test_narrow_band_never_enforces(self, hook, monkeypatch):
-    """THE seg-29 fix: an inferred ≤2-lane guess (40) at v_ego 85 on a wide road
-    is DISPLAY-ONLY — planner_hook never lowers v_cruise for it. Lane count is a
-    poor predictor of a LOW limit, so a narrow read must not command a brake."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    v_cruise, v_ego = 100 / 3.6, 85 / 3.6
-    self._sl(hook, 40, source=2, road='', narrow=True)   # narrow-band lane guess
-    r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
-    assert r == pytest.approx(v_cruise)                  # v_cruise unchanged (no brake)
-    assert hook._baseline_ms is None                     # no floor built from a narrow read
-    assert hook._large_drop_since is None                # large-drop gate never armed
-
-  def test_narrow_band_never_enforces_when_sustained(self, hook, monkeypatch):
-    """Sustained (13.4 s in seg 29) narrow-band read: still never enforces —
-    unlike the large-drop gate, this is not a delay, it is a permanent exclusion
-    from the enforcement path."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    v_cruise, v_ego = 100 / 3.6, 85 / 3.6
-    self._sl(hook, 40, source=2, road='', narrow=True)
-    for dt in (0.0, 3.5, 13.4, 30.0):                    # well past LARGE_DROP_GATE_S
-      t[0] = 1000.0 + dt
-      r = hook.on_v_cruise(v_cruise, v_ego, self._sm())
-      assert r == pytest.approx(v_cruise), f"enforced a narrow guess at t+{dt}"
-
-  def test_narrow_band_named_road_still_never_enforces(self, hook, monkeypatch):
-    """Even with a road identity, a narrow-band read builds no baseline hold and
-    never lowers v_cruise (the display-only rule is independent of road_id)."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    self._sl(hook, 40, source=2, road='某路', narrow=True)
-    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
-    assert r == pytest.approx(100 / 3.6)
-    assert hook._baseline_ms is None
-
-  def test_three_lane_inferred_still_enforces(self, hook):
-    """≥3-lane lane-count limits are informative (wide→faster) and KEEP enforcing:
-    a 3-lane → 60 inferred limit lowers v_cruise as before (narrow=False)."""
-    self._sl(hook, 60, source=2, road='A', narrow=False)
-    r = hook.on_v_cruise(100 / 3.6, 100 / 3.6, self._sm())
-    assert r < 100 / 3.6                                  # enforced (lowered)
-    assert r == pytest.approx(60 * 1.15 / 3.6, abs=0.1)
-
-  def test_four_lane_inferred_still_enforces(self, hook):
-    """4-lane → 80 inferred limit still enforces (narrow=False)."""
-    self._sl(hook, 80, source=2, road='A', narrow=False)
-    r = hook.on_v_cruise(120 / 3.6, 120 / 3.6, self._sm())
-    assert r < 120 / 3.6
-    assert r == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
-
-  def test_gs_promote_still_enforces(self, hook):
-    """G/S expressway promote (S20 → 100, gs_osm, source 2, narrow=False) enforces
-    normally — the display-only rule only touches narrow-band lane guesses."""
-    self._sl(hook, 100, source=2, road='S20', narrow=False)
-    r = hook.on_v_cruise(130 / 3.6, 130 / 3.6, self._sm())
-    assert r < 130 / 3.6
-    assert r == pytest.approx(100 * 1.10 / 3.6, abs=0.1)
-
-  def test_narrow_band_coincident_curve_cap_enforces_the_cap(self, hook, monkeypatch):
-    """review Critical (planner side): the driver SEES the narrow 40 (display), but
-    a coincident curve cap ABOVE it (enforcedSpeedLimit=50, source 4) is what the
-    planner enforces — the car slows to 50 for the curve, it does NOT go display-
-    only and coast through at 85."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    self._sl(hook, 40, source=2, road='', narrow=True,
-             enforced=50, enforced_source=4, enforced_safety=True)
-    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
-    assert r == pytest.approx(50 / 3.6, abs=0.1)         # curve cap enforced (no offset)
-    assert r < 85 / 3.6                                  # definitely slowed for the curve
-
-  def test_narrow_band_coincident_reactive_cap_enforces_the_cap(self, hook, monkeypatch):
-    """Same as above for a reactive measured-a_y cap sitting above the narrow
-    guess: display 40, enforced 55 (source 4) → planner enforces 55."""
-    t = [1000.0]
-    monkeypatch.setattr(hook.time, 'monotonic', lambda: t[0])
-    self._sl(hook, 40, source=2, road='', narrow=True,
-             enforced=55, enforced_source=4, enforced_safety=True)
-    r = hook.on_v_cruise(100 / 3.6, 85 / 3.6, self._sm())
-    assert r == pytest.approx(55 / 3.6, abs=0.1)
 
 
 # ============================================================
@@ -1955,6 +1792,126 @@ class TestLaneCountFirstInference:
     assert mw.lane_count_stable == 3
     assert self._published(mw)['inferredSpeed'] == 60
 
+  # --- noise-tolerant narrow-band (≤2) confirmation (route 3d3 seg 16) -------
+  # A single directional debounce timer resets on ANY raw-count change, so on a
+  # genuine 2-lane ramp with brief 3↔4 occlusion spikes the demotion window kept
+  # restarting and lane_count_stable never committed to 2 (seg 16: raw ≤2 for
+  # 24 s continuous, never committed). The leaky time-in-narrow accumulator
+  # (NARROW_* in speedlimitd) commits ≤2 once sustained NARROW_CONFIRM_S, tolerating
+  # sub-NARROW_CONFIRM_S occlusion spikes.
+
+  def _lane_models(self):
+    """modelV2 stand-ins whose laneLineProbs infer 1/2/3/4 raw lanes (straight →
+    no curvature cap, no edge boost; the 2-lane probs give vision_speed_cap 0 so
+    the published inferredSpeed is purely the lane-count table)."""
+    return {
+      1: self._straight_model([0.6, 0.1, 0.1, 0.1]),   # 1 visible line
+      2: self._straight_model([0.6, 0.7, 0.1, 0.1]),   # 2 visible lines
+      3: self._straight_model([0.6, 0.7, 0.7, 0.1]),   # 3 visible lines
+      4: self._straight_model([0.6, 0.7, 0.7, 0.6]),   # 4 visible lines
+    }
+
+  def _feed(self, mw, holder, clock, raw_seq, dt=0.2):
+    """Drive update() once per raw lane count in raw_seq, advancing the clock by
+    dt each tick (5 Hz default). Returns the elapsed time (from the first tick) at
+    which lane_count_stable first commits to ≤2, or None if it never does."""
+    models = self._lane_models()
+    t0 = clock['t']
+    commit_t = None
+    for raw in raw_seq:
+      holder['model'] = models[raw]
+      mw.update()
+      if commit_t is None and mw.lane_count_stable <= 2:
+        commit_t = round(clock['t'] - t0, 3)
+      clock['t'] += dt
+    return commit_t
+
+  def test_noisy_two_lane_ramp_commits_and_enforces(self, sld, monkeypatch):
+    """THE seg-16 case: a genuine 2-lane ramp read as ≤2 with brief single-frame
+    3-4 occlusion spikes (~every 1 s) sustained > 3 s → the leaky accumulator
+    commits lane_count_stable to 2 within ~3-4 s, and the inferred limit is 40 —
+    an ENFORCING source-2 reading (planner lowers v_cruise; no display-only skip)."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 6000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4               # came off a wide road onto the ramp
+    # 25 s of ≤2 with a single 3-4 occlusion spike every ~1 s (every 5th tick).
+    seq = [(3 if i % 5 == 4 else 2) for i in range(125)]
+    commit_t = self._feed(mw, holder, clock, seq)
+    assert commit_t is not None                    # genuine ramp DID commit
+    assert 3.0 <= commit_t <= 4.6                  # within ~3-4 s despite spikes
+    assert mw.lane_count_stable == 2
+    pub = self._published(mw)
+    assert pub['inferredSpeed'] == 40             # 2-lane limit
+    assert pub['source'] == 2                     # enforcing (not safety, not display-only)
+    assert pub['safetyCapped'] is False
+
+  def test_transient_narrow_dip_never_commits(self, sld, monkeypatch):
+    """A sub-3 s narrow dip (occlusion transients cluster ~0.1 s; here a generous
+    2 s) then raw ≥3 sustained → the accumulator never reaches NARROW_CONFIRM_S, so
+    lane_count_stable never commits to 2 — no spurious 40 (the seg-29 false narrow)."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 7000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    # 2.0 s of raw=2 (10 ticks) — under the 3 s threshold — then 6 s of raw=4.
+    seq = [2] * 10 + [4] * 30
+    commit_t = self._feed(mw, holder, clock, seq)
+    assert commit_t is None                        # NEVER committed to ≤2
+    assert mw.lane_count_stable == 4
+    assert self._published(mw)['inferredSpeed'] == 80
+
+  def test_clean_two_lane_ramp_commits_at_3s(self, sld, monkeypatch):
+    """A clean genuine ramp (raw ≤2 continuous, no spikes) commits to 2 at ~3 s
+    (NARROW_CONFIRM_S), not before."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 8000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    commit_t = self._feed(mw, holder, clock, [2] * 30)
+    assert commit_t is not None
+    assert 3.0 <= commit_t <= 3.4                  # ~3 s (first-tick dt=0 → 3.0 s)
+    assert mw.lane_count_stable == 2
+    assert self._published(mw)['inferredSpeed'] == 40
+
+  def test_leaving_ramp_promotes_back_to_wide(self, sld, monkeypatch):
+    """The narrow accumulator must NOT block promotion: after committing to 2, a
+    sustained raw=4 (rejoining a wide road) commits back to 4 → 80 via the existing
+    up-debounce (1.5 s)."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 9000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    self._feed(mw, holder, clock, [2] * 30)        # commit to 2 (→40)
+    assert mw.lane_count_stable == 2
+    self._feed(mw, holder, clock, [4] * 20)        # 4 s of raw=4 → promote
+    assert mw.lane_count_stable == 4
+    assert self._published(mw)['inferredSpeed'] == 80
+
+  def test_two_lane_no_cap_enforces_source2_40(self, sld):
+    """Committed 2-lane → 40 is published as an ENFORCING source-2 limit (not
+    safety-capped): the seg-29 regression removal — a genuine ramp 40 is no longer
+    excluded from enforcement (planner lowers v_cruise; see TestPlannerHook)."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 2
+    mw.update()
+    pub = self._published(mw)
+    assert pub['speedLimit'] == 40
+    assert pub['source'] == 2
+    assert pub['safetyCapped'] is False
+
+  def test_curve_cap_below_two_lane_enforces_as_safety(self, sld):
+    """Curve-cap / lane-count interaction: a curve cap BELOW the 2-lane guess
+    (30 < 40) binds as the safety source — speedLimit 30, source 4, safetyCapped."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 2
+    mw.curvature_cap = 30
+    mw.update()
+    pub = self._published(mw)
+    assert pub['speedLimit'] == 30
+    assert pub['source'] == 4
+    assert pub['safetyCapped'] is True
+
   # --- source / telemetry -----------------------------------
 
   def test_source_stays_road_type_inference_class(self, sld):
@@ -1965,161 +1922,6 @@ class TestLaneCountFirstInference:
     mw.update()
     assert self._published(mw)['source'] == 2
     assert self._published(mw)['inferenceMode'] == 'lane_count'
-
-
-# ============================================================
-# Narrow-band lane-count limits are DISPLAY-ONLY (route 3d1 seg 29)
-# ============================================================
-
-class TestNarrowBandDisplayFlag:
-  """speedlimitd still PUBLISHES a ≤2-lane inferred limit for display (the driver
-  sees 40/30), but marks it laneCountNarrow=True so planner_hook excludes it from
-  enforcement. ≥3-lane limits and G/S promotes stay laneCountNarrow=False."""
-
-  def _mw(self, sld):
-    import plugins.speedlimitd.speedlimitd as mod
-    with patch.object(mod.messaging, 'SubMaster'):
-      mw = mod.SpeedLimitMiddleware()
-    mw._sl_pub = MagicMock()
-    sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
-    sm.update = MagicMock()
-    mw.sm = sm
-    mw._cmd_sub = None
-    mw._lc_sub = None
-    return mw
-
-  def _result(self, **kw):
-    base = {'wayRef': '', 'wayName': '', 'speedLimit': 0.0, 'lanes': 0,
-            'roadContext': 1, 'roadName': '', 'highwayType': '', 'distance': 5.0}
-    base.update(kw)
-    return base
-
-  def _published(self, mw):
-    return mw._sl_pub.send.call_args[0][0]
-
-  def test_seg29_two_lane_displayed_but_flagged_narrow(self, sld):
-    """THE seg-29 case: non-G/S, 2 confident lanes → 40 is PUBLISHED for display
-    (speedLimit==40, source 2, not safety-capped) but flagged laneCountNarrow so
-    it never enforces."""
-    mw = self._mw(sld)
-    mw.lane_count_stable = 2
-    mw.update()
-    pub = self._published(mw)
-    assert pub['speedLimit'] == 40          # driver still SEES 40
-    assert pub['inferredSpeed'] == 40
-    assert pub['source'] == 2
-    assert pub['safetyCapped'] is False
-    assert pub['laneCountNarrow'] is True   # ...but excluded from enforcement
-    assert pub['inferenceMode'] == 'lane_count'
-
-  def test_one_lane_displayed_but_flagged_narrow(self, sld):
-    mw = self._mw(sld)
-    mw.lane_count_stable = 1
-    mw.update()
-    pub = self._published(mw)
-    assert pub['speedLimit'] == 30
-    assert pub['laneCountNarrow'] is True
-
-  def test_three_lane_not_narrow(self, sld):
-    """3-lane → 60 is informative (wide→faster), enforcing: laneCountNarrow False."""
-    mw = self._mw(sld)
-    mw.lane_count_stable = 3
-    mw.update()
-    pub = self._published(mw)
-    assert pub['speedLimit'] == 60
-    assert pub['laneCountNarrow'] is False
-
-  def test_four_lane_not_narrow(self, sld):
-    mw = self._mw(sld)
-    mw.lane_count_stable = 4
-    mw.update()
-    pub = self._published(mw)
-    assert pub['speedLimit'] == 80
-    assert pub['laneCountNarrow'] is False
-
-  def test_gs_promote_not_narrow(self, sld):
-    """G/S expressway promote is never narrow-band (gs_mode requires ≥3 lanes)."""
-    mw = self._mw(sld)
-    mw.lane_count_stable = 3
-    mw._ingest_osm_result(self._result(wayRef='S20', roadContext=0,
-                                       highwayType='trunk'))
-    mw.update()
-    pub = self._published(mw)
-    assert pub['inferenceMode'] == 'gs_osm'
-    assert pub['laneCountNarrow'] is False
-
-  def test_curve_cap_binds_not_narrow_even_at_two_lanes(self, sld):
-    """When a safety curve cap is the binding source (source 4) the displayed
-    limit is the cap, not the narrow guess, so laneCountNarrow is False — the flag
-    describes the PUBLISHED limit, and the safety cap must enforce."""
-    mw = self._mw(sld)
-    mw.lane_count_stable = 2               # base inference would be narrow 40
-    mw.curvature_cap = 30                  # raw curve cap binds lower, source 4
-    mw.update()
-    pub = self._published(mw)
-    assert pub['source'] == 4
-    assert pub['safetyCapped'] is True
-    assert pub['laneCountNarrow'] is False
-    # Enforcement mirrors display here (the safety cap already won the min).
-    assert pub['enforcedSpeedLimit'] == 30
-    assert pub['enforcedSource'] == 4
-    assert pub['enforcedSafetyCapped'] is True
-
-  # --- review Critical: a curve cap ABOVE the narrow guess must still enforce ---
-
-  def test_critical_curve_above_narrow_display40_enforce50(self, sld):
-    """THE review Critical: at 2 lanes the base guess is 40; a curvature cap sits
-    ABOVE it at raw 50 (snaps to 50). The 40 wins the DISPLAY min (shown to the
-    driver), but the narrow guess is EXCLUDED from the enforcement min, so the 50
-    curve cap is what enforces — the car still slows for the curve. (Under the
-    old flag-only mechanism the whole reading went display-only and the 50 curve
-    cap never enforced — the Critical bug.)"""
-    mw = self._mw(sld)
-    mw.lane_count_stable = 2
-    mw.curvature_cap = 50                  # raw curve cap ABOVE the narrow 40
-    mw.update()
-    pub = self._published(mw)
-    # Display: the narrow guess is still shown.
-    assert pub['speedLimit'] == 40
-    assert pub['source'] == 2
-    assert pub['safetyCapped'] is False
-    assert pub['laneCountNarrow'] is True
-    # Enforcement: the narrow guess is excluded, so the curve cap enforces.
-    assert pub['enforcedSpeedLimit'] == 50
-    assert pub['enforcedSource'] == 4
-    assert pub['enforcedSafetyCapped'] is True
-
-  def test_tie_curve_equals_narrow_curve_enforces(self, sld):
-    """Exact tie: curve cap == narrow guess (both 40) at 2 lanes. The curve
-    candidate is ordered before the base, so it wins BOTH display and enforcement
-    as a safety cap — source 4, safety-capped."""
-    mw = self._mw(sld)
-    mw.lane_count_stable = 2
-    mw.curvature_cap = 40
-    mw.update()
-    pub = self._published(mw)
-    assert pub['speedLimit'] == 40
-    assert pub['source'] == 4               # curve wins the tie (ordered first)
-    assert pub['laneCountNarrow'] is False
-    assert pub['enforcedSpeedLimit'] == 40
-    assert pub['enforcedSource'] == 4
-    assert pub['enforcedSafetyCapped'] is True
-
-  def test_reactive_above_narrow_enforces_reactive(self, sld):
-    """A reactive measured-a_y cap ABOVE the narrow guess (react ~55, narrow 40)
-    is excluded-from-min the same way: display 40, enforced = the reactive cap."""
-    mw = self._mw(sld)
-    mw.lane_count_stable = 2
-    mw._react_cap_ms = 55.0 / 3.6           # engaged reactive cap above the narrow 40
-    mw.react_lat_accel_threshold = 2.5
-    mw.update()
-    pub = self._published(mw)
-    assert pub['speedLimit'] == 40
-    assert pub['laneCountNarrow'] is True
-    assert pub['enforcedSpeedLimit'] == sld.snap_to_standard_speed(55)
-    assert pub['enforcedSource'] == 4
-    assert pub['enforcedSafetyCapped'] is True
 
 
 # ============================================================
