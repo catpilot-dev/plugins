@@ -955,6 +955,44 @@ class TestPlannerHook:
       assert target - 1e-9 <= r <= v_cruise + 1e-9
       clk['t'] += 0.5
 
+  def test_glide_ratchets_down_with_slowing_car(self, hook, monkeypatch):
+    """If the car slows below the gliding ceiling (traffic / driver brake), the
+    ceiling ratchets to the car and never re-permits the given-up speed while the
+    reduction stays active — even if the car speeds back up."""
+    clk = self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=2, road='')
+    v_cruise = 90 / 3.6
+    v = 80 / 3.6
+    r0 = hook.on_v_cruise(v_cruise, v, self._sm())
+    assert r0 == pytest.approx(v, abs=1e-9)          # ceiling starts at v_ego
+    clk['t'] += 0.5
+    r1 = hook.on_v_cruise(v_cruise, v, self._sm())   # one glide cycle, ~v-0.1
+    # car slows 3 m/s below the ceiling
+    v_slow = r1 - 3.0
+    clk['t'] += 0.5
+    r2 = hook.on_v_cruise(v_cruise, v_slow, self._sm())
+    assert r2 == pytest.approx(v_slow, abs=1e-6)     # ratcheted to the car
+    # car speeds back up — the ceiling must not re-rise
+    clk['t'] += 0.5
+    r3 = hook.on_v_cruise(v_cruise, v, self._sm())
+    assert r3 <= v_slow + 1e-6                        # given-up speed not re-permitted
+
+  def test_glide_car_below_limit_pins_at_target(self, hook, monkeypatch):
+    """Car already below the new limit at reduction start (v_ego < floored_target):
+    the ceiling pins at floored_target (the limit), not v_ego — cap-only semantics
+    let DCC accelerate up to the limit but never above it."""
+    self._real_clock(monkeypatch, hook)
+    self._sl(hook, 60, source=2, road='')            # target 60*1.15
+    target = 60 * 1.15 / 3.6
+    v = 40 / 3.6                                      # below the 60 target
+    v_cruise = 120 / 3.6
+    r = hook.on_v_cruise(v_cruise, v, self._sm())
+    assert r == pytest.approx(target, abs=1e-6)      # capped at the LIMIT, not v_ego
+    assert r > v                                      # DCC may accelerate toward it
+    for _ in range(5):
+      r = hook.on_v_cruise(v_cruise, v, self._sm())
+      assert r == pytest.approx(target, abs=1e-6)    # pinned at target, never above
+
 
 # ============================================================
 # Change 1 — MapdCurveTargetLatAccel param wiring

@@ -184,6 +184,12 @@ def on_v_cruise(v_cruise, v_ego, sm):
       dt = min(max(now - _glide_last_t, 0.0), 0.5)
       # Descending only; floored at the target so enforcement is never weakened.
       _glide_ms = max(floored_target, _glide_ms - INFERRED_GLIDE_DECEL * dt)
+    # Ratchet the ceiling down with the car (same idiom as the gas floor): if the
+    # car has already slowed below the ceiling (traffic, driver brake), never
+    # re-permit that given-up speed while the reduction is still active. Bounded
+    # below by floored_target so a car already under the limit never drags the
+    # ceiling below the (correct, lower) target.
+    _glide_ms = min(_glide_ms, max(v_ego, floored_target))
     _glide_last_t = now
     # Ceiling toward the target; never above v_cruise, never below floored_target
     # (the hard floor — the glide softens the approach, not the enforcement).
