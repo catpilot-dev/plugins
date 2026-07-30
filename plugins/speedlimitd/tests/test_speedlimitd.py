@@ -1874,6 +1874,20 @@ class TestLaneCountFirstInference:
     assert mw.lane_count_stable == 2
     assert self._published(mw)['inferredSpeed'] == 40
 
+  def test_narrow_commits_to_2_despite_raw1_glitch(self, sld, monkeypatch):
+    """L1 (route 3d3 seg16 / 3d1 seg29): both real ramps commit on a raw=1
+    occluded frame. The commit must be a FIXED 2 (→40), never the glitch raw=1
+    (which would read 30 on the very ramps this fixes)."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 8500.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    # sustained narrow with a single raw=1 occlusion frame right at the commit
+    commit_t = self._feed(mw, holder, clock, [2] * 14 + [1] + [2] * 15)
+    assert commit_t is not None
+    assert mw.lane_count_stable == 2                # NOT 1
+    assert self._published(mw)['inferredSpeed'] == 40   # NOT 30
+
   def test_leaving_ramp_promotes_back_to_wide(self, sld, monkeypatch):
     """The narrow accumulator must NOT block promotion: after committing to 2, a
     sustained raw=4 (rejoining a wide road) commits back to 4 → 80 via the existing

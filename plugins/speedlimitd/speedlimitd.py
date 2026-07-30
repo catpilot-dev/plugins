@@ -642,7 +642,6 @@ class SpeedLimitMiddleware:
     self.lane_count_locked: bool = False  # True once vision has a 2 s stable reading
     # Leaky narrow-band (≤2) confirmation state (see NARROW_* constants).
     self._narrow_accum: float = 0.0       # net time-in-narrow, seconds, [0, cap]
-    self._narrow_min_raw: int = 2         # sustained-narrow value to commit (1 or 2)
     self._lane_last_t: float = 0.0        # last modelV2 tick time, for the accumulator dt
     self.lane_conf: float = 0.0           # smoothed lane line confidence (0.0–1.0)
     self.vision_cap: int = 0
@@ -950,17 +949,19 @@ class SpeedLimitMiddleware:
       # Committing DOWN into the narrow band (≤2): leaky NARROW_CONFIRM_S confirmation
       # (see NARROW_* constants). ADD dt while raw ≤2, bleed NARROW_DECAY·dt while
       # raw ≥3, clamp [0, cap]. A genuine 2-lane ramp climbs to the threshold in
-      # ~3-4 s and commits (to the recent min raw seen while narrow, 1 or 2); a
-      # sub-3 s transient dip never reaches it. Once fully decayed the target resets.
+      # ~3-4 s and commits; a sub-3 s transient dip never reaches it.
+      # Commit to a FIXED 2 (→40), NOT the min raw seen while narrow: the commit
+      # fires during the noisiest lane-loss moment, where a single occluded frame
+      # can read raw=1, and both verified ramps (3d3 seg16 / 3d1 seg29) commit on
+      # exactly such a frame — committing to that raw would read 30 instead of 40
+      # on the very ramps this fixes. A true 1-lane→30 road would need its own
+      # separate confirmation; 2→40 is the correct choice for the 2-lane target.
       if raw_lane_count <= 2:
         self._narrow_accum = min(self._narrow_accum + dt, NARROW_ACCUM_CAP)
-        self._narrow_min_raw = min(self._narrow_min_raw, raw_lane_count)
       else:
         self._narrow_accum = max(self._narrow_accum - NARROW_DECAY * dt, 0.0)
-        if self._narrow_accum == 0.0:
-          self._narrow_min_raw = 2
       if self._narrow_accum >= NARROW_CONFIRM_S:
-        self.lane_count_stable = self._narrow_min_raw
+        self.lane_count_stable = 2
         self.lane_count_locked = True
 
       # Lane line confidence: sum of all probs divided by line count.
