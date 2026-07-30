@@ -1,3 +1,5 @@
+import time
+
 from openpilot.common.constants import CV
 
 # Lead vehicle override: if lead is traveling above the speed limit,
@@ -16,6 +18,14 @@ LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
 # docs/superpowers/specs/2026-07-10-speedlimitd-driver-intent-enforcement-design.md
 SOURCE_ROAD_TYPE_INFERENCE = 2  # _sl_data['source'] value for inferred limits
 
+# A lane-count-variation limit reduction (e.g. a >=3-lane 80 dropping to a
+# <=2-lane ramp 40) is REGULATORY, not imminent-safety geometry. The display
+# ladder publishes it as instant target steps every few seconds, which DCC
+# chases at ~1 m/s2 (a harsh sawtooth). Ease inferred reductions in as a gentle
+# glide instead; safety caps (curve/reactive) stay prompt. (user directive
+# 2026-07-31)
+INFERRED_GLIDE_DECEL = 0.2  # m/s2 — regulatory (lane-count) limit reductions ease in gently; safety caps stay prompt (user directive 2026-07-31)
+
 _sl_sub = None
 _sl_data = None
 
@@ -23,6 +33,8 @@ _sl_data = None
 _baseline_ms = None   # inferred running-max target on the current road (floor)
 _gas_floor_ms = None  # driver-override hold floor (all sources), set post gas
 _road_id = ''         # last non-empty OSM road identity
+_glide_ms = None      # descending glide ceiling for inferred reductions (None = inactive)
+_glide_last_t = 0.0   # monotonic time of the last glide update
 
 
 def _get_sl_data():
@@ -85,13 +97,14 @@ def _gas_pressed(sm) -> bool:
 
 def _reset_all():
   """Clear the floors (road identity is kept across brief invalid limits)."""
-  global _baseline_ms, _gas_floor_ms
+  global _baseline_ms, _gas_floor_ms, _glide_ms
   _baseline_ms = None
   _gas_floor_ms = None
+  _glide_ms = None
 
 
 def on_v_cruise(v_cruise, v_ego, sm):
-  global _baseline_ms, _gas_floor_ms, _road_id
+  global _baseline_ms, _gas_floor_ms, _road_id, _glide_ms, _glide_last_t
   _get_sl_data()  # update from plugin bus
   if _sl_data is None:
     _reset_all()
@@ -122,6 +135,7 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # hold floor to current speed so enforcement resumes from here on release.
   if _gas_pressed(sm):
     _gas_floor_ms = v_ego
+    _glide_ms = None  # resume glide from v_ego on release, not the stale ceiling
     return v_cruise
 
   # Ratchet the gas floor down with the driver; clear once eased to the limit.
@@ -150,10 +164,35 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # doesn't make a curve less tight — route 2fd), or when a gas hold is active.
   if not inferred and not safety_capped and _gas_floor_ms is None \
       and _lead_overrides_limit(sm, speed_limit):
+    _glide_ms = None
     return v_cruise
 
-  # Enforce the cap directly; DCC comfort-limits the deceleration. floored_target
-  # is <= v_ego whenever the limit dropped, so the cap never commands accel.
+  # Inferred (regulatory, lane-count) reductions ease in as a gentle glide at
+  # INFERRED_GLIDE_DECEL: a ceiling that starts at the car's actual speed and
+  # descends toward floored_target. Safety caps and manual limits fall through
+  # to prompt enforcement below (byte-identical to before). The glide only
+  # engages when this cycle is an inferred reduction; every other cycle resets
+  # it so a resume (gas release, churn release, road/limit recovery) re-inits
+  # from v_ego rather than a stale descended value.
+  if inferred and floored_target < v_cruise:
+    now = time.monotonic()
+    if _glide_ms is None:
+      # Start the glide from the car's actual speed (not the old cap), so a drop
+      # while the car sits below the previous limit never permits a speed-up.
+      _glide_ms = v_ego
+    else:
+      dt = min(max(now - _glide_last_t, 0.0), 0.5)
+      # Descending only; floored at the target so enforcement is never weakened.
+      _glide_ms = max(floored_target, _glide_ms - INFERRED_GLIDE_DECEL * dt)
+    _glide_last_t = now
+    # Ceiling toward the target; never above v_cruise, never below floored_target
+    # (the hard floor — the glide softens the approach, not the enforcement).
+    return max(floored_target, min(_glide_ms, v_cruise))
+
+  # Not an active inferred reduction — drop the glide and enforce promptly.
+  # DCC comfort-limits the deceleration. floored_target is <= v_ego whenever the
+  # limit dropped, so the cap never commands accel.
+  _glide_ms = None
   if floored_target < v_cruise:
     return floored_target
   return v_cruise

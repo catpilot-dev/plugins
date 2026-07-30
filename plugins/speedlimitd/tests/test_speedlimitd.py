@@ -540,7 +540,16 @@ class TestPlannerHook:
     mod._baseline_ms = None
     mod._gas_floor_ms = None
     mod._road_id = ''
+    mod._glide_ms = None
+    mod._glide_last_t = 0.0
     return mod
+
+  def _real_clock(self, monkeypatch, hook, t0=1000.0):
+    """Patch planner_hook's time.monotonic to a controllable clock (the glide
+    is time-driven, unlike the immediate-enforcement paths)."""
+    clock = {'t': t0}
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: clock['t'])
+    return clock
 
   # helpers -------------------------------------------------
 
@@ -598,14 +607,25 @@ class TestPlannerHook:
     self._sl(hook, 40, source=1)
     assert hook.on_v_cruise(100 / 3.6, 20.0, self._sm()) == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
 
-  def test_inferred_lane_count_40_enforces_no_display_only(self, hook):
+  def test_inferred_lane_count_40_enforces_via_glide(self, hook, monkeypatch):
     """route 3d3 seg 16 / 3d1 seg 29 regression removed: a genuine 2-lane ramp 40
-    (inferred, source 2, unnamed road, no coincident cap) ENFORCES immediately —
-    v_cruise is lowered. Under the reverted narrow-band display-only patch this
-    was suppressed (car coasted through at speed)."""
+    (inferred, source 2, unnamed road, no coincident cap) ENFORCES — it is not
+    display-only-suppressed (car must not coast through at speed). Since the
+    2026-07-31 glide directive, an inferred reduction eases in at 0.2 m/s2: the
+    first cycle starts the glide near v_ego, then it descends to the 40 target."""
+    clk = self._real_clock(monkeypatch, hook)
     self._sl(hook, 40, source=2, road='')
-    r = hook.on_v_cruise(85 / 3.6, 85 / 3.6, self._sm())
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # enforced (offset applies)
+    target = 40 * 1.15 / 3.6
+    r0 = hook.on_v_cruise(85 / 3.6, 85 / 3.6, self._sm())
+    assert r0 == pytest.approx(85 / 3.6, abs=0.05)        # glide starts at v_ego
+    # let the glide run to the target (0.2 m/s2, dt clamped to 0.5 s/cycle)
+    r = r0
+    for _ in range(400):
+      clk['t'] += 0.5
+      r = hook.on_v_cruise(85 / 3.6, 85 / 3.6, self._sm())
+      if r <= target + 1e-6:
+        break
+    assert r == pytest.approx(target, abs=0.05)           # enforced (offset applies)
     assert r < 85 / 3.6                                   # v_cruise lowered
 
   def test_no_cap_if_already_below(self, hook):
@@ -670,15 +690,25 @@ class TestPlannerHook:
     assert r >= 100 / 3.6 - 0.2       # held at current speed
     assert r > 75 / 3.6               # definitely NOT braked toward 60
 
-  def test_inferred_real_drop_new_road_slows(self, hook):
-    """road_id change → baseline resets → new lower limit enforced immediately
-    (DCC shapes the deceleration, no artificial ramp)."""
+  def test_inferred_real_drop_new_road_glides(self, hook, monkeypatch):
+    """road_id change → baseline resets → new lower inferred limit enforced, but
+    as a regulatory glide (0.2 m/s2), not an instant step. The baseline still
+    resets to the new target; the glide eases v_cruise down to it."""
+    clk = self._real_clock(monkeypatch, hook)
     self._sl(hook, 100, source=2, road='A')
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     self._sl(hook, 40, source=2, road='B')  # new road, real lower limit
-    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
-    assert hook._baseline_ms == pytest.approx(40 * 1.15 / 3.6, abs=0.1)  # baseline reset
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # cap enforced immediately
+    target = 40 * 1.15 / 3.6
+    r0 = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    assert hook._baseline_ms == pytest.approx(target, abs=0.1)  # baseline reset
+    assert r0 > target                                          # not an instant step
+    r = r0
+    for _ in range(400):
+      clk['t'] += 0.5
+      r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+      if r <= target + 1e-6:
+        break
+    assert r == pytest.approx(target, abs=0.05)   # cap enforced after the glide
 
   def test_inferred_recovery_allows_accel(self, hook, monkeypatch):
     """Inferred limit rises again → cap restores up, acceleration allowed."""
@@ -775,15 +805,24 @@ class TestPlannerHook:
 
   # baseline floor requires a road identity ------------------
 
-  def test_empty_road_id_disables_baseline_hold(self, hook):
+  def test_empty_road_id_disables_baseline_hold(self, hook, monkeypatch):
     """No OSM identity (road_id='') → baseline hold invalid → the inferred/vision
-    cap is enforced immediately (route 3a1 unnamed motorway_link ramp)."""
+    cap is enforced (route 3a1 unnamed motorway_link ramp), not held forever at
+    v_ego. Since the glide directive it is enforced as a 0.2 m/s2 glide down to
+    the target rather than an instant step — but it DOES reach the target."""
+    clk = self._real_clock(monkeypatch, hook)
     self._sl(hook, 100, source=2, road='')          # unnamed way
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     self._sl(hook, 40, source=2, road='')           # vision cap → 40, still unnamed
-    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    target = 40 * 1.15 / 3.6
+    r = None
+    for _ in range(400):
+      r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+      clk['t'] += 0.5
+      if r <= target + 1e-6:
+        break
     assert hook._baseline_ms is None                # baseline not built without identity
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # enforced immediately, not held
+    assert r == pytest.approx(target, abs=0.05)     # enforced (glided), not held at v_ego
 
   def test_named_road_id_keeps_baseline_hold(self, hook, monkeypatch):
     """With a road identity, spurious same-road drops are still held (unchanged)."""
@@ -797,6 +836,124 @@ class TestPlannerHook:
       r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
       clk.tick(0.2)
     assert r >= 100 / 3.6 - 0.2                      # held at current speed
+
+  # inferred-reduction glide (0.2 m/s2) ----------------------
+
+  def test_glide_starts_at_vego_and_descends_at_decel(self, hook, monkeypatch):
+    """Inferred 40 on an unnamed way, car at 80 kph, v_cruise 80 kph: the glide
+    ceiling starts at v_ego and descends at 0.2 m/s2. Advancing the clock 0.5 s
+    per cycle drops the cap by 0.2*0.5 = 0.1 m/s each cycle."""
+    clk = self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=2, road='')
+    v = 80 / 3.6
+    r0 = hook.on_v_cruise(v, v, self._sm())
+    assert r0 == pytest.approx(v, abs=1e-9)          # glide starts at v_ego
+    prev = r0
+    for _ in range(4):
+      clk['t'] += 0.5
+      r = hook.on_v_cruise(v, v, self._sm())
+      assert r == pytest.approx(prev - 0.1, abs=1e-9)  # 0.2 m/s2 * 0.5 s
+      prev = r
+
+  def test_glide_reaches_target_in_expected_time(self, hook, monkeypatch):
+    """Total time to reach the target ≈ (v_ego − target) / 0.2, then it sticks."""
+    clk = self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=2, road='')
+    v = 80 / 3.6
+    target = 40 * 1.15 / 3.6
+    hook.on_v_cruise(v, v, self._sm())              # init at t0, dt=0
+    elapsed = 0.0
+    for _ in range(1000):
+      clk['t'] += 0.5
+      elapsed += 0.5
+      r = hook.on_v_cruise(v, v, self._sm())
+      if r <= target + 1e-9:
+        break
+    assert elapsed == pytest.approx((v - target) / 0.2, abs=0.5)
+    clk['t'] += 0.5
+    assert hook.on_v_cruise(v, v, self._sm()) == pytest.approx(target, abs=1e-9)
+
+  def test_glide_safety_cap_immediate_no_glide(self, hook, monkeypatch):
+    """A safety cap enforces promptly and never engages the glide (byte-same as
+    before the glide: returns the raw target on the first cycle)."""
+    self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=4, safety=True)
+    r = hook.on_v_cruise(80 / 3.6, 80 / 3.6, self._sm())
+    assert r == pytest.approx(40 / 3.6, abs=0.1)
+    assert hook._glide_ms is None
+
+  def test_glide_manual_limit_immediate_no_glide(self, hook, monkeypatch):
+    """A manual/confirmed (source 1) reduction enforces promptly, no glide."""
+    self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=1)
+    r = hook.on_v_cruise(80 / 3.6, 80 / 3.6, self._sm())
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)
+    assert hook._glide_ms is None
+
+  def test_glide_churn_release_reinits_from_vego(self, hook, monkeypatch):
+    """A brief 40 excursion glides down only a little; when the limit recovers
+    (no reduction) the glide resets, and re-entering the reduction re-inits from
+    the current v_ego — not the stale descended ceiling (Y-fork churn)."""
+    clk = self._real_clock(monkeypatch, hook)
+    v = 80 / 3.6
+    self._sl(hook, 40, source=2, road='')
+    r = hook.on_v_cruise(v, v, self._sm())          # glide inits at v_ego
+    for _ in range(6):                              # ~3 s of glide
+      clk['t'] += 0.5
+      r = hook.on_v_cruise(v, v, self._sm())
+    assert r < v                                    # descended
+    assert r > v - 1.0                              # only a little (0.2 * ~3 s)
+    # limit recovers → no reduction → glide resets
+    self._sl(hook, 120, source=2, road='')
+    clk['t'] += 0.5
+    r2 = hook.on_v_cruise(v, v, self._sm())
+    assert hook._glide_ms is None
+    assert r2 == pytest.approx(v)
+    # re-enter the reduction → re-init from v_ego, not the old descended value
+    self._sl(hook, 40, source=2, road='')
+    clk['t'] += 0.5
+    r3 = hook.on_v_cruise(v, v, self._sm())
+    assert r3 == pytest.approx(v, abs=1e-9)
+
+  def test_glide_gas_press_resets_then_reinits(self, hook, monkeypatch):
+    """Gas mid-glide → early return (unchanged) and glide reset; on release the
+    glide re-inits from the (new) v_ego."""
+    clk = self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=2, road='')
+    hook.on_v_cruise(80 / 3.6, 80 / 3.6, self._sm())   # glide init
+    clk['t'] += 1.0
+    hook.on_v_cruise(80 / 3.6, 80 / 3.6, self._sm())   # descend a little
+    assert hook._glide_ms is not None
+    clk['t'] += 0.5
+    r_gas = hook.on_v_cruise(80 / 3.6, 70 / 3.6, self._sm(gas=True))
+    assert r_gas == pytest.approx(80 / 3.6)            # suspended, unchanged
+    assert hook._glide_ms is None                      # reset
+    clk['t'] += 0.5
+    r = hook.on_v_cruise(80 / 3.6, 70 / 3.6, self._sm(gas=False))
+    assert r == pytest.approx(70 / 3.6, abs=1e-9)      # re-init from current v_ego
+
+  def test_glide_dt_clamped_to_half_second(self, hook, monkeypatch):
+    """A long gap between calls moves the glide by only 0.2 * 0.5 = 0.1 m/s, not
+    0.2 * gap — the dt clamp protects against a stall/backgrounding jump."""
+    clk = self._real_clock(monkeypatch, hook)
+    v = 80 / 3.6
+    self._sl(hook, 40, source=2, road='')
+    r0 = hook.on_v_cruise(v, v, self._sm())
+    clk['t'] += 10.0
+    r1 = hook.on_v_cruise(v, v, self._sm())
+    assert r0 - r1 == pytest.approx(0.1, abs=1e-9)     # 0.5 s clamp, not 10 s
+
+  def test_glide_bounded_by_target_and_vcruise(self, hook, monkeypatch):
+    """The returned cap is always within [floored_target, v_cruise] throughout."""
+    clk = self._real_clock(monkeypatch, hook)
+    v = 80 / 3.6
+    v_cruise = 90 / 3.6
+    target = 40 * 1.15 / 3.6
+    self._sl(hook, 40, source=2, road='')
+    for _ in range(300):
+      r = hook.on_v_cruise(v_cruise, v, self._sm())
+      assert target - 1e-9 <= r <= v_cruise + 1e-9
+      clk['t'] += 0.5
 
 
 # ============================================================
