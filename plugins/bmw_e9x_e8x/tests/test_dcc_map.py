@@ -8,7 +8,8 @@ if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
 from bmw.dcc_map import (expected_accel, gap_for_accel, accel_envelope,
-                         select_cruise_command, MS_TO_KPH, V_ERROR_DEADZONE)
+                         select_cruise_command, MS_TO_KPH, V_ERROR_DEADZONE,
+                         ACCEL_TRIGGER_KPH, ACCEL_BRAKE_VETO)
 from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 
@@ -71,9 +72,12 @@ def cmd(a_target, v_ego, setpoint, v_target, min_setpoint=5.0):
 
 
 def test_deadband_emits_nothing():
+  # v_target kept within ACCEL_TRIGGER_KPH of v so this stays in the
+  # braking/holding branch (a v_target 5 km/h out would now route to the
+  # acceleration branch instead).
   v, a = 20.0, 0.0
   sp = v + gap_for_accel(a, v)
-  assert cmd(a, v, sp, v_target=v + 5.0) is None
+  assert cmd(a, v, sp, v_target=v + 0.2) is None
 
 
 def test_accel_request_below_target_emits_plus():
@@ -82,9 +86,14 @@ def test_accel_request_below_target_emits_plus():
 
 
 def test_large_setpoint_error_uses_step5():
+  # plus5 is only reachable from the braking/holding branch's raise path now
+  # (the acceleration branch never emits it -- see ACCEL_TRIGGER_KPH/plus1
+  # docs above). Keep v_target within ACCEL_TRIGGER_KPH of v_ego so this
+  # stays in that branch, but set setpoint far enough below the
+  # authority-clamped desired setpoint to need a 5 km/h step.
   v = 20.0
   _, a_max = accel_envelope(v)
-  assert cmd(a_max, v, setpoint=v, v_target=v + 10.0) == "plus5"
+  assert cmd(a_max, v, setpoint=18.0, v_target=v + 0.2) == "plus5"
 
 
 def test_small_setpoint_error_uses_step1():
@@ -193,11 +202,19 @@ def test_floor_raise_invariant_sweep():
   whenever a_target < 0 and desired_raw < setpoint, no plus command may ever
   be emitted: the floor must hold the setpoint, never raise it against a
   planner that is asking for less than what's already commanded.
+
+  This invariant is specific to the braking/holding branch's floor logic
+  (desired_raw only feeds the setpoint there). Grid points where v_error is
+  large enough to route into the acceleration branch are skipped -- there,
+  a_target is only a coarse veto (below ACCEL_BRAKE_VETO), not the signal
+  this invariant is about; the veto behaviour has its own dedicated tests.
   """
   min_sp = 9.72  # 35 km/h cruise floor
   checked = 0
   for v_ego in [8.0, 8.5, 9.0, 9.5, 10.0, 11.0, 12.0]:
     for v_target in [min_sp, min_sp + 0.5, min_sp + 2.0, min_sp + 5.0]:
+      if (v_target - v_ego) * MS_TO_KPH > ACCEL_TRIGGER_KPH:
+        continue  # routes to the acceleration branch instead
       for a_target in [-3.0, -2.0, -1.0, -0.5, -0.1]:
         desired_raw = min(v_ego + gap_for_accel(a_target, v_ego), v_target)
         if desired_raw >= min_sp:
@@ -252,7 +269,10 @@ def test_floor_never_pushes_setpoint_past_v_target_when_setpoint_at_or_below_it(
     (-1.0, 11.0, 9.17, 10.5, 9.72, None),
     (-0.8, 10.0, 8.9,  4.0,  9.72, None),
     (-0.8, 13.9, 13.0, 4.0,  9.72, 'minus5'),
-    ( 0.4, 10.0, 9.0,  15.0, 9.72, 'plus5'),
+    # Was 'plus5' before the acceleration split: v_error = 15.0-10.0 = 5.0 m/s
+    # (18 km/h) is well above ACCEL_TRIGGER_KPH, so this now routes to the
+    # acceleration branch, which only ever emits 'plus1'.
+    ( 0.4, 10.0, 9.0,  15.0, 9.72, 'plus1'),
     ( 0.3, 20.0, 20.0, 25.0, 5.0,  'plus1'),
     (-0.5, 25.0, 25.0, 20.0, 5.0,  'minus5'),
 ])
@@ -260,7 +280,10 @@ def test_canonical_cases_unchanged(a_target, v_ego, setpoint, v_target, min_setp
   """Locks in the hand-verified reference cases from the direction-gate spec.
   These must not move when the gate is added: three already return None on
   pre-existing guards, and the other three have a_target and v_error agreeing
-  on direction, so the new gate is a no-op on them."""
+  on direction, so the new gate is a no-op on them.
+
+  One case (a_target=0.4, ...) changed with the acceleration-branch split:
+  see the inline comment above."""
   assert cmd(a_target, v_ego, setpoint, v_target, min_setpoint) == expected
 
 
@@ -295,9 +318,14 @@ def test_gate_minus_allowed_with_small_positive_v_error():
 
 
 def test_gate_suppresses_plus_when_a_target_disagrees():
-  """v_error is strongly positive and err_kph > 0, but a_target is negative
-  (noisy modelV2 disagreement) -- the gate must block the raise."""
-  assert cmd(-0.1, 20.0, 18.0, 25.0, 5.0) is None
+  """v_error is strongly positive, putting this in the acceleration branch.
+  a_target is mildly negative (-0.1) -- but that is exactly the noisy-model
+  regime the acceleration split is designed to ignore: only a_target below
+  ACCEL_BRAKE_VETO (-0.3) counts as a real braking request. A mild -0.1
+  reading must NOT block the raise (this is the old, now-fixed behaviour --
+  see test_real_world_sluggish_case and the brake-veto tests for the cases
+  that DO still block)."""
+  assert cmd(-0.1, 20.0, 18.0, 25.0, 5.0) == 'plus1'
 
 
 def test_gate_suppresses_minus_when_a_target_disagrees():
@@ -308,10 +336,17 @@ def test_gate_suppresses_minus_when_a_target_disagrees():
 
 def test_gate_conjunction_sweep():
   """Sweep a grid of (a_target, v_ego, setpoint, v_target, min_setpoint) and
-  assert the direction gate's conjunction holds on every emitted command:
-  every plus has v_error > V_ERROR_DEADZONE and a_target > 0; every minus has
+  assert the direction gate's conjunction holds on every emitted command.
+
+  Braking/holding branch (v_error*MS_TO_KPH <= ACCEL_TRIGGER_KPH): every plus
+  has v_error > V_ERROR_DEADZONE and a_target > 0; every minus has
   v_error < V_ERROR_DEADZONE and a_target < 0 (the gate is asymmetric: both
-  branches pivot on the same +V_ERROR_DEADZONE threshold, favouring braking)."""
+  branches pivot on the same +V_ERROR_DEADZONE threshold, favouring braking).
+
+  Acceleration branch (v_error*MS_TO_KPH > ACCEL_TRIGGER_KPH): the a_target>0
+  requirement no longer applies -- a_target only vetoes (must be >=
+  ACCEL_BRAKE_VETO) -- and only 'plus1' may ever be emitted, never 'plus5' or
+  a minus (v_error is by construction strongly positive there)."""
   a_targets = [-2.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0]
   v_egos = [6.0, 9.0, 11.0, 15.0, 20.0, 28.0]
   setpoints = [8.0, 9.2, 10.0, 12.0, 15.0, 20.0, 25.0]
@@ -331,7 +366,12 @@ def test_gate_conjunction_sweep():
               continue
             emitted += 1
             v_error = v_target - v_ego
-            if result in ("plus1", "plus5"):
+            if v_error * MS_TO_KPH > ACCEL_TRIGGER_KPH:
+              assert result == 'plus1', \
+                  f"acceleration branch emitted {result}, expected plus1 only"
+              assert a_target >= ACCEL_BRAKE_VETO, \
+                  f"acceleration branch fired despite veto: a_target={a_target}"
+            elif result in ("plus1", "plus5"):
               assert v_error > V_ERROR_DEADZONE and a_target > 0, \
                   f"plus emitted without agreement: v_error={v_error}, a_target={a_target}"
             else:
@@ -347,11 +387,19 @@ def test_full_invariant_sweep_plus_and_minus_and_planner_intent():
   command:
 
     1. A plus tick must never land the setpoint above v_target if the current
-       setpoint started at or below v_target.
+       setpoint started at or below v_target. (Holds across BOTH branches:
+       in the acceleration branch this follows from err_kph >= 1.0 gating
+       'plus1', proven algebraically in
+       test_acceleration_branch_never_overshoots_v_target.)
     2. A minus tick must never land the setpoint below min_setpoint if the
        current setpoint started at or above min_setpoint.
     3. A plus must never be emitted when desired_raw (the planner's actual
-       ask, before the floor clamp) is below the current setpoint.
+       ask, before the floor clamp) is below the current setpoint. This is
+       specific to the braking/holding branch -- desired_raw isn't even
+       computed in the acceleration branch, which deliberately trusts
+       v_target over the aTarget-derived map (that's the whole point of the
+       split; see dcc_map.select_cruise_command's docstring) -- so it is only
+       checked there.
 
   This is the grid that would have caught both the original min-speed-floor
   bug and the second hole where the `desired > v_target` guard was wrongly
@@ -376,6 +424,7 @@ def test_full_invariant_sweep_plus_and_minus_and_planner_intent():
               continue
             step_kph = 5.0 if result in ("plus5", "minus5") else 1.0
             step_ms = step_kph / MS_TO_KPH
+            in_accel_branch = (v_target - v_ego) * MS_TO_KPH > ACCEL_TRIGGER_KPH
 
             if result in ("plus1", "plus5"):
               new_setpoint = setpoint + step_ms
@@ -383,12 +432,12 @@ def test_full_invariant_sweep_plus_and_minus_and_planner_intent():
               if setpoint <= v_target and new_setpoint > v_target + 1e-9:
                 violations.append(
                     ("v_target ceiling breached", a_target, v_ego, setpoint, v_target, min_sp, result))
-              # Invariant 3: desired_raw is the planner's own ask; a plus must
-              # never fire when that ask is already below the current setpoint.
-              desired_raw = min(v_ego + gap_for_accel(a_target, v_ego), v_target)
-              if desired_raw < setpoint - 1e-9:
-                violations.append(
-                    ("planner-intent guard breached", a_target, v_ego, setpoint, v_target, min_sp, result))
+              # Invariant 3: braking/holding branch only -- see docstring.
+              if not in_accel_branch:
+                desired_raw = min(v_ego + gap_for_accel(a_target, v_ego), v_target)
+                if desired_raw < setpoint - 1e-9:
+                  violations.append(
+                      ("planner-intent guard breached", a_target, v_ego, setpoint, v_target, min_sp, result))
 
             elif result in ("minus1", "minus5"):
               new_setpoint = setpoint - step_ms
@@ -399,3 +448,60 @@ def test_full_invariant_sweep_plus_and_minus_and_planner_intent():
 
   assert checked == len(a_targets) * len(v_egos) * len(setpoints) * len(v_targets) * len(min_setpoints)
   assert not violations, f"{len(violations)} invariant violation(s), first few: {violations[:5]}"
+
+
+# ---- acceleration branch: drive from v_target, veto only on real braking ----
+
+def test_real_world_sluggish_case_now_accelerates():
+  """The motivating field observation: car held at 80 km/h (v_ego=24.08 m/s)
+  with a 97 km/h target (v_target=27.11 m/s) because a_target was a barely
+  positive +0.015 -- under the old aTarget-driven setpoint, gap_for_accel of
+  that tiny a_target put the setpoint only ~1.3 km/h above v_ego, below the
+  1.0 km/h deadband, so nothing was ever sent. The acceleration branch fixes
+  this by targeting v_target directly."""
+  assert cmd(0.015, 24.08, 24.44, 27.11, 9.72) == 'plus1'
+
+
+def test_brake_veto_blocks_acceleration():
+  """a_target below ACCEL_BRAKE_VETO means the model wants real braking, even
+  though v_error is clearly calling for acceleration -- conflicting signals
+  must coast (None), not fight the model."""
+  assert cmd(-0.5, 20.0, 20.0, 30.0, 5.0) is None
+
+
+def test_brake_veto_boundary_just_above_still_accelerates():
+  """a_target just above ACCEL_BRAKE_VETO (-0.29 > -0.3) is not a real braking
+  request, so a large shortfall must still produce a raise."""
+  assert cmd(-0.29, 20.0, 20.0, 30.0, 5.0) == 'plus1'
+
+
+def test_acceleration_branch_deadband():
+  """Setpoint already within 1 km/h of v_target must emit nothing, even
+  though v_error is well above ACCEL_TRIGGER_KPH."""
+  v_ego, v_target = 20.0, 25.0
+  setpoint = v_target - 0.5 / MS_TO_KPH   # 0.5 km/h short of v_target
+  assert cmd(0.5, v_ego, setpoint, v_target, 5.0) is None
+
+
+def test_acceleration_branch_never_overshoots_v_target():
+  """Sweep the grid where the acceleration branch fires and assert a plus1
+  tick can never carry the setpoint above v_target -- algebraically
+  guaranteed because 'plus1' only fires when
+  (v_target - setpoint) * MS_TO_KPH >= SETPOINT_DEADBAND_KPH (1.0), i.e.
+  setpoint <= v_target - 1/MS_TO_KPH."""
+  checked = 0
+  for a_target in [-0.29, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0]:
+    for v_ego in [0.0, 6.0, 9.0, 11.0, 15.0, 20.0, 28.0]:
+      for setpoint in [v_ego - 2.0, v_ego, v_ego + 1.0, v_ego + 3.0, v_ego + 6.0]:
+        for v_target in [v_ego + 0.5, v_ego + 1.0, v_ego + 2.0, v_ego + 5.0, v_ego + 10.0]:
+          for min_sp in [5.0, 9.72]:
+            if (v_target - v_ego) * MS_TO_KPH <= ACCEL_TRIGGER_KPH:
+              continue  # not in the acceleration branch on this grid point
+            result = cmd(a_target, v_ego, setpoint, v_target, min_sp)
+            if result is None:
+              continue
+            checked += 1
+            assert result == 'plus1'
+            assert setpoint + 1.0 / MS_TO_KPH <= v_target + 1e-9, \
+                f"plus1 overshoots v_target: setpoint={setpoint}, v_target={v_target}"
+  assert checked > 0, "sweep grid produced no emitted acceleration-branch commands"

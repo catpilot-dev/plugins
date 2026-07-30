@@ -14,6 +14,8 @@ from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 MS_TO_KPH = 3.6                # local literal: this module must not import opendbc
 SETPOINT_DEADBAND_KPH = 1.0    # below one tick there is nothing to send
 V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — speed-error direction deadzone
+ACCEL_TRIGGER_KPH = 1.0        # speed shortfall that puts us in acceleration mode
+ACCEL_BRAKE_VETO = -0.3        # aTarget below this means the model wants real braking; do not accelerate
 
 
 def _clamp(x, lo, hi):
@@ -60,12 +62,42 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   where the measured map says it should be. Returns a CruiseStalk member name
   or None.
 
+  Split into two branches because aTarget cannot be trusted symmetrically.
+  Upstream's longitudinal_planner.py takes
+  min(output_a_target_e2e, output_a_target_mpc), so the noisy vision model
+  can only ever VETO acceleration, never braking — vTarget, by contrast,
+  comes from the MPC alone. Measured against what the plant gain implies
+  from the speed error, aTarget is only ~0.13x the needed value when
+  accelerating but ~3.0-3.3x when braking. Deriving the setpoint from aTarget
+  therefore makes acceleration hopeless (observed: car held at 80 km/h with
+  a 97 km/h target because aTarget was +0.015). So acceleration is driven
+  from vTarget directly (aTarget only vetoes it), while braking keeps using
+  aTarget, where it is conservative and safe.
+
   Open-loop on the map: measured aEgo is deliberately not an input.
   """
   # Guard against non-finite inputs (NaN or +/-inf)
   if any(not math.isfinite(x) for x in [a_target, v_ego, setpoint, v_target, min_setpoint]):
     return None
 
+  v_error = v_target - v_ego
+
+  if v_error * MS_TO_KPH > ACCEL_TRIGGER_KPH:
+    # ACCELERATION: trust the MPC's speed target for the destination; aTarget
+    # is used only as a veto (conflicting signals -> coast, don't fight the
+    # model), never for magnitude. Only ever 'plus1' -- never 'plus5' -- both
+    # because plus1 at 20 Hz gives smoother acceleration and because this
+    # branch may need to close a large gap gradually rather than in one jump.
+    if a_target < ACCEL_BRAKE_VETO:
+      return None
+    err_kph = (v_target - setpoint) * MS_TO_KPH
+    if err_kph < SETPOINT_DEADBAND_KPH:
+      return None
+    # Can never overshoot v_target: a plus1 tick moves exactly 1 km/h and is
+    # only emitted while err_kph >= 1.0 (i.e. setpoint + 1 km/h <= v_target).
+    return 'plus1'
+
+  # BRAKING / HOLDING: unchanged from before the acceleration split above.
   desired_raw = min(v_ego + gap_for_accel(a_target, v_ego), v_target)
   desired = max(desired_raw, min_setpoint)
   err_kph = (desired - setpoint) * MS_TO_KPH
@@ -100,7 +132,6 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   # above vEgo in 94% of those cases — the car physically cannot decelerate
   # from there. Favouring braking is the safe direction: a wanted brake that
   # gets suppressed is worse than one that fires slightly early.
-  v_error = v_target - v_ego
   if err_kph > 0:
     if not (v_error > V_ERROR_DEADZONE and a_target > 0):
       return None
