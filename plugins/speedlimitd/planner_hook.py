@@ -18,13 +18,17 @@ LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
 # docs/superpowers/specs/2026-07-10-speedlimitd-driver-intent-enforcement-design.md
 SOURCE_ROAD_TYPE_INFERENCE = 2  # _sl_data['source'] value for inferred limits
 
-# A lane-count-variation limit reduction (e.g. a >=3-lane 80 dropping to a
-# <=2-lane ramp 40) is REGULATORY, not imminent-safety geometry. The display
-# ladder publishes it as instant target steps every few seconds, which DCC
-# chases at ~1 m/s2 (a harsh sawtooth). Ease inferred reductions in as a gentle
-# glide instead; safety caps (curve/reactive) stay prompt. (user directive
-# 2026-07-31)
-INFERRED_GLIDE_DECEL = 0.2  # m/s2 — regulatory (lane-count) limit reductions ease in gently; safety caps stay prompt (user directive 2026-07-31)
+# An inferred (source==2) limit reduction is REGULATORY, not imminent-safety
+# geometry. This covers BOTH lane-count-variation drops (e.g. a >=3-lane 80
+# dropping to a <=2-lane ramp 40) AND gs_osm expressway (G/S road) reductions —
+# planner_hook cannot and should not distinguish them (both publish source==2),
+# and the G/S promote limits are themselves lane-count-derived, so the same
+# gentle-glide treatment is consistent with the directive. The display ladder
+# publishes these as instant target steps every few seconds, which DCC chases at
+# ~1 m/s2 (a harsh sawtooth). Ease inferred reductions in as a gentle glide
+# instead; safety caps (curve/reactive, safetyCapped) stay prompt. (user
+# directive 2026-07-31)
+INFERRED_GLIDE_DECEL = 0.2  # m/s2 — inferred (lane-count AND gs_osm expressway) reductions ease in gently; safety caps stay prompt (user directive 2026-07-31)
 
 _sl_sub = None
 _sl_data = None
@@ -167,13 +171,19 @@ def on_v_cruise(v_cruise, v_ego, sm):
     _glide_ms = None
     return v_cruise
 
-  # Inferred (regulatory, lane-count) reductions ease in as a gentle glide at
-  # INFERRED_GLIDE_DECEL: a ceiling that starts at the car's actual speed and
-  # descends toward floored_target. Safety caps and manual limits fall through
-  # to prompt enforcement below (byte-identical to before). The glide only
-  # engages when this cycle is an inferred reduction; every other cycle resets
-  # it so a resume (gas release, churn release, road/limit recovery) re-inits
-  # from v_ego rather than a stale descended value.
+  # Inferred (regulatory: lane-count AND gs_osm expressway) reductions ease in as
+  # a gentle glide at INFERRED_GLIDE_DECEL: a ceiling that starts at the car's
+  # actual speed and descends toward floored_target. Safety caps and manual
+  # limits fall through to prompt enforcement below (byte-identical to before).
+  # The glide only engages when this cycle is an inferred reduction; every other
+  # cycle resets it so a resume (gas release, churn release, road/limit recovery)
+  # re-inits from v_ego rather than a stale descended value.
+  #
+  # A road_id change does NOT reset the glide (unlike the baseline/gas floors): a
+  # surviving ceiling is only ever equal-or-stricter than a fresh re-init, because
+  # the ratchet below immediately pulls it down to the new road's v_ego. Letting
+  # it survive avoids a spurious upward jump at the tile boundary of a continuous
+  # reduction.
   if inferred and floored_target < v_cruise:
     now = time.monotonic()
     if _glide_ms is None:

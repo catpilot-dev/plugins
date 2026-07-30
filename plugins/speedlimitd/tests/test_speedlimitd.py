@@ -993,6 +993,71 @@ class TestPlannerHook:
       r = hook.on_v_cruise(v_cruise, v, self._sm())
       assert r == pytest.approx(target, abs=1e-6)    # pinned at target, never above
 
+  def test_glide_to_safety_cap_transition_prompt_and_resets(self, hook, monkeypatch):
+    """A safety cap firing mid-glide enforces promptly AND resets _glide_ms that
+    cycle (guards the non-inferred fall-through reset against future edits)."""
+    clk = self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=2, road='')
+    v_cruise = 90 / 3.6
+    v = 80 / 3.6
+    hook.on_v_cruise(v_cruise, v, self._sm())
+    clk['t'] += 0.5
+    hook.on_v_cruise(v_cruise, v, self._sm())        # glide mid-descent
+    assert hook._glide_ms is not None
+    # a curve/reactive (safetyCapped) cap fires
+    self._sl(hook, 30, source=4, safety=True)
+    clk['t'] += 0.5
+    r = hook.on_v_cruise(v_cruise, v, self._sm())
+    assert r == pytest.approx(30 / 3.6, abs=1e-6)    # prompt enforcement, no glide
+    assert hook._glide_ms is None                     # glide reset that cycle
+
+  def test_glide_limit_rise_tracks_up_to_new_floor(self, hook, monkeypatch):
+    """An inferred limit rising mid-glide (40 -> 60, still inferred, still below
+    v_cruise) raises floored_target: the ceiling tracks UP to the new higher
+    floor but never above it."""
+    clk = self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=2, road='')
+    v_cruise = 120 / 3.6
+    v = 80 / 3.6
+    target60 = 60 * 1.15 / 3.6
+    # descend the glide below the (higher) 60 floor
+    r = None
+    for _ in range(400):
+      r = hook.on_v_cruise(v_cruise, v, self._sm())
+      clk['t'] += 0.5
+      if r < target60:
+        break
+    assert r < target60                               # ceiling now below the 60 floor
+    # limit rises to 60 — still inferred, still a reduction vs v_cruise
+    self._sl(hook, 60, source=2, road='')
+    r2 = hook.on_v_cruise(v_cruise, v, self._sm())
+    assert r2 == pytest.approx(target60, abs=1e-6)    # tracked UP to the new floor
+    clk['t'] += 0.5
+    r3 = hook.on_v_cruise(v_cruise, v, self._sm())
+    assert r3 == pytest.approx(target60, abs=1e-6)    # held at floor, never above
+
+  def test_glide_survives_road_change_ratchets_to_new_vego(self, hook, monkeypatch):
+    """A road_id change does not reset the glide; the surviving ceiling is
+    immediately ratcheted down to the new road's (lower) v_ego, so it is
+    equal-or-stricter than a fresh re-init would be."""
+    clk = self._real_clock(monkeypatch, hook)
+    self._sl(hook, 40, source=2, road='A')
+    v_cruise = 120 / 3.6
+    v_hi = 80 / 3.6
+    hook.on_v_cruise(v_cruise, v_hi, self._sm())
+    clk['t'] += 0.5
+    hook.on_v_cruise(v_cruise, v_hi, self._sm())      # ceiling ~ v_hi - 0.1
+    assert hook._glide_ms is not None
+    ceiling_before = hook._glide_ms
+    # road changes; the car is slower on the new road
+    self._sl(hook, 40, source=2, road='B')
+    v_lo = 50 / 3.6
+    clk['t'] += 0.5
+    r2 = hook.on_v_cruise(v_cruise, v_lo, self._sm())
+    assert r2 == pytest.approx(v_lo, abs=1e-6)        # ratcheted to the new v_ego
+    assert hook._glide_ms == pytest.approx(v_lo, abs=1e-6)  # survived-then-ratcheted
+    assert r2 < ceiling_before                        # stricter than pre-change ceiling
+
 
 # ============================================================
 # Change 1 — MapdCurveTargetLatAccel param wiring
