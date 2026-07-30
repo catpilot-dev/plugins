@@ -17,6 +17,25 @@ The study succeeded, but it invalidates the model the Phase 2 sketch was built o
 1. **Cadence (hold 40 Hz vs single 20 Hz) has no measurable effect** — not on
    achieved acceleration, and not on tick acceptance rate once burst duration is
    controlled for. Half of the current threshold logic buys nothing.
+
+   > **CORRECTED 2026-07-31 — this claim is true for ±1 ONLY, and wrong for ±5.**
+   > Re-measured over ~300 min of logs, duration-normalised: `minus5` yields
+   > **39.74 setpoint ticks/sec at 40 Hz vs 18.76 at 20 Hz — 2.1×** — because DCC
+   > accepts ±5 *per transmitted frame* (≈0.5–0.6 ticks/frame at either cadence).
+   > `minus1` (8.36 vs 7.65) and `plus1` (8.33 vs 9.09) really are inert.
+   >
+   > Two errors produced the wrong claim. The duration-controlled tick-rate table
+   > below used bins starting at 0.5 s, but **91.2 % of ±5 bursts are shorter than
+   > 0.3 s** and the ≥0.5 s bins held only 7 hold / 3 single `minus5` bursts — so
+   > duration was controlled precisely where the effect vanishes, using almost no
+   > ±5 data. And the per-burst *acceleration* comparison behind "no effect" was
+   > ±1 only, on a measurement §3 had already shown sat at the noise floor: an
+   > underpowered null read as evidence of absence.
+   >
+   > At a **matched gap** the residual cadence effect is only ≤~0.05 m/s² with
+   > mixed sign, against ~1.1 m/s² of swing from the gap itself — so cadence acts
+   > *through* the gap by setting slew rate, not as an independent input.
+   > `carcontroller.py` now transmits ±5 at 40 Hz and ±1 at 20 Hz.
 2. **The per-burst `peak_delta_a` numbers in `summary.txt` for `plus1`/`minus1`
    are indistinguishable from noise.** A no-command null test returns the same
    ±0.28 m/s² that those commands "produce". Only the ±5 commands clear the floor.
