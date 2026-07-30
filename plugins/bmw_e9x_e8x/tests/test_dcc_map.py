@@ -8,7 +8,7 @@ if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
 from bmw.dcc_map import (expected_accel, gap_for_accel, accel_envelope,
-                         select_cruise_command, MS_TO_KPH)
+                         select_cruise_command, MS_TO_KPH, V_ERROR_DEADZONE)
 from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 
@@ -89,8 +89,9 @@ def test_large_setpoint_error_uses_step5():
 
 def test_small_setpoint_error_uses_step1():
   v = 20.0
-  sp = v + gap_for_accel(0.0, v) - (2.0 / 3.6)   # 2 km/h short -> one tick
-  assert cmd(0.0, v, setpoint=sp, v_target=v + 10.0) == "plus1"
+  a = 0.1   # small positive a_target: 0.0 would fail the direction gate (needs a_target > 0)
+  sp = v + gap_for_accel(a, v) - (2.0 / 3.6)   # 2 km/h short -> one tick
+  assert cmd(a, v, setpoint=sp, v_target=v + 10.0) == "plus1"
 
 
 def test_setpoint_never_commanded_above_v_target():
@@ -245,6 +246,80 @@ def test_floor_never_pushes_setpoint_past_v_target_when_setpoint_at_or_below_it(
   """
   assert cmd(-0.5, 15.0, 7.0, 8.0, 9.72) is None    # setpoint 7.00 < v_target 8.0
   assert cmd(-0.5, 15.0, 8.0, 8.0, 9.72) is None    # setpoint == v_target 8.0 (equality edge)
+
+
+@pytest.mark.parametrize("a_target,v_ego,setpoint,v_target,min_setpoint,expected", [
+    (-1.0, 11.0, 9.17, 10.5, 9.72, None),
+    (-0.8, 10.0, 8.9,  4.0,  9.72, None),
+    (-0.8, 13.9, 13.0, 4.0,  9.72, 'minus5'),
+    ( 0.4, 10.0, 9.0,  15.0, 9.72, 'plus5'),
+    ( 0.3, 20.0, 20.0, 25.0, 5.0,  'plus1'),
+    (-0.5, 25.0, 25.0, 20.0, 5.0,  'minus5'),
+])
+def test_canonical_cases_unchanged(a_target, v_ego, setpoint, v_target, min_setpoint, expected):
+  """Locks in the hand-verified reference cases from the direction-gate spec.
+  These must not move when the gate is added: three already return None on
+  pre-existing guards, and the other three have a_target and v_error agreeing
+  on direction, so the new gate is a no-op on them."""
+  assert cmd(a_target, v_ego, setpoint, v_target, min_setpoint) == expected
+
+
+# ---- direction gate: v_error and a_target must agree ----
+
+def test_gate_suppresses_plus_inside_deadzone():
+  """v_error is inside the deadzone even though err_kph > 0 and a_target > 0."""
+  assert cmd(0.3, 20.0, 18.0, 20.1, 5.0) is None
+
+
+def test_gate_suppresses_minus_inside_deadzone():
+  """v_error is inside the deadzone even though err_kph < 0 and a_target < 0."""
+  assert cmd(-0.3, 20.0, 22.0, 19.9, 5.0) is None
+
+
+def test_gate_suppresses_plus_when_a_target_disagrees():
+  """v_error is strongly positive and err_kph > 0, but a_target is negative
+  (noisy modelV2 disagreement) -- the gate must block the raise."""
+  assert cmd(-0.1, 20.0, 18.0, 25.0, 5.0) is None
+
+
+def test_gate_suppresses_minus_when_a_target_disagrees():
+  """v_error is strongly negative and err_kph < 0, but a_target is positive
+  (noisy modelV2 disagreement) -- the gate must block the lower."""
+  assert cmd(0.1, 25.0, 22.0, 15.0, 5.0) is None
+
+
+def test_gate_conjunction_sweep():
+  """Sweep a grid of (a_target, v_ego, setpoint, v_target, min_setpoint) and
+  assert the direction gate's conjunction holds on every emitted command:
+  every plus has v_error > V_ERROR_DEADZONE and a_target > 0; every minus has
+  v_error < -V_ERROR_DEADZONE and a_target < 0."""
+  a_targets = [-2.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0]
+  v_egos = [6.0, 9.0, 11.0, 15.0, 20.0, 28.0]
+  setpoints = [8.0, 9.2, 10.0, 12.0, 15.0, 20.0, 25.0]
+  v_targets = [4.0, 8.0, 10.5, 15.0, 19.9, 20.0, 20.1, 22.0, 30.0]
+  min_setpoints = [5.0, 9.72]
+
+  checked = 0
+  emitted = 0
+  for a_target in a_targets:
+    for v_ego in v_egos:
+      for setpoint in setpoints:
+        for v_target in v_targets:
+          for min_sp in min_setpoints:
+            checked += 1
+            result = cmd(a_target, v_ego, setpoint, v_target, min_sp)
+            if result is None:
+              continue
+            emitted += 1
+            v_error = v_target - v_ego
+            if result in ("plus1", "plus5"):
+              assert v_error > V_ERROR_DEADZONE and a_target > 0, \
+                  f"plus emitted without agreement: v_error={v_error}, a_target={a_target}"
+            else:
+              assert v_error < -V_ERROR_DEADZONE and a_target < 0, \
+                  f"minus emitted without agreement: v_error={v_error}, a_target={a_target}"
+  assert checked == len(a_targets) * len(v_egos) * len(setpoints) * len(v_targets) * len(min_setpoints)
+  assert emitted > 0, "sweep produced no emitted commands to check"
 
 
 def test_full_invariant_sweep_plus_and_minus_and_planner_intent():

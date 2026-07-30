@@ -6,7 +6,7 @@ from bmw.values import CarControllerParams, CanBus, BmwFlags, CruiseSettings
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.can import CANPacker
 from opendbc.car.common.conversions import Conversions as CV
-from bmw.dcc_map import select_cruise_command, SETPOINT_DEADBAND_KPH  # noqa: F401
+from bmw.dcc_map import select_cruise_command, SETPOINT_DEADBAND_KPH, V_ERROR_DEADZONE  # noqa: F401
 
 
 # DO NOT CHANGE: Cruise control step size
@@ -45,7 +45,8 @@ BURST_LIVE_WINDOW = 0.5       # s — burst considered "live" until this long wi
 # cadence — see docs/superpowers/specs/2026-07-29-dcc-response-findings.md.
 # We invert the measured map to get the gap we need, cap the resulting setpoint
 # at v_target, and emit the ticks still owed.
-V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — deadzone for entry and burst cancellation
+# V_ERROR_DEADZONE lives in dcc_map (single source of truth) — select_cruise_command's
+# direction gate already enforces it, so no separate check is needed at the call site.
 CMD_INTERVAL = SINGLE_INTERVAL # cadence is inert; 20 Hz halves bus load
 
 class CarController(CarControllerBase):
@@ -85,7 +86,6 @@ class CarController(CarControllerBase):
     v_target = actuators.speed
 
     v_current = CS.out.vEgo
-    v_error = v_target - v_current
 
     accel = actuators.accel
 
@@ -176,7 +176,7 @@ class CarController(CarControllerBase):
           cmd_name = select_cruise_command(a_target=accel, v_ego=v_current,
                                            setpoint=CS.out.cruiseState.speed, v_target=v_target,
                                            min_setpoint=self.min_cruise_setpoint)
-          if cmd_name is not None and abs(v_error) > V_ERROR_DEADZONE:
+          if cmd_name is not None:
             cruise_cmd(getattr(CruiseStalk, cmd_name), CMD_INTERVAL)
 
     # Trailing counter overwrite. If commanding stopped (or is briefly idle in

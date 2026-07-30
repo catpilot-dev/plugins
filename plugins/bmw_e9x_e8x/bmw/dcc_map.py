@@ -13,6 +13,7 @@ from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 MS_TO_KPH = 3.6                # local literal: this module must not import opendbc
 SETPOINT_DEADBAND_KPH = 1.0    # below one tick there is nothing to send
+V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — speed-error direction deadzone
 
 
 def _clamp(x, lo, hi):
@@ -82,8 +83,20 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   #    lifts `desired` above v_target).
   if err_kph > 0 and (desired_raw < setpoint or desired > v_target):
     return None
+
+  # Direction gate: the smooth speed error (v_target - v_ego) decides the
+  # DIRECTION of the command; the noisy a_target only shapes the magnitude via
+  # the map above. Requiring both signals to agree before emitting anything is
+  # what the previous production controller did, and it's what keeps modelV2
+  # noise (a_target reverses sign far more often than the speed error) from
+  # manufacturing spurious commands.
+  v_error = v_target - v_ego
   if err_kph > 0:
+    if not (v_error > V_ERROR_DEADZONE and a_target > 0):
+      return None
     return 'plus5' if err_kph >= 5.0 else 'plus1'
+  if not (v_error < -V_ERROR_DEADZONE and a_target < 0):
+    return None
   # No separate min-speed headroom check is needed: `desired` is already floored
   # at min_setpoint, so a tick is only emitted when at least that step of error
   # exists above the floor, and it can never carry the setpoint under it.
