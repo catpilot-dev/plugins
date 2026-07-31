@@ -31,6 +31,13 @@ STEP5_LOWER_KPH = 5.0          # braking overshoot is the safe direction (car en
                                 # slightly slower, self-corrects), so the threshold
                                 # for lowering is relaxed for responsiveness -- but
                                 # see the floor guard in select_cruise_command below.
+BRAKE_LEAD_GAIN = 1.0          # when slowing, lead the setpoint BELOW vTarget in
+                                # proportion to the speed error, so the commanded gap
+                                # becomes (1 + K) * (v_target - v_ego). K=1.0 was chosen
+                                # from route data: it leaves normal cruising untouched
+                                # (median commanded gap unchanged) while the 1st-percentile
+                                # gap reaches -11.9 km/h, which is exactly where DCC
+                                # saturates (~-1.2 m/s2). K=1.5 overshoots that for nothing.
 
 
 def _clamp(x, lo, hi):
@@ -97,12 +104,28 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   can block a raise but never supplies its magnitude. There is deliberately
   NO veto on the braking side -- lowering the setpoint toward vTarget can
   only reduce the commanded speed, so it is always safe.
+
+  Tracking vTarget exactly, however, means the commanded gap (setpoint -
+  v_ego) can never open faster than vTarget itself falls -- on route 3d6 seg
+  26 this left the car braking at minus1's ~3 km/h/s crawl while vEgo ran up
+  to 9.6 km/h above vTarget, and the driver had to take over. So when slowing
+  (v_target < v_ego), the setpoint leads vTarget DOWNWARD in proportion to
+  the speed error (BRAKE_LEAD_GAIN), opening the gap faster than vTarget can
+  fall on its own. This lead is deliberately one-sided: undershooting
+  vTarget while braking merely brakes harder and self-cancels as v_ego
+  converges (safe), whereas leading ABOVE vTarget while holding/accelerating
+  would make the car exceed the planner's target speed (unsafe) -- so there
+  is no lead on that side, only the plain v_target follow.
   """
   # Guard against non-finite inputs (NaN or +/-inf)
   if any(not math.isfinite(x) for x in [a_target, v_ego, setpoint, v_target, min_setpoint]):
     return None
 
-  desired = max(v_target, min_setpoint)          # never strand below min cruise
+  if v_target < v_ego:                       # slowing: lead the setpoint down
+    desired = v_target - BRAKE_LEAD_GAIN * (v_ego - v_target)
+  else:                                      # holding or speeding up: no lead,
+    desired = v_target                       # overshooting ABOVE v_target is unsafe
+  desired = max(desired, min_setpoint)        # never strand below min cruise
   err_kph = (desired - setpoint) * MS_TO_KPH
 
   if abs(err_kph) < SETPOINT_DEADBAND_KPH:

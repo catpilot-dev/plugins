@@ -9,7 +9,7 @@ if _PLUGIN_DIR not in sys.path:
 
 from bmw.dcc_map import (expected_accel, gap_for_accel, accel_envelope,
                          select_cruise_command, MS_TO_KPH, SETPOINT_DEADBAND_KPH,
-                         STEP5_RAISE_KPH, STEP5_LOWER_KPH)
+                         STEP5_RAISE_KPH, STEP5_LOWER_KPH, BRAKE_LEAD_GAIN)
 from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 
@@ -76,7 +76,11 @@ def test_envelope_is_ordered():
 # select_cruise_command no longer inverts the map or splits into an
 # acceleration/braking branch with a direction gate. The whole body is now:
 #
-#   desired = max(v_target, min_setpoint)
+#   if v_target < v_ego:      # slowing: lead the setpoint below v_target
+#     desired = v_target - BRAKE_LEAD_GAIN * (v_ego - v_target)
+#   else:                     # holding/accelerating: no lead
+#     desired = v_target
+#   desired = max(desired, min_setpoint)
 #   err_kph = (desired - setpoint) * MS_TO_KPH
 #   if abs(err_kph) < SETPOINT_DEADBAND_KPH: return None
 #   if err_kph > 0:
@@ -85,6 +89,15 @@ def test_envelope_is_ordered():
 #   use_minus5 = (-err_kph >= STEP5_LOWER_KPH
 #                 and (setpoint - 10.0 / MS_TO_KPH) >= min_setpoint)
 #   return 'minus5' if use_minus5 else 'minus1'
+#
+# BRAKE_LEAD_GAIN (K=1.0) exists because tracking v_target exactly means the
+# commanded gap (setpoint - v_ego) can never open faster than v_target itself
+# falls -- route 3d6 seg 26 showed this crawling at minus1's rate while vEgo
+# ran 9.6 km/h above v_target and the driver had to take over. The lead is
+# one-sided: it only pulls desired below v_target when slowing, since
+# undershooting while braking self-cancels as v_ego converges (safe), but
+# leading above v_target while holding/accelerating would exceed the
+# planner's target speed (unsafe).
 #
 # The two step5 thresholds are deliberately asymmetric:
 #
@@ -167,10 +180,17 @@ def test_small_decel_error_uses_step1():
 
 
 def test_decel_error_just_below_step5_threshold_uses_step1():
-  """Just under STEP5_LOWER_KPH (5 km/h) of error, a minus1 is used."""
+  """Just under STEP5_LOWER_KPH (5 km/h) of error, a minus1 is used.
+
+  With the brake lead, setpoint == v_ego means
+  desired = v_ego - (1 + BRAKE_LEAD_GAIN) * (v_ego - v_target), so the delta
+  that lands err_kph just under the threshold is smaller than the plain
+  (v_ego - v_target) gap would suggest -- solve for it directly rather than
+  assuming err_kph == v_ego - v_target."""
   v = 25.0
   err_kph = STEP5_LOWER_KPH - 0.1
-  assert cmd(-0.5, v, setpoint=v, v_target=v - err_kph / MS_TO_KPH, min_setpoint=5.0) == "minus1"
+  delta = err_kph / (MS_TO_KPH * (1 + BRAKE_LEAD_GAIN))
+  assert cmd(-0.5, v, setpoint=v, v_target=v - delta, min_setpoint=5.0) == "minus1"
 
 
 def test_decel_error_at_or_above_step5_threshold_uses_step5():
@@ -220,6 +240,70 @@ def test_no_veto_on_braking_side():
   unlike the old direction gate, a positive a_target (disagreeing with the
   speed error) must not block a minus command."""
   assert cmd(+2.0, 25.0, setpoint=25.0, v_target=5.0, min_setpoint=5.0) == "minus5"
+
+
+# ---- brake lead (route 3d6 near-collision fix) ----
+#
+# Tracking v_target exactly means the commanded gap (setpoint - v_ego) can
+# never open faster than v_target itself falls. On route 3d6 seg 26 the
+# setpoint tracked v_target faithfully (error never exceeded 2 km/h), so
+# minus5 was never eligible and braking crawled at minus1's ~3 km/h/s rate
+# while vEgo ran up to 9.6 km/h above v_target -- the driver had to take
+# over. BRAKE_LEAD_GAIN fixes this by leading the setpoint below v_target,
+# in proportion to the speed error, only when slowing.
+
+def test_route_3d6_seg26_near_collision_regression():
+  """The actual field samples from the near-collision, min_setpoint=9.72
+  (measured DCC enable floor). Under the old vTarget-follow law all four of
+  these stayed at minus1 (error never exceeded 2 km/h against a bare
+  v_target). With the brake lead, the last three now clear STEP5_LOWER_KPH
+  and command minus5, opening the gap fast enough that this braking event
+  would no longer require driver takeover."""
+  min_sp = 9.72
+  assert cmd(-1.53, 17.67, setpoint=17.22, v_target=17.03, min_setpoint=min_sp) == "minus1"
+  assert cmd(-2.15, 17.42, setpoint=16.39, v_target=15.83, min_setpoint=min_sp) == "minus5"
+  assert cmd(-2.09, 16.86, setpoint=15.00, v_target=14.67, min_setpoint=min_sp) == "minus5"
+  assert cmd(-2.69, 16.14, setpoint=13.89, v_target=13.47, min_setpoint=min_sp) == "minus5"
+
+
+def test_no_lead_when_holding_or_accelerating():
+  """When v_target >= v_ego (holding or speeding up), desired must equal
+  v_target exactly -- no brake lead. Verified by placing the setpoint 0.5
+  km/h short of v_target (inside the 1.0 km/h deadband): if any lead leaked
+  into this branch, desired would shift and the deadband would no longer
+  swallow the error."""
+  for v_ego, v_target in [(20.0, 20.0), (20.0, 22.0), (10.0, 30.0)]:
+    setpoint = v_target - 0.5 / MS_TO_KPH
+    assert cmd(0.5, v_ego, setpoint, v_target, min_setpoint=5.0) is None
+
+
+def test_brake_lead_is_proportional_to_speed_error():
+  """The lead is proportional to the speed error. Pinning setpoint == v_target
+  makes err_kph measure (desired - v_target) directly (the "amount desired
+  sits below v_target"), which equals -BRAKE_LEAD_GAIN * (v_ego - v_target).
+  Doubling (v_ego - v_target) must therefore exactly double that amount:
+  delta1 is chosen to land just under STEP5_LOWER_KPH (minus1), and 2*delta1
+  lands at exactly double the error, comfortably over the threshold
+  (minus5) -- only possible if the lead scales linearly with the speed
+  error."""
+  v_target, min_sp = 15.0, 5.0
+  setpoint = v_target
+  delta1 = (STEP5_LOWER_KPH - 0.5) / (MS_TO_KPH * BRAKE_LEAD_GAIN)
+  delta2 = 2 * delta1
+  assert cmd(-0.5, v_target + delta1, setpoint, v_target, min_sp) == "minus1"
+  assert cmd(-0.5, v_target + delta2, setpoint, v_target, min_sp) == "minus5"
+
+
+def test_desired_floored_at_min_setpoint_despite_large_brake_lead():
+  """A large lead can push v_target - BRAKE_LEAD_GAIN * (v_ego - v_target)
+  far below min_setpoint (here, unclamped, desired would be 0.0 - 1.0 *
+  (50.0 - 0.0) = -50.0 m/s). desired must still clamp to min_setpoint exactly
+  like the plain v_target case, giving the same outcome as the no-lead floor
+  guard scenario: only 8 km/h of room above the floor, less than the 10 km/h
+  a minus5 2-tick landing needs, so minus1."""
+  min_sp = 9.72
+  setpoint = min_sp + 8.0 / MS_TO_KPH
+  assert cmd(-0.8, 50.0, setpoint, 0.0, min_sp) == "minus1"
 
 
 # ---- safety regression tests (still-relevant floor/veto cases) ----
@@ -339,9 +423,9 @@ def test_deadband_blocks_even_with_large_setpoint_gap_to_floor():
 def test_full_invariant_sweep():
   """Brute-force sweep checking, on every emitted command:
 
-    1. A plus tick never carries the setpoint above desired = max(v_target,
-       min_setpoint), and only moves 5 km/h (plus5) when the error is >=
-       STEP5_RAISE_KPH, else 1 km/h (plus1).
+    1. A plus tick never carries the setpoint above desired (see below), and
+       only moves 5 km/h (plus5) when the error is >= STEP5_RAISE_KPH, else
+       1 km/h (plus1).
     2. A minus tick never carries the setpoint below desired, and only moves
        5 km/h (minus5) when the error is >= STEP5_LOWER_KPH AND the setpoint
        has at least 10 km/h of room above min_setpoint (the floor guard),
@@ -349,6 +433,11 @@ def test_full_invariant_sweep():
     3. Acceleration (a plus command) never happens when a_target <= 0.
     4. (covered separately by test_nan_guards / test_inf_guard) non-finite
        input always returns None.
+
+  desired mirrors select_cruise_command's own formula: when slowing
+  (v_target < v_ego) it leads v_target down by BRAKE_LEAD_GAIN * (v_ego -
+  v_target); otherwise it is v_target unchanged. Either way it is floored at
+  min_setpoint.
   """
   a_targets = [-1.5, -1.0, -0.5, -0.1, 0.0, 0.01, 0.2, 0.5, 2.0]
   v_egos = [6.0, 9.0, 11.0, 15.0, 20.0, 28.0]
@@ -369,7 +458,11 @@ def test_full_invariant_sweep():
             if result is None:
               continue
             emitted += 1
-            desired = max(v_target, min_sp)
+            if v_target < v_ego:
+              desired = v_target - BRAKE_LEAD_GAIN * (v_ego - v_target)
+            else:
+              desired = v_target
+            desired = max(desired, min_sp)
             step_kph = 5.0 if result in ("plus5", "minus5") else 1.0
             step_ms = step_kph / MS_TO_KPH
             err_kph = (desired - setpoint) * MS_TO_KPH
