@@ -9,7 +9,8 @@ if _PLUGIN_DIR not in sys.path:
 
 from bmw.dcc_map import (expected_accel, gap_for_accel, accel_envelope,
                          select_cruise_command, MS_TO_KPH, SETPOINT_DEADBAND_KPH,
-                         STEP5_RAISE_KPH, STEP5_LOWER_KPH, BRAKE_LEAD_GAIN)
+                         STEP5_RAISE_KPH, STEP5_LOWER_KPH, BRAKE_LEAD_GAIN,
+                         DECEL_STEP5_ATARGET)
 from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 
@@ -86,9 +87,17 @@ def test_envelope_is_ordered():
 #   if err_kph > 0:
 #     if a_target <= 0: return None      # model veto, raise side only
 #     return 'plus5' if err_kph >= STEP5_RAISE_KPH else 'plus1'
-#   use_minus5 = (-err_kph >= STEP5_LOWER_KPH
-#                 and (setpoint - 10.0 / MS_TO_KPH) >= min_setpoint)
-#   return 'minus5' if use_minus5 else 'minus1'
+#   urgent = (-err_kph >= STEP5_LOWER_KPH) or (-a_target >= DECEL_STEP5_ATARGET)
+#   floor_ok = (setpoint - 10.0 / MS_TO_KPH) >= min_setpoint
+#   return 'minus5' if (urgent and floor_ok) else 'minus1'
+#
+# DECEL_STEP5_ATARGET (0.9) restores the previous production controller's
+# aTarget-based urgency trigger, as a second, independent way to reach the
+# minus5 branch -- NOT as an input to `desired`. aTarget anticipates the
+# setpoint error (route 3d6 seg 26: a_target read -1.03 while the setpoint
+# gap was still under a km/h), so it upgrades minus1 -> minus5 earlier than
+# the error alone or the brake lead above can. The floor guard is unchanged
+# and applies identically to both triggers.
 #
 # BRAKE_LEAD_GAIN (K=1.0) exists because tracking v_target exactly means the
 # commanded gap (setpoint - v_ego) can never open faster than v_target itself
@@ -202,6 +211,45 @@ def test_decel_error_at_or_above_step5_threshold_uses_step5():
   assert cmd(-0.5, v, setpoint=v, v_target=v - err_kph / MS_TO_KPH, min_setpoint=5.0) == "minus5"
 
 
+def test_atarget_trigger_alone_yields_minus5():
+  """A small setpoint error (well under STEP5_LOWER_KPH) still fires minus5
+  when a_target alone clears DECEL_STEP5_ATARGET. This is the point of the
+  restored trigger: aTarget anticipates the speed error and upgrades minus1
+  to minus5 before the setpoint error itself would."""
+  v = 20.0
+  assert cmd(-DECEL_STEP5_ATARGET, v, setpoint=v, v_target=v - 1.0 / MS_TO_KPH,
+             min_setpoint=5.0) == "minus5"
+
+
+def test_atarget_just_above_threshold_uses_minus1():
+  """Just inside DECEL_STEP5_ATARGET (a_target=-0.89, magnitude 0.89 < 0.9),
+  with the same small setpoint error, stays minus1 -- the trigger is a strict
+  magnitude threshold, not a loose one."""
+  v = 20.0
+  assert cmd(-0.89, v, setpoint=v, v_target=v - 1.0 / MS_TO_KPH,
+             min_setpoint=5.0) == "minus1"
+
+
+def test_atarget_trigger_blocked_by_floor_guard():
+  """aTarget alone clears the urgency trigger (-2.0, well past
+  DECEL_STEP5_ATARGET), but the setpoint only has 8 km/h of room above
+  min_setpoint -- less than the 10 km/h a minus5's 2-tick landing needs -- so
+  minus1 is used instead, NOT minus5. The floor guard applies identically
+  regardless of which trigger (setpoint error or aTarget) fired."""
+  min_sp = 9.72
+  setpoint = min_sp + 8.0 / MS_TO_KPH
+  assert cmd(-2.0, 12.5, setpoint, 12.0, min_sp) == "minus1"
+
+
+def test_atarget_trigger_does_not_bypass_deadband():
+  """Even a strongly urgent a_target (-2.0) does not bypass the 1.0 km/h
+  deadband: the aTarget trigger only upgrades a decrease we were already
+  going to command (minus1 -> minus5), it does not create a command from
+  nothing. err_kph here is -0.36, inside the deadband."""
+  v = 20.0
+  assert cmd(-2.0, v, setpoint=v, v_target=v - 0.05, min_setpoint=5.0) is None
+
+
 def test_decel_step5_blocked_by_floor_guard():
   """err_kph clears STEP5_LOWER_KPH, but the setpoint only has 8 km/h of room
   above min_setpoint -- less than the 10 km/h a minus5's 2-tick landing
@@ -256,13 +304,36 @@ def test_route_3d6_seg26_near_collision_regression():
   """The actual field samples from the near-collision, min_setpoint=9.72
   (measured DCC enable floor). Under the old vTarget-follow law all four of
   these stayed at minus1 (error never exceeded 2 km/h against a bare
-  v_target). With the brake lead, the last three now clear STEP5_LOWER_KPH
-  and command minus5, opening the gap fast enough that this braking event
-  would no longer require driver takeover."""
+  v_target). With the brake lead, the last three clear STEP5_LOWER_KPH and
+  command minus5, opening the gap fast enough that this braking event would
+  no longer require driver takeover.
+
+  The first sample now ALSO resolves to minus5, not minus1: a_target=-1.53
+  clears DECEL_STEP5_ATARGET (0.9) on its own, via the aTarget urgency
+  trigger reintroduced alongside the brake lead -- see
+  test_route_3d6_seg26_atarget_urgency_regression below, which covers the
+  full aTarget-vs-setpoint-error timeline for this incident."""
   min_sp = 9.72
-  assert cmd(-1.53, 17.67, setpoint=17.22, v_target=17.03, min_setpoint=min_sp) == "minus1"
+  assert cmd(-1.53, 17.67, setpoint=17.22, v_target=17.03, min_setpoint=min_sp) == "minus5"
   assert cmd(-2.15, 17.42, setpoint=16.39, v_target=15.83, min_setpoint=min_sp) == "minus5"
   assert cmd(-2.09, 16.86, setpoint=15.00, v_target=14.67, min_setpoint=min_sp) == "minus5"
+  assert cmd(-2.69, 16.14, setpoint=13.89, v_target=13.47, min_setpoint=min_sp) == "minus5"
+
+
+def test_route_3d6_seg26_atarget_urgency_regression():
+  """The aTarget urgency trigger (DECEL_STEP5_ATARGET) this change restores.
+  Real seg-26 field samples, min_setpoint=9.72. aTarget anticipates the speed
+  error: at t+35.5 the setpoint error was only ~1.3 km/h (well under
+  STEP5_LOWER_KPH, so the brake lead alone would still say minus1) while
+  a_target already read -1.03 -- over the 0.9 m/s2 threshold -- so this fires
+  minus5 immediately. That is ~1.3s earlier than the setpoint-error trigger
+  alone reaches minus5 in this same braking event (t+36.8 per the incident
+  timeline), and the previous production controller fired at this same
+  aTarget-driven point."""
+  min_sp = 9.72
+  assert cmd(-1.03, 17.81, setpoint=17.78, v_target=17.61, min_setpoint=min_sp) == "minus5"
+  assert cmd(-1.53, 17.67, setpoint=17.22, v_target=17.03, min_setpoint=min_sp) == "minus5"
+  assert cmd(-2.15, 17.42, setpoint=16.39, v_target=15.83, min_setpoint=min_sp) == "minus5"
   assert cmd(-2.69, 16.14, setpoint=13.89, v_target=13.47, min_setpoint=min_sp) == "minus5"
 
 
@@ -426,13 +497,26 @@ def test_full_invariant_sweep():
     1. A plus tick never carries the setpoint above desired (see below), and
        only moves 5 km/h (plus5) when the error is >= STEP5_RAISE_KPH, else
        1 km/h (plus1).
-    2. A minus tick never carries the setpoint below desired, and only moves
-       5 km/h (minus5) when the error is >= STEP5_LOWER_KPH AND the setpoint
-       has at least 10 km/h of room above min_setpoint (the floor guard),
-       else 1 km/h (minus1).
+    2. A minus1 tick never carries the setpoint below desired (minus5 is
+       exempt from this -- see below). A minus tick only moves 5 km/h
+       (minus5) when (the error is >= STEP5_LOWER_KPH OR a_target magnitude
+       is >= DECEL_STEP5_ATARGET) AND the setpoint has at least 10 km/h of
+       room above min_setpoint (the floor guard), else 1 km/h (minus1).
     3. Acceleration (a plus command) never happens when a_target <= 0.
     4. (covered separately by test_nan_guards / test_inf_guard) non-finite
        input always returns None.
+
+  Why minus5 is exempt from the "never undershoots desired" check that
+  minus1 is held to: even before the aTarget trigger, a minus5 lands ~2
+  ticks (10 km/h) in practice, not the nominal 5 km/h this sweep uses for
+  the check -- see test_two_tick_landing_never_overshoots_target, which
+  deliberately checks the 2-tick landing against min_setpoint only, not
+  against desired, because overshooting past desired while braking is the
+  documented SAFE direction (self-corrects as v_ego converges). The aTarget
+  trigger makes this structural: it is designed to fire minus5 BEFORE the
+  setpoint error grows to STEP5_LOWER_KPH, so by construction the
+  setpoint-to-desired gap can be smaller than the nominal step at the moment
+  it fires. That is anticipation working as intended, not an overshoot bug.
 
   desired mirrors select_cruise_command's own formula: when slowing
   (v_target < v_ego) it leads v_target down by BRAKE_LEAD_GAIN * (v_ego -
@@ -479,11 +563,16 @@ def test_full_invariant_sweep():
                 violations.append(("plus5 used below step5 raise threshold", a_target, v_ego, setpoint, v_target, min_sp, result))
             elif result in ("minus1", "minus5"):
               new_setpoint = setpoint - step_ms
-              if new_setpoint < desired - 1e-9:
-                violations.append(("minus undershoots desired", a_target, v_ego, setpoint, v_target, min_sp, result))
+              # minus5 is deliberately exempt here -- see the docstring above:
+              # both its real ~2-tick landing and the aTarget trigger's
+              # anticipation are expected to land it below `desired`, which
+              # is the documented-safe overshoot direction, not a violation.
+              if result == "minus1" and new_setpoint < desired - 1e-9:
+                violations.append(("minus1 undershoots desired", a_target, v_ego, setpoint, v_target, min_sp, result))
               if result == "minus5":
-                if -err_kph < STEP5_LOWER_KPH - 1e-9:
-                  violations.append(("minus5 used below step5 lower threshold", a_target, v_ego, setpoint, v_target, min_sp, result))
+                urgent = (-err_kph >= STEP5_LOWER_KPH - 1e-9) or (-a_target >= DECEL_STEP5_ATARGET - 1e-9)
+                if not urgent:
+                  violations.append(("minus5 used without either urgency trigger", a_target, v_ego, setpoint, v_target, min_sp, result))
                 if setpoint - 10.0 / MS_TO_KPH < min_sp - 1e-9:
                   violations.append(("minus5 used despite floor guard", a_target, v_ego, setpoint, v_target, min_sp, result))
             else:

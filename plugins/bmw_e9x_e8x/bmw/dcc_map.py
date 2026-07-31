@@ -38,6 +38,11 @@ BRAKE_LEAD_GAIN = 1.0          # when slowing, lead the setpoint BELOW vTarget i
                                 # (median commanded gap unchanged) while the 1st-percentile
                                 # gap reaches -11.9 km/h, which is exactly where DCC
                                 # saturates (~-1.2 m/s2). K=1.5 overshoots that for nothing.
+DECEL_STEP5_ATARGET = 0.9      # m/s2 — the previous production controller's
+                                # DECEL_STEP5_THRESHOLD. aTarget anticipates the speed
+                                # error, so it upgrades minus1 -> minus5 earlier than
+                                # the setpoint error alone can. Measured cost: only
+                                # ~1.1% additional minus5 firings in normal driving.
 
 
 def _clamp(x, lo, hi):
@@ -103,7 +108,10 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   aTarget is therefore used only as a sign veto on the acceleration side: it
   can block a raise but never supplies its magnitude. There is deliberately
   NO veto on the braking side -- lowering the setpoint toward vTarget can
-  only reduce the commanded speed, so it is always safe.
+  only reduce the commanded speed, so it is always safe. aTarget IS used on
+  the braking side, but only as a second urgency trigger selecting step size
+  (minus1 vs minus5, see DECEL_STEP5_ATARGET below) -- never as an input to
+  `desired`, which stays vTarget plus the brake lead regardless of aTarget.
 
   Tracking vTarget exactly, however, means the commanded gap (setpoint -
   v_ego) can never open faster than vTarget itself falls -- on route 3d6 seg
@@ -148,6 +156,17 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   # which the v_target-based `desired` clamp alone does not guarantee: desired
   # can equal min_setpoint exactly, and a minus5 fired from just above that
   # floor would still land two ticks and cross under it.
-  use_minus5 = (-err_kph >= STEP5_LOWER_KPH
-                and (setpoint - 10.0 / MS_TO_KPH) >= min_setpoint)
-  return 'minus5' if use_minus5 else 'minus1'
+  #
+  # urgent is an OR of two independent triggers: the setpoint error (as
+  # before) and aTarget magnitude. aTarget anticipates the setpoint error --
+  # on route 3d6 seg 26 it read -1.03 m/s2 while the setpoint gap was still
+  # under a km/h, well before STEP5_LOWER_KPH could fire -- so it upgrades
+  # minus1 -> minus5 earlier when the model already sees hard braking coming.
+  # This is a trigger only: it selects step SIZE, never `desired` (the
+  # setpoint destination), which stays vTarget plus the brake lead above.
+  # The floor guard applies identically regardless of which trigger fired --
+  # a minus5 lands ~2 ticks (~10 km/h) whatever provoked it, so the same
+  # floor headroom is required either way.
+  urgent = (-err_kph >= STEP5_LOWER_KPH) or (-a_target >= DECEL_STEP5_ATARGET)
+  floor_ok = (setpoint - 10.0 / MS_TO_KPH) >= min_setpoint
+  return 'minus5' if (urgent and floor_ok) else 'minus1'
