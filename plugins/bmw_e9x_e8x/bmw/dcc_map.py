@@ -23,9 +23,14 @@ from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 MS_TO_KPH = 3.6                # local literal: this module must not import opendbc
 SETPOINT_DEADBAND_KPH = 1.0    # below one tick there is nothing to send
-STEP5_THRESHOLD_KPH = 10.0     # a +-5 command typically lands 2 ticks (measured
-                                # median 2.00, 96% >= 2), so only use it when at
-                                # least two ticks of error exist
+STEP5_RAISE_KPH = 10.0         # a +-5 command typically lands 2 ticks (measured
+                                # median 2.00, 96% >= 2). Raising must not overshoot
+                                # v_target (unsafe direction), so plus5 is only used
+                                # once two ticks of error exist.
+STEP5_LOWER_KPH = 5.0          # braking overshoot is the safe direction (car ends
+                                # slightly slower, self-corrects), so the threshold
+                                # for lowering is relaxed for responsiveness -- but
+                                # see the floor guard in select_cruise_command below.
 
 
 def _clamp(x, lo, hi):
@@ -106,9 +111,20 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   if err_kph > 0:                                # raise the setpoint
     if a_target <= 0:
       return None                                # model veto: do not speed up against it
-    return 'plus1'                                # plus1 only, 20 Hz -- smooth
-  # lower the setpoint: always safe, it can only reduce commanded speed
-  # +-1 is preferred below STEP5_THRESHOLD_KPH: a short burst lands ~1 tick,
-  # while +-5 lands ~2 ticks (measured median 2.00, 96% >= 2), so +-5 is only
-  # used once at least two ticks of error exist.
-  return 'minus5' if -err_kph >= STEP5_THRESHOLD_KPH else 'minus1'
+    # plus5 lands ~2 ticks like minus5 (measured), and overshoot is UNSAFE
+    # when accelerating (car would end above v_target), so it is only used
+    # once two ticks of error exist -- same reasoning as the lower branch,
+    # just without the floor guard (there is no upper-side analogue of
+    # min_setpoint to protect against).
+    return 'plus5' if err_kph >= STEP5_RAISE_KPH else 'plus1'
+
+  # lower the setpoint: always safe in magnitude, it can only reduce commanded
+  # speed -- but a minus5 typically moves 10 km/h (2-tick landing), so we only
+  # permit it when the setpoint has at least that much room above
+  # min_setpoint. This protects against DCC disengaging on a too-low setpoint,
+  # which the v_target-based `desired` clamp alone does not guarantee: desired
+  # can equal min_setpoint exactly, and a minus5 fired from just above that
+  # floor would still land two ticks and cross under it.
+  use_minus5 = (-err_kph >= STEP5_LOWER_KPH
+                and (setpoint - 10.0 / MS_TO_KPH) >= min_setpoint)
+  return 'minus5' if use_minus5 else 'minus1'

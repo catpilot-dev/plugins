@@ -43,11 +43,12 @@ def test_new_constants_present(mock_opendbc):
 
 
 def test_tx_interval_selects_by_command_magnitude(mock_opendbc):
-  """+-5 commands must transmit at HOLD_INTERVAL (40 Hz; measured 2.1x more
-  setpoint ticks/sec than 20 Hz), +-1 commands at SINGLE_INTERVAL (20 Hz;
-  measured cadence-insensitive)."""
+  """minus5 (braking) transmits at HOLD_INTERVAL (40 Hz; measured 2.1x more
+  setpoint ticks/sec than 20 Hz) for faster slew rate. plus5 (acceleration)
+  is deliberately gentler and stays at SINGLE_INTERVAL (20 Hz), like plus1/
+  minus1 (measured cadence-insensitive)."""
   mod = _cc(mock_opendbc)
-  assert mod._tx_interval("plus5") == mod.HOLD_INTERVAL
+  assert mod._tx_interval("plus5") == mod.SINGLE_INTERVAL
   assert mod._tx_interval("minus5") == mod.HOLD_INTERVAL
   assert mod._tx_interval("plus1") == mod.SINGLE_INTERVAL
   assert mod._tx_interval("minus1") == mod.SINGLE_INTERVAL

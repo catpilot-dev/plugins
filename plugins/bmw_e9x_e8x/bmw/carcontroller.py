@@ -52,7 +52,10 @@ def _tx_interval(cmd_name):
   # +-5 is accepted by DCC per transmitted frame, so its slew rate scales
   # with TX cadence (measured 2.1x more setpoint ticks/sec at 40 Hz vs 20 Hz);
   # +-1 is cadence-insensitive (measured ~unchanged), so it stays at 20 Hz.
-  return HOLD_INTERVAL if cmd_name.endswith("5") else SINGLE_INTERVAL
+  # minus5 (braking) wants the faster cadence for slew rate; plus5
+  # (acceleration) is deliberately gentler and stays at the single-press
+  # cadence -- overshoot is unsafe on the accel side, so we do not chase it.
+  return HOLD_INTERVAL if cmd_name == "minus5" else SINGLE_INTERVAL
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
