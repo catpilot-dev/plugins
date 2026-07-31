@@ -49,13 +49,20 @@ BURST_LIVE_WINDOW = 0.5       # s — burst considered "live" until this long wi
 
 
 def _tx_interval(cmd_name):
-  # +-5 is accepted by DCC per transmitted frame, so its slew rate scales
-  # with TX cadence (measured 2.1x more setpoint ticks/sec at 40 Hz vs 20 Hz);
-  # +-1 is cadence-insensitive (measured ~unchanged), so it stays at 20 Hz.
-  # minus5 (braking) wants the faster cadence for slew rate; plus5
-  # (acceleration) is deliberately gentler and stays at the single-press
-  # cadence -- overshoot is unsafe on the accel side, so we do not chase it.
-  return HOLD_INTERVAL if cmd_name == "minus5" else SINGLE_INTERVAL
+  # Cadence is keyed on DIRECTION, not step size.
+  #
+  # Braking runs entirely at the hold cadence. minus5 genuinely gains slew rate
+  # from it (measured 2.1x more setpoint ticks/sec at 40 Hz than 20 Hz, because
+  # +-5 is accepted per transmitted frame). minus1's own tick yield is
+  # cadence-insensitive -- measured identical at 40 Hz and 20 Hz across four
+  # duration bins -- so it is here for COHERENCE, not slew: a braking event
+  # steps minus5 -> minus1 as the error closes, and holding one cadence across
+  # that transition avoids DCC seeing a press/release, which it infers from
+  # cadence (see the 0x194 note above).
+  #
+  # Acceleration stays at the single-press cadence: deliberately gentler, and
+  # overshoot is the unsafe direction there so there is nothing to chase.
+  return HOLD_INTERVAL if cmd_name.startswith("minus") else SINGLE_INTERVAL
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):

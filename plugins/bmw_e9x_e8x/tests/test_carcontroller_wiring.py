@@ -42,16 +42,26 @@ def test_new_constants_present(mock_opendbc):
   assert mod.SETPOINT_DEADBAND_KPH == 1.0
 
 
-def test_tx_interval_selects_by_command_magnitude(mock_opendbc):
-  """minus5 (braking) transmits at HOLD_INTERVAL (40 Hz; measured 2.1x more
-  setpoint ticks/sec than 20 Hz) for faster slew rate. plus5 (acceleration)
-  is deliberately gentler and stays at SINGLE_INTERVAL (20 Hz), like plus1/
-  minus1 (measured cadence-insensitive)."""
+def test_tx_interval_selects_by_direction(mock_opendbc):
+  """Cadence is keyed on DIRECTION, not step size.
+
+  Both braking commands transmit at HOLD_INTERVAL (40 Hz): minus5 for slew rate
+  (measured 2.1x more setpoint ticks/sec than 20 Hz), minus1 for coherence, so a
+  braking event that steps minus5 -> minus1 never changes cadence mid-event --
+  DCC infers press-vs-hold from cadence. Both acceleration commands stay at
+  SINGLE_INTERVAL (20 Hz), deliberately gentler."""
   mod = _cc(mock_opendbc)
-  assert mod._tx_interval("plus5") == mod.SINGLE_INTERVAL
   assert mod._tx_interval("minus5") == mod.HOLD_INTERVAL
+  assert mod._tx_interval("minus1") == mod.HOLD_INTERVAL
+  assert mod._tx_interval("plus5") == mod.SINGLE_INTERVAL
   assert mod._tx_interval("plus1") == mod.SINGLE_INTERVAL
-  assert mod._tx_interval("minus1") == mod.SINGLE_INTERVAL
+
+
+def test_tx_interval_no_cadence_change_within_a_braking_event(mock_opendbc):
+  """The whole point of the above: as the setpoint error closes, the command
+  steps down from minus5 to minus1. That transition must not change cadence."""
+  mod = _cc(mock_opendbc)
+  assert mod._tx_interval("minus5") == mod._tx_interval("minus1")
 
 
 def test_decision_function_is_wired_in(mock_opendbc):
