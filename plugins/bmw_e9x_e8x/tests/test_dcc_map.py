@@ -8,7 +8,8 @@ if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
 from bmw.dcc_map import (expected_accel, gap_for_accel, accel_envelope,
-                         select_cruise_command, MS_TO_KPH, SETPOINT_DEADBAND_KPH)
+                         select_cruise_command, MS_TO_KPH, SETPOINT_DEADBAND_KPH,
+                         STEP5_THRESHOLD_KPH)
 from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 
@@ -81,7 +82,16 @@ def test_envelope_is_ordered():
 #   if err_kph > 0:
 #     if a_target <= 0: return None      # model veto, raise side only
 #     return 'plus1'
-#   return 'minus5' if -err_kph >= 5.0 else 'minus1'
+#   return 'minus5' if -err_kph >= STEP5_THRESHOLD_KPH else 'minus1'
+#
+# STEP5_THRESHOLD_KPH (10.0, not 5.0) exists because a measured 49-burst
+# sample of isolated minus5 commands landed a median of 2.00 ticks (96% >= 2
+# ticks) -- the car's cruise module auto-repeats and can deliver a second
+# tick after we stop transmitting. A minus5 fired at exactly 5 km/h of error
+# would then typically overshoot the target by another 5 km/h. Raising the
+# threshold to 10.0 means even a 2-tick (10 km/h) landing does not undershoot
+# desired. There is no corresponding plus5 branch -- the raise side is
+# plus1-only regardless of err_kph (see test_raise_is_always_plus1_never_plus5).
 #
 # There is deliberately NO veto on the braking side: lowering the setpoint
 # toward vTarget can only reduce the commanded speed, so it is always safe.
@@ -132,6 +142,23 @@ def test_large_decel_error_uses_step5():
 def test_small_decel_error_uses_step1():
   v = 25.0
   assert cmd(-0.5, v, setpoint=v, v_target=v - 2.0 / MS_TO_KPH, min_setpoint=5.0) == "minus1"
+
+
+def test_decel_error_just_below_step5_threshold_uses_step1():
+  """Just under STEP5_THRESHOLD_KPH (10 km/h) of error, a minus1 is used --
+  a minus5 here would risk a 2-tick landing overshooting past the target."""
+  v = 25.0
+  err_kph = STEP5_THRESHOLD_KPH - 0.1
+  assert cmd(-0.5, v, setpoint=v, v_target=v - err_kph / MS_TO_KPH, min_setpoint=5.0) == "minus1"
+
+
+def test_decel_error_at_or_above_step5_threshold_uses_step5():
+  """At or above STEP5_THRESHOLD_KPH (10 km/h) of error, a minus5 is used --
+  a 2-tick (10 km/h) landing cannot undershoot the target from here."""
+  v = 25.0
+  assert cmd(-0.5, v, setpoint=v, v_target=v - STEP5_THRESHOLD_KPH / MS_TO_KPH, min_setpoint=5.0) == "minus5"
+  err_kph = STEP5_THRESHOLD_KPH + 0.1
+  assert cmd(-0.5, v, setpoint=v, v_target=v - err_kph / MS_TO_KPH, min_setpoint=5.0) == "minus5"
 
 
 def test_commanded_setpoint_never_goes_below_min():
@@ -277,7 +304,7 @@ def test_full_invariant_sweep():
     1. A plus1 tick never carries the setpoint above desired = max(v_target,
        min_setpoint), and only ever moves exactly 1 km/h.
     2. A minus tick never carries the setpoint below desired, and only moves
-       5 km/h when the error is >= 5 km/h, else 1 km/h.
+       5 km/h when the error is >= STEP5_THRESHOLD_KPH, else 1 km/h.
     3. Acceleration (a plus command) never happens when a_target <= 0.
     4. (covered separately by test_nan_guards / test_inf_guard) non-finite
        input always returns None.
@@ -318,11 +345,52 @@ def test_full_invariant_sweep():
               new_setpoint = setpoint - step_ms
               if new_setpoint < desired - 1e-9:
                 violations.append(("minus undershoots desired", a_target, v_ego, setpoint, v_target, min_sp, result))
-              if result == "minus5" and -err_kph < 5.0 - 1e-9:
-                violations.append(("minus5 used below 5 kph error", a_target, v_ego, setpoint, v_target, min_sp, result))
+              if result == "minus5" and -err_kph < STEP5_THRESHOLD_KPH - 1e-9:
+                violations.append(("minus5 used below step5 threshold", a_target, v_ego, setpoint, v_target, min_sp, result))
             else:
               violations.append(("unexpected command", a_target, v_ego, setpoint, v_target, min_sp, result))
 
   assert checked == len(a_targets) * len(v_egos) * len(setpoints) * len(v_targets) * len(min_setpoints)
   assert emitted > 0, "sweep produced no emitted commands to check"
   assert not violations, f"{len(violations)} invariant violation(s), first few: {violations[:5]}"
+
+
+def test_two_tick_landing_never_overshoots_target():
+  """Overshoot-safety regression for the bug this threshold fixes: measured
+  telemetry showed a minus5 typically lands 2 accepted ticks (median 2.00,
+  96% >= 2), not the 1 tick the old 5.0 km/h threshold assumed. This sweeps a
+  grid of (setpoint, v_target, min_setpoint) and asserts that even a 2-tick
+  (10 km/h) landing does not cross past desired = max(v_target, min_setpoint)
+  in the overshoot direction, for whichever of minus5/plus5 is emitted.
+
+  plus5 is not currently reachable (the raise path is plus1-only -- see
+  test_raise_is_always_plus1_never_plus5), so this loop only ever exercises
+  the plus5 branch if that changes in the future; it is included so the
+  safety property is verified either way.
+  """
+  a_targets = [-1.5, -1.0, -0.5, -0.1, 0.0, 0.01, 0.2, 0.5, 2.0]
+  v_egos = [6.0, 9.0, 11.0, 15.0, 20.0, 28.0]
+  setpoints = [8.0, 9.2, 10.0, 12.0, 15.0, 20.0, 25.0]
+  v_targets = [4.0, 8.0, 10.5, 15.0, 22.0, 30.0]
+  min_setpoints = [5.0, 9.72]
+  two_tick_ms = 10.0 / MS_TO_KPH   # a 2-tick landing moves 10 km/h, not 5
+
+  checked_minus5 = 0
+  checked_plus5 = 0
+  for a_target in a_targets:
+    for v_ego in v_egos:
+      for setpoint in setpoints:
+        for v_target in v_targets:
+          for min_sp in min_setpoints:
+            result = cmd(a_target, v_ego, setpoint, v_target, min_sp)
+            desired = max(v_target, min_sp)
+            if result == "minus5":
+              checked_minus5 += 1
+              assert setpoint - two_tick_ms >= desired - 1e-9, \
+                  f"minus5 2-tick landing would undershoot desired={desired} from setpoint={setpoint}"
+            elif result == "plus5":
+              checked_plus5 += 1
+              assert setpoint + two_tick_ms <= desired + 1e-9, \
+                  f"plus5 2-tick landing would overshoot desired={desired} from setpoint={setpoint}"
+
+  assert checked_minus5 > 0, "sweep produced no minus5 commands to check"

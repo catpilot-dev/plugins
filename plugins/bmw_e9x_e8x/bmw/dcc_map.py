@@ -23,6 +23,9 @@ from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 MS_TO_KPH = 3.6                # local literal: this module must not import opendbc
 SETPOINT_DEADBAND_KPH = 1.0    # below one tick there is nothing to send
+STEP5_THRESHOLD_KPH = 10.0     # a +-5 command typically lands 2 ticks (measured
+                                # median 2.00, 96% >= 2), so only use it when at
+                                # least two ticks of error exist
 
 
 def _clamp(x, lo, hi):
@@ -105,4 +108,7 @@ def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
       return None                                # model veto: do not speed up against it
     return 'plus1'                                # plus1 only, 20 Hz -- smooth
   # lower the setpoint: always safe, it can only reduce commanded speed
-  return 'minus5' if -err_kph >= 5.0 else 'minus1'
+  # +-1 is preferred below STEP5_THRESHOLD_KPH: a short burst lands ~1 tick,
+  # while +-5 lands ~2 ticks (measured median 2.00, 96% >= 2), so +-5 is only
+  # used once at least two ticks of error exist.
+  return 'minus5' if -err_kph >= STEP5_THRESHOLD_KPH else 'minus1'
