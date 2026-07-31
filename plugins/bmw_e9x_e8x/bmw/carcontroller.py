@@ -6,7 +6,7 @@ from bmw.values import CarControllerParams, CanBus, BmwFlags, CruiseSettings
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.can import CANPacker
 from opendbc.car.common.conversions import Conversions as CV
-from bmw.dcc_map import select_cruise_command, SETPOINT_DEADBAND_KPH, V_ERROR_DEADZONE  # noqa: F401
+from bmw.dcc_map import select_cruise_command, SETPOINT_DEADBAND_KPH  # noqa: F401
 
 
 # DO NOT CHANGE: Cruise control step size
@@ -41,12 +41,11 @@ PRE_TICK_LEAD = 0.015         # lead window 15 ms — wide enough to catch ≥1 
 BURST_LIVE_WINDOW = 0.5       # s — burst considered "live" until this long without TX
 
 # DCC command selection.
-# The car's acceleration tracks the setpoint gap, not the command — see
-# docs/superpowers/specs/2026-07-29-dcc-response-findings.md. We invert the
-# measured map to get the gap we need, cap the resulting setpoint at v_target,
-# and emit the ticks still owed.
-# V_ERROR_DEADZONE lives in dcc_map (single source of truth) — select_cruise_command's
-# direction gate already enforces it, so no separate check is needed at the call site.
+# The controller's only job is to track the cruise setpoint to v_target (the
+# smooth MPC signal) — see docs/superpowers/specs/2026-07-29-dcc-response-findings.md
+# and bmw.dcc_map.select_cruise_command's docstring. select_cruise_command is
+# the single source of truth for the deadband/veto logic; no separate check
+# is needed at the call site.
 
 
 def _tx_interval(cmd_name):

@@ -60,9 +60,22 @@ def test_decision_function_is_wired_in(mock_opendbc):
 
 
 def test_safety_machinery_survives(mock_opendbc):
-  """The burst/counter-overwrite and entry-deadzone machinery must not be
-  collateral damage of the rewrite."""
+  """The burst/counter-overwrite machinery must not be collateral damage of
+  the vTarget-tracking rewrite. V_ERROR_DEADZONE is gone -- it belonged to the
+  deleted direction gate, not to the burst machinery -- so it is intentionally
+  excluded here (see test_v_error_deadzone_is_gone)."""
   mod = _cc(mock_opendbc)
-  for name in ("V_ERROR_DEADZONE", "HOLD_INTERVAL", "SINGLE_INTERVAL",
+  for name in ("HOLD_INTERVAL", "SINGLE_INTERVAL",
                "PRE_TICK_LEAD", "BURST_LIVE_WINDOW", "CRUISE_STALK_IDLE_TICK_STOCK"):
     assert hasattr(mod, name), f"{name} was removed but is still required"
+
+
+def test_v_error_deadzone_is_gone(mock_opendbc):
+  """V_ERROR_DEADZONE was the direction gate's threshold; the gate (and the
+  gap-map inversion it supported) is gone from the control path, so the
+  symbol must no longer be importable from either module."""
+  mod = _cc(mock_opendbc)
+  assert not hasattr(mod, "V_ERROR_DEADZONE")
+  from bmw import dcc_map
+  assert not hasattr(dcc_map, "V_ERROR_DEADZONE")
+  assert not hasattr(dcc_map, "ACCEL_TRIGGER_KPH")

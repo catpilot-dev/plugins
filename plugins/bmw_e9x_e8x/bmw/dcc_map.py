@@ -1,11 +1,21 @@
-"""Measured DCC response map and its inverse.
+"""Measured DCC response map, and the setpoint-tracking controller that drives
+the cruise stalk.
 
 The car's acceleration is a function of the *setpoint gap*
 (cruiseState.speed - vEgo), not of which stalk command produced it — see
-docs/superpowers/specs/2026-07-29-dcc-response-findings.md. This module turns a
-requested acceleration into the gap that delivers it.
+docs/superpowers/specs/2026-07-29-dcc-response-findings.md.
 
-Open-loop by design: nothing here consumes measured aEgo.
+select_cruise_command no longer inverts this map to get a target acceleration.
+aTarget is unreliable for magnitude in BOTH directions (upstream's
+`a_target = min(e2e_model, mpc)` understates acceleration ~87% and overstates
+braking ~3x), the achievable deceleration is DCC's to decide, not ours, and
+DCC's response latency is out of our control too. The controller's only job
+is to track the cruise setpoint to vTarget -- the smooth MPC signal, and the
+only thing we can actually chase.
+
+expected_accel, gap_for_accel, accel_envelope, and the dcc_map_table import
+below are retained for OFFLINE ANALYSIS ONLY (tools/dcc_study/) and are no
+longer part of the control path.
 """
 import math
 
@@ -13,8 +23,6 @@ from bmw.dcc_map_table import GAP_BPS, V_BPS, A_TABLE
 
 MS_TO_KPH = 3.6                # local literal: this module must not import opendbc
 SETPOINT_DEADBAND_KPH = 1.0    # below one tick there is nothing to send
-V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — speed-error direction deadzone
-ACCEL_TRIGGER_KPH = 1.0        # speed shortfall that puts us in acceleration mode
 
 
 def _clamp(x, lo, hi):
@@ -40,111 +48,61 @@ def _column(v_ego):
 
 
 def expected_accel(gap, v_ego):
-  """Acceleration DCC is expected to produce at this gap and speed (m/s^2)."""
+  """Acceleration DCC is expected to produce at this gap and speed (m/s^2).
+
+  OFFLINE ANALYSIS ONLY -- not used by select_cruise_command.
+  """
   return _interp(gap, GAP_BPS, _column(v_ego))
 
 
 def accel_envelope(v_ego):
-  """(a_min, a_max) reachable at this speed — DCC's authority limits."""
+  """(a_min, a_max) reachable at this speed — DCC's authority limits.
+
+  OFFLINE ANALYSIS ONLY -- not used by select_cruise_command.
+  """
   col = _column(v_ego)
   return col[0], col[-1]
 
 
 def gap_for_accel(a_target, v_ego):
-  """Setpoint gap (m/s) that produces a_target, clamped to what DCC can do."""
+  """Setpoint gap (m/s) that produces a_target, clamped to what DCC can do.
+
+  OFFLINE ANALYSIS ONLY -- not used by select_cruise_command.
+  """
   col = _column(v_ego)
   return _interp(_clamp(a_target, col[0], col[-1]), col, GAP_BPS)
 
 
 def select_cruise_command(a_target, v_ego, setpoint, v_target, min_setpoint):
   """Which stalk command closes the gap between the current DCC setpoint and
-  where the measured map says it should be. Returns a CruiseStalk member name
-  or None.
+  vTarget. Returns a CruiseStalk member name or None.
 
-  Split into two branches because aTarget cannot be trusted symmetrically.
-  Upstream's longitudinal_planner.py takes
-  min(output_a_target_e2e, output_a_target_mpc), so the noisy vision model
-  can only ever VETO acceleration, never braking — vTarget, by contrast,
-  comes from the MPC alone. Measured against what the plant gain implies
-  from the speed error, aTarget is only ~0.13x the needed value when
-  accelerating but ~3.0-3.3x when braking. Deriving the setpoint from aTarget
-  therefore makes acceleration hopeless (observed: car held at 80 km/h with
-  a 97 km/h target because aTarget was +0.015). So acceleration is driven
-  from vTarget directly (aTarget only vetoes it), while braking keeps using
-  aTarget, where it is conservative and safe.
+  The controller's only job is to track the cruise setpoint to vTarget, the
+  smooth MPC signal -- not to invert an acceleration map. aTarget is
+  unreliable for magnitude in both directions (upstream's
+  min(e2e_model, mpc) understates acceleration ~87% and overstates braking
+  ~3x, per docs/superpowers/specs/2026-07-29-dcc-response-findings.md), the
+  achievable deceleration is DCC's to decide, not ours, and DCC's response
+  latency is out of our control too.
 
-  Open-loop on the map: measured aEgo is deliberately not an input.
+  aTarget is therefore used only as a sign veto on the acceleration side: it
+  can block a raise but never supplies its magnitude. There is deliberately
+  NO veto on the braking side -- lowering the setpoint toward vTarget can
+  only reduce the commanded speed, so it is always safe.
   """
   # Guard against non-finite inputs (NaN or +/-inf)
   if any(not math.isfinite(x) for x in [a_target, v_ego, setpoint, v_target, min_setpoint]):
     return None
 
-  v_error = v_target - v_ego
-
-  if v_error * MS_TO_KPH > ACCEL_TRIGGER_KPH:
-    # ACCELERATION: trust the MPC's speed target for the destination (aTarget
-    # is only ~0.13x the needed value here, per the module docstring, so it
-    # cannot supply the magnitude). aTarget still has to agree in SIGN before
-    # we accelerate -- the vision model retains its veto over a positive-sign
-    # command -- so a_target must be strictly positive, matching what the
-    # previous production controller required (`accel > 0`). Measured cost of
-    # this gate: 70.7% duty cycle on real data, blocked stretches median
-    # 0.31 s; since DCC accepts only ~3 ticks/s while we offer 20 commands/s,
-    # the climb rate is essentially unaffected. Only ever 'plus1' -- never
-    # 'plus5' -- both because plus1 at 20 Hz gives smoother acceleration and
-    # because this branch may need to close a large gap gradually rather than
-    # in one jump.
-    if a_target <= 0:
-      return None
-    err_kph = (v_target - setpoint) * MS_TO_KPH
-    if err_kph < SETPOINT_DEADBAND_KPH:
-      return None
-    # Can never overshoot v_target: a plus1 tick moves exactly 1 km/h and is
-    # only emitted while err_kph >= 1.0 (i.e. setpoint + 1 km/h <= v_target).
-    return 'plus1'
-
-  # BRAKING / HOLDING: unchanged from before the acceleration split above.
-  desired_raw = min(v_ego + gap_for_accel(a_target, v_ego), v_target)
-  desired = max(desired_raw, min_setpoint)
+  desired = max(v_target, min_setpoint)          # never strand below min cruise
   err_kph = (desired - setpoint) * MS_TO_KPH
 
   if abs(err_kph) < SETPOINT_DEADBAND_KPH:
     return None
-  # The min-speed floor may hold the setpoint up, but it must never RAISE it
-  # past either of two ceilings — neither guard below implies the other:
-  #  - desired_raw < setpoint: the planner has already asked for something
-  #    lower than what's currently commanded, so an upward tick would fight it.
-  #  - desired > v_target: the floor has pushed the commanded setpoint past
-  #    the planner's target speed (this happens when v_target < min_setpoint
-  #    and the current setpoint is already at or below v_target, so
-  #    desired_raw == v_target is not < setpoint, yet the floor clamp still
-  #    lifts `desired` above v_target).
-  if err_kph > 0 and (desired_raw < setpoint or desired > v_target):
-    return None
 
-  # Direction gate: the smooth speed error (v_target - v_ego) decides the
-  # DIRECTION of the command; the noisy a_target only shapes the magnitude via
-  # the map above. Requiring both signals to agree before emitting anything is
-  # what the previous production controller did, and it's what keeps modelV2
-  # noise (a_target reverses sign far more often than the speed error) from
-  # manufacturing spurious commands.
-  #
-  # The two branches are deliberately asymmetric, both pivoting on the same
-  # +V_ERROR_DEADZONE threshold: acceleration requires the speed error to
-  # CLEARLY call for speeding up (v_error > V_ERROR_DEADZONE); braking only
-  # requires that it is NOT clearly calling for speeding up
-  # (v_error < V_ERROR_DEADZONE). Measurement showed the symmetric gate
-  # blocked 75.5% of wanted braking commands, leaving the setpoint at or
-  # above vEgo in 94% of those cases — the car physically cannot decelerate
-  # from there. Favouring braking is the safe direction: a wanted brake that
-  # gets suppressed is worse than one that fires slightly early.
-  if err_kph > 0:
-    if not (v_error > V_ERROR_DEADZONE and a_target > 0):
-      return None
-    return 'plus5' if err_kph >= 5.0 else 'plus1'
-  if not (v_error < V_ERROR_DEADZONE and a_target < 0):
-    return None
-  # No separate min-speed headroom check is needed: `desired` is already floored
-  # at min_setpoint, so a tick is only emitted when at least that step of error
-  # exists above the floor, and it can never carry the setpoint under it.
+  if err_kph > 0:                                # raise the setpoint
+    if a_target <= 0:
+      return None                                # model veto: do not speed up against it
+    return 'plus1'                                # plus1 only, 20 Hz -- smooth
+  # lower the setpoint: always safe, it can only reduce commanded speed
   return 'minus5' if -err_kph >= 5.0 else 'minus1'
