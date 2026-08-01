@@ -10,6 +10,15 @@ import importlib
 _PLUGINS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _PLUGINS_DIR not in sys.path:
   sys.path.insert(0, _PLUGINS_DIR)
+# The tests import `plugins.speedlimitd.speedlimitd` as a package — that needs
+# the REPO ROOT on sys.path too (the documented invocation is
+# `PYTHONPATH=. uv run pytest` from the repo root; this insert makes a bare
+# `pytest` from any cwd work the same). NOTE: dev-machine only — the device's
+# flat runtime layout has no `plugins` package; on-device coverage is
+# on_device_probe.py, not this file.
+_REPO_ROOT = os.path.dirname(_PLUGINS_DIR)
+if _REPO_ROOT not in sys.path:
+  sys.path.insert(0, _REPO_ROOT)
 
 
 @pytest.fixture(autouse=True)
