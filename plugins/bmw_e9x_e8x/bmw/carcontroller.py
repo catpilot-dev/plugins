@@ -6,7 +6,6 @@ from bmw.values import CarControllerParams, CanBus, BmwFlags, CruiseSettings
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.can import CANPacker
 from opendbc.car.common.conversions import Conversions as CV
-from bmw.dcc_map import select_cruise_command, SETPOINT_DEADBAND_KPH  # noqa: F401
 
 
 # DO NOT CHANGE: Cruise control step size
@@ -33,36 +32,23 @@ CRUISE_STALK_IDLE_TICK_STOCK = 0.2
 # At burst end, DCC accepts SZL's resumption only if (1 + M − K) mod 15 ∈ [1,7]
 # where M = slots overwritten, K = total frames. Until that holds, keep
 # transmitting (with neutral act=0 if openpilot has stopped commanding).
-HOLD_INTERVAL = 0.025         # 40 Hz — live again: selected by command magnitude
-                              # (+-5), not by an accel threshold like the
-                              # original controller used
+HOLD_INTERVAL = 0.025         # 40 Hz — used when commanded accel ≥ ACCEL_HOLD_THRESHOLD
 SINGLE_INTERVAL = 0.050       # 20 Hz — single-press cadence
 PRE_TICK_LEAD = 0.015         # lead window 15 ms — wide enough to catch ≥1 OP cycle (10 ms) with phase jitter
 BURST_LIVE_WINDOW = 0.5       # s — burst considered "live" until this long without TX
 
-# DCC command selection.
-# The controller's only job is to track the cruise setpoint to v_target (the
-# smooth MPC signal) — see docs/superpowers/specs/2026-07-29-dcc-response-findings.md
-# and bmw.dcc_map.select_cruise_command's docstring. select_cruise_command is
-# the single source of truth for the deadband/veto logic; no separate check
-# is needed at the call site.
+# DCC command selection thresholds
+V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — deadzone for entry and burst cancellation
+ACCEL_HOLD_THRESHOLD = 0.2     # m/s² — use HOLD_INTERVAL above this, SINGLE_INTERVAL below
+ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — use +5 above this, +1 below (midpoint of 0.4–1.2)
+DECEL_HOLD_THRESHOLD = 0.4
+DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint of 0.6–1.2)
 
-
-def _tx_interval(cmd_name):
-  # Cadence is keyed on DIRECTION, not step size.
-  #
-  # Braking runs entirely at the hold cadence. minus5 genuinely gains slew rate
-  # from it (measured 2.1x more setpoint ticks/sec at 40 Hz than 20 Hz, because
-  # +-5 is accepted per transmitted frame). minus1's own tick yield is
-  # cadence-insensitive -- measured identical at 40 Hz and 20 Hz across four
-  # duration bins -- so it is here for COHERENCE, not slew: a braking event
-  # steps minus5 -> minus1 as the error closes, and holding one cadence across
-  # that transition avoids DCC seeing a press/release, which it infers from
-  # cadence (see the 0x194 note above).
-  #
-  # Acceleration stays at the single-press cadence: deliberately gentler, and
-  # overshoot is the unsafe direction there so there is nothing to chase.
-  return HOLD_INTERVAL if cmd_name.startswith("minus") else SINGLE_INTERVAL
+# DCC Calibration
+# PLUS1 + HOLD = +0.4 m/s²
+# PLUS5 + HOLD = +1.2 m/s²
+# MINUS1 + HOLD = -0.6 m/s²
+# MINUS5 + HOLD = -1.2 m/s²
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
@@ -101,6 +87,7 @@ class CarController(CarControllerBase):
     v_target = actuators.speed
 
     v_current = CS.out.vEgo
+    v_error = v_target - v_current
 
     accel = actuators.accel
 
@@ -188,11 +175,20 @@ class CarController(CarControllerBase):
         if CS.out.gasPressed:
           cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL)
         else:
-          cmd_name = select_cruise_command(a_target=accel, v_ego=v_current,
-                                           setpoint=CS.out.cruiseState.speed, v_target=v_target,
-                                           min_setpoint=self.min_cruise_setpoint)
-          if cmd_name is not None:
-            cruise_cmd(getattr(CruiseStalk, cmd_name), _tx_interval(cmd_name))
+          setpoint_error = v_target - CS.out.cruiseState.speed
+
+          if v_error > V_ERROR_DEADZONE and accel > 0 and setpoint_error > 0:
+            cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
+            interval = HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL
+            cruise_cmd(cmd, interval)
+
+          elif v_error < -V_ERROR_DEADZONE and accel < 0 and setpoint_error < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
+            headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
+            cmd = CruiseStalk.minus5 if -accel >= DECEL_STEP5_THRESHOLD else CruiseStalk.minus1
+            interval = HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL
+            step = 5 if cmd == CruiseStalk.minus5 else 1
+            if headroom_kmh >= step:
+              cruise_cmd(cmd, interval)
 
     # Trailing counter overwrite. If commanding stopped (or is briefly idle in
     # a deadzone) but the burst is still live, keep transmitting at the burst's
