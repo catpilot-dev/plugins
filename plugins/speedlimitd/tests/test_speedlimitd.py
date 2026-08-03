@@ -1935,6 +1935,44 @@ class TestLaneCountFirstInference:
     assert mw.lane_count_stable == 4
     assert self._published(mw)['inferredSpeed'] == 80
 
+  # --- wide commit resets the narrow accumulator (route 3e0 seg 33) ---------
+
+  def test_wide_commit_resets_narrow_accumulator(self, sld, monkeypatch):
+    """3e0 五洲大道 exit: after a committed narrow, a sustained raw=4 commits WIDE
+    and zeroes the narrow accumulator. A subsequent single ≤2 edge-lane dip of
+    2.5 s then does NOT re-commit narrow — it needs a fresh full NARROW_CONFIRM_S
+    (3 s). Without the reset the residual would re-commit in ~2-3 s, repeatedly
+    yanking the climbing limit back to 40-60 (the 20.8 s hesitation)."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 9500.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    self._feed(mw, holder, clock, [2] * 20)        # commit narrow (~3 s of raw 2)
+    assert mw.lane_count_stable == 2
+    assert mw._narrow_accum > 0.0                  # accumulator loaded (at cap)
+    # Sustained raw=4 → commit wide (up-debounce 1.5 s) AND reset the accumulator.
+    self._feed(mw, holder, clock, [4] * 12)        # ~2.4 s of raw 4
+    assert mw.lane_count_stable == 4
+    assert mw._narrow_accum == 0.0                 # reset on the wide commit
+    # A 2.5 s ≤2 dip must NOT re-commit — the residual is gone, so 2.5 s < 3 s.
+    self._feed(mw, holder, clock, [2] * 12)        # ~2.4 s of raw 2
+    assert mw.lane_count_stable == 4               # stayed wide
+
+  def test_re_narrow_after_wide_commit_needs_full_3s(self, sld, monkeypatch):
+    """The reset does not break genuine re-narrowing: a full 3 s of sustained
+    raw=2 after a committed widening DOES re-commit narrow (→40)."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 9800.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    self._feed(mw, holder, clock, [2] * 20)        # commit narrow
+    self._feed(mw, holder, clock, [4] * 12)        # commit wide → accum 0.0
+    assert mw.lane_count_stable == 4 and mw._narrow_accum == 0.0
+    commit_t = self._feed(mw, holder, clock, [2] * 18)   # ~3.4 s of raw 2
+    assert commit_t is not None                    # re-committed narrow
+    assert mw.lane_count_stable == 2
+    assert self._published(mw)['inferredSpeed'] == 40
+
   def test_two_lane_no_cap_enforces_source2_40(self, sld):
     """Committed 2-lane → 40 is published as an ENFORCING source-2 limit (not
     safety-capped): the seg-29 regression removal — a genuine ramp 40 is no longer

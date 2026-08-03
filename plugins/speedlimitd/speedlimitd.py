@@ -1070,6 +1070,17 @@ class SpeedLimitMiddleware:
         if now - self.lane_count_stable_since > stability_window:
           self.lane_count_stable = self.lane_count
           self.lane_count_locked = True
+          # A committed widening is positive evidence the narrow section ended —
+          # zero the leaky narrow accumulator (route 3e0 seg 33, 2026-08-04).
+          # Without this the residual (it only drains 0.5·dt during wide
+          # stretches) lets a stray ≤2 edge-lane dip re-commit narrow in ~2-3 s;
+          # on the 五洲大道 exit that repeatedly yanked the climbing limit back
+          # to 40-60, gating acceleration for 20.8 s (car crept 59→77). With the
+          # reset, a re-narrow after a committed widening needs a fresh full
+          # NARROW_CONFIRM_S (3.0 s). Accepted trade: a post-Y-fork re-narrow on a
+          # genuine ramp arrives ~1.5 s later (3d4 seg 7 class — the apex curve
+          # cap covers it).
+          self._narrow_accum = 0.0
 
       # Committing DOWN into the narrow band (≤2): leaky NARROW_CONFIRM_S confirmation
       # (see NARROW_* constants). ADD dt while raw ≤2, bleed NARROW_DECAY·dt while
