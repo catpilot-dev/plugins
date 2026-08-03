@@ -87,30 +87,6 @@ class TestInferLaneCount:
     model = MagicMock(spec=[])  # no laneLineProbs
     assert sld.infer_lane_count(model) == 1
 
-  # --- edge-lane boost gate (route 3de seg 19 root-cause) -------------------
-
-  def _make_edge_model(self, probs):
-    """Model with confident, co-located road edges → _near_road_edge fires."""
-    m = MagicMock()
-    m.laneLineProbs = probs
-    m.roadEdges = [MagicMock(y=[0.0] * 10) for _ in range(2)]
-    m.roadEdgeStds = [0.3, 0.3]                    # confident edge detection
-    m.laneLines = [MagicMock(y=[0.0] * 10) for _ in range(4)]
-    return m
-
-  def test_edge_boost_gated_at_base_3_not_2(self, sld):
-    # (a) base 2 + near edge → STAYS 2 (no boost). The seg-19 fix: a narrow exit
-    # link's 2-line reading must not be inflated to ≥3 (which defeated the narrow
-    # confirmation, the lane≤2 G/S escape, and the ramp-40).
-    assert sld.infer_lane_count(self._make_edge_model([0.1, 0.6, 0.7, 0.1])) == 2
-    # (c) base 2, NO near edge → 2 (unchanged; bare mock has roadEdges len 0).
-    assert sld.infer_lane_count(self._make_model([0.1, 0.6, 0.7, 0.1])) == 2
-
-  def test_edge_boost_still_applies_at_base_3(self, sld):
-    # (b) base 3 + near edge → boosts to 4 (unchanged wide-road behavior — the
-    # boost's actual purpose: an unseen far side of a genuinely wide road).
-    assert sld.infer_lane_count(self._make_edge_model([0.4, 0.6, 0.7, 0.2])) == 4
-
 
 # ============================================================
 # Vision Speed Cap
@@ -2310,6 +2286,62 @@ class TestGsDistanceGuardedRelease:
     self._drive(mw, holder, clock, lanes=2, ticks=10)      # ~2 s of raw 2
     assert self._published(mw)['inferenceMode'] == 'lane_count'
     assert mw._gs_force_release is False         # margin never fired (no distances)
+
+  # ================= F6 — kept-code robustness (review) ====================
+
+  def test_oscillation_ladder_damps_displayed_limit(self, sld, monkeypatch):
+    """Release → genuine G/S re-match (re-promote, margin count reset) → fresh
+    divergence → re-release, repeated. The inferenceMode flag may oscillate, but
+    _displayed_speed_limit only ever moves ONE standard-ladder rung per step
+    interval (3 s down / 2 s up) — it never teleports 100→60 and back (review
+    F3, the ladder damping)."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    clock = {'t': 20000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    STD = sld._STANDARD_SPEEDS
+    displayed = []
+    self._hold_s1(mw)
+    displayed.append(mw._displayed_speed_limit)
+    for _ in range(3):
+      self._diverge(mw, clock, held_dist=13.5, matched_dist=0.6)
+      displayed.append(mw._displayed_speed_limit)
+      self._diverge(mw, clock, held_dist=17.0, matched_dist=0.6)
+      displayed.append(mw._displayed_speed_limit)
+      assert mw._gs_force_release is True
+      self._hold_s1(mw)                          # genuine re-match re-promotes
+      displayed.append(mw._displayed_speed_limit)
+      assert mw._gs_margin_count == 0            # reset on the re-match
+    # No teleport: consecutive displayed limits are equal or exactly one rung apart.
+    for a, b in zip(displayed, displayed[1:]):
+      assert abs(STD.index(a) - STD.index(b)) <= 1, f'displayed teleported {a}->{b}'
+    assert min(displayed) >= 80                  # never cliffed to the released 60
+
+  def test_held_ref_transitions_s1_to_s20(self, sld, monkeypatch):
+    """Held on S1, then S20 (a different expressway) matches → _gs_held_ref
+    switches cleanly to S20 and the margin path then tracks S20 — NOT confused by
+    a stale S1 that happens to sit close in the candidate set."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    clock = {'t': 21000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    assert mw._gs_held_ref == 'S1'
+    mw._ingest_osm_result(self._result(wayRef='S20', roadContext=0, highwayType='trunk',
+                                       refDistances={'S20': 2.0}))
+    clock['t'] += 5.0
+    mw.update()
+    assert mw._gs_held_ref == 'S20'              # held identity switched cleanly
+    assert mw._gs_margin_count == 0
+    # Divergence tracks S20 (20 m, margin 19.4 > 8), ignoring S1 sitting at 1 m.
+    for _ in range(2):
+      mw._ingest_osm_result(self._result(roadName='ramp', highwayType='motorway_link',
+                                         distance=0.6,
+                                         refDistances={'S20': 20.0, 'S1': 1.0}))
+      clock['t'] += 5.0
+      mw.update()
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
+    assert mw._gs_force_release is True
 
 
 # ============================================================

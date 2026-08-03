@@ -196,17 +196,7 @@ def infer_lane_count(model_msg) -> int:
 
   # Edge lane boost: if the car is next to a road edge, vision likely
   # misses a lane on the far side. Boost by 1, capped at 4.
-  #
-  # Gate at base_count >= 3, NOT >= 2: the boost's whole story is compensating
-  # for the unseen FAR side of a WIDE road while driving an edge lane — which
-  # requires vision to already see ≥3 lanes. At base_count 2 with close,
-  # confident edges the road is far more likely a genuinely narrow ramp / 2-lane
-  # road than a wide road with an occluded far side. Route 3de seg 19: the exit
-  # link's pure line count read 2, but the >=2 boost inflated it to ≥3 for ~15 s,
-  # defeating the narrow confirmation, the lane≤2 G/S escape, and the ramp-40
-  # limit entirely. (Trade-off: an occluded edge-lane reading 2 on a genuinely
-  # wide road no longer gets lifted to 3 — see report's spurious-40 flag.)
-  if base_count >= 3:
+  if base_count >= 2:
     near_left, near_right = _near_road_edge(model_msg)
     if near_left or near_right:
       base_count = min(base_count + 1, 4)

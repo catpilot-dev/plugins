@@ -166,10 +166,12 @@ class OsmTileReader:
     REF-carrying candidate way considered this query (all ways passing the
     bbox pre-filter — a superset of the MAX_WAY_DISTANCE nearest-match set, so a
     held expressway ref 25-50 m off still shows up with its true distance rather
-    than looking absent). Its purpose is the caller's distance-guarded G/S hold
-    release (speedlimitd GS_GONE_DIST_M): while holding an expressway the caller
-    looks up the held ref here — present-and-far or absent both mean the car has
-    diverged from it (genuine exit); present-and-near means a stacked mis-match.
+    than looking absent). Its purpose is the caller's margin-rule G/S hold
+    release (speedlimitd _eval_gs_margin_release / GS_RELEASE_MARGIN_M): while
+    holding an expressway the caller compares the held ref's distance here
+    against the matched way's distance — the matched way decisively closer, or
+    the held ref absent, means the car has diverged from it (genuine exit); a
+    held ref co-located with the matched way means a stacked mis-match.
     """
     if self.schema is None:
       return None
