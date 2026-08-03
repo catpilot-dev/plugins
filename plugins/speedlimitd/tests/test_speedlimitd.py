@@ -87,6 +87,30 @@ class TestInferLaneCount:
     model = MagicMock(spec=[])  # no laneLineProbs
     assert sld.infer_lane_count(model) == 1
 
+  # --- edge-lane boost gate (route 3de seg 19; ships per user decision) ------
+
+  def _make_edge_model(self, probs):
+    """Model with confident, co-located road edges → _near_road_edge fires."""
+    m = MagicMock()
+    m.laneLineProbs = probs
+    m.roadEdges = [MagicMock(y=[0.0] * 10) for _ in range(2)]
+    m.roadEdgeStds = [0.3, 0.3]                    # confident edge detection
+    m.laneLines = [MagicMock(y=[0.0] * 10) for _ in range(4)]
+    return m
+
+  def test_edge_boost_gated_at_base_3_not_2(self, sld):
+    # (a) base 2 + near edge → STAYS 2 (no boost). The seg-19 fix: a narrow exit
+    # link's 2-line reading must not be inflated to ≥3 (which defeated the narrow
+    # confirmation, the lane≤2 G/S escape, and the ramp-40).
+    assert sld.infer_lane_count(self._make_edge_model([0.1, 0.6, 0.7, 0.1])) == 2
+    # base 2, NO near edge → 2 (unchanged; bare mock has roadEdges len 0).
+    assert sld.infer_lane_count(self._make_model([0.1, 0.6, 0.7, 0.1])) == 2
+
+  def test_edge_boost_still_applies_at_base_3(self, sld):
+    # (b) base 3 + near edge → boosts to 4 (unchanged wide-road behavior — the
+    # boost's actual purpose: an unseen far side of a genuinely wide road).
+    assert sld.infer_lane_count(self._make_edge_model([0.4, 0.6, 0.7, 0.2])) == 4
+
 
 # ============================================================
 # Vision Speed Cap
@@ -2342,6 +2366,42 @@ class TestGsDistanceGuardedRelease:
       mw.update()
     assert self._published(mw)['inferenceMode'] == 'lane_count'
     assert mw._gs_force_release is True
+
+  def test_f1_edge_misread_releases_expressway_hold_accepted(self, sld, monkeypatch):
+    """F1 accepted-risk characterization (user decision 2026-08-03, made with the
+    replay + review numbers in view). With the edge boost gated to ≥3 visible
+    lanes, an edge-lane MISREAD on a genuine expressway (vision sees only 2 lines
+    while hugging an edge) reads RAW 2 — the gate does NOT rescue it to 3.
+    Sustained ≥3 s while gs-held (ref still matching), the narrow accumulator
+    commits lane_count_stable=2 and the existing lane≤2 escape releases the
+    100/120 hold to a 40 base inference. Asserted AS the accepted behavior
+    (damped by the 3 s accumulator + display ladder, gas-overridable) so a future
+    change that alters it is a conscious one."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 22000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    # base-2 probs WITH confident, co-located edges — the gate keeps it at 2.
+    edge2 = self._straight_model([0.6, 0.7, 0.1, 0.1])
+    edge2.roadEdgeStds = [0.3, 0.3]
+    assert sld.infer_lane_count(edge2) == 2        # gate does NOT boost to 3
+    # Establish an S1 hold (raw 4, ref matching).
+    holder['model'] = self._model(4)
+    for _ in range(3):
+      mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+      mw.update()
+      clock['t'] += 0.2
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'
+    # The edge-lane misread: raw 2 sustained > 3 s while S1 keeps matching.
+    holder['model'] = edge2
+    for _ in range(25):                            # 5 s
+      mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+      mw.update()
+      clock['t'] += 0.2
+    pub = self._published(mw)
+    assert mw.lane_count_stable == 2               # accumulator committed narrow
+    assert pub['inferenceMode'] == 'lane_count'    # 100/120 hold released
+    assert pub['inferredSpeed'] == 40              # narrow base inference
 
 
 # ============================================================
