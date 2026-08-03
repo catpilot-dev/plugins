@@ -87,6 +87,30 @@ class TestInferLaneCount:
     model = MagicMock(spec=[])  # no laneLineProbs
     assert sld.infer_lane_count(model) == 1
 
+  # --- edge-lane boost gate (route 3de seg 19 root-cause) -------------------
+
+  def _make_edge_model(self, probs):
+    """Model with confident, co-located road edges → _near_road_edge fires."""
+    m = MagicMock()
+    m.laneLineProbs = probs
+    m.roadEdges = [MagicMock(y=[0.0] * 10) for _ in range(2)]
+    m.roadEdgeStds = [0.3, 0.3]                    # confident edge detection
+    m.laneLines = [MagicMock(y=[0.0] * 10) for _ in range(4)]
+    return m
+
+  def test_edge_boost_gated_at_base_3_not_2(self, sld):
+    # (a) base 2 + near edge → STAYS 2 (no boost). The seg-19 fix: a narrow exit
+    # link's 2-line reading must not be inflated to ≥3 (which defeated the narrow
+    # confirmation, the lane≤2 G/S escape, and the ramp-40).
+    assert sld.infer_lane_count(self._make_edge_model([0.1, 0.6, 0.7, 0.1])) == 2
+    # (c) base 2, NO near edge → 2 (unchanged; bare mock has roadEdges len 0).
+    assert sld.infer_lane_count(self._make_model([0.1, 0.6, 0.7, 0.1])) == 2
+
+  def test_edge_boost_still_applies_at_base_3(self, sld):
+    # (b) base 3 + near edge → boosts to 4 (unchanged wide-road behavior — the
+    # boost's actual purpose: an unseen far side of a genuinely wide road).
+    assert sld.infer_lane_count(self._make_edge_model([0.4, 0.6, 0.7, 0.2])) == 4
+
 
 # ============================================================
 # Vision Speed Cap
@@ -1945,6 +1969,347 @@ class TestLaneCountFirstInference:
     mw.update()
     assert self._published(mw)['source'] == 2
     assert self._published(mw)['inferenceMode'] == 'lane_count'
+
+
+# ============================================================
+# Distance-guarded fast release for the G/S sticky hold (route 3de seg 19)
+# ============================================================
+
+class TestGsDistanceGuardedRelease:
+  """Distance-guarded fast release for the sticky G/S hold (route 3de seg 19),
+  two independent paths OR'd alongside the existing 10 s timer / 30 s ceiling /
+  lane≤2 escape:
+
+    Path 1 — MARGIN rule: while holding and the best match is non-G/S, release
+    when the matched way is GS_RELEASE_MARGIN_M CLOSER than the held G/S way (or
+    the held way is absent → margin +inf) for GS_RELEASE_MARGIN_QUERIES
+    consecutive queries. An absolute gate on the held-way distance fails — at
+    seg-19 ramp entry the held S1 is only ~13.5 m off — so the MARGIN separates a
+    genuine exit (car on the ramp, held way receding) from a stacked mis-match
+    (matched way co-located with the held one, margin 0.2-5 m).
+
+    Path 2 — ref-empty + narrow-drop conjunction: the held ref has stopped
+    matching AND the RAW lane count has held ≤2 for GS_LANE_DROP_S (1.5 s). Two
+    independent signals, no OSM candidate-distance dependence.
+  """
+
+  def _mw(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def _result(self, **kw):
+    base = {'wayRef': '', 'wayName': '', 'speedLimit': 0.0, 'lanes': 0,
+            'roadContext': 1, 'roadName': '', 'highwayType': '', 'distance': 5.0}
+    base.update(kw)
+    return base
+
+  def _published(self, mw):
+    return mw._sl_pub.send.call_args[0][0]
+
+  def _hold_s1(self, mw):
+    """Establish an S1 (trunk, 100) sticky hold and return the published limit."""
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0,
+                                       highwayType='trunk',
+                                       refDistances={'S1': 3.0}))
+    mw.update()
+    return self._published(mw)
+
+  def _diverge(self, mw, clock, held_dist, matched_dist, hwtype='motorway_link'):
+    """One non-G/S query: matched way at `matched_dist`, held S1 at `held_dist`
+    (margin = held_dist - matched_dist), then a 5 s-cadence update()."""
+    ref_d = {} if held_dist is None else {'S1': held_dist}
+    mw._ingest_osm_result(self._result(roadName='ramp', highwayType=hwtype,
+                                       distance=matched_dist, refDistances=ref_d))
+    clock['t'] += 5.0
+    mw.update()
+    return self._published(mw)
+
+  # --- helpers for the model-driven (path 2) tests --------------------------
+
+  def _straight_model(self, probs):
+    m = MagicMock()
+    m.laneLineProbs = list(probs)
+    n = 33
+    m.orientationRate.z = [0.0] * n              # straight → no curvature cap
+    m.velocity.x = [20.0] * n
+    m.position.x = [float(i * 3) for i in range(n)]
+    m.position.yStd = [0.1] * n
+    m.roadEdges = [MagicMock(y=[0.0] * 10) for _ in range(2)]
+    m.roadEdgeStds = [1.0, 1.0]                  # not near an edge → no boost
+    m.laneLines = [MagicMock(y=[0.0] * 10) for _ in range(4)]
+    return m
+
+  def _model(self, lanes):
+    return self._straight_model({
+      1: [0.6, 0.1, 0.1, 0.1],
+      2: [0.6, 0.7, 0.1, 0.1],
+      3: [0.6, 0.7, 0.7, 0.1],
+      4: [0.6, 0.7, 0.7, 0.6],
+    }[lanes])
+
+  def _mw_model(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    holder = {'model': None}
+    sm = MagicMock()
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    sm.__getitem__ = MagicMock(
+      side_effect=lambda k: holder['model'] if k == 'modelV2' else MagicMock())
+    mw.sm = sm
+    return mw, holder
+
+  # ======================= Path 1 — MARGIN rule ============================
+
+  def test_margin_exit_releases_on_second_query(self, sld, monkeypatch):
+    """seg-19-style exit: matched link at 0.6 m, held S1 at 13.5 m (margin ~13)
+    for 2 queries → release on the 2nd query (~5 s into absence), NOT the 10 s
+    timer. The 1st divergent query alone must NOT release."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3                     # wide connector, NOT narrow
+    clock = {'t': 5000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    pub = self._hold_s1(mw)
+    assert pub['inferenceMode'] == 'gs_osm' and pub['inferredSpeed'] == 100
+    # Query 1: margin ~12.9 > 8 → count=1, still held.
+    pub = self._diverge(mw, clock, held_dist=13.5, matched_dist=0.6)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert mw._gs_margin_count == 1
+    # Query 2: margin still > 8 → count=2 → release.
+    pub = self._diverge(mw, clock, held_dist=17.0, matched_dist=0.6)
+    assert pub['inferenceMode'] == 'lane_count'
+    assert pub['inferredSpeed'] == 60            # lane_count(3)
+
+  def test_margin_stacked_no_early_release(self, sld, monkeypatch):
+    """Stacked: matched surface street 5.7 m, held 中环路-style S1 at 5.9 m
+    (margin 0.2) → NO release; the 10 s timer governs and an S1 re-match
+    resets it, exactly as today."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    clock = {'t': 6000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    for _ in range(2):                           # two stacked queries, margin 0.2
+      pub = self._diverge(mw, clock, held_dist=5.9, matched_dist=5.7,
+                          hwtype='residential')
+      assert pub['inferenceMode'] == 'gs_osm'
+    assert mw._gs_margin_count == 0              # never accumulated
+    # An S1 re-match resets the absence timer.
+    self._hold_s1(mw)
+    assert mw._gs_absent_since is None
+
+  def test_margin_6m_sustained_no_release(self, sld, monkeypatch):
+    # Margin 6 m (< 8) sustained across many queries → never releases via margin.
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    clock = {'t': 6500.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    pub = self._diverge(mw, clock, held_dist=8.0, matched_dist=2.0)   # margin 6
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert mw._gs_margin_count == 0
+
+  def test_margin_resets_on_a_below_threshold_query(self, sld, monkeypatch):
+    # margin 9 (one query) then margin 4 → count resets, no release.
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    clock = {'t': 6800.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    self._diverge(mw, clock, held_dist=11.0, matched_dist=2.0)        # margin 9
+    assert mw._gs_margin_count == 1
+    pub = self._diverge(mw, clock, held_dist=6.0, matched_dist=2.0)   # margin 4
+    assert mw._gs_margin_count == 0              # reset
+    assert pub['inferenceMode'] == 'gs_osm'
+
+  def test_margin_boundary_strictly_greater(self, sld, monkeypatch):
+    # margin exactly 8 → NOT counted (>, not >=); margin 8.01 → counted.
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    clock = {'t': 7000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    self._diverge(mw, clock, held_dist=10.0, matched_dist=2.0)        # margin 8.0
+    assert mw._gs_margin_count == 0
+    self._diverge(mw, clock, held_dist=10.01, matched_dist=2.0)       # margin 8.01
+    assert mw._gs_margin_count == 1
+
+  def test_margin_held_ref_absent_releases(self, sld, monkeypatch):
+    """Held S1 absent from the candidate set → margin +inf → releases after 2
+    consecutive absent queries."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    clock = {'t': 7300.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    pub = self._diverge(mw, clock, held_dist=None, matched_dist=5.0)  # S1 absent
+    assert pub['inferenceMode'] == 'gs_osm' and mw._gs_margin_count == 1
+    pub = self._diverge(mw, clock, held_dist=None, matched_dist=5.0)
+    assert pub['inferenceMode'] == 'lane_count'
+    assert pub['inferredSpeed'] == 60
+
+  def test_margin_unavailable_falls_back_to_timer(self, sld, monkeypatch):
+    """No refDistances anywhere → the seam signals distance-unavailable → the
+    margin path never fires; the 10 s absence timer still releases, unchanged."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    clock = {'t': 9000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+    mw.update()
+    assert self._published(mw)['inferredSpeed'] == 100
+    mw._ingest_osm_result(self._result(roadName='ramp', highwayType='primary'))
+    clock['t'] += 5.0
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'   # < 10 s → still held
+    assert mw._gs_margin_count == 0                            # margin path idle
+    clock['t'] += 11.0
+    mw._ingest_osm_result(self._result(roadName='ramp', highwayType='primary'))
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'lane_count'  # 10 s timer
+
+  def test_held_ref_tracked_on_match_and_reset_on_rematch(self, sld, monkeypatch):
+    mw = self._mw(sld)
+    mw.lane_count_stable = 4
+    clock = {'t': 9500.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    assert mw._gs_held_ref == 'S1'
+    # A ref-less 'motorway' hold has no trackable identity → margin path disabled.
+    mw._ingest_osm_result(self._result(highwayType='motorway', roadContext=0))
+    mw.update()
+    assert mw._gs_held_ref == ''
+
+  def test_force_release_is_sticky_until_rematch(self, sld, monkeypatch):
+    """Once the margin forces release, a stacked way drifting back within range
+    must NOT re-hold — only a genuine G/S re-match re-enters gs mode."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    clock = {'t': 9700.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    self._diverge(mw, clock, held_dist=40.0, matched_dist=0.6)
+    self._diverge(mw, clock, held_dist=40.0, matched_dist=0.6)
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
+    # A later query shows the (stacked) way back at 5 m — still released.
+    pub = self._diverge(mw, clock, held_dist=5.0, matched_dist=4.0)
+    assert pub['inferenceMode'] == 'lane_count'
+    # A genuine S1 re-match re-enters gs mode.
+    self._hold_s1(mw)
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'
+
+  # ============ Path 2 — ref-empty + narrow-drop conjunction ===============
+
+  def _drive(self, mw, holder, clock, lanes, ticks, dt=0.2):
+    """Feed `ticks` modelV2 updates at raw `lanes`, advancing the clock dt each."""
+    holder['model'] = self._model(lanes)
+    for _ in range(ticks):
+      mw.update()
+      clock['t'] += dt
+
+  def test_path2_ref_empty_lane_drop_releases_at_1p5s(self, sld, monkeypatch):
+    """ref empty + RAW drops 4→2 sustained 1.5 s → release at ~1.5 s (before both
+    the margin's 2 queries and the 10 s timer)."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 10000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    # Establish an S1 hold (raw 4).
+    holder['model'] = self._model(4)
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+    mw.update()
+    clock['t'] += 0.2
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'
+    # Ref goes empty (exit) and vision drops to raw 2 and holds.
+    mw._ingest_osm_result(self._result(roadName='ramp'))   # ref empty, non-G/S
+    self._drive(mw, holder, clock, lanes=2, ticks=7)       # ~1.4 s of raw 2
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'   # < 1.5 s → held
+    self._drive(mw, holder, clock, lanes=2, ticks=2)       # cross 1.5 s
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
+
+  def test_path2_short_dip_then_recover_no_release(self, sld, monkeypatch):
+    """ref empty + raw 2 for only ~0.8 s then back to 3 → the 1.5 s run resets →
+    no release."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 11000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(4)
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+    mw.update()
+    clock['t'] += 0.2
+    mw._ingest_osm_result(self._result(roadName='ramp'))   # ref empty
+    self._drive(mw, holder, clock, lanes=2, ticks=4)       # ~0.8 s of raw 2
+    self._drive(mw, holder, clock, lanes=3, ticks=10)      # raw ≥3 → run resets
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'
+    assert mw._gs_lane_drop_since is None
+
+  def test_path2_requires_ref_empty_not_stacked(self, sld, monkeypatch):
+    """raw drops to 2 but the G/S ref is STILL matching (stacked) → NO release:
+    the conjunction requires ref-empty. Same 1.5 s+ duration that releases when
+    ref IS empty (previous test)."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 12000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(2)
+    # S1 keeps matching on every query while raw sits at 2 for ~1.8 s.
+    for _ in range(9):
+      mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+      mw.update()
+      clock['t'] += 0.2
+    assert self._published(mw)['inferenceMode'] == 'gs_osm'   # ref present → no path-2
+
+  # ============ Both paths coexist (layered for geometry) ==================
+
+  def test_coexist_margin_first_on_wide_ramp(self, sld, monkeypatch):
+    """Wide ramp (raw ≥3, so path 2 idle): the MARGIN path releases."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 13000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(4)             # wide → raw stays 4
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk',
+                                       refDistances={'S1': 3.0}))
+    mw.update()
+    clock['t'] += 0.2
+    for _ in range(2):                           # two divergent queries (margin ~13)
+      mw._ingest_osm_result(self._result(roadName='ramp', highwayType='motorway_link',
+                                         distance=0.6, refDistances={'S1': 13.5}))
+      mw.update()
+      clock['t'] += 0.2
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
+    assert mw._gs_force_release is True          # released via the margin path
+    assert mw._gs_lane_drop_since is None        # path 2 never armed (raw ≥3)
+
+  def test_coexist_lanedrop_first_on_narrow_ramp(self, sld, monkeypatch):
+    """Narrow ramp with NO candidate distances (margin can't fire): the
+    ref-empty + lane-drop path releases at 1.5 s."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 14000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(4)
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+    mw.update()
+    clock['t'] += 0.2
+    mw._ingest_osm_result(self._result(roadName='ramp'))   # ref empty, NO refDistances
+    self._drive(mw, holder, clock, lanes=2, ticks=10)      # ~2 s of raw 2
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
+    assert mw._gs_force_release is False         # margin never fired (no distances)
 
 
 # ============================================================

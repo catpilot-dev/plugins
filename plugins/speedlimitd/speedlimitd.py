@@ -196,7 +196,17 @@ def infer_lane_count(model_msg) -> int:
 
   # Edge lane boost: if the car is next to a road edge, vision likely
   # misses a lane on the far side. Boost by 1, capped at 4.
-  if base_count >= 2:
+  #
+  # Gate at base_count >= 3, NOT >= 2: the boost's whole story is compensating
+  # for the unseen FAR side of a WIDE road while driving an edge lane — which
+  # requires vision to already see ≥3 lanes. At base_count 2 with close,
+  # confident edges the road is far more likely a genuinely narrow ramp / 2-lane
+  # road than a wide road with an occluded far side. Route 3de seg 19: the exit
+  # link's pure line count read 2, but the >=2 boost inflated it to ≥3 for ~15 s,
+  # defeating the narrow confirmation, the lane≤2 G/S escape, and the ramp-40
+  # limit entirely. (Trade-off: an occluded edge-lane reading 2 on a genuinely
+  # wide road no longer gets lifted to 3 — see report's spurious-40 flag.)
+  if base_count >= 3:
     near_left, near_right = _near_road_edge(model_msg)
     if near_left or near_right:
       base_count = min(base_count + 1, 4)
@@ -541,6 +551,42 @@ GS_RELEASE_CONT_S = 10.0    # release once non-G/S matches have been CONTINUOUS
                             # resetting it (stickiness preserved). Bounds a stale
                             # 100/120 hold well under the 30 s ceiling (a wide
                             # gentle exit must not defeat safety caps for 30 s).
+GS_RELEASE_MARGIN_M = 8.0   # release when the matched non-G/S way is this much
+                            # CLOSER than the held G/S way — the car is decisively
+                            # ON another road. An absolute distance gate on the
+                            # held way does NOT work: fresh 3de seg 19 tile
+                            # measurement shows the held S1 polyline only 13.5 m
+                            # away at ramp entry (diverging 0.84 m/s, never past
+                            # 21 m in the segment), so a 25 m gate would fire
+                            # later than the 10 s timer. The generic
+                            # discriminator is instead the MARGIN between the
+                            # matched way and the held way: on a genuine exit the
+                            # car sits on the ramp (matched ≈ 0.6 m) while the
+                            # held expressway recedes (margin ≈ 13 m); a stacked
+                            # mis-match matches a way essentially co-located with
+                            # the held one (margin 0.2-5 m, 3d0 forensics). Held
+                            # way ABSENT from candidates ⇒ margin +inf.
+GS_RELEASE_MARGIN_QUERIES = 2  # consecutive OSM queries (~5 s cadence) the
+                            # margin must hold before releasing — one divergent
+                            # query could be a single mis-query; two in a row is
+                            # the car committed to the other road. Still bounded
+                            # well under the 10 s absence timer and 30 s ceiling.
+GS_LANE_DROP_S = 1.5        # release path 2 (route 3de user addition): while the
+                            # held G/S ref has stopped matching (ref-empty absence
+                            # run active), a RAW lane count (infer_lane_count) that
+                            # holds ≤2 continuously this long is the second,
+                            # independent exit signal — two signals agreeing = an
+                            # unambiguous exit onto a narrow ramp, needing NO OSM
+                            # candidate-distance data. Deliberately HALF the
+                            # general 3 s narrow confirmation (NARROW_CONFIRM_S):
+                            # that 3 s must reject noise from vision ALONE; here
+                            # the ref-empty corroboration is a second independent
+                            # signal, so a shorter window is justified. NOTE: on
+                            # 3de seg 19 this path would NOT have fired — the
+                            # edge-aware lane count read ≥3 on that wide ramp for
+                            # ~15 s; the margin rule (path 1) covers that geometry.
+                            # This path covers genuinely-narrow exits and is robust
+                            # when candidate distances are unavailable.
 LANE_COUNT_LIMIT_3 = 60     # 3 confident lanes → 60 km/h
 LANE_COUNT_LIMIT_4 = 80     # ≥4 confident lanes → 80 km/h
 
@@ -635,6 +681,18 @@ class SpeedLimitMiddleware:
     self._gs_absent_since: float | None = None  # start of the current continuous
                                                  # non-G/S run (None ⇒ last match
                                                  # was G/S)
+    # Distance-guarded fast release (route 3de seg 19). Held-way identity + the
+    # two independent divergence signals that let the sticky hold drop before
+    # the 10 s absence timer when the car has clearly left the expressway.
+    self._gs_held_ref: str = ''         # ref of the currently-held G/S way
+                                        # ('' ⇒ none, or a ref-less motorway hold
+                                        # with no trackable identity)
+    self._gs_force_release: bool = False  # margin-rule (path 1) divergence latch;
+                                          # sticky until a genuine G/S re-match
+    self._gs_margin_count: int = 0        # consecutive divergent-margin OSM queries
+    self._gs_lane_drop_since: float | None = None  # start of the continuous RAW
+                                                    # ≤2 lane run (path 2); None ⇒
+                                                    # last raw read was ≥3
     self.inference_mode: str = 'lane_count'  # 'gs_osm' | 'lane_count'
     self.lane_count: int = 1
     self.lane_count_stable: int = 1
@@ -847,6 +905,57 @@ class SpeedLimitMiddleware:
       self.last_road_name = ''
       self.last_osm_hwtype = ''
 
+    # Per-query margin-rule evaluation (route 3de seg 19). _ingest_osm_result is
+    # the once-per-OSM-query hook (both on-device and in tests), so the
+    # consecutive-query margin count is tracked here, not in the 5 Hz update().
+    self._eval_gs_margin_release(result)
+
+  def _eval_gs_margin_release(self, result: dict | None):
+    """Margin-rule fast release for the sticky G/S hold (route 3de seg 19).
+
+    Called once per OSM query. While a G/S hold is active and THIS query's best
+    match is non-G/S, the car has decisively moved onto another road when the
+    matched way is GS_RELEASE_MARGIN_M closer than the held G/S way — or the
+    held way has dropped out of the candidate set entirely (margin +inf) — for
+    GS_RELEASE_MARGIN_QUERIES consecutive such queries. An absolute distance
+    gate on the held way does not work: at seg-19 ramp entry the held S1
+    polyline is only ~13.5 m off (a 25 m gate would fire later than the 10 s
+    timer). The MARGIN is the generic discriminator — a genuine exit sits the
+    car on the ramp (matched ≈ 0.6 m) while the held expressway recedes
+    (margin ≈ 13 m); a stacked mis-match matches a way co-located with the held
+    one (margin 0.2-5 m, 3d0 forensics).
+
+    Sets the sticky _gs_force_release latch (cleared only by a genuine G/S
+    re-match, below). Distance unavailable (no refDistances / no result / no
+    matched distance) ⇒ leave the count and latch untouched: the 10 s absence
+    timer is the fallback.
+    """
+    current_is_gs = (is_gs_expressway_ref(self.last_way_ref)
+                     or self.last_osm_hwtype == 'motorway')
+    if current_is_gs:
+      # A genuine G/S match (re-)establishes the held identity and clears all
+      # margin-divergence evidence — the hold is fresh. A ref-less motorway hold
+      # has no trackable ref, so the margin path is disabled for it ('' held
+      # ref) and the timer/lane-drop paths govern instead.
+      self._gs_held_ref = self.last_way_ref if is_gs_expressway_ref(self.last_way_ref) else ''
+      self._gs_force_release = False
+      self._gs_margin_count = 0
+      return
+    if not self._gs_held_ref:
+      return  # no trackable held identity — margin path disabled
+    ref_dists = result.get('refDistances') if result else None
+    matched_dist = result.get('distance') if result else None
+    if ref_dists is None or matched_dist is None:
+      return  # distance unavailable → timer fallback, evidence untouched
+    held_dist = ref_dists.get(self._gs_held_ref)
+    margin = math.inf if held_dist is None else held_dist - matched_dist
+    if margin > GS_RELEASE_MARGIN_M:
+      self._gs_margin_count += 1
+      if self._gs_margin_count >= GS_RELEASE_MARGIN_QUERIES:
+        self._gs_force_release = True
+    else:
+      self._gs_margin_count = 0
+
   def update(self):
     global SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED, LANE_WIDTH_CLASS_TABLE
     self.sm.update(0)
@@ -927,6 +1036,17 @@ class SpeedLimitMiddleware:
       # guard a stalled tick; 0 on the first sample.
       dt = min(max(now - self._lane_last_t, 0.0), 0.5) if self._lane_last_t > 0.0 else 0.0
       self._lane_last_t = now
+
+      # Release path 2 (route 3de user addition) — RAW-lane-drop run timer. Track
+      # a continuous raw ≤2 run off infer_lane_count directly (NOT the debounced
+      # lane_count_stable), reset on any raw ≥3. Consumed only in conjunction with
+      # the ref-empty absence condition in the G/S release block below; see
+      # GS_LANE_DROP_S for why RAW + a 1.5 s window is safe here.
+      if raw_lane_count <= 2:
+        if self._gs_lane_drop_since is None:
+          self._gs_lane_drop_since = now
+      else:
+        self._gs_lane_drop_since = None
 
       # Committing UP / between wide counts: the existing directional debounce.
       # A steady raw reading commits after a stability window — 1.5 s going up, and
@@ -1062,20 +1182,39 @@ class SpeedLimitMiddleware:
       )
       self._gs_last_seen_t = now
       self._gs_absent_since = None        # a G/S match resets the absence run
+      self._gs_lane_drop_since = None     # ...and the path-2 lane-drop run
     elif self._gs_last_seen_t > 0.0 and self._gs_absent_since is None:
       self._gs_absent_since = now         # first non-G/S tick of a new run
 
+    # Path 2 (route 3de user addition) — ref-empty + narrow-drop conjunction:
+    # the held G/S ref has stopped matching (absence run active) AND the RAW lane
+    # count has held ≤2 for GS_LANE_DROP_S. Two independent signals agreeing = an
+    # unambiguous exit onto a narrow ramp, with NO dependence on OSM candidate
+    # distances (robust when refDistances is unavailable). See GS_LANE_DROP_S for
+    # why RAW lane count and the half-length 1.5 s window are justified, and why
+    # this path would NOT have fired on the (wide) 3de seg 19 ramp — the margin
+    # rule (path 1, _gs_force_release) covers that geometry.
+    gs_lane_drop = (self._gs_absent_since is not None
+                    and self._gs_lane_drop_since is not None
+                    and now - self._gs_lane_drop_since >= GS_LANE_DROP_S)
+
     # Release the sticky expressway hold on ANY of:
     #   - absolute ceiling (GS_STICKY_S) since the last G/S match;
+    #   - the margin rule (path 1): the matched way is decisively closer than the
+    #     held G/S way for GS_RELEASE_MARGIN_QUERIES queries (_gs_force_release);
+    #   - the ref-empty + narrow-drop conjunction (path 2, gs_lane_drop above);
     #   - non-G/S matches CONTINUOUS for GS_RELEASE_CONT_S — a genuine exit
     #     accumulates it in one run; an alternating stacked flicker keeps
-    #     resetting _gs_absent_since so it never accumulates (stickiness kept);
+    #     resetting _gs_absent_since so it never accumulates (stickiness kept).
+    #     This is the fallback when candidate distances are unavailable;
     #   - a narrow section (lane_count_stable ≤ 2, already debounced): a ramp/
     #     exit off the expressway must obey the narrow-road limit immediately,
     #     never a stale 100/120.
     gs_released = (
         self._gs_last_seen_t == 0.0
         or now - self._gs_last_seen_t > GS_STICKY_S
+        or self._gs_force_release
+        or gs_lane_drop
         or (self._gs_absent_since is not None
             and now - self._gs_absent_since >= GS_RELEASE_CONT_S)
         or self.lane_count_stable <= 2)
