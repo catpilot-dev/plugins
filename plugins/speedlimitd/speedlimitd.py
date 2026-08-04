@@ -613,6 +613,23 @@ NARROW_CONFIRM_S = 3.0      # sustained (leaky) time-in-narrow before committing
 NARROW_ACCUM_CAP = 3.0      # accumulator clamp (== confirm threshold; no banking)
 NARROW_DECAY = 0.5          # bleed fraction of dt while raw ≥3 (occlusion spike)
 
+# --- Fix F: post-narrow promotion ceiling (2026-08-05, route 3e1) ---
+# Route 3e1 has genuine 2-lane links that ghost lane lines falsely promote
+# 40→80; perception fixes proven impossible. Replay-gated state-machine damage
+# limiter (M=45 / E=0.5, robust-entry-over-exit-release per user priority):
+# after ANY narrow commit the lane-count-derived limit is capped at 60 ("ceiling
+# armed"). The ceiling stays armed while narrow evidence (raw ≤2) keeps arriving
+# and disarms only after CEILING_RELEASE_CLEAN_S continuous seconds clean of
+# qualifying evidence. One evidence event = cumulative raw≤2 time ≥
+# CEILING_EVIDENCE_S within the trailing CEILING_EVIDENCE_WINDOW_S window. The
+# cap touches ONLY the lane-count limit (80→60); never the narrow 40/30 values,
+# curve caps, the reactive a_y cap, G/S promote/hold, or the gas-override path.
+# Known soft costs: 延迟 80 on genuine exits while evidence keeps refreshing;
+# extends pre-existing spurious narrow commits into 60-holds.
+CEILING_RELEASE_CLEAN_S = 45.0    # continuous clean-of-evidence seconds to disarm (M)
+CEILING_EVIDENCE_S = 0.5          # cumulative raw≤2 within the window to qualify (E)
+CEILING_EVIDENCE_WINDOW_S = 2.0   # trailing rolling window for evidence accumulation (ROLL)
+
 # China expressway ref grammar (国家高速 / 省级高速 numbering system):
 #   [GS]\d{1,2}  national/provincial expressway TRUNKS — G2, G15, S1, S20
 #   [GS]\d{4}    regional ring / spur expressways      — G1501 (Shenyang ring)
@@ -706,6 +723,10 @@ class SpeedLimitMiddleware:
     # Leaky narrow-band (≤2) confirmation state (see NARROW_* constants).
     self._narrow_accum: float = 0.0       # net time-in-narrow, seconds, [0, cap]
     self._lane_last_t: float = 0.0        # last modelV2 tick time, for the accumulator dt
+    # Fix F post-narrow promotion ceiling state (see CEILING_* constants).
+    self._ceiling_armed: bool = False        # while True, lane-count limit capped at 60
+    self._ceiling_last_evidence: float = 0.0 # last time qualifying narrow evidence arrived
+    self._ceiling_evidence_win: list = []    # (t, raw≤2, dt) within CEILING_EVIDENCE_WINDOW_S
     self.lane_conf: float = 0.0           # smoothed lane line confidence (0.0–1.0)
     self.vision_cap: int = 0
     self.vision_cap_stable: int = 0
@@ -1096,9 +1117,39 @@ class SpeedLimitMiddleware:
         self._narrow_accum = min(self._narrow_accum + dt, NARROW_ACCUM_CAP)
       else:
         self._narrow_accum = max(self._narrow_accum - NARROW_DECAY * dt, 0.0)
+      # Fix F arming hook: capture stable BEFORE the (byte-identical) commit so a
+      # fresh narrow commit (stable transitioning INTO 2) can be detected without
+      # altering the commit logic itself.
+      _pre_commit_stable = self.lane_count_stable
       if self._narrow_accum >= NARROW_CONFIRM_S:
         self.lane_count_stable = 2
         self.lane_count_locked = True
+
+      # --- Fix F: post-narrow promotion ceiling state machine ---
+      # Mirrors fixf_core.FixFCommitter (replay-gated M=45/E=0.5). Box mode is
+      # omitted — the gate chose evidence-decay disarm (box=None); arm_time is
+      # therefore unused here. A fresh narrow commit (arm), qualifying raw≤2
+      # evidence (refresh), and CEILING_RELEASE_CLEAN_S of clean time (disarm)
+      # are the only transitions. lane_count_stable is deliberately left as the
+      # true committed count so telemetry stays honest — the cap is applied only
+      # at the limit-derivation point below.
+      fired_narrow = (self._narrow_accum >= NARROW_CONFIRM_S
+                      and _pre_commit_stable != 2)
+      self._ceiling_evidence_win.append((now, raw_lane_count <= 2, dt))
+      while (self._ceiling_evidence_win
+             and now - self._ceiling_evidence_win[0][0] > CEILING_EVIDENCE_WINDOW_S):
+        self._ceiling_evidence_win.pop(0)
+      roll_narrow = sum(w[2] for w in self._ceiling_evidence_win if w[1])
+      qualifying = roll_narrow >= CEILING_EVIDENCE_S
+      if fired_narrow:
+        # (re-)arm on every narrow commit; the fresh commit is itself evidence.
+        self._ceiling_armed = True
+        self._ceiling_last_evidence = now
+      elif self._ceiling_armed:
+        if qualifying:
+          self._ceiling_last_evidence = now
+        if now - self._ceiling_last_evidence > CEILING_RELEASE_CLEAN_S:
+          self._ceiling_armed = False
 
       # Lane line confidence: sum of all probs divided by line count.
       # Scales with both the number of visible lines and their individual strength.
@@ -1247,6 +1298,14 @@ class SpeedLimitMiddleware:
       # can't flicker it.
       inferred_speed = lane_count_limit(self.lane_count_stable)
       self.inference_mode = 'lane_count'
+      # Fix F ceiling: while armed, cap the lane-count-derived limit at 60 (a
+      # stable ≥4 reads 60 instead of 80). This only ever lowers — the narrow
+      # 40/30 values are already ≤60 and untouched, and the cap never raises
+      # anything. Applied only in lane-count mode; the G/S promote/hold path
+      # above is deliberately exempt. Curve/reactive caps still compose via the
+      # min() below, so an armed 60 with a 50 curve cap yields 50.
+      if self._ceiling_armed and inferred_speed > LANE_COUNT_LIMIT_3:
+        inferred_speed = LANE_COUNT_LIMIT_3
 
     # Vision cap: when vision confidently sees ≤2 lanes, cap inferred speed.
     # Only apply when lane_count_stable < 3 — on confirmed multi-lane roads the

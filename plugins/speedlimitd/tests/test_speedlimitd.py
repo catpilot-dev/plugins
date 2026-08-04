@@ -1923,8 +1923,10 @@ class TestLaneCountFirstInference:
 
   def test_leaving_ramp_promotes_back_to_wide(self, sld, monkeypatch):
     """The narrow accumulator must NOT block promotion: after committing to 2, a
-    sustained raw=4 (rejoining a wide road) commits back to 4 → 80 via the existing
-    up-debounce (1.5 s)."""
+    sustained raw=4 (rejoining a wide road) commits back to 4 via the existing
+    up-debounce (1.5 s). Since Fix F (route 3e1) the recent narrow commit holds
+    the LIMIT at 60 for CEILING_RELEASE_CLEAN_S — the count promotes immediately,
+    the 80 arrives only after the ceiling releases (see TestPostNarrowCeiling)."""
     mw, holder = self._mw_model(sld)
     clock = {'t': 9000.0}
     monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
@@ -1933,7 +1935,7 @@ class TestLaneCountFirstInference:
     assert mw.lane_count_stable == 2
     self._feed(mw, holder, clock, [4] * 20)        # 4 s of raw=4 → promote
     assert mw.lane_count_stable == 4
-    assert self._published(mw)['inferredSpeed'] == 80
+    assert self._published(mw)['inferredSpeed'] == 60   # ceiling armed: 60, not 80
 
   # --- wide commit resets the narrow accumulator (route 3e0 seg 33) ---------
 
@@ -2467,3 +2469,200 @@ class TestPluginManifest:
 
     assert 'cereal' not in manifest or not manifest.get('cereal', {}).get('slots')
     assert 'services' not in manifest or not manifest.get('services')
+
+
+# ============================================================
+# Fix F — post-narrow promotion ceiling (route 3e1 ghost lanes)
+# ============================================================
+
+class TestPostNarrowCeiling:
+  """After any narrow commit the lane-count-derived limit is capped at 60
+  ("ceiling armed") and stays armed while narrow evidence (raw ≤2) keeps
+  arriving; it disarms only after CEILING_RELEASE_CLEAN_S continuous seconds
+  clean of qualifying evidence (M=45 / E=0.5, replay-gated on route 3e1).
+  Mirrors fixf_core.FixFCommitter semantics."""
+
+  def _setup(self, sld, monkeypatch):
+    """Build a SpeedLimitMiddleware with a controllable monotonic clock and a
+    controllable raw lane count fed through infer_lane_count. Returns
+    (mw, clock, state)."""
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    mw._cmd_sub = None
+    mw._lc_sub = None
+
+    clock = {'t': 1000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+
+    state = {'raw': 4}
+    monkeypatch.setattr(sld, 'infer_lane_count', lambda m: state['raw'])
+
+    # Benign straight-road model: no curvature, no vision cap. infer_lane_count
+    # is monkeypatched so laneLineProbs only feeds vision_speed_cap (→0 here).
+    model = MagicMock()
+    model.laneLineProbs = [0.0, 0.0, 0.0, 0.0]
+    model.orientationRate.z = [0.0] * 33
+    model.velocity.x = [20.0] * 33
+    model.position.x = [0.0] * 33
+    model.position.yStd = [0.1] * 33
+
+    sm = MagicMock()
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    sm.__getitem__ = MagicMock(side_effect=lambda k: model if k == 'modelV2' else MagicMock())
+    mw.sm = sm
+    return mw, clock, state
+
+  def _drive(self, mw, clock, state, raw, seconds, dt=0.1):
+    """Advance the clock in dt steps calling update() each tick with the given
+    raw lane count. Returns the number of ticks run."""
+    state['raw'] = raw
+    ticks = 0
+    elapsed = 0.0
+    while elapsed < seconds - 1e-9:
+      clock['t'] += dt
+      mw.update()
+      elapsed += dt
+      ticks += 1
+    return ticks
+
+  def _pub(self, mw):
+    return mw._sl_pub.send.call_args[0][0]
+
+  # --- Test 1: narrow commit arms the ceiling ---------------
+  def test_narrow_commit_arms_ceiling_caps_80_to_60(self, sld, monkeypatch):
+    mw, clock, state = self._setup(sld, monkeypatch)
+    # 3.3 s of raw≤2 → narrow commit (stable=2) arms the ceiling.
+    self._drive(mw, clock, state, 2, 3.3)
+    assert mw._ceiling_armed is True
+    assert mw.lane_count_stable == 2
+    # Now a sustained wide read (raw=4) promotes stable to 4, but the armed
+    # ceiling caps the lane-count limit at 60 instead of 80.
+    self._drive(mw, clock, state, 4, 3.0)
+    assert mw.lane_count_stable == 4          # true count still committed
+    pub = self._pub(mw)
+    assert pub['inferredSpeed'] == 60         # capped, NOT 80
+    assert pub['laneCount'] == 4              # telemetry keeps the true count
+    assert pub['inferenceMode'] == 'lane_count'
+
+  # --- Test 2: evidence refresh keeps it armed indefinitely -
+  def test_evidence_refresh_holds_ceiling_past_release(self, sld, monkeypatch):
+    mw, clock, state = self._setup(sld, monkeypatch)
+    self._drive(mw, clock, state, 2, 3.3)     # arm
+    self._drive(mw, clock, state, 4, 2.0)     # promote to 4
+    assert mw.lane_count_stable == 4
+    # Six cycles of 8 s wide + 0.6 s narrow-dip (≥0.5 s cumulative → qualifies as
+    # one evidence event) ≈ 51.6 s > 45 s, but every clean gap is only 8 s < 45 s
+    # → the ceiling never disarms.
+    for _ in range(6):
+      self._drive(mw, clock, state, 4, 8.0)
+      self._drive(mw, clock, state, 2, 0.6)   # sub-commit dip (never reaches 3 s)
+    self._drive(mw, clock, state, 4, 1.0)
+    assert mw.lane_count_stable == 4           # dips never re-commit narrow
+    assert mw._ceiling_armed is True
+    assert self._pub(mw)['inferredSpeed'] == 60
+
+  # --- Test 3: clean release after 45 s ---------------------
+  def test_clean_45s_releases_ceiling_back_to_80(self, sld, monkeypatch):
+    mw, clock, state = self._setup(sld, monkeypatch)
+    self._drive(mw, clock, state, 2, 3.3)     # arm
+    # 20 s of clean wide driving — still armed.
+    self._drive(mw, clock, state, 4, 20.0)
+    assert mw._ceiling_armed is True
+    assert self._pub(mw)['inferredSpeed'] == 60
+    # Continue clean well past the 45 s release window → disarm → 80 returns.
+    self._drive(mw, clock, state, 4, 30.0)
+    assert mw._ceiling_armed is False
+    assert self._pub(mw)['inferredSpeed'] == 80
+
+  # --- Test 4: sub-threshold noise does NOT refresh ---------
+  def test_single_frame_blips_do_not_extend_hold(self, sld, monkeypatch):
+    mw, clock, state = self._setup(sld, monkeypatch)
+    self._drive(mw, clock, state, 2, 3.3)     # arm
+    self._drive(mw, clock, state, 4, 2.0)     # promote to 4
+    # Isolated single-frame (0.1 s) raw≤2 blips every 3 s: cumulative ≤2 time in
+    # any 2 s window is 0.1 s < E(0.5 s) → never qualifies → does NOT refresh.
+    # Over ~51 s the ceiling still disarms on the 45 s clean rule.
+    for _ in range(17):
+      self._drive(mw, clock, state, 2, 0.1)   # one blip
+      self._drive(mw, clock, state, 4, 3.0)   # clean gap
+    assert mw.lane_count_stable == 4
+    assert mw._ceiling_armed is False
+    assert self._pub(mw)['inferredSpeed'] == 80
+
+  # --- Test 5: reach-60 promotion is not delayed ------------
+  def test_reach_60_unaffected_by_ceiling(self, sld, monkeypatch):
+    # Armed instance: commit narrow, then promote to 3 lanes → 60.
+    mw_a, clock_a, state_a = self._setup(sld, monkeypatch)
+    self._drive(mw_a, clock_a, state_a, 2, 3.3)  # arm
+    assert mw_a._ceiling_armed is True
+    state_a['raw'] = 3
+    ticks_armed = 0
+    while mw_a.lane_count_stable != 3:
+      clock_a['t'] += 0.1
+      mw_a.update()
+      ticks_armed += 1
+      assert ticks_armed < 100
+    assert self._pub(mw_a)['inferredSpeed'] == 60   # ceiling never lowers 60
+
+    # Unarmed reference: same 40→60 promotion, no prior narrow commit.
+    mw_b, clock_b, state_b = self._setup(sld, monkeypatch)
+    self._drive(mw_b, clock_b, state_b, 2, 0.5)    # brief ≤2, no commit/arm
+    assert mw_b._ceiling_armed is False
+    state_b['raw'] = 3
+    ticks_unarmed = 0
+    while mw_b.lane_count_stable != 3:
+      clock_b['t'] += 0.1
+      mw_b.update()
+      ticks_unarmed += 1
+      assert ticks_unarmed < 100
+    # Commit timing identical — the ceiling never touches lane_count_stable.
+    assert ticks_armed == ticks_unarmed
+    assert self._pub(mw_b)['inferredSpeed'] == 60
+
+  # --- Test 6: re-arm after release -------------------------
+  def test_rearm_after_release(self, sld, monkeypatch):
+    mw, clock, state = self._setup(sld, monkeypatch)
+    self._drive(mw, clock, state, 2, 3.3)     # arm
+    self._drive(mw, clock, state, 4, 50.0)    # clean → release
+    assert mw._ceiling_armed is False
+    assert self._pub(mw)['inferredSpeed'] == 80
+    # A fresh narrow confirmation re-arms.
+    self._drive(mw, clock, state, 2, 3.3)
+    assert mw._ceiling_armed is True
+    self._drive(mw, clock, state, 4, 3.0)
+    assert mw.lane_count_stable == 4
+    assert self._pub(mw)['inferredSpeed'] == 60
+
+  # --- Test 7: non-interference with commit machinery -------
+  def test_ceiling_does_not_alter_lane_count_stable(self, sld, monkeypatch):
+    mw, clock, state = self._setup(sld, monkeypatch)
+    # Narrow commit → stable=2, accumulator saturated.
+    self._drive(mw, clock, state, 2, 3.3)
+    assert mw.lane_count_stable == 2
+    assert mw._narrow_accum == pytest.approx(sld.NARROW_ACCUM_CAP)
+    # Wide commit → stable=4 AND accumulator reset to 0 (existing behavior,
+    # unchanged by Fix F).
+    self._drive(mw, clock, state, 4, 3.0)
+    assert mw.lane_count_stable == 4
+    assert mw._narrow_accum == pytest.approx(0.0)
+    # Ceiling caps the DISPLAYED limit but leaves the committed count honest.
+    pub = self._pub(mw)
+    assert pub['laneCount'] == 4
+    assert pub['inferredSpeed'] == 60
+
+  # --- Test 8: composes with curve cap via min() ------------
+  def test_curve_cap_composes_below_ceiling(self, sld, monkeypatch):
+    mw, clock, state = self._setup(sld, monkeypatch)
+    self._drive(mw, clock, state, 2, 3.3)     # arm
+    self._drive(mw, clock, state, 4, 2.0)     # promote to 4 → ceiling 60
+    assert self._pub(mw)['inferredSpeed'] == 60
+    # A tighter curve cap of 50 must win via min() — the ceiling never raises it.
+    mw.curvature_cap = 50
+    clock['t'] += 0.1
+    mw.update()
+    pub = self._pub(mw)
+    assert pub['inferredSpeed'] == 60          # base inference still 60 (ceiling)
+    assert pub['speedLimit'] == 50             # curve cap composes below
