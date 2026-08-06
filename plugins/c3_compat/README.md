@@ -1,44 +1,47 @@
 # Comma 3 Compatibility
 
-Keeps the [comma three](https://github.com/commaai/hardware/tree/master/comma_three) (2021) running on openpilot v0.10.3+. Upstream dropped Comma 3 support in v0.10.3 — this plugin restores it without maintaining a separate branch or codebase.
+Keeps the [comma three](https://github.com/commaai/hardware/tree/master/comma_three)
+(2021, code name "tici") fully supported on current catpilot. Upstream openpilot
+dropped the comma three in v0.10.3 — it removed the STM32F4 panda code, the tici
+audio config, and the old display stack, and it now targets a newer device OS
+(AGNOS 16) than the comma three can run (AGNOS 12.8). This plugin bridges every
+one of those gaps at boot, so a comma three runs the same catpilot as newer
+hardware without a separate branch. It is infrastructure, not a driving feature —
+there is nothing to tune and nothing to interact with.
 
-## For Comma 3 Owners
+## What it keeps working
 
-Install a pre-patched [catpilot](https://github.com/catpilot-dev/catpilot) v0.10.3+ release for minimal risk — c3_compat is included and applied automatically on every boot. No manual setup required.
+- **The panda** — the comma three's internal STM32F4 (Dos) board is detected,
+  talks over USB, and skips the firmware reflash it doesn't need.
+- **The screen** — the UI renders through the DRM display backend instead of the
+  Wayland/Weston stack the comma three doesn't use, and boots ~28 s faster for it.
+- **Audio** — the tici speaker/EQ configuration is restored.
+- **The software build** — the Python environment is kept in sync with whatever
+  catpilot version is deployed, so the code always imports and builds on the
+  older AGNOS 12.8 system.
+- **Memory stability** — a known memory leak in a core library is pinned out, so
+  the device doesn't run out of RAM and reset mid-drive.
+- **The modem / cell connection** — a boot-time crash from the older modem
+  firmware is guarded so the device still goes on- and off-road normally.
 
-**Disclaimer**: c3_compat has been fully tested on a comma three device (serial dc8405e6). Please [report any issues](https://github.com/catpilot-dev/plugins/issues). Use at your own risk — we are not liable for any consequences.
+## Do not disable this on a comma three
 
-## Why
+On a comma three this plugin is **enforced**: it is always on and greyed out in
+the Plugins panel, because the device will not run catpilot correctly without it.
+Turn it off and the comma three may fail to see its panda, produce no audio, show
+no UI, or run out of memory and reset. There is no reason to disable it and no
+supported way to run without it. On other hardware (comma 3X / 4) it does nothing
+and stays out of the way.
 
-The Comma 3 (code name "tici") uses a Snapdragon 845 SoC and STM32F4 panda MCU. When comma released v0.10.3, they removed C3-specific code paths: the tici amplifier config, STM32F4 panda support, SPI protocol compatibility, and the Wayland/Weston display stack. Without this plugin, a Comma 3 running v0.10.3 can't detect its panda, produce audio, or render a UI.
+## For comma three owners
 
-The other major gap is AGNOS — the comma device OS. Comma 3 is capped at AGNOS 12.8, while openpilot v0.10.3 targets AGNOS 16. c3_compat bridges the differences: missing system packages, read-only root filesystem constraints, Wayland→DRM display backend, and Python venv dependencies that changed between the two AGNOS versions.
+Install a pre-patched [catpilot](https://github.com/catpilot-dev/catpilot)
+release — c3_compat is bundled and applied automatically on every boot, with no
+manual setup. Please
+[report any issues](https://github.com/catpilot-dev/plugins/issues). Use at your
+own risk — we are not liable for any consequences.
 
-## What It Does
+## More
 
-**Boot patches** (`boot_patch.sh`) — applied before openpilot launches:
-
-- Restores STM32F4 (Dos board) panda support: MCU type, USB detection, firmware version skip, SPI→USB fallback
-- Restores tici amplifier EQ config (audio)
-- Replaces Weston/Wayland display stack with DRM backend (eliminates 28s boot delay)
-- Installs `venv_sync` — ensures venv matches `uv.lock` on every boot regardless of how code was deployed
-- Patches `launch_chffrplus.sh` with correct PATH/PYTHONPATH for scons builds
-- Symlinks cache directories to `/data/` (prevents 100MB `/home` overlay from filling up)
-- Persistent crash diagnostics: rotated dmesg + system state snapshots in `/data/crash_diag/`
-- Background watchdog for system health monitoring
-
-**Panda health hook** (`compat.py`) — runtime STM32F4/Dos health check
-
-## Plugin Details
-
-**Type**: hybrid (process + hook) | **Device filter**: tici (Comma 3 only)
-
-```
-c3_compat/
-  plugin.json          # Plugin manifest
-  boot_patch.sh        # AGNOS 12.8 boot-time patches (14 sections)
-  compat.py            # device.health_check hook
-  venv_sync.py         # uv.lock → venv dependency synchronizer
-  watchdog.sh          # Background system health monitor
-  raylib_drm/          # DRM-backend raylib .so (Git LFS)
-```
+Every compatibility shim, why it exists, and how it hooks in at boot are in
+[DESIGN.md](DESIGN.md).

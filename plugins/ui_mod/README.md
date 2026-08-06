@@ -1,57 +1,61 @@
-# ui_mod — UI Customizations
+# UI Customizations (ui_mod)
 
-**Type**: hook
+The catpilot look-and-feel: a branded home screen, the car emblem on the
+driving screen, and the extra Settings panels. It doesn't drive the car — it
+only changes what you see and gives you the switches for the other plugins.
 
-## What it does
+## What you see
 
-Adds settings panels, home screen widgets, drive tracking, and the branded experimental mode button.
+### Home screen (offroad)
 
-### Settings Panels
+- **Left**: a map of your **last drive** — the GPS trace on a dark map, a
+  green dot where you started and a red dot where you stopped, auto-zoomed to
+  fit the whole route.
+- **Right**: your car's **emblem and model name**, your **last drive**
+  (distance, time, % engaged) and a **past-7-days** summary (distance, hours,
+  drives, % engaged). The weekly numbers come from the connect-on-device
+  service; the last-drive numbers are measured on the car itself.
+- A small **update dot** appears when plugin updates are available.
 
-- **Driving** — personality selector, lane centering toggle, conditional speed control toggle, curve comfort setting
-- **Vehicle** — brand emblem + car name, car-specific settings (populated by car plugins via `ui.vehicle_settings` hook)
-- **Plugins** — enable/disable plugins with toggles, check for updates
+### Driving screen (onroad)
 
-### Home Screen
+- The stock steering-wheel / experimental-mode button is replaced by your
+  **car's brand emblem**. Tap it to toggle experimental mode, exactly like the
+  stock button (only on cars where that's allowed).
+  - White emblem = normal (chill) mode.
+  - Color emblem = experimental mode.
+  - A **green ring** around the emblem means **Lane Keeping is actively
+    holding the lane** (the `lane_keeping` plugin is anchored). The ring goes
+    dark when lane keeping releases — worn paint, a lane change — and comes
+    back on its own.
+- If enabled, the current **road name / highway ref** shows at the bottom of
+  the screen (read from the speed-limit plugin).
 
-- **Left column**: Route map showing last drive GPS trace with auto-zoom, start/end markers, and offline tile support
-- **Right column**: Brand emblem + car name, last drive stats (distance, duration, engaged %), past 7 days summary (drives, distance, hours)
-- **Ecosystem update badge** — notification dot when plugin updates are available
+### Settings
 
-### Drive Tracker
+ui_mod adds two panels to Settings:
 
-Real-time drive statistics accumulator that runs during every drive:
-- Accumulates distance, duration, and engagement time from cereal messages at ~2 Hz (gated on deviceState)
-- Captures GPS start/end coordinates and route trace (50m minimum between points)
-- Writes summary JSON on offroad transition for instant display without parsing qlogs
-- Minimum thresholds: 5s duration AND 100m distance (prevents stationary ignition cycles from overwriting real data)
+- **Driving** — everything about how the car drives: personality
+  (aggressive / standard / relaxed) plus a toggle for each installed driving
+  plugin (Lane Keeping, Lane Centering, Speed Limit Sign, Road Info, Look
+  Ahead Steering, …). When a car is recognized, that car's **own settings**
+  (e.g. BMW lane-change and steering options) appear in this same list, under
+  the car's emblem and fingerprint.
+- **Plugins** — turn whole plugins on and off, and check for / install plugin
+  updates. Some core plugins are locked on and can't be toggled.
 
-### Experimental Mode Button
+The Driving panel is the default panel Settings opens to.
 
-Branded replacement for the stock onroad experimental/chill mode button. Shows vehicle emblem with lane centering visual feedback ring.
+## How it's on/off
 
-## Hooks
+ui_mod is a normal plugin: **Settings → Plugins → "UI Customizations"**. With
+it off you get the stock openpilot UI. There is no separate toggle for the
+home screen or the emblem — they come and go with the plugin as a whole. The
+individual features it exposes (Lane Keeping, Road Info, etc.) each have their
+own toggle in the Driving panel.
 
-| Hook | Function | Description |
-|------|----------|-------------|
-| `ui.settings_extend` | on_settings_extend | Add Driving, Vehicle, Plugins panels |
-| `ui.home_extend` | on_home_extend | Add route map + drive stats widgets |
-| `ui.main_extend` | on_main_extend | Set default panel, wire plugins callback |
-| `ui.state_tick` | on_state_tick | Tick drive tracker with cereal messages |
-| `ui.onroad_exp_button` | on_exp_button | Branded experimental mode button |
+## More
 
-## Key Files
-
-```
-ui_mod/
-  plugin.json          # Plugin manifest
-  hooks.py             # Hook handlers
-  driving_panel.py     # Driving settings panel
-  vehicle_panel.py     # Vehicle settings panel
-  plugins_panel.py     # Plugins settings panel
-  drive_stats.py       # DriveStatsWidget (home screen right column)
-  drive_tracker.py     # DriveTracker (real-time stats accumulator)
-  route_map.py         # Route map rendering (GPS trace + tiles)
-  route_map_widget.py  # RouteMapWidget (home screen left column)
-  exp_button.py        # Branded experimental mode button
-```
+Architecture, the panel-injection and vehicle-settings dispatch pattern,
+plugin-bus topics, and the route-map rendering are in
+[DESIGN.md](DESIGN.md).

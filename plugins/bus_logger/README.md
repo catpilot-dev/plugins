@@ -1,26 +1,45 @@
-# bus_logger — Plugin Bus Logger
+# Bus Logger
 
-**Type**: daemon | **Process**: 5 Hz, only_onroad
+Records what other plugins are saying to each other, so you can see it later.
 
 ## What it does
 
-Captures all inter-plugin bus messages to cereal for rlog recording and debugging. Scans `/tmp/plugin_bus/` for active ZMQ topics, subscribes to all, buffers messages, and publishes a `pluginBusLog` cereal message every 200 ms.
+Several plugins (speedlimitd, lane_keeping, and others) publish their internal
+state onto a lightweight local "plugin bus" — small JSON messages used for
+inter-plugin communication and on-screen overlays. That bus normally isn't
+visible outside the device.
 
-Topics are auto-discovered — new publishers are picked up within one cycle.
+This plugin watches the bus, buffers whatever passes through it, and every
+200 ms writes a `pluginBusLog` cereal message containing all the entries seen
+(topic name, JSON payload, and timestamp). Because it's a real cereal
+message, it gets picked up by loggerd and ends up in the rlog for every
+drive — the same place carState, modelV2, and everything else live.
 
-## Cereal Messages
+The point is post-drive debugging: if you're digging into why speedlimitd or
+lane_keeping did something on a route, the bus_logger entries in that route's
+rlog show you what those plugins were internally publishing at the time,
+without needing to have been watching the device live.
 
-| Message | Direction | Frequency |
-|---------|-----------|-----------|
-| pluginBusLog | publish | 5 Hz |
+## Is this a driver feature?
 
-Each message contains a list of entries with topic name, JSON payload, and monotonic timestamp.
+No. There's nothing to look at or interact with while driving — no toggle,
+no HUD element, no setting. It's background tooling for whoever's inspecting
+logs afterward. It runs automatically while onroad and needs no attention
+from the driver.
 
-## Key Files
+## How it works
 
-```
-bus_logger/
-  plugin.json      # Plugin manifest
-  bus_logger.py     # Main daemon loop
-  cereal/slot1.capnp  # PluginBusLog schema
-```
+- Hooked into `device.health_check`, which reports whether the logger
+  process is alive and how many bus topics it currently sees.
+- Runs as its own background process (only while onroad), scanning for
+  active plugin-bus topics, subscribing to all of them, and flushing the
+  buffered messages to cereal 5 times a second.
+- New publishers on the bus are picked up automatically within one cycle —
+  nothing needs to register with bus_logger directly.
+
+## Limits
+
+- It only captures what plugins choose to publish on the plugin bus — it
+  has no visibility into plugins that don't use that bus.
+- It adds a small, constant background load (polling + a 5 Hz cereal
+  publish) whenever the car is onroad.

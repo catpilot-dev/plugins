@@ -1,47 +1,50 @@
-# screen_capture — Screen Capture
+# Screen Capture
 
-**Type**: hook
+Tap a button on screen to save a screenshot.
 
 ## What it does
 
-Tap-to-capture screenshots on any screen (home, settings, onroad). A dim camera icon at bottom center acts as the tap zone. Screenshots are saved as PNG files with timestamps.
+A dim white camera icon sits at the bottom-center of every screen — home,
+settings, and onroad. Tap it and the plugin saves a PNG of what's currently
+on screen, with a brief white flash to confirm the capture happened.
 
-### How it works
+Onroad, it also sends a bookmark event alongside the screenshot, so the
+capture shows up as a bookmarked moment in that drive's rlog (visible in
+Connect-on-Device) in addition to the saved image.
 
-1. A dim white camera icon (alpha 50) is drawn at bottom center of every screen
-2. Tap the icon to capture — a brief white flash confirms the capture
-3. The screenshot is read from the render texture (offscreen FBO), which contains the complete frame without the camera icon overlay
-4. Saved to `/data/media/screenshots/capture_YYYYMMDD_HHMMSS.png`
+## How to use it
 
-### Design decisions
+Tap the camera icon at the bottom-center of the screen. There's a 1-second
+cooldown between captures so a stray double-tap doesn't save two images.
 
-- **Render texture capture** — uses `load_image_from_texture()` instead of `load_image_from_screen()` to avoid DRM framebuffer orientation issues on C3
-- **Clean captures** — camera icon and flash draw to the screen buffer only, not the render texture, so they never appear in screenshots
-- **1-second cooldown** prevents accidental double-captures
-- **Onroad tap suppression** — registers the tap zone via `ui.render_overlay` to prevent triggering the sidebar toggle
+No setting to turn this on or off — the tap zone is always present. The
+capture itself is read from the app's off-screen render texture, so the
+camera icon and the flash effect never appear in the saved image, and
+onroad, tapping it doesn't also trigger the sidebar toggle underneath it.
+
+## Where captures go
+
+```
+/data/media/screenshots/capture_YYYYMMDD_HHMMSS.png
+```
+
+Pull them off the device with:
+
+```bash
+scp c3:/data/media/screenshots/*.png .
+```
 
 ## Hooks
 
-| Hook | Function | Description |
-|------|----------|-------------|
-| `ui.pre_end_drawing` | on_pre_end_drawing | Draw icon, detect taps, capture |
-| `ui.render_overlay` | on_render_overlay | Register tap zone for onroad suppression |
+| Hook | What it's for |
+|------|----------------|
+| `ui.pre_end_drawing` | Draws the icon, watches for a tap, shows the flash |
+| `ui.post_end_drawing` | Does the actual screenshot capture + bookmark, after the frame finishes (so it doesn't block drawing) |
+| `ui.render_overlay` | Registers the icon's tap zone so it doesn't double as the onroad sidebar-toggle area |
+| `device.health_check` | Reports plugin status (always "ok" — no state to be unhealthy about) |
 
-## Output
+## Limits
 
-```
-/data/media/screenshots/
-  capture_20260314_101051.png   # 2160x1080 PNG
-  capture_20260314_101157.png
-  ...
-```
-
-Retrieve via: `scp c3:/data/media/screenshots/*.png .`
-
-## Key Files
-
-```
-screen_capture/
-  plugin.json    # Plugin manifest
-  capture.py     # Tap detection, render texture capture, camera icon
-```
+- No history or gallery in the app itself — screenshots just accumulate in
+  the folder above until you clear them or pull them off.
+- Onroad, saving still writes to local storage; there's no upload step.

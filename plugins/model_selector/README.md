@@ -1,94 +1,63 @@
 # Model Selector
 
-Download and swap openpilot driving and driver monitoring models. Discovers new models from the [openpilot](https://github.com/commaai/openpilot) repository, downloads ONNX files via Git LFS, and handles device-specific PKL compilation caching.
+Browse, download, and switch between openpilot driving and driver-monitoring
+models — right on the device, no SSH.
 
-## How It Works
+## What it does
 
-openpilot ships with one driving model and one driver monitoring (DM) model. Model Selector lets you switch between multiple versions — useful for testing new releases or rolling back if a model misbehaves.
+openpilot ships with one driving model and one driver-monitoring (DM) model.
+This plugin lets you keep several of each on the device and pick which one is
+active:
 
-**Two independent model types:**
+- **Driving model** — the neural net that actually steers and paces the car
+  (lateral and longitudinal). Swapping it is the one that changes how the car
+  drives.
+- **Driver-monitoring model** — the net that watches your attention/eyes.
+  Swapping it changes how driver monitoring behaves, not how the car drives.
 
-| Type | ONNX files | Storage |
-|------|-----------|---------|
-| Driving | `driving_vision.onnx` + `driving_policy.onnx` | `/data/models/driving/` |
-| Driver Monitoring | `dmonitoring_model.onnx` | `/data/models/dm/` |
+It can also reach out to the [openpilot](https://github.com/commaai/openpilot)
+GitHub repo, find newer models that comma has published, and download them for
+you.
 
-**ONNX + PKL caching:**
+## How to use it
 
-Models are stored as portable ONNX files downloaded from GitHub. On first boot after a swap, openpilot compiles ONNX to device-specific tinygrad PKL files (~60s on C3). Model Selector caches compiled PKL files per model, so subsequent swaps to a previously used model skip compilation entirely. PKL cache is invalidated automatically when the tinygrad version changes.
+Everything lives in **Settings → Software**. The plugin adds three rows:
 
-## For Users
+- **Driving Model** — shows the active driving model; tap **SELECT** to see
+  every driving model installed on the device and switch, or delete one you no
+  longer want.
+- **Driver Monitoring** — same, for the DM model.
+- **New Models** — tap **CHECK**. It asks GitHub what comma has published
+  since, lists anything newer than what you have, and lets you download it.
+  The row shows status (`checking…`, `N available`, `downloading`,
+  `download complete`, `up to date`).
 
-Use [Connect on Device](https://github.com/catpilot-dev/connect) to browse, download, and swap models from the web UI — no SSH required.
+When you activate a model, the plugin stages it and asks you to **Reboot** —
+the swap only takes effect after the reboot. If you cancel the reboot prompt,
+it puts the previous model back, so nothing changes until you actually reboot.
 
-## For Developers
+## Things to know
 
-### Model registry
+- **A driving-model swap changes how the car drives.** Treat a new driving
+  model like any other tuning change: try it somewhere safe first.
+- **It takes effect after a reboot**, not live while driving.
+- **First drive after a swap is slow to start.** The first time a given model
+  runs on this device, openpilot has to compile it for the hardware (roughly a
+  minute on a comma three). After that it's cached — switching back to a model
+  you've used before is instant.
+- **You can't delete the model that's currently active.** Switch to another
+  one first.
+- **Old models are hidden.** Models too old to work with this openpilot
+  version are filtered out of the lists automatically, so you can't
+  accidentally install one that won't run.
 
-The registry at `/data/models/model_registry.json` tracks available models with their GitHub commit hashes, dates, and PR references. Update it from GitHub:
+## Turning it on and off
 
-```bash
-python model_download.py update-registry
-```
+It's a standard plugin: enable or disable it under **Settings → Plugins**.
+With it off, the extra rows in the Software panel simply don't appear and the
+active model is whatever was last selected.
 
-### Download a model
+## More
 
-```bash
-# List available models
-python model_download.py list
-python model_download.py list --type driving
-
-# Download a specific model
-python model_download.py download --type driving cool_people_3c957c6
-
-# Add a model from a GitHub PR
-python model_download.py add-from-pr 36849
-
-# Check for new models not yet installed
-python model_download.py check-updates
-```
-
-### Swap the active model
-
-```bash
-# List installed models
-python model_swapper.py --type driving list
-
-# Show active model
-python model_swapper.py --type driving active
-
-# Swap (requires reboot)
-python model_swapper.py --type driving swap cool_people_3c957c6
-
-# Verify ONNX files and PKL cache
-python model_swapper.py --type driving verify cool_people_3c957c6
-
-# Delete an installed model
-python model_swapper.py --type driving delete old_model_abc1234
-```
-
-### File layout on device
-
-```
-/data/models/
-├── model_registry.json          # Available models catalog
-├── active_driving_model          # JSON tracker (current driving model ID)
-├── active_dm_model               # JSON tracker (current DM model ID)
-├── driving/
-│   └── cool_people_3c957c6/
-│       ├── model_info.json       # Name, commit, date, description
-│       ├── driving_vision.onnx   # Portable (from GitHub)
-│       ├── driving_policy.onnx   # Portable (from GitHub)
-│       ├── driving_vision_tinygrad.pkl   # Compiled (device-specific cache)
-│       ├── driving_policy_tinygrad.pkl   # Compiled (device-specific cache)
-│       └── .tinygrad_commit      # tinygrad version that built the PKL
-└── dm/
-    └── medium_fanta_cc8f6ea/
-        ├── model_info.json
-        ├── dmonitoring_model.onnx
-        └── dmonitoring_model_tinygrad.pkl
-```
-
-### Compatibility filtering
-
-Driving models older than the `desire_pulse` transition (August 27, 2025) are incompatible with openpilot v0.10.1+ and are flagged during download. The registry auto-update also excludes reverted models.
+Where models are stored, how downloads and the ONNX→PKL cache work, and the
+hooks it uses are in [DESIGN.md](DESIGN.md).

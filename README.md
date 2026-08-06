@@ -19,7 +19,7 @@ below is already on the device.
 
 | Plugin | What it does for you |
 |--------|----------------------|
-| `ui_mod` | The catpilot look: home screen with drive stats and a route map, your car's emblem on the driving screen, and extra settings panels (Driving, Vehicle, Plugins) |
+| `ui_mod` | The catpilot look: home screen with drive stats and a route map, your car's emblem on the driving screen, and extra settings panels (Driving, Plugins) |
 | `model_selector` | Lets you download and switch between driving models from the Software panel |
 | `screen_capture` | Tap the camera icon to save a screenshot of the driving screen |
 
@@ -28,7 +28,7 @@ below is already on the device.
 | Plugin | What it does for you |
 |--------|----------------------|
 | `c3_compat` | Keeps the comma three fully supported on current catpilot (display, panda, OS compatibility) |
-| `mapd` | Map data support (speed limits, road info). Currently off by default — speed limits come through `speedlimitd` |
+| `mapd` | Manages an external OpenStreetMap data binary. Currently inactive (unwired in its manifest) — speed limits come through `speedlimitd` instead |
 | `bus_logger` | Saves the plugins' status messages into the drive logs, so problems can be diagnosed after a drive |
 | `ui_recorder` | Renders drives into HUD-overlay video for the Connect-on-Device (COD) replay service — works in the background, nothing to operate |
 

@@ -87,8 +87,9 @@ render and before the alert renderer. Render pipeline order:
 | `ui.software_settings_extend` | `selfdrive/ui/layouts/settings/software.py` | model_selector | `(None, software_layout) → None` (void) |
 
 `ui.settings_extend` is called during `SettingsLayout.__init__`. The
-`ui_mod` plugin uses it to inject custom panels (Driving, Vehicle, Plugins)
-into the settings sidebar.
+`ui_mod` plugin uses it to inject custom panels (Driving, Plugins) into the
+settings sidebar. Vehicle-specific rows render inside the Driving panel via
+the plugin-dispatched `ui.vehicle_settings` hook (below).
 
 ### Plugin-dispatched hooks
 
@@ -97,7 +98,7 @@ catpilot itself has no call site:
 
 | Hook | Dispatched by | Provider | Signature |
 |------|--------------|----------|-----------|
-| `ui.vehicle_settings` | ui_mod (Vehicle panel) | bmw_e9x_e8x | `(items, CP) → items` |
+| `ui.vehicle_settings` | ui_mod (Driving panel) | bmw_e9x_e8x | `(items, CP) → items` |
 
 This is the pattern for car-specific settings: ui_mod owns the panel, car
 plugins contribute rows.
