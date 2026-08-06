@@ -118,6 +118,7 @@ class OsmTileReader:
     self._tile_cache = {}   # path -> (ways, timestamp)
     self._cache_ttl = 300   # seconds
     self._loading = set()   # paths currently being loaded in background
+    self.tile_missing = False  # last query found no tile file at all (UI warning)
 
   def _load_tile_bg(self, path: str):
     """Background thread: parse tile and store in cache."""
@@ -177,9 +178,19 @@ class OsmTileReader:
       return None
 
     # Prefer the self-generated tile (has highwayType) when it exists
-    path = _hw_tile_path(lat, lon)
-    if not os.path.exists(path):
-      path = _tile_path(lat, lon)
+    hw_path = _hw_tile_path(lat, lon)
+    pf_path = _tile_path(lat, lon)
+    if os.path.exists(hw_path):
+      path = hw_path
+      self.tile_missing = False
+    elif os.path.exists(pf_path):
+      path = pf_path
+      self.tile_missing = False
+    else:
+      # Neither tile file exists — area not covered by downloaded tiles.
+      # Distinct from "tile present but still loading" (not missing).
+      self.tile_missing = True
+      return None
     ways = self._get_tile(path)
     if ways is None:
       return None

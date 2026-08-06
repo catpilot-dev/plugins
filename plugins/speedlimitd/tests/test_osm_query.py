@@ -180,3 +180,39 @@ class TestRefDistances:
     r = self._query_loaded(reader, self.LAT, self.LON)
     assert r is not None
     assert r['refDistances'] == {}
+
+
+class TestTileMissing:
+  """OsmTileReader.tile_missing — missing-tiles signal for the UI warning."""
+
+  def test_no_tile_file_sets_flag(self, osm_query):
+    reader = osm_query.OsmTileReader()
+    assert reader.tile_missing is False  # init default
+    assert reader.query(31.0, 121.0) is None
+    assert reader.tile_missing is True
+
+  def test_present_tile_clears_flag_even_while_loading(self, osm_query):
+    reader = osm_query.OsmTileReader()
+    path = osm_query._tile_path(31.0, 121.0)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write_tile(reader.schema, path, [
+      {'name': 'Test Rd', 'maxSpeed': 22.2,
+       'nodes': [(30.999, 120.999), (31.001, 121.001)]},
+    ])
+    # First query kicks off a background load — result may be None, but the
+    # tile file EXISTS, so tile_missing must be False.
+    reader.query(31.0, 121.0)
+    assert reader.tile_missing is False
+
+  def test_flag_recovers_after_tile_appears(self, osm_query):
+    reader = osm_query.OsmTileReader()
+    reader.query(31.0, 121.0)
+    assert reader.tile_missing is True
+    path = osm_query._tile_path(31.0, 121.0)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write_tile(reader.schema, path, [
+      {'name': 'Test Rd', 'maxSpeed': 22.2,
+       'nodes': [(30.999, 120.999), (31.001, 121.001)]},
+    ])
+    reader.query(31.0, 121.0)
+    assert reader.tile_missing is False
