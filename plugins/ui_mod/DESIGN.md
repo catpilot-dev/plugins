@@ -41,8 +41,11 @@ installed/removed plugins appear). The rows, in order:
    `.disabled`; toggles the plugin's `LaneKeepEnable` param.
 3. **Lane Centering in Turns** — if `lane_centering` present; toggles
    `LaneCenteringEnabled`.
-4. **Speed Limit Sign** + **Road Info** — if `speedlimitd` present; toggle
-   `speedlimitd`'s `ShowSpeedLimitSign` and ui_mod's own `RoadInfoOverlay`.
+4. **Speed Limit Sign**, **Road Info**, **Mapd/OSM Data Integration** — if
+   `speedlimitd` present; toggle `speedlimitd`'s `ShowSpeedLimitSign` and
+   `OsmDataIntegration`, and ui_mod's own `RoadInfoOverlay`. The OSM toggle
+   can add a conditional missing-tiles warning row directly under it — see
+   below.
 5. **Look Ahead Steering** — if `look_ahead` present; toggles
    `LookAheadEnabled`.
 6. **Cruise Speed Memory** and **Consecutive Lane Changes** — display-only
@@ -55,6 +58,17 @@ installed/removed plugins appear). The rows, in order:
 
 A heading strip (brand icon + `CP.carFingerprint`) is drawn above the scroller
 when a car is fingerprinted.
+
+**Missing-tiles warning.** When the OSM toggle is on, `_osm_tiles_missing()`
+decides whether to insert an extra warning `ListItem` directly under it.
+Precise signal first: speedlimitd's persisted `OsmTilesMissing` param
+(`'1'`/`'0'`, written live by the daemon's OSM tile queries). If that param
+has never been written (`''`), it falls back to a coarse offroad check —
+walking `/data/media/0/osm/offline_hw` and `/data/media/0/osm/offline` for
+any file at all, treating an empty/missing tree as missing. The row (title
+`⚠ Offline Map Tiles`, amber `TextAction` reading `Missing`) is only ever
+built while the toggle is on; it never appears when the toggle is off,
+regardless of tile state.
 
 ### Plugins panel (`plugins_panel.py`)
 
@@ -184,6 +198,8 @@ ui_mod's **own** param is a file in its data dir
 | `LaneKeepEnable` | lane_keeping data dir | Lane Keeping toggle |
 | `LaneCenteringEnabled` | lane_centering data dir | Lane Centering toggle |
 | `ShowSpeedLimitSign` | speedlimitd data dir | Speed-limit sign toggle |
+| `OsmDataIntegration` | speedlimitd data dir | OSM-as-base-speed toggle; ui_mod reads/writes it like any other cross-plugin toggle — the region-resolved default and freshness/priority logic live entirely in speedlimitd |
+| `OsmTilesMissing` | speedlimitd data dir, **write-owned by speedlimitd** | Missing-offline-tiles flag consumed by `_osm_tiles_missing()` for the warning row; ui_mod only ever reads it, never writes it |
 | `LookAheadEnabled` | look_ahead data dir | Look Ahead Steering toggle |
 | `LongitudinalPersonality` | openpilot `Params` | Driving personality |
 | `ExperimentalMode` / `ExperimentalModeConfirmed` | openpilot `Params` | Emblem-button toggle + gate |

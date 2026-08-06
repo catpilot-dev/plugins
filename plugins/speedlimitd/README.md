@@ -14,10 +14,11 @@ It works out the limit from what it can see and what it knows about the road:
 - **The map.** Pre-downloaded offline map tiles tell it the road's identity —
   its name, and whether it's a numbered expressway (a "G" national or "S"
   provincial route). On expressways it raises the limit accordingly (100 or
-  120 km/h). It does **not** trust the map's posted speed numbers or road
-  geometry — in China those are too often wrong or ambiguous where roads stack
-  on top of each other — so on ordinary roads it ignores the map's limit and
-  reads the road itself.
+  120 km/h). By default it does **not** trust the map's posted speed numbers or
+  road geometry for ordinary roads — in China those are too often wrong or
+  ambiguous where roads stack on top of each other — so it reads the road
+  itself with the camera instead. An optional toggle (see below) lets it use
+  the map's posted numbers directly, where they're reliable.
 - **The camera.** It counts how many lanes the road has from the driving model
   and turns that into a sensible limit: a wide multi-lane road gets a higher
   limit than a narrow two-lane street or an on/off ramp.
@@ -51,6 +52,34 @@ Two things you control while driving:
   your cruise speed. It starts confirmed (active) as soon as you go onroad.
 - **Show or hide the sign.** *Show Speed Limit Sign* in the plugin's settings
   turns the on-screen sign on or off (enforcement is unaffected).
+
+## Using OpenStreetMap's posted speed limits (optional)
+
+*Mapd/OSM Data Integration*, in the plugin's settings, lets speedlimitd use
+the actual posted speed limit from the offline map data instead of guessing
+it from lane count and road type.
+
+- **When it's on and the map has a fresh, plausible limit for the road you're
+  on**, that number becomes the limit — the camera-based lane-count guess
+  steps aside. The camera's curve and cornering caps still apply on top, and
+  the car always obeys whichever number is lowest, exactly as above.
+- **When it's off, or the map has nothing usable** — no tiles downloaded, no
+  limit tagged on that road, GPS not locked, or the reading has gone stale —
+  it falls straight back to reading the road with the camera, the same as
+  before this feature existed.
+- **Default: off in China, on everywhere else.** This is set automatically
+  the first time the car ever gets a GPS fix, based on where you are — in
+  China the map's posted numbers are often wrong or missing, but they're
+  reliable in most other places. After that first fix it's entirely up to
+  you: flip it either way in the plugin's settings and it stays that way.
+- **Map tiles come from Connect.** This only works where you've downloaded
+  offline map tiles for your area through the Connect app. If the toggle is
+  on but there's no tile data for where you're driving, the Driving settings
+  panel shows a yellow warning under the toggle: *"No offline map tiles for
+  your area — download them in Connect."* Download the tiles in Connect and
+  the warning clears.
+- **Turning it off restores exactly the previous behavior** — nothing else
+  about how speedlimitd works changes.
 
 ## Honest limits
 
