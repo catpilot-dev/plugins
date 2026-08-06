@@ -14,6 +14,9 @@ DT_CTRL = 0.01  # openpilot control-loop period (s); the hook runs at 100 Hz
 LAT_DELAY_FALLBACK = 0.6  # s; used when the hook passes no lat_delay
 X_PRED_MIN = 5.0          # m; keep a meaningful prediction at crawl
 X_PRED_MAX = 50.0         # m; stay inside the model's reliable line region
+AC_DEADBAND_V = [15.0, 25.0]  # m/s (54-90 km/h) — speed breakpoints for the
+                              # ac_deadband -> ac_deadband_hi taper (2026-08-06,
+                              # route 3e7: see the ac_deadband config comment)
 
 
 def _clip(x, lo, hi):
@@ -53,6 +56,17 @@ class AnchorConfig:
   gap_min: float = 0.6           # driver-wheel-to-line comfort band (m)
   gap_max: float = 1.0
   t_preview: float = 1.5         # pure-pursuit look-ahead time (s)
+  lp_max: float = 25.0           # look-ahead distance cap (m). Route 3e7 segs
+                                 # 41-48 (2026-08-06, 82 km/h): uncapped lp =
+                                 # v·t_preview collapses pursuit gain as 1/v²
+                                 # (3.7× weaker than the urban speeds the damper
+                                 # was field-tuned at), leaving 2/3 of the model's
+                                 # sub-Hz wander uncancelled. Capping the aim
+                                 # point at 25 m (reached at 60 km/h) keeps the
+                                 # field-verified urban behavior bit-identical
+                                 # and lets bias a_y authority grow with v²
+                                 # beyond it, matching how the wander's a_y
+                                 # grows. kappa_bias_max/rate still bound output.
   excess_max: float = 0.5        # max deadband excess acted on (m)
   kappa_bias_max: float = 0.002  # hard cap on curvature bias (1/m)
   kappa_rate_max: float = 0.002  # bias slew (1/m per second)
@@ -67,7 +81,16 @@ class AnchorConfig:
                                  # ~this: zero-mean correction by construction, so the
                                  # 3c1 arm-wrestle (model counter-steers a sustained
                                  # bias to a stalemate) is structurally impossible.
-  ac_deadband: float = 0.10      # AC excess ignored below this (m) — micro-noise
+  ac_deadband: float = 0.10      # AC excess ignored below this (m) at/below
+                                 # AC_DEADBAND_V[0] — micro-noise guard where
+                                 # pursuit gain is at its urban maximum
+  ac_deadband_hi: float = 0.05   # deadband at/above AC_DEADBAND_V[1] (user rule
+                                 # 2026-08-06: higher speed, tighter deadband —
+                                 # route 3e7: the 0.10 band forgave 36% of the
+                                 # wander amplitude at 82 km/h). Safe headroom:
+                                 # above the taper the lp_max cap pins pursuit
+                                 # gain, so a 0.05 m noise blip commands only
+                                 # ~1.6e-4 kappa (~0.1 m/s^2 a_y at 90 km/h)
   prob_on: float = 0.5           # driver-side line confidence to engage.
                                  # 0.6->0.5 (2026-07-23, measured): gap noise in prob
                                  # [0.5,0.6) is 0.047-0.050 m — statistically the same as
@@ -121,7 +144,9 @@ class LaneAnchor:
 
   def _pursuit(self, excess, v_ego):
     cfg = self.cfg
-    lp = max(v_ego * cfg.t_preview, 1.0)   # look-ahead floor avoids div0 at standstill
+    # look-ahead floor avoids div0 at standstill; lp_max cap keeps highway
+    # authority (see the lp_max config comment)
+    lp = _clip(v_ego * cfg.t_preview, 1.0, cfg.lp_max)
     kappa = self.curv_sign * 2.0 * excess / (lp * lp)
     return _clip(kappa, -cfg.kappa_bias_max, cfg.kappa_bias_max)
 
@@ -240,7 +265,8 @@ class LaneAnchor:
       if in_floor:
         excess = self._excess(self.gap_filt)
       else:
-        excess = excess_ac - _clip(excess_ac, -cfg.ac_deadband, cfg.ac_deadband)
+        db = _interp(v_ego, AC_DEADBAND_V, [cfg.ac_deadband, cfg.ac_deadband_hi])
+        excess = excess_ac - _clip(excess_ac, -db, db)
         excess = _clip(excess, -cfg.excess_max, cfg.excess_max)
         # Addendum 2026-07-27: near the driver-side line, suppress only the
         # toward-line direction (excess > 0 -> pursuit steers toward the

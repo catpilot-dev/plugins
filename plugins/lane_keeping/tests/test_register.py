@@ -51,16 +51,19 @@ def test_load_config_defaults(data_dir):
   assert cfg.driver_side == 'left'
   assert cfg.gap_min == 0.6 and cfg.gap_max == 1.0
   assert cfg.t_preview == 1.5
+  assert cfg.lp_max == 25.0
 
 
 def test_load_config_overrides(data_dir):
   (data_dir / 'LaneKeepDriverSide').write_text('right')
   (data_dir / 'LaneKeepGapMin').write_text('0.5')
   (data_dir / 'LaneKeepEnable').write_text('0')
+  (data_dir / 'LaneKeepLpMax').write_text('30')
   cfg = register._load_config()
   assert cfg.driver_side == 'right'
   assert cfg.gap_min == 0.5
   assert cfg.enable is False
+  assert cfg.lp_max == 30.0
 
 
 def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):
@@ -130,8 +133,12 @@ def test_hook_passes_lat_delay_through(data_dir, monkeypatch):
 def test_load_config_ac_params(data_dir):
   cfg = register._load_config()
   assert cfg.dc_tau == 20.0 and cfg.ac_deadband == 0.10
+  assert cfg.ac_deadband_hi == 0.05
   (data_dir / 'LaneKeepDcTau').write_text('30')
-  assert register._load_config().dc_tau == 30.0
+  (data_dir / 'LaneKeepAcDeadbandHi').write_text('0.07')
+  cfg = register._load_config()
+  assert cfg.dc_tau == 30.0
+  assert cfg.ac_deadband_hi == 0.07
 
 
 def test_live_toggle_disables_and_releases(data_dir, monkeypatch):
