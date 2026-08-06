@@ -2086,6 +2086,73 @@ class TestLaneCountFirstInference:
     assert mw.lane_count_stable == 2
     assert self._published(mw)['inferredSpeed'] == 40
 
+  # --- Fix I1 threshold-hold wide commit (route 3e6 seg12/13 S20 merge) -------
+  # The old up-debounce required raw to hold the SAME exact value for the full
+  # 1.5 s interval, so an oscillating raw (2↔3↔4) starved it. New semantics: a
+  # window opens on raw ≥3, tracks the MINIMUM raw while every frame stays ≥3,
+  # and commits that minimum after 1.5 s sustained. Any raw ≤2 frame closes it.
+
+  def test_s20_merge_oscillating_wide_commits(self, sld, monkeypatch):
+    """THE S20 regression: from stable=2, an oscillating raw with EVERY frame ≥3
+    (alternating 3/4) sustained past 1.5 s commits to 3 (the minimum). The OLD
+    exact-match semantics would never commit here (raw != lane_count every frame
+    resets the up clock → 11.4 s of unjustified 40). Then a sustained raw=4
+    promotes to 4."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 10000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 2
+    # 3.2 s of oscillating 3/4 — every frame ≥3, no exact-match hold possible.
+    self._feed(mw, holder, clock, [3, 4] * 8)
+    assert mw.lane_count_stable == 3       # committed the MIN (3), not 40-stuck
+    assert self._published(mw)['inferredSpeed'] == 60
+    # sustained raw=4 → threshold-held promotion to 4
+    self._feed(mw, holder, clock, [4] * 24)
+    assert mw.lane_count_stable == 4
+    assert self._published(mw)['inferredSpeed'] == 80
+
+  def test_wide_window_closed_by_narrow_frame(self, sld, monkeypatch):
+    """A single raw ≤2 frame closes the wide window: 1.0 s of raw ≥3, one raw=2
+    frame, then raw ≥3 again does NOT carry the earlier 1.0 s — a fresh full 1.5 s
+    clean window is required before the wide commit fires."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 10500.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 2
+    self._feed(mw, holder, clock, [3] * 6)        # 1.0 s ≥3 — under 1.5 s
+    assert mw.lane_count_stable == 2
+    self._feed(mw, holder, clock, [2] * 1)        # one narrow frame closes window
+    assert mw.lane_count_stable == 2
+    self._feed(mw, holder, clock, [3] * 6)        # 1.0 s of a FRESH window
+    assert mw.lane_count_stable == 2              # pre-narrow 1.0 s did NOT carry
+    self._feed(mw, holder, clock, [3] * 6)        # completes the fresh 1.5 s window
+    assert mw.lane_count_stable == 3
+
+  def test_min_raw_commit_conservative(self, sld, monkeypatch):
+    """A window of mixed 4/3/4 commits the MINIMUM (3), never 4 — conservative."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 11000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 2
+    self._feed(mw, holder, clock, [4, 3, 4] * 4)  # 3.6 s, every frame ≥3, min=3
+    assert mw.lane_count_stable == 3
+    assert self._published(mw)['inferredSpeed'] == 60
+
+  def test_in_ramp_ghost_burst_still_blocked(self, sld, monkeypatch):
+    """From stable=2 with the narrow accumulator full, a 1.0 s ghost burst of
+    raw=4 inside otherwise-narrow traffic does NOT commit wide — the window is
+    under 1.5 s and closes on the next narrow frame."""
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 11500.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    self._feed(mw, holder, clock, [2] * 20)       # commit narrow, accum at cap
+    assert mw.lane_count_stable == 2
+    assert mw._narrow_accum > 0.0
+    self._feed(mw, holder, clock, [4] * 5)        # 1.0 s ghost burst — under 1.5 s
+    assert mw.lane_count_stable == 2              # NOT promoted
+    assert self._published(mw)['inferredSpeed'] == 40
+
   def test_two_lane_no_cap_enforces_source2_40(self, sld):
     """Committed 2-lane → 40 is published as an ENFORCING source-2 limit (not
     safety-capped): the seg-29 regression removal — a genuine ramp 40 is no longer

@@ -756,6 +756,12 @@ class SpeedLimitMiddleware:
     self.lane_count_locked: bool = False  # True once vision has a 2 s stable reading
     # Leaky narrow-band (≤2) confirmation state (see NARROW_* constants).
     self._narrow_accum: float = 0.0       # net time-in-narrow, seconds, [0, cap]
+    # Fix I1 threshold-hold wide-commit window state (2026-08-05). A window is
+    # open whenever raw ≥3 has held continuously; it tracks the MINIMUM raw seen
+    # so far. Any raw ≤2 frame closes it. See the modelV2 lane block below.
+    self._wide_win_open: bool = False     # True while raw has stayed ≥3
+    self._wide_win_start: float = 0.0     # window open time (up-hold clock start)
+    self._wide_win_min: int = 9           # minimum raw seen during the open window
     self._lane_last_t: float = 0.0        # last modelV2 tick time, for the accumulator dt
     self.lane_conf: float = 0.0           # smoothed lane line confidence (0.0–1.0)
     self.vision_cap: int = 0
@@ -1104,34 +1110,71 @@ class SpeedLimitMiddleware:
       else:
         self._gs_lane_drop_since = None
 
-      # Committing UP / between wide counts: the existing directional debounce.
-      # A steady raw reading commits after a stability window — 1.5 s going up, and
-      # the demotion window (2 s curving / 5 s straight) for wide→less-wide drops
-      # that stay ≥3. Demotion INTO the narrow band (≤2) is handled by the leaky
-      # accumulator below instead: a single debounce timer resets on any raw
-      # flicker and so never commits on a noisy 2-lane ramp (route 3d3 seg 16).
+      # Committing UP / between wide counts. Fix I1 threshold-hold wide commit
+      # (2026-08-05, route 3e6 seg12/13 S20 merge, replay-gated). The old up
+      # debounce required raw to hold the SAME EXACT value for the full 1.5 s
+      # interval — raw != lane_count reset the clock. On the S20 merge raw
+      # oscillated 2↔3↔4 and starved that exact-match hold, leaving 11.4 s of
+      # unjustified 40 after the driver was established on the 4-lane mainline.
+      # New UP semantics: a wide-commit window opens when raw ≥3; while EVERY
+      # frame stays ≥3 the window persists, tracking the MINIMUM raw seen; after a
+      # sustained 1.5 s it commits lane_count_stable = that minimum (3 when mixed
+      # 3/4 — conservative). Any raw ≤2 frame closes the window. After a commit the
+      # window re-arms (a fresh 1.5 s hold is required for the next up step — this
+      # is how a 3→4 promotion stays threshold-held). Replay-gated: +8.5 s exit
+      # gain; accepted ~+18 s false-60-band on 3e1 ghost links (user decision) and
+      # +0.7–1.5 s min-raw reach-80 on genuine exits. Wide→less-wide DOWN drops
+      # that stay ≥3 keep the demotion window (2 s curving / 5 s straight);
+      # demotion INTO the narrow band (≤2) is handled by the leaky accumulator
+      # below instead (a single debounce timer never commits on a noisy 2-lane
+      # ramp, route 3d3 seg 16).
       curving = self.curvature_cap > 0  # curvature_speed_cap detected upcoming curve
+      # Exact-match tracker: drives the DOWN-among-wide demotion clock. Resets the
+      # stability clock whenever raw changes. The UP window below runs off raw
+      # directly and is independent of this, so oscillation no longer starves it.
       if raw_lane_count != self.lane_count:
         self.lane_count = raw_lane_count
         self.lane_count_stable_since = now
-      elif raw_lane_count >= 3:
+
+      committed_down = False
+      # DOWN-among-wide demotion (wide → less-wide, staying ≥3) — unchanged.
+      if raw_lane_count >= 3 and raw_lane_count == self.lane_count:
         going_down = raw_lane_count < self.lane_count_stable
-        demotion_window = 2.0 if curving else 5.0
-        stability_window = demotion_window if going_down else 1.5
-        if now - self.lane_count_stable_since > stability_window:
-          self.lane_count_stable = self.lane_count
-          self.lane_count_locked = True
-          # A committed widening is positive evidence the narrow section ended —
-          # zero the leaky narrow accumulator (route 3e0 seg 33, 2026-08-04).
-          # Without this the residual (it only drains 0.5·dt during wide
-          # stretches) lets a stray ≤2 edge-lane dip re-commit narrow in ~2-3 s;
-          # on the 五洲大道 exit that repeatedly yanked the climbing limit back
-          # to 40-60, gating acceleration for 20.8 s (car crept 59→77). With the
-          # reset, a re-narrow after a committed widening needs a fresh full
-          # NARROW_CONFIRM_S (3.0 s). Accepted trade: a post-Y-fork re-narrow on a
-          # genuine ramp arrives ~1.5 s later (3d4 seg 7 class — the apex curve
-          # cap covers it).
-          self._narrow_accum = 0.0
+        if going_down:
+          demotion_window = 2.0 if curving else 5.0
+          if now - self.lane_count_stable_since > demotion_window:
+            self.lane_count_stable = self.lane_count
+            self.lane_count_locked = True
+            self._narrow_accum = 0.0
+            committed_down = True
+
+      # UP threshold-hold window (min-raw commit).
+      if raw_lane_count >= 3:
+        if not self._wide_win_open:
+          self._wide_win_open = True
+          self._wide_win_start = now
+          self._wide_win_min = raw_lane_count
+        else:
+          self._wide_win_min = min(self._wide_win_min, raw_lane_count)
+        if not committed_down and now - self._wide_win_start >= 1.5:
+          target = self._wide_win_min
+          if target > self.lane_count_stable:
+            self.lane_count_stable = target
+            self.lane_count_locked = True
+            # A committed widening is positive evidence the narrow section ended —
+            # zero the leaky narrow accumulator (route 3e0 seg 33, 2026-08-04).
+            # Without this the residual (it only drains 0.5·dt during wide
+            # stretches) lets a stray ≤2 edge-lane dip re-commit narrow in ~2-3 s;
+            # on the 五洲大道 exit that repeatedly yanked the climbing limit back
+            # to 40-60, gating acceleration for 20.8 s (car crept 59→77). With the
+            # reset, a re-narrow after a committed widening needs a fresh full
+            # NARROW_CONFIRM_S (3.0 s).
+            self._narrow_accum = 0.0
+          # Re-arm: a fresh 1.5 s hold is required before the next up-commit.
+          self._wide_win_start = now
+          self._wide_win_min = raw_lane_count
+      else:
+        self._wide_win_open = False
 
       # Committing DOWN into the narrow band (≤2): leaky NARROW_CONFIRM_S confirmation
       # (see NARROW_* constants). ADD dt while raw ≤2, bleed NARROW_DECAY·dt while
