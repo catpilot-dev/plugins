@@ -280,8 +280,8 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
 
     print()
     print("Next steps:")
-    print(f"  1. Verify: python selfdrive/modeld/model_swapper.py --type {model_type.value} verify {model_id}")
-    print(f"  2. Swap: python selfdrive/modeld/model_swapper.py --type {model_type.value} swap {model_id}")
+    print(f"  1. Verify: python model_swapper.py --type {model_type.value} verify {model_id}")
+    print(f"  2. Swap: python model_swapper.py --type {model_type.value} swap {model_id}")
     print("=" * 70)
 
     return 0 if not failed_files else 1
@@ -504,7 +504,9 @@ def add_model_from_pr(pr_number: int, model_type: str = 'driving'):
     clean_name = re.sub(r'[^a-z0-9_]', '', clean_name)
 
     # Use PR number as model_id for dedup (same PR = same model)
-    # Check if registry already has an entry from this PR
+    # Check if the registry already has an entry from this PR
+    driving_models, dm_models = load_registry()
+    registry = driving_models if model_type == 'driving' else dm_models
     existing_id = None
     for mid, minfo in registry.items():
         if minfo.get('pr', '').strip('#()') == str(pr_number):
