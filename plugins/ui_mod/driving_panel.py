@@ -10,7 +10,7 @@ Vehicle heading (brand icon + fingerprint) shown when a car is detected.
 """
 import os
 
-from config import PLUGINS_RUNTIME_DIR, PLUGINS_REPO_DIR, read_plugin_param, write_plugin_param
+from config import PLUGINS_RUNTIME_DIR, PLUGINS_REPO_DIR, MEDIA_DIR, read_plugin_param, write_plugin_param
 from cereal import log
 import pyray as rl
 from openpilot.common.params import Params
@@ -19,7 +19,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.list_view import toggle_item, text_item, multiple_button_item
+from openpilot.system.ui.widgets.list_view import toggle_item, text_item, multiple_button_item, ListItem, TextAction
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.lib.multilang import tr
 
@@ -33,6 +33,27 @@ ICON_SIZE = 64
 def _plugin_enabled(plugin_id):
   return (os.path.isdir(os.path.join(PLUGINS_DIR, plugin_id)) and
           not os.path.exists(os.path.join(PLUGINS_DIR, plugin_id, '.disabled')))
+
+
+def _osm_tiles_missing():
+  """Missing-tiles signal for the OSM toggle warning.
+
+  Precise: speedlimitd's persisted OsmTilesMissing status (written from live
+  tile queries). Coarse fallback when the daemon has never written it: do the
+  tile dirs contain any files at all?
+  """
+  v = read_plugin_param('speedlimitd', 'OsmTilesMissing', '')
+  if v != '':
+    return v == '1'
+  for d in (os.path.join(MEDIA_DIR, '0/osm/offline_hw'),
+            os.path.join(MEDIA_DIR, '0/osm/offline')):
+    try:
+      for _root, _dirs, files in os.walk(d):
+        if files:
+          return False
+    except OSError:
+      pass
+  return True
 
 
 class DrivingLayout(Widget):
@@ -173,6 +194,24 @@ class DrivingLayout(Widget):
       )
       items.append(self._road_info)
 
+      current_osm = read_plugin_param('speedlimitd', 'OsmDataIntegration') == '1'
+      self._osm_integration = toggle_item(
+        "Mapd/OSM Data Integration",
+        "Use OpenStreetMap speed limits as the base speed limit when available. "
+        "OSM data may be unreliable in some regions (e.g. China). Requires "
+        "offline map tiles downloaded via Connect.",
+        current_osm,
+        callback=self._on_osm_integration,
+      )
+      items.append(self._osm_integration)
+
+      if current_osm and _osm_tiles_missing():
+        items.append(ListItem(
+          title="⚠ Offline Map Tiles",
+          description="No offline map tiles for your area — download them in Connect.",
+          action_item=TextAction(text="Missing", color=rl.Color(255, 193, 7, 255)),
+        ))
+
     # --- Look Ahead Lateral Control (if plugin enabled) ---
     if _plugin_enabled('look_ahead'):
       current_la = read_plugin_param('look_ahead', 'LookAheadEnabled') != '0'
@@ -236,6 +275,9 @@ class DrivingLayout(Widget):
 
   def _on_road_info(self, state):
     write_plugin_param('ui_mod', 'RoadInfoOverlay', '1' if state else '0')
+
+  def _on_osm_integration(self, state):
+    write_plugin_param('speedlimitd', 'OsmDataIntegration', '1' if state else '0')
 
   def _on_look_ahead(self, state):
     write_plugin_param('look_ahead', 'LookAheadEnabled', '1' if state else '0')
