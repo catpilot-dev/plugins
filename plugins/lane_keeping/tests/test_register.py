@@ -51,16 +51,19 @@ def test_load_config_defaults(data_dir):
   assert cfg.driver_side == 'left'
   assert cfg.gap_min == 0.6 and cfg.gap_max == 1.0
   assert cfg.t_preview == 1.5
+  assert cfg.lp_max == 25.0
 
 
 def test_load_config_overrides(data_dir):
   (data_dir / 'LaneKeepDriverSide').write_text('right')
   (data_dir / 'LaneKeepGapMin').write_text('0.5')
   (data_dir / 'LaneKeepEnable').write_text('0')
+  (data_dir / 'LaneKeepLpMax').write_text('30')
   cfg = register._load_config()
   assert cfg.driver_side == 'right'
   assert cfg.gap_min == 0.5
   assert cfg.enable is False
+  assert cfg.lp_max == 30.0
 
 
 def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):

@@ -78,6 +78,7 @@ def _load_config():
     gap_min=fget('LaneKeepGapMin', d.gap_min),
     gap_max=fget('LaneKeepGapMax', d.gap_max),
     t_preview=fget('LaneKeepTPreview', d.t_preview),
+    lp_max=fget('LaneKeepLpMax', d.lp_max),
     excess_max=fget('LaneKeepExcessMax', d.excess_max),
     kappa_bias_max=fget('LaneKeepKappaBiasMax', d.kappa_bias_max),
     kappa_rate_max=fget('LaneKeepKappaRateMax', d.kappa_rate_max),

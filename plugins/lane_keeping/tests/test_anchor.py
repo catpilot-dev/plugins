@@ -54,13 +54,25 @@ def test_excess_signs_and_clip():
 
 def test_pursuit_magnitude_and_sign_left():
   a = LaneAnchor(AnchorConfig(driver_side='left', t_preview=1.5, kappa_bias_max=1.0))
-  # excess +0.3 (car too far from left line) at 25 m/s:
-  # Lp = 25*1.5 = 37.5; kappa = 2*0.3/37.5^2 = 0.000426..., positive (steer left, left-positive curvature)
-  k = a._pursuit(0.3, 25.0)
-  assert abs(k - (2 * 0.3 / 37.5 ** 2)) < 1e-9
+  # excess +0.3 (car too far from left line) at 12 m/s (below the lp_max cap):
+  # Lp = 12*1.5 = 18; kappa = 2*0.3/18^2 = 0.00185..., positive (steer left, left-positive curvature)
+  k = a._pursuit(0.3, 12.0)
+  assert abs(k - (2 * 0.3 / 18.0 ** 2)) < 1e-9
   assert k > 0
   # excess -0.3 (car too close to left line) -> steer right (negative)
-  assert a._pursuit(-0.3, 25.0) < 0
+  assert a._pursuit(-0.3, 12.0) < 0
+
+
+def test_pursuit_lookahead_cap():
+  # Route 3e7 (2026-08-06): above 60 km/h the aim point pins at lp_max, so gain
+  # stops collapsing as 1/v² — 25 m/s and 30 m/s command the same kappa.
+  a = LaneAnchor(AnchorConfig(driver_side='left', t_preview=1.5, kappa_bias_max=1.0,
+                              lp_max=25.0))
+  k_at_cap = 2 * 0.3 / 25.0 ** 2
+  assert abs(a._pursuit(0.3, 25.0) - k_at_cap) < 1e-9
+  assert abs(a._pursuit(0.3, 30.0) - k_at_cap) < 1e-9
+  # below the cap speed (lp = v*1.5 < 25 for v < 16.67) the law is unchanged
+  assert abs(a._pursuit(0.3, 12.0) - (2 * 0.3 / 18.0 ** 2)) < 1e-9
 
 
 def test_pursuit_sign_right_driver():
