@@ -179,8 +179,7 @@ inside its Driving panel: when a car is detected, ui_mod draws a vehicle
 heading (brand emblem from `logos/icons/bmw.png` via `CP.brand`, plus the
 fingerprint) and runs `ui.vehicle_settings` to collect car-specific rows —
 this plugin's `on_vehicle_settings` is the producer. (There is no separate
-Vehicle settings panel in the shipped UI; a dormant `VehicleLayout` exists in
-ui_mod but is not registered.)
+Vehicle settings panel; these rows render within the Driving panel.)
 
 ## Configuration / params
 
