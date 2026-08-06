@@ -124,3 +124,59 @@ class TestHwTileDirPreference:
     assert result is not None
     assert result['roadName'] == 'old'
     assert result['highwayType'] == ''
+
+
+class TestRefDistances:
+  """refDistances producer (route 3de seg 19). Feeds the caller's margin-rule
+  G/S hold release: {ref: nearest 2D polyline distance} over every ref-carrying
+  bbox-passing way — a superset of the single nearest-match, so a held
+  expressway ref 30-50 m off is still present with its true distance."""
+  LAT, LON = 31.3137, 121.5395
+
+  def _reader(self, osm_query, ways):
+    reader = osm_query.OsmTileReader()
+    _write_tile(reader.schema, osm_query._tile_path(self.LAT, self.LON), ways)
+    return reader
+
+  def _query_loaded(self, reader, lat, lon):
+    for _ in range(100):
+      r = reader.query(lat, lon)
+      if r is not None:
+        return r
+      time.sleep(0.02)
+    return None
+
+  def test_min_over_same_ref_segments(self, osm_query):
+    # Two ways sharing ref 'S1' at different distances: the producer records the
+    # MINIMUM (nearest) per ref. Min-over-segments is conservative-only (review
+    # F2): it can only make the held way look CLOSER, never farther, so at worst
+    # it SUPPRESSES a margin-release — a held way is never falsely declared
+    # "gone" and the 100/120 hold is never dropped on bad distance data.
+    near = {'ref': 'S1', 'nodes': [(31.3136, 121.5394), (31.3202, 121.5394)]}  # ~9.5 m
+    far = {'ref': 'S1', 'nodes': [(31.3136, 121.5390), (31.3202, 121.5390)]}   # ~47 m
+    reader = self._reader(osm_query, [far, near])                 # far listed first
+    r = self._query_loaded(reader, self.LAT, self.LON)
+    assert r is not None
+    rd = r['refDistances']
+    assert 'S1' in rd
+    assert rd['S1'] == pytest.approx(9.46, abs=1.0)               # the NEAR (min)
+    assert rd['S1'] < 20.0                                        # not the ~47 m one
+
+  def test_ref_carrying_way_at_30_to_50m_present_with_true_distance(self, osm_query):
+    # A ref-carrying way ~40 m off is PRESENT with its true distance (superset
+    # semantics — not dropped because it isn't the single nearest match), so a
+    # held expressway that far off is guarded, not mistaken for absent.
+    way = {'ref': 'S1', 'nodes': [(31.3136, 121.539077), (31.3202, 121.539077)]}  # ~40 m
+    reader = self._reader(osm_query, [way])
+    r = self._query_loaded(reader, self.LAT, self.LON)
+    assert r is not None
+    assert r['refDistances']['S1'] == pytest.approx(40.0, abs=3.0)
+
+  def test_refless_way_omitted_from_ref_distances(self, osm_query):
+    # Ways with no ref carry no lookup key — they are omitted from refDistances
+    # (the caller keys strictly by the held expressway ref).
+    way = {'name': '白城路', 'nodes': [(31.3136, 121.5394), (31.3202, 121.5394)]}
+    reader = self._reader(osm_query, [way])
+    r = self._query_loaded(reader, self.LAT, self.LON)
+    assert r is not None
+    assert r['refDistances'] == {}

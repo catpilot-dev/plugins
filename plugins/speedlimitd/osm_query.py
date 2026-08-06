@@ -159,7 +159,19 @@ class OsmTileReader:
     """Find the nearest way to the given GPS position.
 
     Returns dict with wayRef, wayName, speedLimit, lanes, roadContext, distance,
-    or None if no tile loaded yet or no nearby way. Never blocks on I/O.
+    refDistances, or None if no tile loaded yet or no nearby way. Never blocks
+    on I/O.
+
+    `refDistances` is {ref: nearest 2D polyline distance in meters} over every
+    REF-carrying candidate way considered this query (all ways passing the
+    bbox pre-filter — a superset of the MAX_WAY_DISTANCE nearest-match set, so a
+    held expressway ref 25-50 m off still shows up with its true distance rather
+    than looking absent). Its purpose is the caller's margin-rule G/S hold
+    release (speedlimitd _eval_gs_margin_release / GS_RELEASE_MARGIN_M): while
+    holding an expressway the caller compares the held ref's distance here
+    against the matched way's distance — the matched way decisively closer, or
+    the held ref absent, means the car has diverged from it (genuine exit); a
+    held ref co-located with the matched way means a stacked mis-match.
     """
     if self.schema is None:
       return None
@@ -174,6 +186,7 @@ class OsmTileReader:
 
     best_dist = MAX_WAY_DISTANCE
     best_way = None
+    ref_distances: dict[str, float] = {}
 
     for way in ways:
       min_lat, max_lat, min_lon, max_lon, nodes = way[:5]
@@ -192,6 +205,14 @@ class OsmTileReader:
           nodes[i + 1][0], nodes[i + 1][1])
         if d < min_seg_dist:
           min_seg_dist = d
+
+      # Record the nearest distance per ref (a ref spans many way segments;
+      # keep the closest). Feeds the caller's held-way divergence check.
+      ref = way[5]
+      if ref:
+        prev = ref_distances.get(ref)
+        if prev is None or min_seg_dist < prev:
+          ref_distances[ref] = min_seg_dist
 
       if min_seg_dist < best_dist:
         best_dist = min_seg_dist
@@ -217,4 +238,5 @@ class OsmTileReader:
       'roadName': name,
       'highwayType': highway_type,
       'distance': best_dist,
+      'refDistances': ref_distances,
     }
