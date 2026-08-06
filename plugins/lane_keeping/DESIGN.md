@@ -2,8 +2,7 @@
 
 Standalone plugin on `controls.curvature_correction` (runs inside controlsd at
 100 Hz, before the lateral controller). Damps the sub-Hz lane wander of the
-e2e driving model without ever fighting the model for position. A second, dormant hook
-(`modeld.calib_bias`) belongs to the retired calibration trim (see below).
+e2e driving model without ever fighting the model for position.
 
 ## Signal flow
 
@@ -101,9 +100,8 @@ read at process start except the live toggle. Full list in `_load_config`
 Topic `lane_keeping` on the plugin bus (recorded in rlogs via
 `customReserved1`), published at 100 Hz: `prob`, `line_y`, `gap`, `gap_filt`,
 `gap_pred`, `gap_dc`, `excess`, `excess_ac`, `kappa_in`, `kappa_ref`,
-`kappa_bias`, `authority`, `state` (`anchor`/`model`), `x_pred`, `v_ego`,
-plus dormant `trim_*` fields. The ui_mod emblem ring reads `state` from this
-topic.
+`kappa_bias`, `authority`, `state` (`anchor`/`model`), `x_pred`, `v_ego`.
+The ui_mod emblem ring reads `state` from this topic.
 
 ## Design history
 
@@ -117,13 +115,3 @@ supersession banners; the one-line summary is that every mechanism which
 held an *opinion about position* was removed after losing to the model in
 the field (fundamental finding, route 3c1: the e2e model counter-steers a
 sustained bias to a stalemate and wins), and what remains is a pure damper.
-
-## Calibration trim (retired)
-
-`calib_trim.py` and its `modeld.calib_bias` reader remain in the tree but
-are inert: `CalibTrimMode=0` by default, and the modeld-side call sites
-were never deployed (archived on the catpilot `calib-trim-parked` branch,
-2026-07-29). It was a perception-side DC lever designed to move the
-model's chosen line by biasing the calibration yaw — built and reviewed,
-then retired when the hard-floor removal dissolved the problem it
-targeted. Design record: `2026-07-25-calibration-trim-design.md`.
