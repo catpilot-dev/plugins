@@ -15,12 +15,13 @@
 Fork of openpilot with the plugin framework built-in. Contains:
 
 - `selfdrive/plugins/hooks.py` — HookRegistry: register, run, fail-safe
-- `selfdrive/plugins/loader.py` — Plugin discovery + lazy-load per-process
-- `selfdrive/plugins/registry.py` — PluginRegistry: manifest scanning, enable/disable
-- `selfdrive/plugins/plugind.py` — Boot-time plugin manager process
+- `selfdrive/plugins/registry.py` — PluginRegistry: manifest scanning, enable/disable, lazy per-process load
+- `selfdrive/plugins/manifest.py` — plugin.json parsing/validation
+- `selfdrive/plugins/plugind.py` — Boot-time plugin manager process (also dispatches `device.health_check`)
 - `selfdrive/plugins/builder.py` — Boot-time capnp/services/events injection
-- `selfdrive/plugins/bus.py` — ZMQ IPC pub/sub (PluginPub/PluginSub)
-- Hook call sites in: controlsd, plannerd, card, longitudinal_planner, desire_helper, car_helpers, selfdrived, torqued, webrtcd, ui layouts, ui_state, application
+- `selfdrive/plugins/plugin_bus.py` — ZMQ IPC pub/sub (PluginPub/PluginSub)
+- `selfdrive/plugins/api.py`, `plugin_base.py`, `update_checker.py` — plugin API surface, process base class, update checks
+- Hook call sites in: controlsd, plannerd, card, longitudinal_planner, desire_helper, torqued, ui layouts, ui_state, hud/onroad renderers, application — 24 in total, listed in `HOOK_INTEGRATION_POINTS.md`
 
 No `plugins/` directory — all plugin code lives in the plugins repo.
 
@@ -33,14 +34,16 @@ plugins/
   install.sh              # Deploy plugins to /data/plugins-runtime/; install cereal slots
   plugins/
     config.py             # Shared path config; deployed to /data/plugins-runtime/config.py
-    bmw_e9x_e8x/          # BMW E8x/E9x car interface (hook-based registration)
+    bmw_e9x_e8x/          # BMW E8x/E9x car interface (monkey-patch registration)
     bus_logger/           # Plugin bus capture for logging
     c3_compat/            # Comma 3 AGNOS compatibility (boot patches, venv_sync)
-    mapd/                 # OSM map data process
+    lane_keeping/         # AC wander damper on controls.curvature_correction
+    mapd/                 # OSM map data process (disabled by default)
     model_selector/       # Runtime driving model swapping
     screen_capture/       # Tap-to-capture screenshots
     speedlimitd/          # Speed limit fusion (process + hook)
     ui_mod/               # Custom UI panels: Driving, Vehicle, Plugins, drive stats
+    ui_recorder/          # HUD-rendered video capture for COD
   docs/                   # This documentation
 ```
 
@@ -65,11 +68,13 @@ Web app for device management. Served on port 8082 (redirected from port 80 via 
   bmw_e9x_e8x/
   bus_logger/
   c3_compat/
+  lane_keeping/
   mapd/
   model_selector/
   screen_capture/
   speedlimitd/
   ui_mod/
+  ui_recorder/
     data/                   # Plugin-specific param storage (plugin_data_dir())
 
 /data/connect-on-device/    # COD repo (git clone)
@@ -178,7 +183,7 @@ openpilot manager
             └─ register services in services.py
             └─ write param defaults to /data/params/d/
        └─ start plugin processes (mapd, speedlimitd, phone_watchdog, ...)
-  └─ selfdrived, controlsd, plannerd, card, webrtcd, ...
+  └─ controlsd, plannerd, card, ui, ...
        └─ hooks._ensure_loaded() on first hooks.run() call
             └─ PluginRegistry.discover() + load_enabled()
             └─ plugin hook callbacks registered in this process

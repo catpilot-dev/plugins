@@ -1,127 +1,61 @@
 # catpilot plugins
 
-Plugin packages for [catpilot](https://github.com/catpilot-dev/catpilot). Integrated into catpilot releases starting from `v0.10.3` — plugins are automatically installed on first boot.
+Plugins for [catpilot](https://github.com/catpilot-dev/catpilot) — the
+features that ride on top of stock openpilot. They come pre-installed with
+every catpilot release (from `v0.10.3`): flash catpilot, and everything
+below is already on the device.
 
-## Plugins
+## What you get
 
-| Plugin | Type | Description |
-|--------|------|-------------|
-| `bmw_e9x_e8x` | car | BMW E82/E90 car interface — VIN detection, cruise, lane change, torque learning |
-| `c3_compat` | hybrid | Comma 3 compatibility (AGNOS 12.8, STM32F4 panda, DRM display, MSGQ fix) |
-| `mapd` | process | OSM map daemon for speed limits, curves, and road context |
-| `model_selector` | hook | Download and swap driving models from Software panel |
-| `speedlimitd` | hybrid | Conditional speed control — road type inference, vision cap, per-country speed tables |
-| `bus_logger` | process | Capture plugin bus messages to cereal for logging |
-| `ui_mod` | hook | Settings panels (Driving, Vehicle, Plugins), home screen (drive stats, route map, emblem) |
-| `screen_capture` | hook | Tap-to-capture screenshots with camera icon overlay |
+### On the road
 
-## Directory Layout
+| Plugin | What it does for you |
+|--------|----------------------|
+| `bmw_e9x_e8x` | Makes BMW E9x/E8x cars (E82/E90 family) drivable with catpilot: cruise control, steering, lane changes — no factory driver-assist needed |
+| `speedlimitd` | Watches the speed limit for you — from map data and what the camera sees (lane count, road type) — and slows the car for sharp curves and highway ramps |
+| `lane_keeping` | Calms the slow left-right sway ("ping-pong") inside the lane, so the car holds its line more steadily |
 
-```
-plugins/
-├── install.sh                     # Plugin installer (→ /data/plugins-runtime/)
-├── logos/                         # Brand emblems and icons for all supported cars
-│   ├── emblems/                   #   Color SVG+PNG (512px)
-│   └── icons/                     #   White-on-transparent PNG (168px)
-├── plugins/                       # Plugin packages
-│   ├── bmw_e9x_e8x/
-│   ├── bus_logger/
-│   ├── c3_compat/
-│   ├── mapd/
-│   ├── model_selector/
-│   ├── screen_capture/
-│   ├── speedlimitd/
-│   └── ui_mod/
-└── docs/                          # Architecture and technical docs
-```
+### On the screen
 
-## Installation
+| Plugin | What it does for you |
+|--------|----------------------|
+| `ui_mod` | The catpilot look: home screen with drive stats and a route map, your car's emblem on the driving screen, and extra settings panels (Driving, Vehicle, Plugins) |
+| `model_selector` | Lets you download and switch between driving models from the Software panel |
+| `screen_capture` | Tap the camera icon to save a screenshot of the driving screen |
 
-Plugins are installed automatically with catpilot. To update manually:
+### Under the hood
 
-```bash
-ssh comma
-cd /data/plugins
-git pull origin dev && bash install.sh
-```
+| Plugin | What it does for you |
+|--------|----------------------|
+| `c3_compat` | Keeps the comma three fully supported on current catpilot (display, panda, OS compatibility) |
+| `mapd` | Map data support (speed limits, road info). Currently off by default — speed limits come through `speedlimitd` |
+| `bus_logger` | Saves the plugins' status messages into the drive logs, so problems can be diagnosed after a drive |
+| `ui_recorder` | Renders drives into HUD-overlay video for the Connect-on-Device (COD) replay service — works in the background, nothing to operate |
 
-install.sh copies plugins to `/data/plugins-runtime/`, injects cereal schemas and services, clears bytecode caches, and writes a restart marker. The plugin daemon (plugind) detects the marker when offroad and restarts managed processes and the UI.
+## Turning things on and off
 
-## Managing Plugins
+- **Settings → Plugins** — one toggle per plugin.
+- Feature-level switches live in their own panels: for example, the
+  **Driving** panel has the "Lane Keeping" toggle, and the **Software**
+  panel hosts the model selector.
+- A few plugins are marked *enforced* because the car depends on them
+  (for example `lane_keeping` on BMW) — for those, use their feature
+  toggle instead of disabling the whole plugin.
 
-### From the device
+## Updating
 
-Settings → Plugins panel lets you enable/disable plugins with toggles.
+Plugins update together with catpilot. Nothing to do — a catpilot update
+brings the matching plugins with it.
 
-### From SSH
+## Learn more
 
-```bash
-# Disable a plugin
-touch /data/plugins-runtime/speedlimitd/.disabled
+Every plugin has its own `README.md` inside
+[`plugins/`](plugins/) explaining what it does in more detail; the more
+technical ones also carry design docs (for example
+[`lane_keeping/DESIGN.md`](plugins/lane_keeping/DESIGN.md)).
 
-# Re-enable
-rm /data/plugins-runtime/speedlimitd/.disabled
-```
-
-## Writing a Plugin
-
-A plugin needs a directory in `plugins/` with a `plugin.json` manifest and one or more Python modules.
-
-### Minimal example
-
-```
-my_plugin/
-├── plugin.json
-└── my_hook.py
-```
-
-**plugin.json:**
-```json
-{
-  "id": "my_plugin",
-  "name": "My Plugin",
-  "version": "1.0.0",
-  "type": "hook",
-  "hooks": {
-    "planner.v_cruise": {
-      "module": "my_hook",
-      "function": "on_v_cruise",
-      "priority": 50
-    }
-  }
-}
-```
-
-**my_hook.py:**
-```python
-def on_v_cruise(v_cruise, v_ego, sm):
-    return min(v_cruise, 120.0)
-```
-
-### Plugin types
-
-- **hook** — registers callbacks on catpilot hook points, runs in existing processes
-- **process** — runs as a managed daemon via plugind (PID files in `/data/plugins-runtime/.pids/`)
-- **car** — registers a car interface via monkey-patching (no opendbc fork needed)
-- **hybrid** — combination of hook + process
-
-### Key rules
-
-- **ALL UI imports MUST be lazy** — import inside the hook function body, not at module level. Hooks load during `__init__` mid-import.
-- **Plugin params** go in `/data/plugins/<id>/data/`, never `/data/params/d/` (openpilot wipes unknown keys on boot).
-- **Fail-safe by default** — if your hook raises an exception, the default value is returned and other plugins continue.
-
-### Available hooks
-
-See the [catpilot README](https://github.com/catpilot-dev/catpilot#hook-call-sites) for the full list of 26 hook call sites.
-
-## Testing
-
-```bash
-PYTHONPATH=. uv run pytest
-```
-
-A pre-push hook runs all tests automatically. Tests that require openpilot/opendbc auto-skip when those dependencies are unavailable.
+Want to build a plugin or understand the framework? Start with
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 ## License
 
