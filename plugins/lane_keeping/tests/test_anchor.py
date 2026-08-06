@@ -377,11 +377,11 @@ def test_ac_deadband_ignores_micro_noise():
 
 
 def test_ac_deadband_tightens_with_speed():
-  # User rule (2026-08-06, route 3e7): higher speed, tighter deadband. The same
-  # +0.08 m AC excursion sits INSIDE the 0.10 band at urban speed (silent) but
-  # OUTSIDE the 0.05 band at/above 25 m/s (damped).
+  # Speed taper mechanism (opt-in via ac_deadband_hi — default is flat after
+  # the 3ea rollback): the same +0.08 m AC excursion sits INSIDE the 0.10 band
+  # at urban speed (silent) but OUTSIDE the 0.05 band at/above 25 m/s (damped).
   for v, fires in ((14.0, False), (25.0, True)):
-    a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+    a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0, ac_deadband_hi=0.05))
     _run(a, 0.84, 1000, v=v)
     out = 0.0
     for _ in range(300):                         # 3 s at the stepped gap

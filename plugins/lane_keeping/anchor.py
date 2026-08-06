@@ -56,17 +56,19 @@ class AnchorConfig:
   gap_min: float = 0.6           # driver-wheel-to-line comfort band (m)
   gap_max: float = 1.0
   t_preview: float = 1.5         # pure-pursuit look-ahead time (s)
-  lp_max: float = 25.0           # look-ahead distance cap (m). Route 3e7 segs
-                                 # 41-48 (2026-08-06, 82 km/h): uncapped lp =
-                                 # v·t_preview collapses pursuit gain as 1/v²
-                                 # (3.7× weaker than the urban speeds the damper
-                                 # was field-tuned at), leaving 2/3 of the model's
-                                 # sub-Hz wander uncancelled. Capping the aim
-                                 # point at 25 m (reached at 60 km/h) keeps the
-                                 # field-verified urban behavior bit-identical
-                                 # and lets bias a_y authority grow with v²
-                                 # beyond it, matching how the wander's a_y
-                                 # grows. kappa_bias_max/rate still bound output.
+  lp_max: float = 9999.0         # look-ahead distance cap (m). DEFAULT INERT
+                                 # (uncapped: pursuit gain collapses as 1/v² at
+                                 # speed — the safe, field-verified behavior).
+                                 # A 25 m cap was tried 2026-08-06 to restore
+                                 # highway damping authority and FAILED its
+                                 # verdict drive: the doubled gain turned the
+                                 # near-line away-push into a floor-class
+                                 # sustained push — arm-wrestle stalemate ON
+                                 # the line, DC poisoning during the ride, then
+                                 # recovery opposition above the asym gate and
+                                 # a sway to the far line. Do not lower this
+                                 # default again without a structural fix for
+                                 # all three mechanisms.
   excess_max: float = 0.5        # max deadband excess acted on (m)
   kappa_bias_max: float = 0.002  # hard cap on curvature bias (1/m)
   kappa_rate_max: float = 0.002  # bias slew (1/m per second)
@@ -84,13 +86,14 @@ class AnchorConfig:
   ac_deadband: float = 0.10      # AC excess ignored below this (m) at/below
                                  # AC_DEADBAND_V[0] — micro-noise guard where
                                  # pursuit gain is at its urban maximum
-  ac_deadband_hi: float = 0.05   # deadband at/above AC_DEADBAND_V[1] (user rule
-                                 # 2026-08-06: higher speed, tighter deadband —
-                                 # route 3e7: the 0.10 band forgave 36% of the
-                                 # wander amplitude at 82 km/h). Safe headroom:
-                                 # above the taper the lp_max cap pins pursuit
-                                 # gain, so a 0.05 m noise blip commands only
-                                 # ~1.6e-4 kappa (~0.1 m/s^2 a_y at 90 km/h)
+  ac_deadband_hi: float = 0.10   # deadband at/above AC_DEADBAND_V[1]. DEFAULT
+                                 # equals ac_deadband (flat taper — inert).
+                                 # 0.05 was tried 2026-08-06 alongside the lp
+                                 # cap ("higher speed, tighter deadband") and
+                                 # rolled back with it — the tighter band kept
+                                 # the over-gained damper engaged through the
+                                 # failure transients. Tighten only together
+                                 # with a structurally fixed high-speed gain.
   prob_on: float = 0.5           # driver-side line confidence to engage.
                                  # 0.6->0.5 (2026-07-23, measured): gap noise in prob
                                  # [0.5,0.6) is 0.047-0.050 m — statistically the same as
