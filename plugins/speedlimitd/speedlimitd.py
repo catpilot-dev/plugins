@@ -783,6 +783,8 @@ class SpeedLimitMiddleware:
     self.osm_integration_enabled: bool = False
     self._osm_default_resolved: bool = False
     self._osm_default_country: str | None = None
+    self.last_osm_speed_kph: float = 0.0   # 0 = no usable OSM maxspeed held
+    self.last_osm_speed_t: float = 0.0     # monotonic time it was stored
 
     self._params_last_read_t: float = 0.0
     self._read_params()
@@ -879,6 +881,17 @@ class SpeedLimitMiddleware:
     except Exception:
       return False
 
+  def _osm_base_active(self, now: float) -> bool:
+    """Toggle ON + fresh, plausible OSM maxspeed → OSM replaces base inference.
+
+    Freshness is 2 query intervals (~10 s): one missed/None query keeps the
+    limit, a sustained loss falls back to vision inference. 30 km/h floor
+    rejects implausible tags (same floor as MIN_SPEED_LIMIT in update()).
+    """
+    return (self.osm_integration_enabled
+            and self.last_osm_speed_kph >= 30.0
+            and now - self.last_osm_speed_t <= 2.0 * self._osm_query_interval)
+
   def _update_reactive_cap(self, a_y_meas, v_ego: float, threshold: float,
                            now: float, dt: float,
                            livepose_updated: bool = True) -> float:
@@ -965,6 +978,7 @@ class SpeedLimitMiddleware:
     Accepts any matched way that carries identity or classification — refs
     (G2), names (白城路), or a bare highwayType (unnamed service roads).
     """
+    prev_road_id = self.last_road_id
     if result and (result['wayRef'] or result['roadName'] or result.get('highwayType')):
       way_ref = result['wayRef']
       self.last_way_ref = way_ref
@@ -991,6 +1005,16 @@ class SpeedLimitMiddleware:
         self.last_highway_type = hw
       elif hw_rank.get(hw, -1) > hw_rank.get(self.last_highway_type, -1):
         self.last_highway_type = hw
+
+      # OSM maxspeed (m/s → km/h). Held across same-road sub-segments that
+      # lack the tag (freshness gate expires it); cleared on a road change
+      # to a way without maxspeed — the held value belongs to the old road.
+      speed_ms = result.get('speedLimit', 0.0) or 0.0
+      if speed_ms > 0.0:
+        self.last_osm_speed_kph = speed_ms * 3.6
+        self.last_osm_speed_t = time.monotonic()
+      elif self.last_road_id != prev_road_id:
+        self.last_osm_speed_kph = 0.0
     else:
       self.last_way_ref = ''
       self.last_road_name = ''

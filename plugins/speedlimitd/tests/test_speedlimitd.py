@@ -2719,3 +2719,84 @@ class TestOsmRegionDefault:
     mw = self._make_middleware(sld)
     assert mw._resolve_osm_default('de') is True
     assert p.read_text() == '0'
+
+
+class TestOsmSpeedStorage:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _result(self, **kw):
+    base = {'wayRef': '', 'wayName': '', 'speedLimit': 0.0, 'lanes': 0,
+            'roadContext': 1, 'roadName': '', 'highwayType': '', 'distance': 5.0}
+    base.update(kw)
+    return base
+
+  def test_maxspeed_stored_in_kph(self, sld):
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=27.78))
+    assert mw.last_osm_speed_kph == pytest.approx(100.0, abs=0.1)
+    assert mw.last_osm_speed_t > 0
+
+  def test_same_road_without_maxspeed_keeps_value(self, sld):
+    # Sub-segments of the same road may lack the tag — hold the value
+    # (the freshness gate expires it if it stays absent).
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=27.78))
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=0.0))
+    assert mw.last_osm_speed_kph == pytest.approx(100.0, abs=0.1)
+
+  def test_new_road_without_maxspeed_clears_value(self, sld):
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=27.78))
+    mw._ingest_osm_result(self._result(roadName='B2', speedLimit=0.0))
+    assert mw.last_osm_speed_kph == 0.0
+
+  def test_no_match_keeps_value_for_staleness(self, sld):
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=27.78))
+    mw._ingest_osm_result(None)
+    assert mw.last_osm_speed_kph == pytest.approx(100.0, abs=0.1)
+
+
+class TestOsmBaseActive:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _arm(self, mw, kph=100.0, age=0.0):
+    import time as _t
+    mw.osm_integration_enabled = True
+    mw.last_osm_speed_kph = kph
+    mw.last_osm_speed_t = _t.monotonic() - age
+
+  def test_active_when_fresh_and_enabled(self, sld):
+    import time as _t
+    mw = self._make_middleware(sld)
+    self._arm(mw)
+    assert mw._osm_base_active(_t.monotonic()) is True
+
+  def test_inactive_when_toggle_off(self, sld):
+    import time as _t
+    mw = self._make_middleware(sld)
+    self._arm(mw)
+    mw.osm_integration_enabled = False
+    assert mw._osm_base_active(_t.monotonic()) is False
+
+  def test_inactive_when_stale(self, sld):
+    import time as _t
+    mw = self._make_middleware(sld)
+    self._arm(mw, age=11.0)  # > 2 × 5 s query interval
+    assert mw._osm_base_active(_t.monotonic()) is False
+
+  def test_inactive_when_implausibly_low(self, sld):
+    import time as _t
+    mw = self._make_middleware(sld)
+    self._arm(mw, kph=20.0)  # < 30 km/h plausibility floor
+    assert mw._osm_base_active(_t.monotonic()) is False
