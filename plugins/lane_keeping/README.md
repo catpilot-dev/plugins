@@ -47,14 +47,6 @@ plugin pauses itself automatically in both cases and resumes on its own.
 - It is vehicle-agnostic: the only car-specific settings are the car's
   half-width and which side the driver sits on.
 
-## Turning it off completely
-
-The toggle above is the supported off switch. Fully removing the plugin
-(`.disabled` marker) is **not** the same thing: the BMW lateral controller
-relies on this plugin's smoothing of the model's steering reference, so full
-removal must be paired with a controller revert. See [DESIGN.md](DESIGN.md)
-for the details — for everyday use, the toggle is all you need.
-
 ## More
 
 Implementation details, tuning parameters, telemetry, and the design
