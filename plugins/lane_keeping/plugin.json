@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "type": "hook",
   "author": "catpilot",
-  "description": "Driver-side lane keeping: stabilizes the wheel-to-line gap by damping wander around the model's chosen line (AC stabilizer); conditions the model curvature reference. Hard floors at the extremes. Also carries an optional calibration trim (perception-side yaw DC bias, CalibTrimMode=0/off by default).",
+  "description": "Driver-side lane keeping: stabilizes the wheel-to-line gap by damping wander around the model's chosen line (AC damper); conditions the model curvature reference.",
   "min_openpilot": "0.10.0",
   "max_openpilot": "0.11.99",
   "conflicts": [],
@@ -17,21 +17,12 @@
     "LaneKeepDriverSide": {
       "default": "left",
       "description": "Which ego lane line to anchor to: left or right"
-    },
-    "CalibTrimMode": {
-      "default": 0,
-      "description": "Calibration trim mode: 0=off, 1=fixed (identification drive), 2=closed-loop"
     }
   },
   "hooks": {
     "controls.curvature_correction": {
       "module": "register",
       "function": "on_curvature_correction",
-      "priority": 50
-    },
-    "modeld.calib_bias": {
-      "module": "register",
-      "function": "on_calib_bias",
       "priority": 50
     }
   }
