@@ -4,11 +4,10 @@ Keeps the car from slowly swaying left and right inside its lane.
 
 ## What it does
 
-openpilot's end-to-end driving model is good at choosing *where* to drive,
-but its steering plan carries a slow side-to-side wander — over roughly ten
-seconds the car drifts a little toward one lane line, then back toward the
-other. It stays inside the lane, but you can feel the sway, especially on
-the highway.
+openpilot's lateral e2e model suffers from sub-Hz wobbling, aka ping-pong,
+within the ego lane: over roughly ten seconds the car drifts a little toward
+one lane line, then back toward the other. It stays inside the lane, but you
+can feel the sway, especially on the highway.
 
 This plugin watches the distance between the driver-side wheels and the
 driver-side lane line and gently damps that wander: when the car starts
