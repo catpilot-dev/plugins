@@ -376,6 +376,22 @@ def test_ac_deadband_ignores_micro_noise():
   assert abs(out) < 1e-6
 
 
+def test_ac_deadband_tightens_with_speed():
+  # User rule (2026-08-06, route 3e7): higher speed, tighter deadband. The same
+  # +0.08 m AC excursion sits INSIDE the 0.10 band at urban speed (silent) but
+  # OUTSIDE the 0.05 band at/above 25 m/s (damped).
+  for v, fires in ((14.0, False), (25.0, True)):
+    a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
+    _run(a, 0.84, 1000, v=v)
+    out = 0.0
+    for _ in range(300):                         # 3 s at the stepped gap
+      out, _t = a.update(0.0, _mv_at(0.92), v, False, lat_delay=0.6)
+    if fires:
+      assert abs(out) > 1e-6
+    else:
+      assert abs(out) < 1e-6
+
+
 def test_lane_change_resets_dc_and_concedes_new_lane():
   # After a lane change the DC re-seeds: the new lane's position — whatever
   # it is — is immediately the reference. No settle-nudge, no old-lane memory.

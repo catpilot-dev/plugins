@@ -88,6 +88,7 @@ def _load_config():
     prob_fade=fget('LaneKeepProbFade', d.prob_fade),
     dc_tau=fget('LaneKeepDcTau', d.dc_tau),
     ac_deadband=fget('LaneKeepAcDeadband', d.ac_deadband),
+    ac_deadband_hi=fget('LaneKeepAcDeadbandHi', d.ac_deadband_hi),
     pred_delay_mult=fget('LaneKeepPredDelayMult', d.pred_delay_mult),
     gap_hard_lo=fget('LaneKeepGapHardLo', d.gap_hard_lo),
     gap_hard_hi=fget('LaneKeepGapHardHi', d.gap_hard_hi),

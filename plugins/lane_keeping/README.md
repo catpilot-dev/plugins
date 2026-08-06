@@ -36,6 +36,7 @@ read at process start except the live toggle:
 | `LaneKeepDcTau` | 5 | concession time constant (s); code default 20 |
 | `LaneKeepAsymGap` | 0.6 (default) | never-oppose-recovery threshold (m); 0 = symmetric |
 | `LaneKeepLpMax` | 25 (default) | pure-pursuit aim-point cap (m), reached at 60 km/h; keeps damper authority from collapsing as 1/v² at highway speed (route 3e7 segs 41–48: only ~30% of the model's sub-Hz wander was cancelled at 82 km/h) |
+| `LaneKeepAcDeadband` / `Hi` | 0.10 / 0.05 (defaults) | AC deadband (m) tapering 0.10→0.05 over 54–90 km/h ("higher speed, tighter deadband"): the 0.10 band forgave 36% of the 3e7 wander amplitude; tightening is safe at speed because the lp cap pins pursuit gain there |
 | `LaneKeepGapHardLo` / `Hi` | **−99 / 99 (floors disabled)** | code defaults 0.3/1.5; field testing showed the floors' sustained push turns brief line touches into pinned stalemates (3c3: 34 s holds vs model-alone 2.8 s) — leave disabled |
 
 UX: green ring on the emblem button while anchored; the Driving-panel

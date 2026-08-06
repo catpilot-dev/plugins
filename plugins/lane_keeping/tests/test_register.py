@@ -133,8 +133,12 @@ def test_hook_passes_lat_delay_through(data_dir, monkeypatch):
 def test_load_config_ac_params(data_dir):
   cfg = register._load_config()
   assert cfg.dc_tau == 20.0 and cfg.ac_deadband == 0.10
+  assert cfg.ac_deadband_hi == 0.05
   (data_dir / 'LaneKeepDcTau').write_text('30')
-  assert register._load_config().dc_tau == 30.0
+  (data_dir / 'LaneKeepAcDeadbandHi').write_text('0.07')
+  cfg = register._load_config()
+  assert cfg.dc_tau == 30.0
+  assert cfg.ac_deadband_hi == 0.07
 
 
 def test_live_toggle_disables_and_releases(data_dir, monkeypatch):
