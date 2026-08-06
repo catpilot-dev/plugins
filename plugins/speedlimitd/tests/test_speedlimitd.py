@@ -2800,3 +2800,114 @@ class TestOsmBaseActive:
     mw = self._make_middleware(sld)
     self._arm(mw, kph=20.0)  # < 30 km/h plausibility floor
     assert mw._osm_base_active(_t.monotonic()) is False
+
+
+class TestOsmBaseSelection:
+  """OSM maxspeed as base inference — full update() cycles."""
+
+  def _mw_for_update(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def _arm(self, mw, kph):
+    import time as _t
+    mw.osm_integration_enabled = True
+    mw.last_osm_speed_kph = kph
+    mw.last_osm_speed_t = _t.monotonic()
+    # update()'s 5 s param refresh would re-read the (absent) param and wipe
+    # the armed toggle — mark params as freshly read.
+    mw._params_last_read_t = _t.monotonic()
+
+  def test_osm_replaces_base_and_bypasses_cn_ladder(self, sld):
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2          # vision table would give a low urban limit
+    self._arm(mw, 104.6)              # 65 mph — NOT a CN-ladder value
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['inferenceMode'] == 'osm'
+    assert pub['speedLimit'] == 105   # round-to-5, NOT snapped to 100/120
+    assert pub['speedLimit'] not in sld._STANDARD_SPEEDS
+
+  def test_toggle_off_is_todays_behavior(self, sld):
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2
+    self._arm(mw, 104.6)
+    mw.osm_integration_enabled = False
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['inferenceMode'] == 'lane_count'
+    assert pub['speedLimit'] in sld._STANDARD_SPEEDS
+
+  def test_stale_osm_falls_back_to_vision(self, sld):
+    import time as _t
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2
+    self._arm(mw, 104.6)
+    mw.last_osm_speed_t = _t.monotonic() - 11.0
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['inferenceMode'] == 'lane_count'
+
+  def test_vision_narrow_cap_not_applied_over_osm(self, sld):
+    # A rural 2-lane road with OSM 90 must NOT be capped by the ≤2-lane
+    # narrow-road heuristic — OSM is authoritative for the base.
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2
+    mw.vision_cap_stable = 60
+    self._arm(mw, 90.0)
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['speedLimit'] == 90
+
+  def test_safety_cap_still_wins_over_osm(self, sld):
+    mw = self._mw_for_update(sld)
+    self._arm(mw, 104.6)
+    mw.curvature_cap = 50
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['speedLimit'] <= sld.snap_to_standard_speed(50)
+    assert pub['safetyCapped'] is True
+
+  def test_osm_suppresses_gs_hold(self, sld):
+    import time as _t
+    mw = self._mw_for_update(sld)
+    # Arm an active G/S sticky hold at 120…
+    mw.lane_count_stable = 4
+    mw.last_highway_type = 'motorway'
+    mw.last_road_context = 'freeway'
+    mw.last_way_ref = 'G2'
+    mw._gs_last_seen_t = _t.monotonic()
+    mw._gs_limit_kph = 120
+    # …and a fresh OSM 100 → OSM wins the base.
+    self._arm(mw, 100.0)
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['inferenceMode'] == 'osm'
+    assert pub['speedLimit'] == 100
+
+  def test_osm_step_is_plus_minus_10(self, sld):
+    mw = self._mw_for_update(sld)
+    self._arm(mw, 65.0)
+    mw._displayed_speed_limit = 105   # previously showing 105
+    mw._last_step_time = 0.0          # step interval elapsed
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['speedLimit'] == 95    # one −10 step toward 65, not a ladder jump
+
+  def test_publish_carries_osm_fields(self, sld):
+    mw = self._mw_for_update(sld)
+    self._arm(mw, 88.5)
+    mw._osm_tiles_missing = True
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['osmSpeedLimit'] == pytest.approx(88.5, abs=0.1)
+    assert pub['osmTilesMissing'] is True
