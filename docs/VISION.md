@@ -32,7 +32,7 @@ A plugin architecture that turns forks into composable, drop-in modules:
 
 24 hook call sites implemented across controls, car, planning, device
 health, and UI — plus plugin-dispatched hooks (e.g. car plugins populate
-ui_mod's Vehicle panel). See `docs/HOOK_INTEGRATION_POINTS.md` for the
+ui_mod's Driving panel). See `docs/HOOK_INTEGRATION_POINTS.md` for the
 authoritative list.
 
 ## Who Benefits
@@ -149,7 +149,7 @@ Proven on Comma 3 (AGNOS 12.8) and Orange Pi 5 Plus (RK3588):
 - bus_logger (plugin bus capture for logging)
 - screen_capture (tap-to-capture screenshots)
 - ui_recorder (HUD-rendered video capture for COD)
-- ui_mod (custom UI panels: Driving, Vehicle, Plugins, drive stats, route map)
+- ui_mod (custom UI panels: Driving, Plugins, drive stats, route map)
 
 Validated:
 - ✅ Overnight stability (10+ hours continuous operation)

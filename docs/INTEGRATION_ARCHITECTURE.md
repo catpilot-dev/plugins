@@ -42,7 +42,7 @@ plugins/
     model_selector/       # Runtime driving model swapping
     screen_capture/       # Tap-to-capture screenshots
     speedlimitd/          # Speed limit fusion (process + hook)
-    ui_mod/               # Custom UI panels: Driving, Vehicle, Plugins, drive stats
+    ui_mod/               # Custom UI panels: Driving, Plugins, drive stats, route map
     ui_recorder/          # HUD-rendered video capture for COD
   docs/                   # This documentation
 ```

@@ -1,98 +1,86 @@
-# mapd — OpenStreetMap Data Plugin
+# Mapd — OpenStreetMap Data
 
-**Type**: process
-**Condition**: always_run
-**Device filter**: tici, tizi, mici
-**Upstream**: [pfeiferj/mapd](https://github.com/pfeiferj/mapd)
-**Status**: ⚠️ **Disabled by default** — see Known Issues below
+**Status: disabled — not currently running.**
 
-## What it does
+## What it's for
 
-Manages the mapd Go binary that provides OpenStreetMap data to openpilot:
+`mapd` is a small Go binary from [pfeiferj/mapd](https://github.com/pfeiferj/mapd)
+that reads GPS and publishes OpenStreetMap data — speed limits, road names,
+map-based curve speeds, and road classification (freeway vs. city). This
+plugin's job is to manage that binary: download it, keep it pinned to a
+known-good version, and start/stop it.
 
-- Speed limits (maxspeed tags)
-- Road names and reference codes
-- Curve speeds (map-based and vision-based)
-- Hazards and advisory speeds
-- Road context (freeway/city)
-- Offline map tile management
+Device filter: `tici`, `tizi`, `mici` — even if re-enabled, this only runs
+on those comma-three-family hardware variants.
 
-## Known Issues
+## Why it's off
 
-### gomsgq shadow subscription (v2.0.6)
+As of the last change to this plugin (`plugin.json` has no `processes` and
+no `hooks` registered, and `panel: false`), mapd doesn't run at all and
+doesn't appear in the Plugins panel — this isn't a Settings toggle you can
+flip, the plugin manifest itself has been emptied out. The code
+(`mapd_manager.py`, `mapd_runner.py`, `hook.py`) is still in the repo, but
+nothing in the plugin framework currently calls it.
 
-mapd v2.0.6 uses a "shadow" subscription for `carState` via gomsgq — it reads
-the msgq ring buffer **without claiming a reader slot**. This means the writer
-has no backpressure from mapd's reader, and can overwrite data mapd hasn't
-consumed yet. This triggers `assert()` failures in `msgq.cc` → SIGABRT →
-process crashes and fragmented routes.
+Two reasons this was turned off:
 
-This is **hardcoded** in the Go binary (`NewSubscriber("carState", ..., shadow=true)`)
-and cannot be changed via settings or `MAPD_SETTINGS` param. The shadow mode was
-introduced because stock openpilot uses 14/15 carState reader slots, leaving no
-room for mapd. catpilot only uses 11/15 slots, so a regular subscription would work.
+- **A crash bug in mapd itself.** mapd v2.0.6 subscribes to `carState` using
+  a "shadow" mode that reads the shared-memory ring buffer without claiming
+  a reader slot. With no backpressure, the writer can overwrite data mapd
+  hasn't read yet, which trips an assert in `msgq.cc` and crashes the
+  process (and fragments the route). This is hardcoded in the upstream
+  binary and can't be configured away. The fix here was pinning to v2.0.5
+  (the last version without shadow mode) — see `MAX_ALLOWED_VERSION` in
+  `mapd_manager.py` — but the plugin was disabled outright rather than
+  relying on the pin alone.
+- **Limited value on the roads this is actually driven on.** OSM coverage
+  in China (speed limits, road classification, curve geometry) is sparse
+  and often wrong. `speedlimitd` gets equivalent or better results there
+  from vision-based road-type inference (lane count + urban/highway
+  tables), so it doesn't depend on mapd to do its job.
 
-**Workaround**: mapd is disabled by default. Users can enable it in the Plugins
-panel, but may experience crashes on C3 devices. speedlimitd works independently
-using vision lane-count inference — no mapd dependency.
+`speedlimitd` does **not** consume mapd's output — it reads the offline OSM
+tiles directly (`osm_query.py`) and infers speed from vision. Older
+`mapdOut` / `suggestedSpeed` references survive only in speedlimitd's
+docstrings; no live code path uses them. So mapd being off costs
+speedlimitd nothing today. (mapd and speedlimitd do share a plugin-param
+store for tile configuration, but not mapd's speed suggestions.)
 
-**Fix**: Awaiting upstream mapd release with configurable shadow mode, or build
-from source with `shadow=false`.
+## If you want to re-enable it
 
-### Limited value in China
+This requires editing `plugin.json` to restore a `processes` entry pointing
+at `mapd_runner.py` (and re-adding the cereal slots for `mapdOut` /
+`mapdExtendedOut` / `mapdIn` if you want the messages logged), then
+reinstalling. Expect the crash risk described above unless you also keep
+the binary pinned to v2.0.5 or older.
 
-OSM coverage in China is sparse — speed limits, road classifications, and curve
-geometry are largely missing or inaccurate. speedlimitd's vision-based road-type
-inference (lane count + urban speed tables) provides equivalent or better results
-for Chinese roads.
+## Binary management (when running)
 
-## How it works
-
-1. `mapd_runner.py` is spawned by the plugin process manager
-2. It calls `ensure_binary()` to download the mapd binary if missing
-3. Then `os.execv()` replaces the Python process with the native Go binary
-4. The binary reads GPS from cereal, queries OSM tiles, publishes `mapdOut` at 20Hz
-
-## Binary management
-
-The binary lives at `/data/media/0/osm/mapd` (outside the repo, persists across updates).
+The binary lives at `/data/media/0/osm/mapd`, outside the plugin/openpilot
+repos, so it survives updates. `mapd_manager.py` can be run by hand:
 
 ```bash
-# Check for updates
-python mapd_manager.py check
-
-# Download/update to latest
-python mapd_manager.py update
-
-# Ensure binary exists (download if missing)
-python mapd_manager.py ensure
+python mapd_manager.py check    # is a newer version available?
+python mapd_manager.py update   # backup, download, swap, restart
+python mapd_manager.py ensure   # download only if missing
 ```
 
-Update flow: backup → download to temp → stop daemon → atomic replace → update version → restart.
-
-## Offline maps
-
-Downloaded to `/data/media/0/osm/offline/`. Use `mapd interactive` TUI to download regions.
-
-## Cereal messages
-
-| Message | Direction | Frequency | Description |
-|---------|-----------|-----------|-------------|
-| mapdOut | publish | 20 Hz | Speed limits, road info, curve speeds |
-| mapdExtendedOut | publish | 20 Hz | Download progress, settings, path points |
-| mapdIn | subscribe | event | Download triggers, settings changes |
-
-## Key files
-
-```
-mapd/
-  plugin.json        # Plugin manifest
-  mapd_manager.py    # Binary download, update, version management
-  mapd_runner.py     # Process entry point (ensure + execv)
-```
+Update flow: backup current binary → download new one → stop the daemon →
+atomically replace the binary → update the version param → restart. Old
+binaries are kept in `/data/media/0/osm/mapd_backups/`.
 
 ## Params
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| MapdVersion | string | v2.0.6 | Currently installed mapd version |
+| MapdVersion | string | v2.0.5 | Version tracked/pinned by `mapd_manager.py` |
+
+## Key files
+
+```
+mapd/
+  plugin.json        # Plugin manifest — currently empty hooks/processes (disabled)
+  mapd_manager.py     # Binary download, update, version management (manual use)
+  mapd_runner.py       # Process entry point (ensure + execv) — not currently invoked
+  hook.py               # device.health_check reporting — not currently invoked
+```
