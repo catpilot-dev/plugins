@@ -106,6 +106,32 @@ when the toggle is OFF.
 - mph display conversion (openpilot's existing IsMetric handling applies).
 - Any change to CN default behavior: toggle OFF ⇒ byte-identical to today.
 
+## 4a. Future enhancements (not in this feature)
+
+The offline tiles are mapd-generated; the difference between our direct
+reader and the mapd Go binary is the runtime engine on top. Capabilities the
+binary has that `osm_query.py` lacks, in value order for US/EU users:
+
+1. **Bearing-aware, sticky way matching** — stateful CurrentWay tracking +
+   connected-way traversal + heading-based direction rejection. Biggest
+   robustness win (divided highways / frontage roads — the US analogue of
+   the CN stacked-ring mismatch). Implementable in `osm_query.py` (tiles
+   carry node sequences; GPS heading is available).
+2. **Upcoming-limit look-ahead** — walk the way graph ahead to announce
+   speed-limit changes with distance, enabling smooth decel before a drop.
+3. **Directional maxspeed** — forward/backward limit selected by heading
+   (needs `maxSpeedBackward` in our capnp read + bearing from item 1).
+4. **Conditional (time-based) limits; map-based curve speeds** — lowest
+   priority; curve speeds stay vision-only per the vision-only constraint.
+
+**Preferred path for these: adopt the mapd Go binary as the engine — gated
+on pfeiferj shipping the configurable slotted-reader option (mapd issue
+#88).** Until that ships, the binary's hardcoded shadow carState read
+panic-flaps under load and there is no free msgq reader slot on 0.11.x for
+a safe slotted build, so items 1–3 would have to be implemented in
+`osm_query.py` if needed sooner. Once #88 lands (and a carState slot budget
+check passes), wiring the binary in replaces per-item reimplementation.
+
 ## 5. Error handling
 
 | Failure | Behavior |
