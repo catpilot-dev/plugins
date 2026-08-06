@@ -83,8 +83,7 @@ list. The BMW plugin (`bmw_e9x_e8x`) is the current producer — its
 `on_vehicle_settings` adds BMW-specific rows. This keeps car-specific UI in the
 car plugin while ui_mod controls placement and styling, so the Driving panel
 gains a vehicle section automatically for whatever car is detected, with no
-ui_mod change. There is no separate Vehicle settings panel — `hooks.py`
-registers only the Driving and Plugins panels.
+ui_mod change. `hooks.py` registers the Driving and Plugins panels.
 
 ## Home screen widgets
 
