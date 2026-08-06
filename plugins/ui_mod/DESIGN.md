@@ -83,14 +83,7 @@ list. The BMW plugin (`bmw_e9x_e8x`) is the current producer — its
 `on_vehicle_settings` adds BMW-specific rows. This keeps car-specific UI in the
 car plugin while ui_mod controls placement and styling, so the Driving panel
 gains a vehicle section automatically for whatever car is detected, with no
-ui_mod change.
-
-> **Note:** `vehicle_panel.py` (`VehicleLayout`) is a standalone Vehicle-panel
-> widget that also dispatches `ui.vehicle_settings`, but it is **not currently
-> registered** by `hooks.py` — only Driving and Plugins panels are added. As
-> shipped, vehicle settings render inside the **Driving** panel, not a separate
-> Vehicle panel. `vehicle_panel.py` is dormant code retained for a possible
-> split-out.
+ui_mod change. `hooks.py` registers the Driving and Plugins panels.
 
 ## Home screen widgets
 
@@ -206,7 +199,6 @@ ui_mod/
   hooks.py             # hook handlers (panels, home, tick, exp button, health)
   driving_panel.py     # DrivingLayout — Driving Settings panel + ui.vehicle_settings dispatch
   plugins_panel.py     # PluginsLayout — plugin enable/disable + updates
-  vehicle_panel.py     # VehicleLayout — DORMANT, not registered (see note)
   drive_stats.py       # DriveStatsWidget — home right column, COD stats
   drive_tracker.py     # DriveTracker — live drive-stats accumulator + COD POST
   route_map.py         # RouteMapRenderer — CartoDB dark tiles + GPS trace
