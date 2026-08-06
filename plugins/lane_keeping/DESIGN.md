@@ -114,6 +114,40 @@ matter in the field:
 | `LaneKeepLpMax` | 25 | pure-pursuit aim-point cap (m); keeps damper authority at highway speed |
 | `LaneKeepAcDeadband` / `Hi` | 0.10 / 0.05 (defaults) | AC deadband taper over 54–90 km/h |
 
+## Porting to other vehicles
+
+The plugin is vehicle-agnostic by construction: it reads modelV2, `v_ego`,
+and `lat_delay`, writes a bounded bias onto `desiredCurvature`, keeps every
+bound in physical units (1/m, m/s²), and its output still passes through
+controlsd's ISO curvature clipping downstream. Both LHD and RHD sign paths
+are implemented and tested. Checklist for a new platform:
+
+1. **Faithful tracking (the one hard requirement).** The inner lateral
+   controller must execute small `desiredCurvature` biases (≤ 0.002 1/m).
+   Any deadzone or heavy reference filter in the inner loop silently eats
+   the correction — a fat curvature-error tolerance once absorbed 44% of
+   the damper's commands here. Stock angle control tracks near-1:1 (best
+   case); stock torque control integrates small biases out through its
+   measured-a_y feedback (good; friction compensation makes low-speed
+   execution less crisp, but that is where the deadband is widest anyway).
+2. **Set the two vehicle params**: `LaneKeepHalfWidth`,
+   `LaneKeepDriverSide`.
+3. **Decide the reference smoothing.** Stock controllers are tuned for raw
+   κ_des and don't need `kappa_filter_tau`; it exists here because the
+   consuming tracker is deadzone-free (see Reference conditioning). On a
+   stock platform it is optional — and the `.enforced` coupling does not
+   apply.
+4. **Check `lat_delay` convergence.** The prediction horizon auto-scales
+   from liveDelay; on most cars it converges and the predictive gap works
+   as designed or better.
+5. **Shake down on telemetry, not feel.** The `lane_keeping` topic carries
+   anchored duty, bias amplitude, and — against measured curvature — the
+   faithful-tracking check itself, before trusting a subjective verdict.
+6. **Expect a tuning pass.** The structure ports; the deadband, `dc_tau`,
+   and speed breakpoints were shaped on one car's wander spectrum and one
+   region's road markings, so field values may want re-validation per
+   platform.
+
 ## Telemetry
 
 Topic `lane_keeping` on the plugin bus (recorded in rlogs via
