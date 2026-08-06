@@ -1,67 +1,52 @@
-# Driver-Side Lane Keeping (AC Wander Damper)
+# Lane Keeping
 
-Standalone plugin on `controls.curvature_correction`. Damps the sub-Hz
-lane wander of the e2e driving model — one of openpilot e2e's three known
-issues (curve cutting, sub-Hz oscillation, curve blindness; this plugin
-addresses the second) — without ever fighting the model for position.
+Keeps the car from slowly swaying left and right inside its lane.
 
-How it works, in one paragraph: the wheel-to-line gap on the driver side
-is measured (plan-based prediction at `v · 1.5 · lat_delay`, bias-cancelling
-by construction) and split into DC and AC. The DC — where the model chooses
-to place the car — is **conceded** via a slow tracker (`LaneKeepDcTau`,
-field-proven 5 s): the model closes its own position loop through the
-camera with unbounded authority, so every sustained output-side push loses
-(field result, routes 3c1/3c3/3c5). The AC — the wander around that line —
-is damped through a bounded, rate-limited pure-pursuit curvature bias.
-Near the line an **asymmetric gate** (`LaneKeepAsymGap`, 0.6 m) suppresses
-corrections *toward* the line so recoveries are never opposed. The damper
-core is width-independent (the constant half-width cancels in the DC/AC
-split); only the asym threshold consumes `LaneKeepHalfWidth`, making the
-plugin vehicle-agnostic in one parameter.
+## What it does
 
-The model curvature reference is also lightly conditioned (0.15 s low-pass,
-frame-jitter only — sub-Hz content deliberately passes; filtering it would
-add group delay to curve entries). With no confident driver-side line the
-position correction is off; the smoothing always runs.
+openpilot's lateral e2e model suffers from sub-Hz wobbling, aka ping-pong,
+within the ego lane: over roughly ten seconds the car drifts a little toward
+one lane line, then back toward the other. It stays inside the lane, but you
+can feel the sway, especially on the highway.
 
-## Configuration
+This plugin watches the distance between the driver-side wheels and the
+driver-side lane line and gently damps that wander: when the car starts
+drifting away from where the model itself has been holding the lane, it adds
+a small, bounded steering correction back. The result is the same lane
+position, held more steadily.
 
-Params are files in `data/` (full list: `_load_config` in `register.py`),
-read at process start except the live toggle:
+Two things it deliberately does **not** do:
 
-| param | field-proven value | note |
-|---|---|---|
-| `LaneKeepEnable` | 1 | **live** (~1 s): the Driving-panel toggle; gates only the position correction, never the smoothing |
-| `LaneKeepDriverSide` | left | China |
-| `LaneKeepDcTau` | 5 | concession time constant (s); code default 20 |
-| `LaneKeepAsymGap` | 0.6 (default) | never-oppose-recovery threshold (m); 0 = symmetric |
-| `LaneKeepLpMax` | 25 (default) | pure-pursuit aim-point cap (m), reached at 60 km/h; keeps damper authority from collapsing as 1/v² at highway speed (route 3e7 segs 41–48: only ~30% of the model's sub-Hz wander was cancelled at 82 km/h) |
-| `LaneKeepAcDeadband` / `Hi` | 0.10 / 0.05 (defaults) | AC deadband (m) tapering 0.10→0.05 over 54–90 km/h ("higher speed, tighter deadband"): the 0.10 band forgave 36% of the 3e7 wander amplitude; tightening is safe at speed because the lp cap pins pursuit gain there |
-| `LaneKeepGapHardLo` / `Hi` | **−99 / 99 (floors disabled)** | code defaults 0.3/1.5; field testing showed the floors' sustained push turns brief line touches into pinned stalemates (3c3: 34 s holds vs model-alone 2.8 s) — leave disabled |
+- It does not pick the car's position in the lane. The model decides that;
+  the plugin only calms the motion *around* the model's own choice. If the
+  model moves over — for a wide truck, a merge, a curve — the plugin follows
+  within seconds.
+- It is not a lane-departure or emergency system. Corrections are small and
+  rate-limited (about a tenth of the steering authority of a normal turn).
 
-UX: green ring on the emblem button while anchored; the Driving-panel
-"Lane Keeping" toggle is the single source of control. Enforced plugin
-(`.enforced`): the BMW lateral controller's simplified tracker depends on
-the smoothed reference, so full removal (`.disabled`) is coupled to
-reverting that controller.
+## How to turn it on and off
 
-## Design history
+**Settings → Driving → "Lane Keeping"** — a single toggle, on by default.
+It takes effect within a second, even while driving, so you can A/B it on
+the move: toggle it off on a straight road and the sway usually becomes
+noticeable; toggle it back on and the car settles.
 
-Specs in `docs/superpowers/specs/`, newest governs:
-`2026-07-23-ac-stabilizer-design.md` (+ its 2026-07-27 asymmetric-damping
-addendum) supersedes the predictive-deadband and 2026-07-22 positioner
-specs. The arc — absolute band → predictive deadband → integral trim →
-AC/DC stabilizer → floors removed → asymmetric gate — is traceable through
-the supersession banners; the one-line summary is that every mechanism
-which held an *opinion about position* was removed after losing to the
-model in the field, and what remains is a pure damper.
+While the plugin is actively anchored to a lane line, a **green ring** is
+drawn around the emblem button on the driving screen. The ring goes dark
+when the line is lost (worn paint, occlusion) or during a lane change — the
+plugin pauses itself automatically in both cases and resumes on its own.
 
-## Calibration trim (retired)
+## When it works
 
-`calib_trim.py` and its `modeld.calib_bias` reader remain in the tree but
-are inert: `CalibTrimMode=0` by default, and the modeld-side call sites
-were never deployed (archived on the catpilot `calib-trim-parked` branch,
-2026-07-29). It was a perception-side DC lever designed to move the
-model's chosen line by biasing the calibration yaw — built and reviewed,
-then retired when the hard-floor removal dissolved the problem it
-targeted. Design record: `2026-07-25-calibration-trim-design.md`.
+- The driver-side lane line must be visible and confidently detected. On
+  well-marked roads the plugin is anchored well over 90% of the time; on
+  worn markings it simply does less, never something wrong.
+- During lane changes it fully disengages (zero correction) and re-anchors
+  in the new lane with no memory of the old one.
+- It is vehicle-agnostic: the only car-specific settings are the car's
+  half-width and which side the driver sits on.
+
+## More
+
+Implementation details, tuning parameters, telemetry, and the design
+history are in [DESIGN.md](DESIGN.md).
