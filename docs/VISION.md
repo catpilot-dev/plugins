@@ -30,8 +30,10 @@ A plugin architecture that turns forks into composable, drop-in modules:
 
 ## Hook Points
 
-28 hook points implemented across controls, car, planning, selfdrived, UI, and WebRTC.
-See `docs/HOOK_INTEGRATION_POINTS.md` for the full list.
+24 hook call sites implemented across controls, car, planning, device
+health, and UI — plus plugin-dispatched hooks (e.g. car plugins populate
+ui_mod's Vehicle panel). See `docs/HOOK_INTEGRATION_POINTS.md` for the
+authoritative list.
 
 ## Who Benefits
 
@@ -52,7 +54,7 @@ These files enable plugin discovery and hook dispatch:
 | File | Lines | Purpose |
 |------|-------|---------|
 | `selfdrive/plugins/hooks.py` | ~20 | HookRegistry: register callbacks, dispatch with fail-safe |
-| `selfdrive/plugins/loader.py` | ~10 | Scan `plugins/`, parse plugin.json, lazy-load hook callbacks |
+| `selfdrive/plugins/registry.py` + `manifest.py` | ~10 (core) | Scan `plugins/`, parse plugin.json, lazy-load hook callbacks |
 
 Zero overhead when no plugins installed — `hooks.run()` returns the default
 value immediately if no callbacks are registered (~50ns).
@@ -64,12 +66,11 @@ These are the minimal touch points in upstream code:
 
 | File | Hook(s) | Lines added |
 |------|---------|-------------|
-| `selfdrive/controls/controlsd.py` | `controls.curvature_correction`, `controls.post_actuators` | 4 |
+| `selfdrive/controls/controlsd.py` | `controls.lat_controller_init`, `controls.curvature_correction`, `controls.post_actuators` | 6 |
 | `selfdrive/controls/lib/longitudinal_planner.py` | `planner.v_cruise`, `planner.accel_limits` | 4 |
-| `selfdrive/controls/lib/desire_helper.py` | `desire.pre/post_lane_change`, `desire.post_update` | 6 |
+| `selfdrive/controls/lib/desire_helper.py` | `desire.post_update` | 2 |
 | `selfdrive/controls/plannerd.py` | `planner.subscriptions` | 2 |
 | `selfdrive/car/card.py` | `car.cruise_initialized` | 2 |
-| `selfdrive/selfdrived/selfdrived.py` | `selfdrived.alert_registry`, `selfdrived.events` | 4 |
 | `selfdrive/locationd/torqued.py` | `torqued.allowed_cars` | 2 |
 | `selfdrive/ui/onroad/augmented_road_view.py` | `ui.render_overlay` | 2 |
 | `selfdrive/ui/onroad/hud_renderer.py` | `ui.onroad_exp_button`, `ui.hud_set_speed_override`, `ui.hud_speed_color` | 6 |
@@ -80,12 +81,16 @@ These are the minimal touch points in upstream code:
 | `selfdrive/ui/layouts/main.py` | `ui.main_extend` | 2 |
 | `selfdrive/ui/layouts/home.py` | `ui.home_extend` | 2 |
 | `system/ui/lib/application.py` | `ui.pre_end_drawing`, `ui.post_end_drawing` | 4 |
-| `system/webrtc/webrtcd.py` | `webrtc.app_routes`, `webrtc.session_started/ended` | 6 |
-| `opendbc_repo/opendbc/car/car_helpers.py` | `car.register_interfaces`, `car.panda_status` | 6 |
+| `selfdrive/plugins/plugind.py` | `device.health_check` (dispatched by the framework itself) | — |
 | `cereal/custom.capnp` | (schema definitions, injected at boot by builder.py) | ~50 |
 | `cereal/services.py` | (service registration, injected at boot) | ~5 |
 
-**Total upstream diff: ~120 lines** across 20 files for the full 28-hook ecosystem. cereal changes are injected at boot by `builder.py` — no static upstream patch needed.
+**Total upstream diff: ~100 lines** across ~17 files for the full 24-hook
+ecosystem. cereal changes are injected at boot by `builder.py` — no static
+upstream patch needed. Car interfaces register by monkey-patching at plugin
+load, so opendbc needs **zero** changes. (The 0.11 rebase retired the
+earlier `selfdrived.*`, `webrtc.*`, extra `desire.*`, and `car_helpers`
+hooks — the surface shrank rather than grew.)
 
 ### What stays outside upstream
 
@@ -137,11 +142,13 @@ lines of unmaintainable diff.
 Proven on Comma 3 (AGNOS 12.8) and Orange Pi 5 Plus (RK3588):
 - bmw_e9x_e8x (car interface + safety + DCC control)
 - c3_compat (AGNOS 12.8 compat: Raylib UI, venv_sync, boot patches, watchdog)
-- mapd (OSM data)
-- speedlimitd (speed limit fusion)
+- lane_keeping (AC wander damper on the curvature hook — vehicle-agnostic)
+- mapd (OSM data; currently disabled by default)
+- speedlimitd (speed limit fusion + curve speed control)
 - model_selector (runtime model swapping)
 - bus_logger (plugin bus capture for logging)
 - screen_capture (tap-to-capture screenshots)
+- ui_recorder (HUD-rendered video capture for COD)
 - ui_mod (custom UI panels: Driving, Vehicle, Plugins, drive stats, route map)
 
 Validated:

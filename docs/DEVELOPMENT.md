@@ -98,8 +98,8 @@ def on_v_cruise(v_cruise, v_ego, sm):
 
 ### Available hooks
 
-See the [catpilot README](https://github.com/catpilot-dev/catpilot#hook-call-sites)
-for the full list of hook call sites.
+See [HOOK_INTEGRATION_POINTS.md](HOOK_INTEGRATION_POINTS.md) for the
+authoritative list of the 24 hook call sites with files and signatures.
 
 ## Testing
 
