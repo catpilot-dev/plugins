@@ -41,7 +41,7 @@ BURST_LIVE_WINDOW = 0.5       # s — burst considered "live" until this long wi
 V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — deadzone for entry and burst cancellation
 ACCEL_HOLD_THRESHOLD = 0.2     # m/s² — use HOLD_INTERVAL above this, SINGLE_INTERVAL below
 ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — use +5 above this, +1 below (midpoint of 0.4–1.2)
-DECEL_HOLD_THRESHOLD = 0.4
+DECEL_HOLD_THRESHOLD = 0.2
 DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint of 0.6–1.2)
 
 # DCC Calibration
