@@ -2647,3 +2647,75 @@ class TestPluginManifest:
 
     assert 'cereal' not in manifest or not manifest.get('cereal', {}).get('slots')
     assert 'services' not in manifest or not manifest.get('services')
+
+
+# ============================================================
+# OSM Data Integration — param wiring + region default
+# ============================================================
+
+class TestOsmIntegrationParam:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def test_read_params_wires_toggle_on(self, sld, monkeypatch):
+    import config
+    monkeypatch.setattr(config, 'read_plugin_param',
+                        lambda pid, key, default='': '1' if key == 'OsmDataIntegration' else '')
+    mw = self._make_middleware(sld)
+    mw._read_params()
+    assert mw.osm_integration_enabled is True
+
+  def test_read_params_missing_means_off(self, sld, monkeypatch):
+    import config
+    monkeypatch.setattr(config, 'read_plugin_param', lambda pid, key, default='': '')
+    mw = self._make_middleware(sld)
+    mw._read_params()
+    assert mw.osm_integration_enabled is False
+
+
+class TestOsmRegionDefault:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _param_path(self, tmp_path):
+    return tmp_path / 'speedlimitd' / 'data' / 'OsmDataIntegration'
+
+  @pytest.fixture
+  def data_dir(self, monkeypatch, tmp_path):
+    import config
+    monkeypatch.setattr(config, 'PLUGINS_RUNTIME_DIR', str(tmp_path))
+    return tmp_path
+
+  def test_cn_defaults_off(self, sld, data_dir):
+    mw = self._make_middleware(sld)
+    assert mw._resolve_osm_default('cn') is True
+    assert self._param_path(data_dir).read_text() == '0'
+    assert mw.osm_integration_enabled is False
+
+  def test_non_cn_defaults_on(self, sld, data_dir):
+    mw = self._make_middleware(sld)
+    assert mw._resolve_osm_default('de') is True
+    assert self._param_path(data_dir).read_text() == '1'
+    assert mw.osm_integration_enabled is True
+
+  def test_unknown_country_defaults_on(self, sld, data_dir):
+    # No bbox match (e.g. US without a us.toml) → not China → ON.
+    mw = self._make_middleware(sld)
+    assert mw._resolve_osm_default(None) is True
+    assert self._param_path(data_dir).read_text() == '1'
+
+  def test_existing_value_never_overwritten(self, sld, data_dir):
+    p = self._param_path(data_dir)
+    p.parent.mkdir(parents=True)
+    p.write_text('0')
+    mw = self._make_middleware(sld)
+    assert mw._resolve_osm_default('de') is True
+    assert p.read_text() == '0'

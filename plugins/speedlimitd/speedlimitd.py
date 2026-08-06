@@ -776,6 +776,14 @@ class SpeedLimitMiddleware:
     # refreshed periodically so a UI change takes effect without a restart.
     self.curve_target_lat_accel: float = CURVE_LAT_ACCEL_DEFAULT
     self.react_lat_accel_threshold: float = REACT_LAT_ACCEL_DEFAULT
+
+    # OSM Data Integration (2026-08-07 spec): use OSM maxspeed as base
+    # inference. Param resolved to a region default on first GPS fix
+    # (cn → OFF, elsewhere → ON), user-controlled thereafter.
+    self.osm_integration_enabled: bool = False
+    self._osm_default_resolved: bool = False
+    self._osm_default_country: str | None = None
+
     self._params_last_read_t: float = 0.0
     self._read_params()
 
@@ -849,6 +857,27 @@ class SpeedLimitMiddleware:
       read_plugin_param('speedlimitd', 'MapdReactLatAccel', ''),
       REACT_LAT_ACCEL_DEFAULT, REACT_LAT_ACCEL_MIN, REACT_LAT_ACCEL_MAX,
       zero_disables=True)
+    self.osm_integration_enabled = read_plugin_param(
+      'speedlimitd', 'OsmDataIntegration', '') == '1'
+
+  def _resolve_osm_default(self, country: str | None) -> bool:
+    """One-time region default for OsmDataIntegration (first GPS fix).
+
+    China → OFF (OSM maxspeed unreliable there); anywhere else → ON.
+    Never overwrites an existing param file (user-controlled once it exists).
+    Returns True when resolved (file exists or write succeeded) so the caller
+    can retry on the next fix after a transient write failure.
+    """
+    try:
+      from config import plugin_data_dir, write_plugin_param
+      if (plugin_data_dir('speedlimitd') / 'OsmDataIntegration').exists():
+        return True
+      default = '0' if country == 'cn' else '1'
+      write_plugin_param('speedlimitd', 'OsmDataIntegration', default)
+      self.osm_integration_enabled = default == '1'
+      return True
+    except Exception:
+      return False
 
   def _update_reactive_cap(self, a_y_meas, v_ego: float, threshold: float,
                            now: float, dt: float,
@@ -1044,6 +1073,9 @@ class SpeedLimitMiddleware:
             except FileNotFoundError:
               pass
           self.country_detected = True
+          self._osm_default_country = country
+        if not self._osm_default_resolved:
+          self._osm_default_resolved = self._resolve_osm_default(self._osm_default_country)
 
     # --- Query OSM tiles at 0.2 Hz ---
     if self._gps_valid and now - self._osm_last_query_t >= self._osm_query_interval:
