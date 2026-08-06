@@ -2877,6 +2877,25 @@ class TestOsmBaseSelection:
     assert pub['speedLimit'] <= sld.snap_to_standard_speed(50)
     assert pub['safetyCapped'] is True
 
+  def test_safety_cap_uses_ladder_snap_not_osm_round(self, sld):
+    # curvature_cap=57 is the discriminating value: the CN-ladder snap
+    # (source 4, safety class) rounds UP to 60, while the OSM round-to-5
+    # display path would give 55. The two disagree in a direction the
+    # downstream "safety cap override" re-clamp (which only ever pulls the
+    # displayed value DOWN toward snap_to_standard_speed(curvature_cap))
+    # cannot paper over — 60 is not < 55, so that block would leave a
+    # regressed 55 standing. If the `osm_display = osm_base and source == 2`
+    # guard drops the `source == 2` check, the safety cap wrongly takes the
+    # OSM round-to-5 path and this test catches the resulting 55.
+    mw = self._mw_for_update(sld)
+    self._arm(mw, 104.6)
+    mw.curvature_cap = 57
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['speedLimit'] == 60
+    assert pub['speedLimit'] in sld._STANDARD_SPEEDS
+    assert pub['safetyCapped'] is True
+
   def test_osm_suppresses_gs_hold(self, sld):
     import time as _t
     mw = self._mw_for_update(sld)
@@ -2911,3 +2930,83 @@ class TestOsmBaseSelection:
     pub = mw._sl_pub.send.call_args[0][0]
     assert pub['osmSpeedLimit'] == pytest.approx(88.5, abs=0.1)
     assert pub['osmTilesMissing'] is True
+
+
+class TestOsmTilesMissingWritePath:
+  """Drives the real `update()` OSM-query block — tile_missing detection and
+  the persisted OsmTilesMissing param, written on first status and on change
+  only (not every 5 s query cycle)."""
+
+  def _mw_for_update(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def _param_path(self, tmp_path):
+    return tmp_path / 'speedlimitd' / 'data' / 'OsmTilesMissing'
+
+  @pytest.fixture
+  def data_dir(self, monkeypatch, tmp_path):
+    import config
+    monkeypatch.setattr(config, 'PLUGINS_RUNTIME_DIR', str(tmp_path))
+    return tmp_path
+
+  def _arm_query(self, mw, tile_missing):
+    """Force update()'s real OSM-query block to run this tick."""
+    mw._gps_valid = True
+    mw._gps_lat = 39.9
+    mw._gps_lon = 116.4
+    mw._osm_last_query_t = 0.0
+    mw._osm = MagicMock()
+    mw._osm.query.return_value = None
+    mw._osm.tile_missing = tile_missing
+
+  def test_first_status_writes_missing_true(self, sld, data_dir):
+    mw = self._mw_for_update(sld)
+    self._arm_query(mw, True)
+    mw.update()
+    assert self._param_path(data_dir).read_text() == '1'
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['osmTilesMissing'] is True
+
+  def test_change_to_present_rewrites_param(self, sld, data_dir):
+    mw = self._mw_for_update(sld)
+    self._arm_query(mw, True)
+    mw.update()
+    assert self._param_path(data_dir).read_text() == '1'
+
+    mw._osm.tile_missing = False
+    mw._osm_last_query_t = 0.0  # allow another query this tick
+    mw.update()
+    assert self._param_path(data_dir).read_text() == '0'
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['osmTilesMissing'] is False
+
+  def test_unchanged_status_not_rewritten(self, sld, data_dir, monkeypatch):
+    import config
+    mw = self._mw_for_update(sld)
+    self._arm_query(mw, True)
+    mw.update()  # first status write — establishes the on-disk baseline
+
+    calls = []
+    real_write = config.write_plugin_param
+
+    def _recording_write(plugin_id, key, value):
+      calls.append((plugin_id, key, value))
+      return real_write(plugin_id, key, value)
+
+    monkeypatch.setattr(config, 'write_plugin_param', _recording_write)
+
+    mw._osm_last_query_t = 0.0  # allow another query this tick
+    mw.update()  # tile_missing unchanged (still True) — no redundant write
+
+    tiles_missing_calls = [c for c in calls if c[1] == 'OsmTilesMissing']
+    assert tiles_missing_calls == []
