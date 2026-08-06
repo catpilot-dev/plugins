@@ -12,7 +12,7 @@ modelV2 lane line + plan ──► gap_pred ──► AC/DC split ──► κ_b
 hook returns κ_ref + κ_bias ──► BMW lateral controller
 ```
 
-## The damper, in one paragraph
+## AC Damper
 
 The wheel-to-line gap on the driver side is measured (plan-based prediction
 at `x = v · pred_delay_mult · lat_delay`, bias-cancelling by construction)
