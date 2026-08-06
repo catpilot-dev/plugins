@@ -194,6 +194,57 @@ def infer_lane_count(model_msg) -> int:
   else:
     base_count = 1
 
+  # --- Fix G: bounded-road demote — "3 lines with both edges → 2 lanes" -------
+  # Canonical rule (user decision, 2026-08-05): when EXACTLY 3 lane lines are
+  # visible AND both road edges are "bounded" — each edge nearly-confident (std
+  # below DEMOTE_FAR_STD_MAX) AND hugging the outermost visible line on its side
+  # (|edge y - outer line y| below DEMOTE_EDGE_GAP_MAX, both read at y-index 2,
+  # ~10 m) — the road is physically closed and holds exactly 2 lanes: the count
+  # is 2 (→ 40 km/h) and the edge boost below is naturally unreachable (base
+  # 2 < 3). Side selection / y-index / visibility mirror _near_road_edge exactly
+  # (the replay gate replicated it): outermost left = idx 0 if probs[0]>0.3 else
+  # 1; outermost right = idx 3 if probs[3]>0.3 else 2; positions at y-index 2.
+  # Config DEMOTE_FAR_STD_MAX=0.9 / DEMOTE_EDGE_GAP_MAX=1.5 is the replay-gated
+  # grid point s0.9/g1.5.
+  #
+  # ACCEPTED TRADE / DESIRED BEHAVIOR (user decision 2026-08-05, made with the
+  # replay-gate numbers in view — same precedent style as the edge-boost gate
+  # below). The gate catches ~83% of the driver-audited 3e5 ramp exemplar but
+  # also fires on barrier/wall-adjacent 3-line highway stretches, in runs that
+  # can exceed the 3 s narrow-confirmation threshold (~+5 narrow commits per
+  # ~4.5 h battery, each briefly showing 40). Per the user: a wall or barrier
+  # hugging the outer line IS a real
+  # road edge — most often a construction zone occupying lanes, where the human
+  # response is to slow down, so demoting to 40 there is the CORRECT read, not a
+  # false positive. The genuine residual cost is only the subset where the
+  # barrier is a permanent sound wall / median divider at full lane count; that
+  # remains gas-overridable. (Field audits 2026-08-05: both replay-flagged
+  # "false fire" specimens — 3d0 seg34 connector, seg56 frontage — proved to be
+  # genuine 2-lane roads; the practical residual is smaller than gated.) Pinned in
+  # test_demote_accepted_wide_road_characterization AS desired construction-
+  # squeeze behavior (with the permanent-barrier residual noted) so any future
+  # change to it is a conscious one.
+  DEMOTE_FAR_STD_MAX = 0.9   # each edge std must be below this to count as bounded
+  DEMOTE_EDGE_GAP_MAX = 1.5  # edge must hug its outermost line within this (m) @ ~10 m
+  if (visible_lines == 3 and hasattr(model_msg, 'roadEdges') and
+      len(model_msg.roadEdges) >= 2 and hasattr(model_msg, 'roadEdgeStds') and
+      len(model_msg.roadEdgeStds) >= 2):
+    re_stds = model_msg.roadEdgeStds
+    try:
+      ll_y = [model_msg.laneLines[i].y[2] for i in range(4)]
+      re_y = [model_msg.roadEdges[i].y[2] for i in range(2)]
+    except (IndexError, AttributeError):
+      ll_y = None
+    if ll_y is not None:
+      left_idx = 0 if probs[0] > 0.3 else (1 if probs[1] > 0.3 else None)
+      right_idx = 3 if probs[3] > 0.3 else (2 if probs[2] > 0.3 else None)
+      left_bounded = (left_idx is not None and re_stds[0] < DEMOTE_FAR_STD_MAX and
+                      abs(re_y[0] - ll_y[left_idx]) < DEMOTE_EDGE_GAP_MAX)
+      right_bounded = (right_idx is not None and re_stds[1] < DEMOTE_FAR_STD_MAX and
+                       abs(re_y[1] - ll_y[right_idx]) < DEMOTE_EDGE_GAP_MAX)
+      if left_bounded and right_bounded:
+        return 2
+
   # Edge boost: when the car is driving next to the road edge and the vision lane
   # count is >= 3, vision likely misses the far-side lane(s) — assume actual =
   # vision_lane_count + 1 (cap 4). At <= 2 visible lanes next to an edge the
@@ -1099,6 +1150,11 @@ class SpeedLimitMiddleware:
       if self._narrow_accum >= NARROW_CONFIRM_S:
         self.lane_count_stable = 2
         self.lane_count_locked = True
+
+      # Fix F post-narrow ceiling (592d39f) removed 2026-08-05 per user decision —
+      # exit-release hold cost outweighed ghost-link protection (see project
+      # record); ghost-link false-80s are accepted modelV2 artifacts pending a
+      # better model.
 
       # Lane line confidence: sum of all probs divided by line count.
       # Scales with both the number of visible lines and their individual strength.

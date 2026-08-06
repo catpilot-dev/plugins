@@ -90,12 +90,31 @@ class TestInferLaneCount:
   # --- edge-lane boost gate (route 3de seg 19; ships per user decision) ------
 
   def _make_edge_model(self, probs):
-    """Model with confident, co-located road edges → _near_road_edge fires."""
+    """Model near the RIGHT edge on an OPEN wide road → _near_road_edge fires.
+
+    The near (right) edge hugs the right line (+2.4 vs +1.9, std 0.3); the FAR
+    (left) edge is open (y −8.0, std 1.5). The far side MUST stay unbounded so
+    the 2026-08-05 bounded-road demote ("3 lines + BOTH edges → 2") does not
+    fire here — this stub exercises the edge BOOST (unseen far side of a genuinely
+    wide road), not the demote.
+    """
     m = MagicMock()
     m.laneLineProbs = probs
-    m.roadEdges = [MagicMock(y=[0.0] * 10) for _ in range(2)]
-    m.roadEdgeStds = [0.3, 0.3]                    # confident edge detection
-    m.laneLines = [MagicMock(y=[0.0] * 10) for _ in range(4)]
+    ll_y = [-4.5, -1.4, 1.9, 3.2]   # lane lines at y-index 2 (~10 m)
+    re_y = [-8.0, 2.4]              # far LEFT edge open; near RIGHT edge hugs +1.9
+    m.laneLines = [MagicMock(y=[0.0, 0.0, ll_y[i], 0.0]) for i in range(4)]
+    m.roadEdges = [MagicMock(y=[0.0, 0.0, re_y[i], 0.0]) for i in range(2)]
+    m.roadEdgeStds = [1.5, 0.3]     # left(far) unbounded; right(near) confident
+    return m
+
+  def _make_full_model(self, probs, ll_y2, re_y2, re_stds):
+    """Fully-specified modelV2 stub: lane-line / road-edge y at index 2 (~10 m)
+    and road-edge stds set explicitly, for the bounded-road demote tests."""
+    m = MagicMock()
+    m.laneLineProbs = probs
+    m.laneLines = [MagicMock(y=[0.0, 0.0, ll_y2[i], 0.0]) for i in range(4)]
+    m.roadEdges = [MagicMock(y=[0.0, 0.0, re_y2[i], 0.0]) for i in range(2)]
+    m.roadEdgeStds = re_stds
     return m
 
   def test_edge_boost_gated_at_base_3_not_2(self, sld):
@@ -108,8 +127,67 @@ class TestInferLaneCount:
 
   def test_edge_boost_still_applies_at_base_3(self, sld):
     # (b) base 3 + near edge → boosts to 4 (unchanged wide-road behavior — the
-    # boost's actual purpose: an unseen far side of a genuinely wide road).
+    # boost's actual purpose: an unseen far side of a genuinely wide road). The
+    # far (left) edge stays unbounded (std 1.5, y −8.0) so the bounded-road
+    # demote does NOT fire here; only the near (right) edge triggers the boost.
     assert sld.infer_lane_count(self._make_edge_model([0.4, 0.6, 0.7, 0.2])) == 4
+
+  # --- Fix G: bounded-road demote — "3 lines + both edges → 2 lanes" ----------
+  # (user rule, 2026-08-05; replay-gated s0.9/g1.5). Exemplar frames carry the
+  # exact driver-audited numbers.
+
+  def test_demote_3e5_ramp_frame(self, sld):
+    # route 3e5 seg7, GPS 09:41:59.7 — driver-audited ramp. 3 lines; BOTH edges
+    # bounded: left gap |−5.5−(−4.7)|=0.8 < 1.5, std 0.75 < 0.9; right gap
+    # |2.6−2.07|=0.53 < 1.5, std 0.33 < 0.9 → demote to 2.
+    model = self._make_full_model(
+        [0.55, 0.98, 0.89, 0.001],
+        [-4.7, -1.45, 2.07, 2.9], [-5.5, 2.6], [0.75, 0.33])
+    assert sld.infer_lane_count(model) == 2
+
+  def test_no_demote_ring_road_frame(self, sld):
+    # seg20 09:55:07 — 4-lane ring road, edge lane. 3 lines but the LEFT edge is
+    # NOT bounded (gap 3.1, std 1.11 both fail) → no demote → base 3; the near
+    # right edge still boosts → 4.
+    model = self._make_full_model(
+        [0.84, 0.99, 0.98, 0.01],
+        [-4.5, -1.36, 1.86, 3.24], [-7.6, 2.35], [1.11, 0.32])
+    assert sld.infer_lane_count(model) == 4
+
+  def test_no_demote_under_occlusion(self, sld):
+    # seg20 09:55:19 — a left-passing vehicle blows up the left edge (std 5.9,
+    # mean −9.0). Not bounded → no demote (fail-safe direction) → 4 via boost.
+    model = self._make_full_model(
+        [0.84, 0.99, 0.98, 0.01],
+        [-4.5, -1.36, 1.86, 3.24], [-9.0, 2.35], [5.9, 0.32])
+    assert sld.infer_lane_count(model) == 4
+
+  def test_demote_accepted_wide_road_characterization(self, sld):
+    # Barrier-adjacent wide-road frame: 3 lines, both edges std 0.8 / gap 1.0 →
+    # demote to 2. Pinned AS DESIRED behavior (user decision 2026-08-05): a wall/
+    # barrier hugging the outer line is a real road edge — most often a
+    # construction zone occupying lanes, where slowing to 40 is the humanly-
+    # correct read. The known residual (permanent sound wall / median divider at
+    # full lane count) stays gas-overridable and Fix-F ceiling-capped. This
+    # assertion pins that behavior so any future change to it is a conscious one.
+    model = self._make_full_model(
+        [0.84, 0.99, 0.98, 0.01],
+        [-4.5, -1.4, 1.9, 3.2], [-5.5, 2.9], [0.8, 0.8])
+    assert sld.infer_lane_count(model) == 2
+
+  def test_demote_requires_exactly_3_lines(self, sld):
+    # Same bounded edges, but 4 visible lines → demote requires exactly 3, so it
+    # does NOT fire; count follows the existing 4-line path (→ 4).
+    four = self._make_full_model(
+        [0.84, 0.99, 0.98, 0.6],
+        [-4.5, -1.4, 1.9, 3.2], [-5.5, 2.9], [0.8, 0.8])
+    assert sld.infer_lane_count(four) == 4
+    # 2 visible lines with the same bounded edges → existing behavior (2); the
+    # demote logic is not involved (base 2, no boost).
+    two = self._make_full_model(
+        [0.1, 0.99, 0.98, 0.1],
+        [-4.5, -1.4, 1.9, 3.2], [-5.5, 2.9], [0.8, 0.8])
+    assert sld.infer_lane_count(two) == 2
 
 
 # ============================================================
@@ -550,6 +628,41 @@ class TestPriorityCascade:
     if time.monotonic() - mw.lane_count_stable_since > stability_window:
       mw.lane_count_stable = mw.lane_count
     assert mw.lane_count_stable == 1
+
+  def test_bounded_demote_commits_narrow_after_3s(self, sld):
+    """Sustained bounded-road demote frames drive the leaky narrow accumulator to
+    a stable=2 commit after NARROW_CONFIRM_S (3 s). Reuses the accumulator
+    machinery (route 3d3/3d1 pattern) with the 3e5 ramp exemplar frame, which
+    infer_lane_count demotes to raw=2 (3 lines, both edges bounded)."""
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'), \
+         patch.object(mod.messaging, 'PubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    # 3e5 ramp exemplar (driver-audited): both edges bounded → raw demotes to 2.
+    m = MagicMock()
+    m.laneLineProbs = [0.55, 0.98, 0.89, 0.001]
+    m.laneLines = [MagicMock(y=[0.0, 0.0, v, 0.0]) for v in (-4.7, -1.45, 2.07, 2.9)]
+    m.roadEdges = [MagicMock(y=[0.0, 0.0, v, 0.0]) for v in (-5.5, 2.6)]
+    m.roadEdgeStds = [0.75, 0.33]
+    assert sld.infer_lane_count(m) == 2  # the frame demotes
+
+    mw.lane_count_stable = 3
+    mw._narrow_accum = 0.0
+    mw._lane_last_t = 0.0
+    now = 100.0
+    for _ in range(80):  # 80 × 0.05 s = 4 s > NARROW_CONFIRM_S (3 s)
+      now += 0.05
+      raw = sld.infer_lane_count(m)
+      dt = min(max(now - mw._lane_last_t, 0.0), 0.5) if mw._lane_last_t > 0.0 else 0.0
+      mw._lane_last_t = now
+      if raw <= 2:
+        mw._narrow_accum = min(mw._narrow_accum + dt, mod.NARROW_ACCUM_CAP)
+      else:
+        mw._narrow_accum = max(mw._narrow_accum - mod.NARROW_DECAY * dt, 0.0)
+      if mw._narrow_accum >= mod.NARROW_CONFIRM_S:
+        mw.lane_count_stable = 2
+    assert mw._narrow_accum >= mod.NARROW_CONFIRM_S
+    assert mw.lane_count_stable == 2
 
 
 # ============================================================
