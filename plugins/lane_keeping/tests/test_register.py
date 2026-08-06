@@ -51,7 +51,7 @@ def test_load_config_defaults(data_dir):
   assert cfg.driver_side == 'left'
   assert cfg.gap_min == 0.6 and cfg.gap_max == 1.0
   assert cfg.t_preview == 1.5
-  assert cfg.lp_max == 25.0
+  assert cfg.lp_max == 9999.0     # inert by default (post-3ea rollback)
 
 
 def test_load_config_overrides(data_dir):
@@ -133,7 +133,7 @@ def test_hook_passes_lat_delay_through(data_dir, monkeypatch):
 def test_load_config_ac_params(data_dir):
   cfg = register._load_config()
   assert cfg.dc_tau == 20.0 and cfg.ac_deadband == 0.10
-  assert cfg.ac_deadband_hi == 0.05
+  assert cfg.ac_deadband_hi == 0.10   # flat taper by default (post-3ea rollback)
   (data_dir / 'LaneKeepDcTau').write_text('30')
   (data_dir / 'LaneKeepAcDeadbandHi').write_text('0.07')
   cfg = register._load_config()

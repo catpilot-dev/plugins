@@ -53,19 +53,25 @@ parameter (plus `LaneKeepDriverSide`).
 - **DC tracker**: EMA with `dc_tau`; seeds and adapts only from trusted
   measurements (authority > 0, not in a hard-floor excursion), freezes on
   line dropouts, resets on lane change and on deliberate disable.
-- **AC deadband** (speed-dependent since 2026-08-06): the AC excess is
-  deadbanded by `interp(v, [15, 25] m/s, [ac_deadband, ac_deadband_hi])` —
-  0.10 m at urban speed, tightening to 0.05 m at/above 90 km/h ("higher
-  speed, tighter deadband"). Safe because the lp cap (next bullet) pins the
-  pursuit gain at exactly the speeds where the band tightens: a 0.05 m noise
-  blip commands ~1.6e-4 κ ≈ 0.1 m/s² a_y.
-- **Pure pursuit** (speed-dependent since 2026-08-06):
+- **AC deadband**: the AC excess is deadbanded by
+  `interp(v, [15, 25] m/s, [ac_deadband, ac_deadband_hi])`. Both default to
+  0.10 m — a flat band. Setting `ac_deadband_hi` lower ("higher speed,
+  tighter deadband") is the opt-in speed taper; see the caution below.
+- **Pure pursuit**:
   `κ = curv_sign · 2 · excess / lp²` with `lp = clip(v · t_preview, 1, lp_max)`,
-  scaled by the authority factor below. Uncapped, the gain collapses as
-  1/v² — a highway field measurement at 82 km/h found the damper 3.7× weaker
-  than at the urban speeds it was field-tuned at, cancelling only ~30% of
-  the model's wander. `lp_max = 25 m` (reached at 60 km/h) keeps urban behavior
-  bit-identical and restores highway authority (×1.9 @ 82, ×2.8 @ 100 km/h).
+  scaled by the authority factor below. With the default (inert) `lp_max`,
+  the gain collapses as 1/v² — at ~80 km/h the damper is several times
+  weaker than at the urban speeds it was tuned at, and much of the model's
+  highway wander passes through. This is deliberate; see the caution below.
+- **Caution — speed-dependent authority is present but off by default.**
+  A field trial capped `lp_max` at 25 m (doubling gain at ~80 km/h) with the
+  deadband tightened to 0.05 m, and regressed badly: the stronger near-line
+  away-push arm-wrestled the model to a stalemate ON the lane line, the DC
+  tracker conceded during the ride (poisoning the reference), and on the
+  model's recovery the damper opposed the escape once the gap rose past the
+  asym threshold — ending in a sway to the far line. A stronger damper with
+  this structure loses the same fight harder. Do not raise highway gain
+  without structurally preventing all three mechanisms.
 - **Authority**: `interp(prob, [prob_on, prob_on + prob_fade], [0, 1])` with
   `prob_on = 0.5`, `prob_fade = 0.1` (measured: gap noise in [0.5, 0.6)
   equals the trusted band; below 0.5 is a real, route-inconsistent quality
@@ -111,8 +117,8 @@ matter in the field:
 | `LaneKeepDcTau` | 5 | concession time constant (s); code default 20 |
 | `LaneKeepAsymGap` | 0.6 (default) | never-oppose-recovery threshold (m); 0 = symmetric |
 | `LaneKeepGapHardLo` / `Hi` | **−99 / 99 (floors disabled)** | code defaults 0.3/1.5 — see hard floors above |
-| `LaneKeepLpMax` | 25 | pure-pursuit aim-point cap (m); keeps damper authority at highway speed |
-| `LaneKeepAcDeadband` / `Hi` | 0.10 / 0.05 (defaults) | AC deadband taper over 54–90 km/h |
+| `LaneKeepLpMax` | 9999 (default, inert) | pure-pursuit aim-point cap (m); lowering it raises highway gain — see the caution in Control law details |
+| `LaneKeepAcDeadband` / `Hi` | 0.10 / 0.10 (defaults, flat) | AC deadband (m); a lower `Hi` opts into the speed taper over 54–90 km/h |
 
 ## Porting to other vehicles
 
@@ -162,7 +168,8 @@ Specs in `docs/superpowers/specs/`, newest governs:
 addendum) supersedes the predictive-deadband and 2026-07-22 positioner
 specs. The arc — absolute band → predictive deadband → integral trim →
 AC/DC stabilizer → floors removed → asymmetric gate → speed-dependent
-authority (lp cap + deadband taper) — is traceable through the supersession
+authority tried and rolled back (lp cap + deadband taper; the caution in
+Control law details) — is traceable through the supersession
 banners; the one-line summary is that every mechanism which held an
 *opinion about position* was removed after losing to the model in the field
 (the fundamental finding: the e2e model counter-steers a sustained bias to
