@@ -2,9 +2,7 @@
 
 Standalone plugin on `controls.curvature_correction` (runs inside controlsd at
 100 Hz, before the lateral controller). Damps the sub-Hz lane wander of the
-e2e driving model — one of openpilot e2e's three known issues (curve cutting,
-sub-Hz oscillation, curve blindness; this plugin addresses the second) —
-without ever fighting the model for position. A second, dormant hook
+e2e driving model without ever fighting the model for position. A second, dormant hook
 (`modeld.calib_bias`) belongs to the retired calibration trim (see below).
 
 ## Signal flow
