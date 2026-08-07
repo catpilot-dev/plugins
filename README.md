@@ -2,8 +2,9 @@
 
 Plugins for [catpilot](https://github.com/catpilot-dev/catpilot) — the
 features that ride on top of stock openpilot. They come pre-installed with
-every catpilot release (from `v0.10.3`): flash catpilot, and everything
-below is already on the device.
+every catpilot release and are versioned with it (release `0.11.1` ships
+plugins `0.11.1`): flash catpilot, and everything below is already on the
+device.
 
 ## What you get
 
@@ -12,7 +13,7 @@ below is already on the device.
 | Plugin | What it does for you |
 |--------|----------------------|
 | `bmw_e9x_e8x` | Makes BMW E9x/E8x cars (E82/E90 family) drivable with catpilot: cruise control, steering, lane changes — no factory driver-assist needed |
-| `speedlimitd` | Watches the speed limit for you — from map data and what the camera sees (lane count, road type) — and slows the car for sharp curves and highway ramps |
+| `speedlimitd` | Watches the speed limit for you — from offline OpenStreetMap data (optional toggle) and what the camera sees (lane count, road type) — and slows the car for sharp curves and highway ramps |
 | `lane_keeping` | Calms the slow left-right sway ("ping-pong") inside the lane, so the car holds its line more steadily |
 
 ### On the screen
