@@ -1,0 +1,11 @@
+name = "catpilot-installer"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+
+routes = [
+  { pattern = "installer.catpilot.dev", custom_domain = true },
+]
+
+[[r2_buckets]]
+binding = "INSTALLERS"
+bucket_name = "catpilot-installers"
