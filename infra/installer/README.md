@@ -30,11 +30,16 @@ cd infra/installer
 wrangler login
 wrangler r2 bucket create catpilot-installers
 
-# template: comma's padded installer, fetched with a device user-agent
-curl -s -A "AGNOSSetup-12.8" -o installer-template \
+# templates: comma's padded installers, fetched with device user-agents.
+# One build covers tici/tizi/mici; the AGNOS generation picks the build
+# (worker serves -legacy to AGNOSSetup major < 17, i.e. the comma three on 12.8).
+curl -s -A "AGNOSSetup-19.4" -o installer-template \
   "https://installer.comma.ai/commaai/release3"
-file installer-template   # must say: ELF 64-bit LSB executable, ARM aarch64
+curl -s -A "AGNOSSetup-12.8" -o installer-template-legacy \
+  "https://installer.comma.ai/commaai/release3"
+file installer-template installer-template-legacy  # both: ELF 64-bit LSB, ARM aarch64
 wrangler r2 object put catpilot-installers/installer-template --file installer-template
+wrangler r2 object put catpilot-installers/installer-template-legacy --file installer-template-legacy
 
 # stable pointer
 printf 'v0.11.1' > stable.txt
@@ -66,8 +71,12 @@ curl -s -o /dev/null -w '%{http_code}\n' https://installer.catpilot.dev/v9.9.9  
 
 ## Template maintenance
 
-The template is comma's own build, so it matches current AGNOS libraries.
-Refresh it (same `curl` as above) whenever AGNOS majors bump. Older AGNOS
-(e.g. the comma three's 12.8) may predate the glibc this binary links against —
-the comma-three fresh-install path has its own open questions (AGNOS version,
-c3_compat) and is not covered by this service yet.
+The templates are comma's own builds, so they match the AGNOS libraries of the
+devices that request them: `installer-template` is the current-AGNOS build
+(3X / comma four), `installer-template-legacy` the old-AGNOS build that comma
+still serves to AGNOS 12.8 (comma three). Refresh both (same `curl` as above)
+whenever AGNOS majors bump. Empirical facts these choices rest on (2026-08-08):
+tici/tizi/mici receive the same BuildID at a given AGNOS version — only the
+baked branch differs — while AGNOS 12.8 receives a distinct older build. The
+comma-three fresh-install path still has its own open question (which AGNOS a
+factory-reset C3 runs, and c3_compat's 12.8 assumption).

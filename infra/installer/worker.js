@@ -6,8 +6,14 @@
 //   /vX.Y.Z      -> that release branch (e.g. /v0.11.1)
 //
 // The R2 bucket (binding INSTALLERS) holds:
-//   installer-template  the padded aarch64 installer ELF (comma's fork-installer format)
-//   stable              plain-text branch name the root path serves (e.g. "v0.11.1")
+//   installer-template         padded aarch64 ELF for current AGNOS (3X, comma four)
+//   installer-template-legacy  padded ELF built for old AGNOS (comma three on 12.8)
+//   stable                     plain-text branch name the root path serves (e.g. "v0.11.1")
+//
+// One build covers all device types (tici/tizi/mici branch at runtime); only the
+// AGNOS generation matters, so the template is chosen from the setup app's own
+// User-Agent ("AGNOSSetup-<os_version>"). Verified against installer.comma.ai:
+// same BuildID for tici/tizi/mici at a given AGNOS, different build for 12.8.
 //
 // The template embeds two '?'-terminated space-padded fields (see openpilot
 // selfdrive/ui/installer/installer.cc — "Leave some extra space for the fork
@@ -65,7 +71,11 @@ export default {
       return new Response(`No catpilot release '${branch}'`, { status: 409 });
     }
 
-    const obj = await env.INSTALLERS.get("installer-template");
+    const ua = request.headers.get("user-agent") || "";
+    const agnosMajor = parseInt((ua.match(/^AGNOSSetup-(\d+)/) || [])[1] ?? "99", 10);
+    const template = agnosMajor < 17 ? "installer-template-legacy" : "installer-template";
+
+    const obj = await env.INSTALLERS.get(template);
     if (!obj) return new Response("installer template missing", { status: 500 });
 
     const buf = new Uint8Array(await obj.arrayBuffer());
