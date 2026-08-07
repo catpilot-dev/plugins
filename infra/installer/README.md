@@ -16,34 +16,33 @@ The device setup app passes any dotted URL through unmodified and requires the
 response to be an aarch64 ELF, which it saves to `/tmp/installer` and executes
 (see catpilot `system/ui/tici_setup.py`). The installer binary embeds a
 `?`-terminated, space-padded git URL and branch — a format comma designed for
-fork installers. The Worker holds one padded template binary in R2 and rewrites
-those two fields per request; the branch comes from the URL path (`/` resolves
-via the `stable` pointer object in R2).
+fork installers. The Worker bundles the padded template binaries as static
+assets and rewrites those two fields per request; the branch comes from the URL
+path (`/` resolves via the bundled `stable` pointer file).
 
 Error responses use HTTP 409 because the setup screen displays a 409 body
 verbatim to the user.
 
-## Deploy (once)
+## Deploy
+
+Templates and the stable pointer live in `assets/` and ship inside the Worker
+(Workers Static Assets — no R2, no extra billing). The template binaries are
+gitignored; fetch them before deploying:
 
 ```bash
 cd infra/installer
 wrangler login
-wrangler r2 bucket create catpilot-installers
 
 # templates: comma's padded installers, fetched with device user-agents.
 # One build covers tici/tizi/mici; the AGNOS generation picks the build
 # (worker serves -legacy to AGNOSSetup major < 17, i.e. the comma three on 12.8).
-curl -s -A "AGNOSSetup-19.4" -o installer-template \
+curl -s -A "AGNOSSetup-19.4" -o assets/installer-template \
   "https://installer.comma.ai/commaai/release3"
-curl -s -A "AGNOSSetup-12.8" -o installer-template-legacy \
+curl -s -A "AGNOSSetup-12.8" -o assets/installer-template-legacy \
   "https://installer.comma.ai/commaai/release3"
-file installer-template installer-template-legacy  # both: ELF 64-bit LSB, ARM aarch64
-wrangler r2 object put catpilot-installers/installer-template --file installer-template
-wrangler r2 object put catpilot-installers/installer-template-legacy --file installer-template-legacy
+file assets/installer-template*   # both: ELF 64-bit LSB, ARM aarch64
 
-# stable pointer
-printf 'v0.11.1' > stable.txt
-wrangler r2 object put catpilot-installers/stable --file stable.txt
+printf 'v0.11.1' > assets/stable   # stable pointer
 
 wrangler deploy          # creates the custom domain + DNS + cert automatically
 ```
@@ -62,12 +61,11 @@ curl -s -o /dev/null -w '%{http_code}\n' https://installer.catpilot.dev/v9.9.9  
 
 1. Push the release branch `vX.Y.Z` in the catpilot repo (and the matching
    branch in the plugins repo; cut the COD GitHub release).
-2. Move the stable pointer:
+2. Move the stable pointer and redeploy:
    ```bash
-   printf 'vX.Y.Z' > stable.txt
-   wrangler r2 object put catpilot-installers/stable --file stable.txt
+   printf 'vX.Y.Z' > assets/stable
+   wrangler deploy
    ```
-   No Worker redeploy needed.
 
 ## Template maintenance
 

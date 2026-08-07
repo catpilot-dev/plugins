@@ -5,7 +5,7 @@
 //   /dev         -> dev branch
 //   /vX.Y.Z      -> that release branch (e.g. /v0.11.1)
 //
-// The R2 bucket (binding INSTALLERS) holds:
+// Bundled static assets (assets/ directory, served via the ASSETS binding):
 //   installer-template         padded aarch64 ELF for current AGNOS (3X, comma four)
 //   installer-template-legacy  padded ELF built for old AGNOS (comma three on 12.8)
 //   stable                     plain-text branch name the root path serves (e.g. "v0.11.1")
@@ -49,13 +49,18 @@ async function branchExists(branch) {
   }
 }
 
+async function getAsset(env, name) {
+  const r = await env.ASSETS.fetch(`https://assets.internal/${name}`);
+  return r.ok ? r : null;
+}
+
 export default {
   async fetch(request, env) {
     const path = new URL(request.url).pathname.replace(/\/+$/, "") || "/";
 
     let branch;
     if (path === "/") {
-      const stable = await env.INSTALLERS.get("stable");
+      const stable = await getAsset(env, "stable");
       branch = stable ? (await stable.text()).trim() : null;
       if (!branch) return new Response("stable pointer not configured", { status: 500 });
     } else if (path === "/dev") {
@@ -75,7 +80,7 @@ export default {
     const agnosMajor = parseInt((ua.match(/^AGNOSSetup-(\d+)/) || [])[1] ?? "99", 10);
     const template = agnosMajor < 17 ? "installer-template-legacy" : "installer-template";
 
-    const obj = await env.INSTALLERS.get(template);
+    const obj = await getAsset(env, template);
     if (!obj) return new Response("installer template missing", { status: 500 });
 
     const buf = new Uint8Array(await obj.arrayBuffer());

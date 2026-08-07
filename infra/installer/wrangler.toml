@@ -6,6 +6,7 @@ routes = [
   { pattern = "installer.catpilot.dev", custom_domain = true },
 ]
 
-[[r2_buckets]]
-binding = "INSTALLERS"
-bucket_name = "catpilot-installers"
+[assets]
+directory = "./assets"
+binding = "ASSETS"
+run_worker_first = true
