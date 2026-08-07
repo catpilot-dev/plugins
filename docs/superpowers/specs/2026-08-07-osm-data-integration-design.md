@@ -58,8 +58,9 @@ base — an explicit, informed choice per the toggle description.
 - `_ingest_osm_result()` additionally stores:
   - `last_osm_speed_kph` = `result['speedLimit']` (m/s) × 3.6, only when > 0
   - `last_osm_speed_t` = query timestamp
-  - cleared when the matched road identity changes to a way without maxspeed,
-    and on no-match results.
+  - cleared when the matched road identity changes to a way without maxspeed;
+    a no-match (None) query keeps the held value — the freshness gate expires
+    it, giving one-missed-query tolerance.
 - **Base-source selection** in `update()`: if toggle ON and
   `last_osm_speed_kph ≥ 30` (MIN_SPEED_LIMIT) and fresh (≤ 10 s):
   - base = OSM speed, `inference_mode = 'osm'`
