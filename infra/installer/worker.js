@@ -58,6 +58,20 @@ export default {
   async fetch(request, env) {
     const path = new URL(request.url).pathname.replace(/\/+$/, "") || "/";
 
+    // comma three gate: catpilot never flashes AGNOS on the comma three
+    // (c3_compat targets 12.8 exactly), so refuse the install up front and
+    // tell the user how to get there. The setup app shows this text in its
+    // download-failed dialog.
+    const deviceType = (request.headers.get("x-openpilot-device-type") || "").trim();
+    const uaVersion = ((request.headers.get("user-agent") || "").match(/^AGNOSSetup-([\d.]+)/) || [])[1] || "";
+    if (deviceType === "tici" && !uaVersion.startsWith("12.8")) {
+      return new Response(
+        `catpilot on the comma three requires AGNOS 12.8 — this device runs AGNOS ${uaVersion || "unknown"}. ` +
+        `First flash AGNOS 12.8 (flash.comma.ai) or install stock openpilot v0.10.0, then install catpilot again.`,
+        { status: 409 },
+      );
+    }
+
     let branch;
     if (path === "/") {
       const stable = await getAsset(env, "stable");
