@@ -1,7 +1,7 @@
 {
   "id": "bmw-e9x-e8x",
   "name": "BMW E9x/E8x Car Interface",
-  "version": "1.0.0",
+  "version": "0.11.1",
   "type": "car",
   "author": "catpilot",
   "description": "BMW E9x/E8x car interface with VIN-based detection, DCC control, and stepper servo steering. Safety model (bmw.h) is compiled C on STM32.",

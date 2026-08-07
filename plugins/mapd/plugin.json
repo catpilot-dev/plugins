@@ -1,7 +1,7 @@
 {
   "id": "mapd",
   "name": "Mapd OSM Integration",
-  "version": "1.0.0",
+  "version": "0.11.1",
   "type": "hybrid",
   "author": "catpilot",
   "description": "Manages the mapd binary (pfeiferj/mapd) that provides OpenStreetMap data including speed limits, road names, curve speeds, and hazards.",

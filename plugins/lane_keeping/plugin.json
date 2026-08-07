@@ -1,7 +1,7 @@
 {
   "id": "lane_keeping",
   "name": "Driver-Side Lane Keeping",
-  "version": "1.0.0",
+  "version": "0.11.1",
   "type": "hook",
   "author": "catpilot",
   "description": "Driver-side lane keeping: stabilizes the wheel-to-line gap by damping wander around the model's chosen line (AC damper); conditions the model curvature reference.",

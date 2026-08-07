@@ -1,7 +1,7 @@
 {
   "id": "model_selector",
   "name": "Model Selector",
-  "version": "1.0.0",
+  "version": "0.11.1",
   "type": "hook",
   "description": "Download and swap driving and DM models from openpilot GitHub commits",
   "hooks": {
