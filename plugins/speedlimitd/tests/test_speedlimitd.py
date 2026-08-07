@@ -2647,3 +2647,366 @@ class TestPluginManifest:
 
     assert 'cereal' not in manifest or not manifest.get('cereal', {}).get('slots')
     assert 'services' not in manifest or not manifest.get('services')
+
+
+# ============================================================
+# OSM Data Integration — param wiring + region default
+# ============================================================
+
+class TestOsmIntegrationParam:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def test_read_params_wires_toggle_on(self, sld, monkeypatch):
+    import config
+    monkeypatch.setattr(config, 'read_plugin_param',
+                        lambda pid, key, default='': '1' if key == 'OsmDataIntegration' else '')
+    mw = self._make_middleware(sld)
+    mw._read_params()
+    assert mw.osm_integration_enabled is True
+
+  def test_read_params_missing_means_off(self, sld, monkeypatch):
+    import config
+    monkeypatch.setattr(config, 'read_plugin_param', lambda pid, key, default='': '')
+    mw = self._make_middleware(sld)
+    mw._read_params()
+    assert mw.osm_integration_enabled is False
+
+
+class TestOsmRegionDefault:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _param_path(self, tmp_path):
+    return tmp_path / 'speedlimitd' / 'data' / 'OsmDataIntegration'
+
+  @pytest.fixture
+  def data_dir(self, monkeypatch, tmp_path):
+    import config
+    monkeypatch.setattr(config, 'PLUGINS_RUNTIME_DIR', str(tmp_path))
+    return tmp_path
+
+  def test_cn_defaults_off(self, sld, data_dir):
+    mw = self._make_middleware(sld)
+    assert mw._resolve_osm_default('cn') is True
+    assert self._param_path(data_dir).read_text() == '0'
+    assert mw.osm_integration_enabled is False
+
+  def test_non_cn_defaults_on(self, sld, data_dir):
+    mw = self._make_middleware(sld)
+    assert mw._resolve_osm_default('de') is True
+    assert self._param_path(data_dir).read_text() == '1'
+    assert mw.osm_integration_enabled is True
+
+  def test_unknown_country_defaults_on(self, sld, data_dir):
+    # No bbox match (e.g. US without a us.toml) → not China → ON.
+    mw = self._make_middleware(sld)
+    assert mw._resolve_osm_default(None) is True
+    assert self._param_path(data_dir).read_text() == '1'
+
+  def test_existing_value_never_overwritten(self, sld, data_dir):
+    p = self._param_path(data_dir)
+    p.parent.mkdir(parents=True)
+    p.write_text('0')
+    mw = self._make_middleware(sld)
+    assert mw._resolve_osm_default('de') is True
+    assert p.read_text() == '0'
+
+
+class TestOsmSpeedStorage:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _result(self, **kw):
+    base = {'wayRef': '', 'wayName': '', 'speedLimit': 0.0, 'lanes': 0,
+            'roadContext': 1, 'roadName': '', 'highwayType': '', 'distance': 5.0}
+    base.update(kw)
+    return base
+
+  def test_maxspeed_stored_in_kph(self, sld):
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=27.78))
+    assert mw.last_osm_speed_kph == pytest.approx(100.0, abs=0.1)
+    assert mw.last_osm_speed_t > 0
+
+  def test_same_road_without_maxspeed_keeps_value(self, sld):
+    # Sub-segments of the same road may lack the tag — hold the value
+    # (the freshness gate expires it if it stays absent).
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=27.78))
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=0.0))
+    assert mw.last_osm_speed_kph == pytest.approx(100.0, abs=0.1)
+
+  def test_new_road_without_maxspeed_clears_value(self, sld):
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=27.78))
+    mw._ingest_osm_result(self._result(roadName='B2', speedLimit=0.0))
+    assert mw.last_osm_speed_kph == 0.0
+
+  def test_no_match_keeps_value_for_staleness(self, sld):
+    mw = self._make_middleware(sld)
+    mw._ingest_osm_result(self._result(roadName='A1', speedLimit=27.78))
+    mw._ingest_osm_result(None)
+    assert mw.last_osm_speed_kph == pytest.approx(100.0, abs=0.1)
+
+
+class TestOsmBaseActive:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _arm(self, mw, kph=100.0, age=0.0):
+    import time as _t
+    mw.osm_integration_enabled = True
+    mw.last_osm_speed_kph = kph
+    mw.last_osm_speed_t = _t.monotonic() - age
+
+  def test_active_when_fresh_and_enabled(self, sld):
+    import time as _t
+    mw = self._make_middleware(sld)
+    self._arm(mw)
+    assert mw._osm_base_active(_t.monotonic()) is True
+
+  def test_inactive_when_toggle_off(self, sld):
+    import time as _t
+    mw = self._make_middleware(sld)
+    self._arm(mw)
+    mw.osm_integration_enabled = False
+    assert mw._osm_base_active(_t.monotonic()) is False
+
+  def test_inactive_when_stale(self, sld):
+    import time as _t
+    mw = self._make_middleware(sld)
+    self._arm(mw, age=11.0)  # > 2 × 5 s query interval
+    assert mw._osm_base_active(_t.monotonic()) is False
+
+  def test_inactive_when_implausibly_low(self, sld):
+    import time as _t
+    mw = self._make_middleware(sld)
+    self._arm(mw, kph=20.0)  # < 30 km/h plausibility floor
+    assert mw._osm_base_active(_t.monotonic()) is False
+
+
+class TestOsmBaseSelection:
+  """OSM maxspeed as base inference — full update() cycles."""
+
+  def _mw_for_update(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def _arm(self, mw, kph):
+    import time as _t
+    mw.osm_integration_enabled = True
+    mw.last_osm_speed_kph = kph
+    mw.last_osm_speed_t = _t.monotonic()
+    # update()'s 5 s param refresh would re-read the (absent) param and wipe
+    # the armed toggle — mark params as freshly read.
+    mw._params_last_read_t = _t.monotonic()
+
+  def test_osm_replaces_base_and_bypasses_cn_ladder(self, sld):
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2          # vision table would give a low urban limit
+    self._arm(mw, 104.6)              # 65 mph — NOT a CN-ladder value
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['inferenceMode'] == 'osm'
+    assert pub['speedLimit'] == 105   # round-to-5, NOT snapped to 100/120
+    assert pub['speedLimit'] not in sld._STANDARD_SPEEDS
+
+  def test_toggle_off_is_todays_behavior(self, sld):
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2
+    self._arm(mw, 104.6)
+    mw.osm_integration_enabled = False
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['inferenceMode'] == 'lane_count'
+    assert pub['speedLimit'] in sld._STANDARD_SPEEDS
+
+  def test_stale_osm_falls_back_to_vision(self, sld):
+    import time as _t
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2
+    self._arm(mw, 104.6)
+    mw.last_osm_speed_t = _t.monotonic() - 11.0
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['inferenceMode'] == 'lane_count'
+
+  def test_vision_narrow_cap_not_applied_over_osm(self, sld):
+    # A rural 2-lane road with OSM 90 must NOT be capped by the ≤2-lane
+    # narrow-road heuristic — OSM is authoritative for the base.
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2
+    mw.vision_cap_stable = 60
+    self._arm(mw, 90.0)
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['speedLimit'] == 90
+
+  def test_safety_cap_still_wins_over_osm(self, sld):
+    mw = self._mw_for_update(sld)
+    self._arm(mw, 104.6)
+    mw.curvature_cap = 50
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['speedLimit'] <= sld.snap_to_standard_speed(50)
+    assert pub['safetyCapped'] is True
+
+  def test_safety_cap_uses_ladder_snap_not_osm_round(self, sld):
+    # curvature_cap=57 is the discriminating value: the CN-ladder snap
+    # (source 4, safety class) rounds UP to 60, while the OSM round-to-5
+    # display path would give 55. The two disagree in a direction the
+    # downstream "safety cap override" re-clamp (which only ever pulls the
+    # displayed value DOWN toward snap_to_standard_speed(curvature_cap))
+    # cannot paper over — 60 is not < 55, so that block would leave a
+    # regressed 55 standing. If the `osm_display = osm_base and source == 2`
+    # guard drops the `source == 2` check, the safety cap wrongly takes the
+    # OSM round-to-5 path and this test catches the resulting 55.
+    mw = self._mw_for_update(sld)
+    self._arm(mw, 104.6)
+    mw.curvature_cap = 57
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['speedLimit'] == 60
+    assert pub['speedLimit'] in sld._STANDARD_SPEEDS
+    assert pub['safetyCapped'] is True
+
+  def test_osm_suppresses_gs_hold(self, sld):
+    import time as _t
+    mw = self._mw_for_update(sld)
+    # Arm an active G/S sticky hold at 120…
+    mw.lane_count_stable = 4
+    mw.last_highway_type = 'motorway'
+    mw.last_road_context = 'freeway'
+    mw.last_way_ref = 'G2'
+    mw._gs_last_seen_t = _t.monotonic()
+    mw._gs_limit_kph = 120
+    # …and a fresh OSM 100 → OSM wins the base.
+    self._arm(mw, 100.0)
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['inferenceMode'] == 'osm'
+    assert pub['speedLimit'] == 100
+
+  def test_osm_step_is_plus_minus_10(self, sld):
+    mw = self._mw_for_update(sld)
+    self._arm(mw, 65.0)
+    mw._displayed_speed_limit = 105   # previously showing 105
+    mw._last_step_time = 0.0          # step interval elapsed
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['speedLimit'] == 95    # one −10 step toward 65, not a ladder jump
+
+  def test_publish_carries_osm_fields(self, sld):
+    mw = self._mw_for_update(sld)
+    self._arm(mw, 88.5)
+    mw._osm_tiles_missing = True
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['osmSpeedLimit'] == pytest.approx(88.5, abs=0.1)
+    assert pub['osmTilesMissing'] is True
+
+
+class TestOsmTilesMissingWritePath:
+  """Drives the real `update()` OSM-query block — tile_missing detection and
+  the persisted OsmTilesMissing param, written on first status and on change
+  only (not every 5 s query cycle)."""
+
+  def _mw_for_update(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def _param_path(self, tmp_path):
+    return tmp_path / 'speedlimitd' / 'data' / 'OsmTilesMissing'
+
+  @pytest.fixture
+  def data_dir(self, monkeypatch, tmp_path):
+    import config
+    monkeypatch.setattr(config, 'PLUGINS_RUNTIME_DIR', str(tmp_path))
+    return tmp_path
+
+  def _arm_query(self, mw, tile_missing):
+    """Force update()'s real OSM-query block to run this tick."""
+    mw._gps_valid = True
+    mw._gps_lat = 39.9
+    mw._gps_lon = 116.4
+    mw._osm_last_query_t = 0.0
+    mw._osm = MagicMock()
+    mw._osm.query.return_value = None
+    mw._osm.tile_missing = tile_missing
+
+  def test_first_status_writes_missing_true(self, sld, data_dir):
+    mw = self._mw_for_update(sld)
+    self._arm_query(mw, True)
+    mw.update()
+    assert self._param_path(data_dir).read_text() == '1'
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['osmTilesMissing'] is True
+
+  def test_change_to_present_rewrites_param(self, sld, data_dir):
+    mw = self._mw_for_update(sld)
+    self._arm_query(mw, True)
+    mw.update()
+    assert self._param_path(data_dir).read_text() == '1'
+
+    mw._osm.tile_missing = False
+    mw._osm_last_query_t = 0.0  # allow another query this tick
+    mw.update()
+    assert self._param_path(data_dir).read_text() == '0'
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['osmTilesMissing'] is False
+
+  def test_unchanged_status_not_rewritten(self, sld, data_dir, monkeypatch):
+    import config
+    mw = self._mw_for_update(sld)
+    self._arm_query(mw, True)
+    mw.update()  # first status write — establishes the on-disk baseline
+
+    calls = []
+    real_write = config.write_plugin_param
+
+    def _recording_write(plugin_id, key, value):
+      calls.append((plugin_id, key, value))
+      return real_write(plugin_id, key, value)
+
+    monkeypatch.setattr(config, 'write_plugin_param', _recording_write)
+
+    mw._osm_last_query_t = 0.0  # allow another query this tick
+    mw.update()  # tile_missing unchanged (still True) — no redundant write
+
+    tiles_missing_calls = [c for c in calls if c[1] == 'OsmTilesMissing']
+    assert tiles_missing_calls == []

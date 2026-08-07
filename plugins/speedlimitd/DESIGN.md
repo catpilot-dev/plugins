@@ -7,11 +7,16 @@ that read that message to draw the on-screen sign and cap cruise speed. It has
 no external process dependencies (`dependencies: []`) — it reads pre-downloaded
 offline OSM tiles directly (`osm_query.py`), not the mapd Go binary.
 
-The governing constraint is **vision-only in China**: OSM *maxspeed* and OSM
-*geometry* are treated as unreliable (roads stack in 2D on elevated sections;
-posted limits are sparse/stale), so OSM is used only for **road identity** —
-name, and whether the way is a numbered G/S expressway. Everything about the
-actual limit on ordinary roads comes from the camera.
+The governing constraint is **vision-only by default in China**: OSM
+*maxspeed* and OSM *geometry* are treated as unreliable there (roads stack in
+2D on elevated sections; posted limits are sparse/stale), so by default OSM
+is used only for **road identity** — name, and whether the way is a numbered
+G/S expressway — and everything about the actual limit on ordinary roads
+comes from the camera. An opt-in `OsmDataIntegration` toggle (default ON
+outside China, OFF inside — see [OSM Data
+Integration](#osm-data-integration-opportunistic-base-source) below) lets
+OSM's posted `maxspeed` become the base source directly; vision remains the
+fallback whenever OSM isn't fresh, plausible, or enabled.
 
 ## Signal flow
 
@@ -47,13 +52,17 @@ three-tier OSM/YOLO/inference *priority*, the live logic (`update()`) is a
 | YOLO sign reading | 1 | 0.80 | `yolo_speed ≥ 30` — **placeholder, currently always 0** |
 | Curvature look-ahead cap | 4 | 0.70 | `curvature_cap ≥ 30` |
 | Reactive measured-a_y cap | 4 | 0.70 | `react_cap ≥ 30` |
-| Base inference (lane-count / G-S promote) | 2 | `lane_conf` | always (`max(inferred, 30)`) |
+| Base inference (OSM / G-S promote / lane-count) | 2 | `lane_conf` | always (`max(inferred, 30)`) |
 
-OSM *maxspeed* is **not** a candidate. Source id 4 is the safety class (either
-curve cap); it has no entry in the `slot0.capnp` `Source` enum (which predates
-it) because the live message is a plain dict on the plugin bus, not the capnp
-struct. `MIN_SPEED_LIMIT = 30` km/h floors every source — no real road is
-lower.
+OSM *maxspeed* is **not** a candidate in its own right — it never gets its own
+source id. When `OsmDataIntegration` is on and a fresh, plausible reading
+exists, it instead supplies the *value* the base-inference candidate (source
+id 2) carries, ahead of the G-S promote and lane-count paths — see [OSM Data
+Integration](#osm-data-integration-opportunistic-base-source) below. Source id
+4 is the safety class (either curve cap); it has no entry in the `slot0.capnp`
+`Source` enum (which predates it) because the live message is a plain dict on
+the plugin bus, not the capnp struct. `MIN_SPEED_LIMIT = 30` km/h floors every
+source — no real road is lower.
 
 ## Lane-count-first inference and the ×20 rule
 
@@ -127,6 +136,134 @@ transient). Release happens on **any** of:
 `_eval_gs_margin_release` runs once per OSM query (in `_ingest_osm_result`); a
 genuine G/S re-match clears the force-release latch and re-establishes the held
 ref.
+
+## OSM Data Integration (opportunistic base source)
+
+An opt-in extension of the same OSM tile read that already runs for G/S
+identity above: `osm_query.py` has always returned a `speedLimit` field on
+every query; when this feature is on, that value is stored and, if fresh and
+plausible, replaces the base-inference candidate (source id 2) outright,
+ahead of the G-S promote and lane-count paths. It adds no new candidate/source
+id — it changes what value source id 2 carries.
+
+### Param + first-fix region default
+
+`OsmDataIntegration` (`'1'`/`'0'`) lives in speedlimitd's own data dir
+(`plugin_data_dir('speedlimitd')`, survives `Params::clearAll`) and is
+re-read on the same 5 s cadence as the lateral-accel params (`_read_params`),
+so a UI toggle takes effect without a restart.
+
+While the param file is absent, `_resolve_osm_default` writes a **one-time**
+region default on the first valid GPS fix (inside `update()`'s country
+auto-detect block): `'0'` if the GPS-detected country is `cn`, `'1'`
+otherwise. It **never overwrites an existing file** — once set (by the
+daemon or by the user), the param is purely user-controlled from then on. A
+write failure leaves `_osm_default_resolved` False, so the daemon retries the
+default on the next GPS fix; until it resolves, `osm_integration_enabled`
+stays at its initial `False` (safe/OFF).
+
+### Storage (`_ingest_osm_result`)
+
+Every OSM query result carrying `speedLimit > 0` (m/s) is converted to km/h
+(`speed_ms * 3.6`) and stored as `last_osm_speed_kph` / `last_osm_speed_t`
+(`time.monotonic()`) — **regardless of whether the toggle is on**, since the
+underlying query always runs (it's also how G/S identity is read):
+
+- **Holds across same-road sub-segments that lack the tag.** A query that
+  matches the *same* `road_id` but returns no `speedLimit` leaves the prior
+  value in place; the freshness gate below is what eventually expires it.
+- **Clears on a road change to a way without `maxspeed`.** When the matched
+  `road_id` changes and the new result has no `speedLimit`,
+  `last_osm_speed_kph` resets to `0.0` — the held value belonged to the old
+  road.
+
+### Freshness gate + floor (`_osm_base_active`)
+
+OSM replaces the base only when **all** of:
+
+- the toggle (`osm_integration_enabled`) is on,
+- `last_osm_speed_kph >= 30.0` — the same 30 km/h floor as `MIN_SPEED_LIMIT`,
+  rejecting implausible tags,
+- `now - last_osm_speed_t <= 2.0 * self._osm_query_interval` — **two query
+  intervals**; queries run at 5 s cadence, so this is a 10 s freshness
+  window. One missed/`None` query keeps the limit; a sustained loss (two
+  consecutive misses) falls back to vision.
+
+### Base-priority order
+
+In `update()`, `osm_base = self._osm_base_active(now)` is checked **before**
+`gs_mode`:
+
+```
+osm_base  → inferred_speed = round(last_osm_speed_kph);  inference_mode = 'osm'
+gs_mode   → inferred_speed = self._gs_limit_kph;          inference_mode = 'gs_osm'
+otherwise → inferred_speed = lane_count_limit(...);       inference_mode = 'lane_count'
+```
+
+i.e. **`osm` > `gs_osm` > `lane_count`**. The G/S sticky-hold bookkeeping
+(`_gs_limit_kph`, absence timers, margin release) keeps running unconditionally
+underneath — it simply isn't consulted for the displayed value while OSM base
+is active, so a toggle-off or a freshness drop falls straight back into
+whatever G/S state it had been tracking.
+
+### Vision narrow-cap skip under OSM base
+
+The ≤2-lane `vision_cap_stable` cap is applied only when `not osm_base and
+self.vision_cap_stable > 0 and self.lane_count_stable < 3`. An authoritative
+posted OSM limit is not overridden by the narrow-road heuristic — a
+legitimate 2-lane rural road is 90–100 km/h in the US/EU, well above the
+40 km/h the heuristic would otherwise impose.
+
+### CN-ladder snap bypass
+
+`_STANDARD_SPEEDS = [30, 40, 50, 60, 80, 100, 120]` is a China-specific
+display ladder. Snapping an OSM value to it is actively wrong outside China —
+snapping *rounds toward the nearest rung*, and for a value like a US 45 mph
+limit (72 km/h) the nearest rung is **up**, to 80: speedlimitd would display
+and enforce a higher number than what's actually posted. When the active base
+is OSM (`osm_display = osm_base and source == 2`):
+
+- **Target** is the OSM speed rounded to the nearest 5 km/h
+  (`round(speed_limit / 5.0) * 5`), not snapped to the ladder.
+- **Gradual transition** steps **±10 km/h** toward that target, clamped so it
+  never overshoots, at the same cadence as every other source
+  (`_STEP_DOWN_INTERVAL = 3 s`, `_STEP_UP_INTERVAL = 2 s`) — instead of
+  walking `_step_speed_limit`'s ladder.
+- Every other source (lane-count, G-S, YOLO) keeps the existing CN-ladder
+  snap/step unchanged.
+
+### Safety caps unchanged and always winning
+
+The proactive curvature cap and reactive measured-a_y cap are computed
+exactly as before and enter the same `candidates` `min()` (source 4) and the
+same post-transition immediate-clamp override, **regardless of `osm_base`**.
+OSM can lower the effective limit but can never raise a value past an active
+safety cap — an OSM-posted 100 km/h limit still yields to a 60 km/h curve cap.
+
+### `OsmTilesMissing` mechanism
+
+`osm_query.OsmTileReader.tile_missing` is set True when a query finds
+**neither** the `offline_hw` nor `offline` tile file on disk for the current
+position (distinct from "tile exists but is still loading in the background",
+which is *not* missing). On every OSM query cycle (0.2 Hz, gated on GPS
+validity — independent of the toggle), the daemon reads that flag and writes
+it to the `OsmTilesMissing` param (`'1'`/`'0'`) **only on the first query or
+when the value changes** (not every cycle, to avoid needless param-file
+churn). Nothing in speedlimitd itself reads this param back — it exists
+purely for ui_mod's Driving-panel warning (see `plugins/ui_mod/DESIGN.md`).
+
+### New publish fields
+
+`speedLimitState` gains two telemetry fields, published every cycle
+regardless of toggle state:
+
+| Field | Meaning |
+|---|---|
+| `osmSpeedLimit` | `round(last_osm_speed_kph, 1)` — held OSM maxspeed in km/h, `0` when none/expired |
+| `osmTilesMissing` | last `OsmTileReader.tile_missing` reading |
+
+`inferenceMode` gains a third value, `'osm'` (OSM base active), alongside the
+existing `'gs_osm'` and `'lane_count'`.
 
 ## Curve caps
 
@@ -264,7 +401,7 @@ with an older subset; the live dict is the authoritative payload:
 | `source` | winning source id: 1 = YOLO, 2 = base inference, 4 = safety cap |
 | `confirmed` | user confirm state (sticky) |
 | `confidence` | winning candidate's confidence (0–1) |
-| `inferenceMode` | `'gs_osm'` (expressway promote) or `'lane_count'` |
+| `inferenceMode` | `'osm'` (OSM maxspeed base), `'gs_osm'` (expressway promote), or `'lane_count'` |
 | `yoloSpeed` | YOLO reading (km/h; placeholder, 0) |
 | `inferredSpeed` | base lane-count/G-S limit before caps (km/h) |
 | `highwayType` | ref-derived class (`motorway`/`trunk`/`''`) |
@@ -279,6 +416,8 @@ with an older subset; the live dict is the authoritative payload:
 | `reactCapEngaged` | reactive a_y cap engaged |
 | `reactCap` | reactive cap value (km/h, 0 = off) |
 | `reactLatAccel` | filtered measured `|a_y|` (m/s²) |
+| `osmSpeedLimit` | held OSM maxspeed (km/h, 0 = none/expired) |
+| `osmTilesMissing` | no offline tile file for the current area |
 
 ## Configuration
 
@@ -292,6 +431,8 @@ without a restart.
 | `ShowSpeedLimitSign` | `1` (true) | Draw the on-screen sign (enforcement unaffected); re-checked ~every 2 s by the overlay |
 | `MapdCurveTargetLatAccel` | `1.5` | Proactive curve-cap target a_y (m/s²), clamp [1.0, 3.0] |
 | `MapdReactLatAccel` | `2.5` | Reactive measured-a_y threshold (m/s²), clamp [1.8, 3.0]; **0 disables** the reactive cap |
+| `OsmDataIntegration` | `'0'` (China) / `'1'` (elsewhere), region-resolved once on first GPS fix | Use OSM `maxspeed` as the base speed source when fresh — see [OSM Data Integration](#osm-data-integration-opportunistic-base-source) |
+| `OsmTilesMissing` | daemon-written only, no default file | Last `OsmTileReader.tile_missing` reading; consumed by ui_mod's Driving-panel warning, not read back by speedlimitd |
 
 The whole plugin is enabled/disabled from **Settings → Plugins** (framework
 toggle), not a param. *(The old README's `MapdSpeedLimitControlEnabled` param

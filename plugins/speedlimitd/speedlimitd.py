@@ -776,6 +776,18 @@ class SpeedLimitMiddleware:
     # refreshed periodically so a UI change takes effect without a restart.
     self.curve_target_lat_accel: float = CURVE_LAT_ACCEL_DEFAULT
     self.react_lat_accel_threshold: float = REACT_LAT_ACCEL_DEFAULT
+
+    # OSM Data Integration (2026-08-07 spec): use OSM maxspeed as base
+    # inference. Param resolved to a region default on first GPS fix
+    # (cn → OFF, elsewhere → ON), user-controlled thereafter.
+    self.osm_integration_enabled: bool = False
+    self._osm_default_resolved: bool = False
+    self._osm_default_country: str | None = None
+    self.last_osm_speed_kph: float = 0.0   # 0 = no usable OSM maxspeed held
+    self.last_osm_speed_t: float = 0.0     # monotonic time it was stored
+    self._osm_tiles_missing: bool = False
+    self._osm_tiles_written: bool = False  # first status write flushes stale param
+
     self._params_last_read_t: float = 0.0
     self._read_params()
 
@@ -849,6 +861,38 @@ class SpeedLimitMiddleware:
       read_plugin_param('speedlimitd', 'MapdReactLatAccel', ''),
       REACT_LAT_ACCEL_DEFAULT, REACT_LAT_ACCEL_MIN, REACT_LAT_ACCEL_MAX,
       zero_disables=True)
+    self.osm_integration_enabled = read_plugin_param(
+      'speedlimitd', 'OsmDataIntegration', '') == '1'
+
+  def _resolve_osm_default(self, country: str | None) -> bool:
+    """One-time region default for OsmDataIntegration (first GPS fix).
+
+    China → OFF (OSM maxspeed unreliable there); anywhere else → ON.
+    Never overwrites an existing param file (user-controlled once it exists).
+    Returns True when resolved (file exists or write succeeded) so the caller
+    can retry on the next fix after a transient write failure.
+    """
+    try:
+      from config import plugin_data_dir, write_plugin_param
+      if (plugin_data_dir('speedlimitd') / 'OsmDataIntegration').exists():
+        return True
+      default = '0' if country == 'cn' else '1'
+      write_plugin_param('speedlimitd', 'OsmDataIntegration', default)
+      self.osm_integration_enabled = default == '1'
+      return True
+    except Exception:
+      return False
+
+  def _osm_base_active(self, now: float) -> bool:
+    """Toggle ON + fresh, plausible OSM maxspeed → OSM replaces base inference.
+
+    Freshness is 2 query intervals (~10 s): one missed/None query keeps the
+    limit, a sustained loss falls back to vision inference. 30 km/h floor
+    rejects implausible tags (same floor as MIN_SPEED_LIMIT in update()).
+    """
+    return (self.osm_integration_enabled
+            and self.last_osm_speed_kph >= 30.0
+            and now - self.last_osm_speed_t <= 2.0 * self._osm_query_interval)
 
   def _update_reactive_cap(self, a_y_meas, v_ego: float, threshold: float,
                            now: float, dt: float,
@@ -936,6 +980,7 @@ class SpeedLimitMiddleware:
     Accepts any matched way that carries identity or classification — refs
     (G2), names (白城路), or a bare highwayType (unnamed service roads).
     """
+    prev_road_id = self.last_road_id
     if result and (result['wayRef'] or result['roadName'] or result.get('highwayType')):
       way_ref = result['wayRef']
       self.last_way_ref = way_ref
@@ -962,6 +1007,16 @@ class SpeedLimitMiddleware:
         self.last_highway_type = hw
       elif hw_rank.get(hw, -1) > hw_rank.get(self.last_highway_type, -1):
         self.last_highway_type = hw
+
+      # OSM maxspeed (m/s → km/h). Held across same-road sub-segments that
+      # lack the tag (freshness gate expires it); cleared on a road change
+      # to a way without maxspeed — the held value belongs to the old road.
+      speed_ms = result.get('speedLimit', 0.0) or 0.0
+      if speed_ms > 0.0:
+        self.last_osm_speed_kph = speed_ms * 3.6
+        self.last_osm_speed_t = time.monotonic()
+      elif self.last_road_id != prev_road_id:
+        self.last_osm_speed_kph = 0.0
     else:
       self.last_way_ref = ''
       self.last_road_name = ''
@@ -1044,6 +1099,9 @@ class SpeedLimitMiddleware:
             except FileNotFoundError:
               pass
           self.country_detected = True
+          self._osm_default_country = country
+        if not self._osm_default_resolved:
+          self._osm_default_resolved = self._resolve_osm_default(self._osm_default_country)
 
     # --- Query OSM tiles at 0.2 Hz ---
     if self._gps_valid and now - self._osm_last_query_t >= self._osm_query_interval:
@@ -1054,6 +1112,18 @@ class SpeedLimitMiddleware:
         result = None
 
       self._ingest_osm_result(result)
+
+      # Missing-tiles status → persisted param for the Driving-panel warning.
+      # Written on first query and on every change (not every cycle).
+      tiles_missing = bool(getattr(self._osm, 'tile_missing', False))
+      if not self._osm_tiles_written or tiles_missing != self._osm_tiles_missing:
+        self._osm_tiles_missing = tiles_missing
+        self._osm_tiles_written = True
+        try:
+          from config import write_plugin_param
+          write_plugin_param('speedlimitd', 'OsmTilesMissing', '1' if tiles_missing else '0')
+        except Exception:
+          pass
 
     # --- Reactive measured-a_y cap + measured-curvature apex point (2026-07-28) ---
     # Read ahead of the modelV2 block below so this tick's measured curvature
@@ -1335,7 +1405,15 @@ class SpeedLimitMiddleware:
         or self.lane_count_stable <= 2)
     gs_mode = not gs_released
 
-    if gs_mode:
+    # OSM Data Integration: a fresh posted limit replaces the base inference
+    # entirely (vision stays the fallback; safety caps below still min() over
+    # it). The G/S bookkeeping above keeps ticking — its hold is simply not
+    # consulted while OSM carries the expressway's real limit.
+    osm_base = self._osm_base_active(now)
+    if osm_base:
+      inferred_speed = int(round(self.last_osm_speed_kph))
+      self.inference_mode = 'osm'
+    elif gs_mode:
       # Hold the last promote-derived limit through momentary non-G/S flips.
       inferred_speed = self._gs_limit_kph
       self.inference_mode = 'gs_osm'
@@ -1350,14 +1428,18 @@ class SpeedLimitMiddleware:
     # Vision cap: when vision confidently sees ≤2 lanes, cap inferred speed.
     # Only apply when lane_count_stable < 3 — on confirmed multi-lane roads the
     # outermost lane line probability naturally fluctuates below the cap threshold
-    # without implying a narrow road, so the cap would fire spuriously.
-    if self.vision_cap_stable > 0 and self.lane_count_stable < 3:
+    # without implying a narrow road, so the cap would fire spuriously. Also
+    # skipped when OSM carries the base — the ≤2-lane narrow-road heuristic
+    # must not defeat an authoritative posted limit (rural 2-lane roads are
+    # legitimately 90-100 in the US/EU).
+    if not osm_base and self.vision_cap_stable > 0 and self.lane_count_stable < 3:
       inferred_speed = min(inferred_speed, self.vision_cap_stable)
 
     MIN_SPEED_LIMIT = 30   # km/h — no real road is below this
 
-    # OSM maxSpeed is unreliable in China — use OSM only for road context,
-    # highway classification (G/S ref), and road name.
+    # OSM maxspeed is consumed as the base when OsmDataIntegration is ON (see
+    # osm_base above). With the toggle OFF (CN default) OSM contributes only
+    # road context, G/S classification, and road name.
 
     # Reactive measured-a_y cap (2026-07-28): enters the SAME min() path as the
     # proactive curve cap, as a safety-class source (source 4). That inheritance
@@ -1382,7 +1464,14 @@ class SpeedLimitMiddleware:
     # --- Gradual speed limit transition ---
     # Curvature cap bypasses gradual transition — it's safety-critical and must
     # apply immediately. The gradual ramp only applies to road-type / YOLO changes.
-    target = snap_to_standard_speed(int(speed_limit))
+    # OSM-sourced base carries the exact posted value — the CN ladder would
+    # round a US 45 mph (72 km/h) limit UP to 80. Round to 5 km/h and step
+    # ±10 toward it; all other sources keep the CN-ladder snap/step.
+    osm_display = osm_base and source == 2
+    if osm_display:
+      target = int(round(speed_limit / 5.0) * 5)
+    else:
+      target = snap_to_standard_speed(int(speed_limit))
     if self._displayed_speed_limit == 0:
       # First reading — set immediately
       self._displayed_speed_limit = target
@@ -1390,7 +1479,12 @@ class SpeedLimitMiddleware:
     elif target != self._displayed_speed_limit:
       interval = _STEP_DOWN_INTERVAL if target < self._displayed_speed_limit else _STEP_UP_INTERVAL
       if now - self._last_step_time >= interval:
-        self._displayed_speed_limit = _step_speed_limit(self._displayed_speed_limit, target)
+        if osm_display:
+          step = 10 if target > self._displayed_speed_limit else -10
+          nxt = self._displayed_speed_limit + step
+          self._displayed_speed_limit = min(nxt, target) if step > 0 else max(nxt, target)
+        else:
+          self._displayed_speed_limit = _step_speed_limit(self._displayed_speed_limit, target)
         self._last_step_time = now
 
     # Safety cap override — clamp displayed limit immediately (bypass gradual
@@ -1468,6 +1562,9 @@ class SpeedLimitMiddleware:
       'reactCapEngaged': self._react_cap_ms > 0.0,
       'reactCap': round(react_cap_kph, 1),          # km/h, 0 = disengaged
       'reactLatAccel': round(self._ay_filt, 2),     # measured filtered |a_y| (m/s²)
+      # OSM Data Integration telemetry
+      'osmSpeedLimit': round(self.last_osm_speed_kph, 1),
+      'osmTilesMissing': self._osm_tiles_missing,
     })
 
 
