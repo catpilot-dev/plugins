@@ -43,7 +43,6 @@ plugins/
     screen_capture/       # Tap-to-capture screenshots
     speedlimitd/          # Speed limit fusion (process + hook)
     ui_mod/               # Custom UI panels: Driving, Plugins, drive stats, route map
-    ui_recorder/          # HUD-rendered video capture for COD
   docs/                   # This documentation
 ```
 
@@ -74,7 +73,6 @@ Web app for device management. Served on port 8082 (redirected from port 80 via 
   screen_capture/
   speedlimitd/
   ui_mod/
-  ui_recorder/
     data/                   # Plugin-specific param storage (plugin_data_dir())
 
 /data/connect-on-device/    # COD repo (git clone)

@@ -30,7 +30,6 @@ below is already on the device.
 | `c3_compat` | Keeps the comma three fully supported on current catpilot (display, panda, OS compatibility) |
 | `mapd` | Manages an external OpenStreetMap data binary. Currently inactive (unwired in its manifest) — speed limits come through `speedlimitd` instead |
 | `bus_logger` | Saves the plugins' status messages into the drive logs, so problems can be diagnosed after a drive |
-| `ui_recorder` | Renders drives into HUD-overlay video for the Connect-on-Device (COD) replay service — works in the background, nothing to operate |
 
 ## Turning things on and off
 
