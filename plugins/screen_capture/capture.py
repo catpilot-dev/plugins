@@ -1,9 +1,11 @@
 """Screen capture plugin — dim camera icon tap zone at bottom center.
 
 Offroad: saves PNG screenshot to /data/media/screenshots/ (GUI documentation).
-Onroad:  saves HUD PNG + sends bookmarkButton (→ userBookmark in rlog).
-         The PNG captures the full HUD overlay from the render texture.
-         COD shows it on the bookmark row for instant HUD frame export.
+Onroad:  sends bookmarkButton only (→ userBookmark in rlog). No GPU readback,
+         no disk write — a tap costs one msgq publish, so it can never stall
+         the driving UI. COD's background screenshot worker later renders the
+         exact HUD frame offline with full fidelity and drops it into
+         /data/media/screenshots/ where bookmark rows pick it up.
 """
 import os
 import threading
@@ -47,7 +49,6 @@ def _ensure_init():
     )
     _icon_x = int(w / 2)
     _icon_y = int(h - TAP_H / 2)
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
 def _draw_camera_icon(cx, cy, alpha):
@@ -98,6 +99,7 @@ def _save_png():
     rt = gui_app._render_texture
     if rt is None:
         return None
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     ts = time.strftime('%Y%m%d_%H%M%S')
     filename = f'capture_{ts}.png'
     path = os.path.join(SCREENSHOT_DIR, filename)
@@ -155,16 +157,21 @@ def on_pre_end_drawing(default):
 
 
 def on_post_end_drawing(default):
-    """GPU readback + bookmark — runs after end_drawing() to avoid blocking the frame."""
+    """Act on a tap after end_drawing().
+
+    Onroad the tap must never touch the GPU or disk — load_image_from_texture
+    forces a full pipeline sync even after end_drawing() returns. Bookmark
+    only; COD's screenshot worker renders the HUD frame offline.
+    """
     global _capture_pending
     if not _capture_pending:
         return
     _capture_pending = False
 
-    _save_png()
-
     if _is_onroad():
         _send_bookmark()
+    else:
+        _save_png()
 
 
 def on_render_overlay(default, content_rect):
