@@ -148,7 +148,6 @@ Proven on Comma 3 (AGNOS 12.8) and Orange Pi 5 Plus (RK3588):
 - model_selector (runtime model swapping)
 - bus_logger (plugin bus capture for logging)
 - screen_capture (tap-to-capture screenshots)
-- ui_recorder (HUD-rendered video capture for COD)
 - ui_mod (custom UI panels: Driving, Plugins, drive stats, route map)
 
 Validated:

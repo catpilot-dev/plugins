@@ -68,7 +68,7 @@ render and before the alert renderer. Render pipeline order:
 | `ui.state_subscriptions` | `selfdrive/ui/ui_state.py` | ui_mod | `(services_list) → services_list` (one-shot at init) |
 | `ui.state_tick` | `selfdrive/ui/ui_state.py` | ui_mod | `(None, sm) → None` (void, every UI frame) |
 | `ui.pre_end_drawing` | `system/ui/lib/application.py` | screen_capture | `(None) → None` (void, before EndDrawing) |
-| `ui.post_end_drawing` | `system/ui/lib/application.py` | screen_capture, ui_recorder | `(None) → None` (void, after EndDrawing) |
+| `ui.post_end_drawing` | `system/ui/lib/application.py` | screen_capture | `(None) → None` (void, after EndDrawing) |
 
 ### UI — Layout Extension
 
