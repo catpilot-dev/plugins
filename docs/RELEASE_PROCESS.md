@@ -18,8 +18,11 @@ Three repos, two cadences:
   update checker fetches that same branch — **the release branch is the update
   channel**. A rolling release is simply a push to the channel branch, tagged
   with the date.
-- **COD**: bootstrap comes from the GitHub release matching the catpilot
-  branch (fallback: latest).
+- **COD**: always a **pre-built tarball** attached to a GitHub release —
+  COD requires a local build step, so devices never clone its repo. The
+  channel is encoded in the tag: bootstrap `vX.Y.Z`, rolling
+  `vX.Y.Z-YYYY.MM.DD`. First boot picks the newest release for the installed
+  channel (rolling first, then bootstrap, then latest as fallback).
 
 ## Branch & tag conventions
 
@@ -53,7 +56,8 @@ Three repos, two cadences:
    it should reflect when that plugin last changed.
 4. Tag `YYYY.MM.DD`, push branch + tag. Devices on that channel pick it up
    through the normal update flow (offroad, `.needs_restart`).
-5. For COD: publish a GitHub release `YYYY.MM.DD` with the tarball asset.
+5. For COD: build locally, then publish a GitHub release tagged
+   `vX.Y.Z-YYYY.MM.DD` (channel prefix + date) with the `cod-*.tar.gz` asset.
 
 ## What may ride a rolling release
 
@@ -67,8 +71,8 @@ plugins can only reach hooks that exist in the installed base.
 
 - catpilot's GitHub default branch (`main`) still shows the pre-0.11 lineage;
   repoint or archive it so visitors land on the release line.
-- COD bootstrap installs from a tarball (no `.git`), so the on-device update
-  checker cannot update it; rolling COD updates currently require reinstall.
-  Options: switch the bootstrap to a git clone of the channel branch (reuses
-  the existing update machinery), or teach COD to self-update from GitHub
-  releases.
+- COD rolling updates need a tarball updater on the device (decided: COD is
+  pre-built, never git-cloned). Design: plugind's update checker compares the
+  installed `VERSION` against the newest `vX.Y.Z-*` release for the channel
+  and downloads/extracts the tarball offroad. Build alongside the COD `v0.11.1`
+  release; until then, rolling COD reaches only fresh installs.
