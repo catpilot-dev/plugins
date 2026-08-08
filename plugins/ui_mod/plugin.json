@@ -5,6 +5,7 @@
   "type": "hook",
   "author": "catpilot",
   "description": "Drive stats, branded exp button, driving/vehicle/plugins panels",
+  "device_filter": ["tici", "tizi"],
   "hooks": {
     "ui.settings_extend": {
       "module": "hooks",
