@@ -22,7 +22,9 @@ Three repos, two cadences:
   COD requires a local build step, so devices never clone its repo. The
   channel is encoded in the tag: bootstrap `vX.Y.Z`, rolling
   `vX.Y.Z-YYYY.MM.DD`. First boot picks the newest release for the installed
-  channel (rolling first, then bootstrap, then latest as fallback).
+  channel (rolling first, then bootstrap, then latest as fallback) — so the
+  tarball only matters for **new installs**. Devices that already have COD
+  update themselves through COD's own self-update.
 
 ## Branch & tag conventions
 
@@ -71,8 +73,7 @@ plugins can only reach hooks that exist in the installed base.
 
 - catpilot's GitHub default branch (`main`) still shows the pre-0.11 lineage;
   repoint or archive it so visitors land on the release line.
-- COD rolling updates need a tarball updater on the device (decided: COD is
-  pre-built, never git-cloned). Design: plugind's update checker compares the
-  installed `VERSION` against the newest `vX.Y.Z-*` release for the channel
-  and downloads/extracts the tarball offroad. Build alongside the COD `v0.11.1`
-  release; until then, rolling COD reaches only fresh installs.
+- COD self-update should respect the channel: when it checks for updates, it
+  must pick the newest `vX.Y.Z-*` release matching the installed channel, not
+  the globally latest release — verify this before the first cross-channel
+  period (a `v0.11.2` release existing while `v0.11.1` devices still roll).
