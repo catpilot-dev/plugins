@@ -73,7 +73,7 @@ plugins can only reach hooks that exist in the installed base.
 
 - catpilot's GitHub default branch (`main`) still shows the pre-0.11 lineage;
   repoint or archive it so visitors land on the release line.
-- COD self-update should respect the channel: when it checks for updates, it
-  must pick the newest `vX.Y.Z-*` release matching the installed channel, not
-  the globally latest release — verify this before the first cross-channel
-  period (a `v0.11.2` release existing while `v0.11.1` devices still roll).
+- ~~COD self-update should respect the channel~~ — done (COD `2bf0348`):
+  the checker lists releases and picks the newest tag on the device's own
+  channel (`vX.Y.Z` / `vX.Y.Z-YYYY.MM.DD` sharing VERSION's `X.Y.Z` prefix);
+  no release on the channel means no update, never a cross-channel fallback.
