@@ -16,6 +16,8 @@ SPEED_SIGN_RADIUS_IMPERIAL = 86   # diameter 172 = imperial MAX width
 SPEED_SIGN_BORDER_RATIO = 0.1     # red ring = 1/10 diameter (Vienna Convention)
 SPEED_SIGN_GAP = 30               # vertical gap between MAX block bottom and sign top
 SPEED_SIGN_FONT_SIZE = 84
+SOURCE_LABEL_FONT_SIZE = 36       # source indicator below the sign
+SOURCE_LABEL_GAP = 12             # gap between sign bottom and label top
 
 # MAX block layout (mirrors hud_renderer.py UIConfig)
 _MAX_X_OFFSET = 60
@@ -33,6 +35,7 @@ _font_bold = None
 _font_medium = None
 _speed_limit = 0.0
 _speed_limit_source = 2  # roadTypeInference default
+_inference_mode = ''       # 'osm' | 'gs_osm' | 'lane_count'
 _speed_limit_confirmed = False
 _tap_hold_until = 0.0  # Hold local confirmed state until this time (monotonic)
 
@@ -57,7 +60,7 @@ _sl_data = None
 
 def _update_state():
   """Read speedLimitState from plugin bus."""
-  global _speed_limit, _speed_limit_source, _speed_limit_confirmed
+  global _speed_limit, _speed_limit_source, _speed_limit_confirmed, _inference_mode
   global _sl_sub, _sl_data
   import time
 
@@ -89,6 +92,7 @@ def _update_state():
   if _sl_data is not None:
     _speed_limit = _sl_data.get('speedLimit', 0)
     _speed_limit_source = _sl_data.get('source', 2)
+    _inference_mode = _sl_data.get('inferenceMode', '')
     if time.monotonic() >= _tap_hold_until:
       _speed_limit_confirmed = _sl_data.get('confirmed', False)
 
@@ -106,11 +110,30 @@ def _sign_geometry(content_rect):
   return cx, cy, r
 
 
+def _source_label() -> str:
+  """Which source produced the displayed limit: posted, sign-read, or inferred.
+
+  'gs_osm' maps to VISION deliberately — in that mode OSM supplies only the
+  road class while the number comes from the lane-count/road-type table. The
+  distinction drawn here is posted vs inferred, which is what makes the label
+  a useful on-road check: on a G/S expressway, OSM means the posted tag passed
+  the gate, VISION means it was rejected or absent.
+
+  YOLO cannot appear yet — speedlimitd's yolo_speed is a permanent 0 until
+  sign vision is wired. The branch is here so that work needs no UI change.
+  """
+  if _speed_limit_source == 1:
+    return 'YOLO'
+  if _speed_limit_source == 2 and _inference_mode == 'osm':
+    return 'OSM'
+  return 'VISION'
+
+
 def _draw_speed_limit_sign(content_rect):
   """Draw Vienna-style speed limit sign (red circle, white fill, black number).
 
   50% opacity when unconfirmed (suggestion), 100% when confirmed (active).
-  Small source indicator below: "OSM" / "SIGN" / "~"
+  Source indicator below the sign: "OSM" / "YOLO" / "VISION".
   """
   cx, cy, r = _sign_geometry(content_rect)
 
@@ -142,6 +165,20 @@ def _draw_speed_limit_sign(content_rect):
     text_color,
   )
 
+  # Source indicator, centred below the sign. Full-opacity white regardless of
+  # the sign's confirmed alpha — it is a diagnostic readout, and legibility
+  # over a bright camera feed matters more than matching the sign's
+  # suggestion/active semantics.
+  label = _source_label()
+  label_size = measure(_font_medium, label, SOURCE_LABEL_FONT_SIZE)
+  rl.draw_text_ex(
+    _font_medium,
+    label,
+    rl.Vector2(cx - label_size.x / 2, cy + r + SOURCE_LABEL_GAP),
+    SOURCE_LABEL_FONT_SIZE,
+    0,
+    rl.Color(255, 255, 255, 255),
+  )
 
 
 _tap_pub = None

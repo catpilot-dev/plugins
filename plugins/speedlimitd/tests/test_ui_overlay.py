@@ -171,6 +171,43 @@ class TestUpdateState:
     assert overlay._speed_limit_source == 2
 
 
+class TestSourceLabel:
+  """OSM / YOLO / VISION indicator — posted vs inferred is the distinction."""
+
+  def test_yolo_source(self, overlay):
+    overlay._speed_limit_source = 1
+    overlay._inference_mode = ''
+    assert overlay._source_label() == 'YOLO'
+
+  def test_osm_posted_maxspeed(self, overlay):
+    overlay._speed_limit_source = 2
+    overlay._inference_mode = 'osm'
+    assert overlay._source_label() == 'OSM'
+
+  def test_gs_osm_is_vision_not_osm(self, overlay):
+    """gs_osm takes only the road CLASS from OSM; the number is table-inferred."""
+    overlay._speed_limit_source = 2
+    overlay._inference_mode = 'gs_osm'
+    assert overlay._source_label() == 'VISION'
+
+  def test_lane_count_is_vision(self, overlay):
+    overlay._speed_limit_source = 2
+    overlay._inference_mode = 'lane_count'
+    assert overlay._source_label() == 'VISION'
+
+  def test_safety_cap_is_vision(self, overlay):
+    """source 4 = curvature / reactive a_y cap, both vision-derived."""
+    overlay._speed_limit_source = 4
+    overlay._inference_mode = 'osm'
+    assert overlay._source_label() == 'VISION'
+
+  def test_update_state_reads_inference_mode(self, overlay):
+    overlay._sl_data = {'speedLimit': 100, 'source': 2, 'inferenceMode': 'osm'}
+    overlay._sl_sub = None
+    overlay._update_state()
+    assert overlay._inference_mode == 'osm'
+
+
 def _mouse_release(x, y):
   """Create a mock MouseEvent with left_released=True at (x, y)."""
   pos = MagicMock()
@@ -282,8 +319,8 @@ class TestOnRenderOverlay:
 
     # Should draw outer ring + inner fill = 2 draw_circle calls
     assert mock_draw_circle.call_count == 2
-    # Should draw speed text
-    assert mock_draw_text.call_count == 1
+    # Should draw speed text + source label
+    assert mock_draw_text.call_count == 2
 
   def test_alpha_confirmed_vs_unconfirmed(self, overlay, mock_openpilot, content_rect):
     """Confirmed = alpha 255, unconfirmed = alpha 128."""
