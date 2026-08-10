@@ -10,7 +10,7 @@ Three repos, two cadences:
 
 ## How versions reach devices
 
-- **catpilot**: `installer.catpilot.dev` serves an installer for a release
+- **catpilot**: `install.catpilot.dev` serves an installer for a release
   branch (`/` → stable pointer, `/vX.Y.Z`, `/dev`). The catpilot repo only
   moves at upstream pace; there are no rolling catpilot updates.
 - **plugins**: `first_boot_setup.sh` clones the plugins branch matching the

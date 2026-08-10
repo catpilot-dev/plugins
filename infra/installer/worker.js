@@ -1,4 +1,4 @@
-// installer.catpilot.dev — serves the catpilot installer binary.
+// install.catpilot.dev — serves the catpilot installer binary.
 //
 // Paths:
 //   /            -> latest stable release (branch name read from R2 object "stable")
@@ -83,7 +83,7 @@ export default {
       branch = path.slice(1);
     } else {
       // 409 bodies are displayed verbatim by the device's setup screen.
-      return new Response("Unknown catpilot channel. Use installer.catpilot.dev, /dev, or /vX.Y.Z", { status: 409 });
+      return new Response("Unknown catpilot channel. Use install.catpilot.dev, /dev, or /vX.Y.Z", { status: 409 });
     }
 
     if (!(await branchExists(branch))) {

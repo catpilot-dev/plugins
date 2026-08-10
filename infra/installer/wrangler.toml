@@ -3,6 +3,8 @@ main = "worker.js"
 compatibility_date = "2026-08-01"
 
 routes = [
+  { pattern = "install.catpilot.dev", custom_domain = true },
+  # kept as an alias — the URL already shipped in v0.11.1-era docs
   { pattern = "installer.catpilot.dev", custom_domain = true },
 ]
 

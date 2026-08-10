@@ -1,4 +1,4 @@
-# installer.catpilot.dev
+# install.catpilot.dev
 
 Serves the catpilot installer binary to comma devices, replacing
 `installer.comma.ai/<user>/<branch>`. A user types one of these into
@@ -6,9 +6,9 @@ Serves the catpilot installer binary to comma devices, replacing
 
 | URL | Installs |
 |-----|----------|
-| `installer.catpilot.dev` | latest stable release |
-| `installer.catpilot.dev/dev` | dev branch |
-| `installer.catpilot.dev/v0.11.1` | that specific release |
+| `install.catpilot.dev` | latest stable release |
+| `install.catpilot.dev/dev` | dev branch |
+| `install.catpilot.dev/v0.11.1` | that specific release |
 
 ## How it works
 
@@ -50,11 +50,11 @@ wrangler deploy          # creates the custom domain + DNS + cert automatically
 Smoke test (any machine):
 
 ```bash
-curl -s https://installer.catpilot.dev/v0.11.1 -o /tmp/inst
+curl -s https://install.catpilot.dev/v0.11.1 -o /tmp/inst
 file /tmp/inst                                  # aarch64 ELF
 strings -a /tmp/inst | grep catpilot.git        # patched URL
 strings -a /tmp/inst | grep '^v0\.11\.1?'       # patched branch
-curl -s -o /dev/null -w '%{http_code}\n' https://installer.catpilot.dev/v9.9.9   # 409
+curl -s -o /dev/null -w '%{http_code}\n' https://install.catpilot.dev/v9.9.9   # 409
 ```
 
 ## Per release
