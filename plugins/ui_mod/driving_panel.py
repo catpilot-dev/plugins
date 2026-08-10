@@ -199,7 +199,7 @@ class DrivingLayout(Widget):
         "Mapd/OSM Data Integration",
         "Use OpenStreetMap speed limits as the base speed limit when available. "
         "OSM data may be unreliable in some regions (e.g. China). Requires "
-        "offline map tiles downloaded via Connect.",
+        "offline map tiles downloaded via Connect-on-Device.",
         current_osm,
         callback=self._on_osm_integration,
       )
@@ -208,7 +208,7 @@ class DrivingLayout(Widget):
       if current_osm and _osm_tiles_missing():
         items.append(ListItem(
           title="⚠ Offline Map Tiles",
-          description="No offline map tiles for your area — download them in Connect.",
+          description="No offline map tiles for your area — download them in Connect-on-Device.",
           action_item=TextAction(text="Missing", color=rl.Color(255, 193, 7, 255)),
         ))
 

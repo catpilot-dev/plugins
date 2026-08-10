@@ -80,10 +80,10 @@ the car still obeys whichever number is lowest.
   After that it's yours to change and it stays where you put it.
 - **In China it's used only on G/S expressways**, where the map data has been
   verified; everywhere else on Chinese roads the camera decides.
-- **Needs offline map tiles** for your area, downloaded through Connect. If
-  they're missing, the toggle shows a yellow warning and speedlimitd simply
-  keeps reading the road with the camera — as it does whenever the map has
-  nothing fresh and plausible to offer.
+- **Needs offline map tiles** for your area, downloaded through
+  Connect-on-Device. If they're missing, the toggle shows a yellow warning and
+  speedlimitd simply keeps reading the road with the camera — as it does
+  whenever the map has nothing fresh and plausible to offer.
 
 ## Limitations
 
