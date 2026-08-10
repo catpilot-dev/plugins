@@ -47,7 +47,7 @@ startup; with it off, BMW isn't in the system at all.
 When a BMW is detected, the vehicle section of **Settings → Driving** adds:
 
 - **Temperature Overlay** — coolant and oil temperature at the bottom right of
-  the driving screen, coloured blue through red from cold to critical. On by
+  the driving screen, colored blue through red from cold to critical. On by
   default.
 - **Resume Button Repurposed** — On this car the
   cruise stalk's resume button does double duty: a short press resumes cruise

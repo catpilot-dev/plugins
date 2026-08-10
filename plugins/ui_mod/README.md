@@ -20,9 +20,9 @@ driving screen, and the extra Settings panels.
 
 ### Driving screen (onroad)
 
-<img src="../../docs/bmw_e9x_onroad.jpg" width="66%" alt="Driving screen: colour BMW emblem top right, road ref S20 at the bottom" />
+<img src="../../docs/bmw_e9x_onroad.jpg" width="66%" alt="Driving screen: color BMW emblem top right, road ref S20 at the bottom" />
 
-Above: the colour emblem (experimental mode) with no green ring — lane keeping
+Above: the color emblem (experimental mode) with no green ring — lane keeping
 is standing by — and the road ref **S20** along the bottom.
 
 - The stock steering-wheel / experimental-mode button is replaced by your
