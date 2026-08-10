@@ -646,6 +646,11 @@ GS_LANE_DROP_S = 1.5        # release path 2 (route 3de user addition): while th
 LANE_COUNT_LIMIT_3 = 60     # 3 confident lanes → 60 km/h
 LANE_COUNT_LIMIT_4 = 80     # ≥4 confident lanes → 80 km/h
 
+# CN ramp-sign guard (2026-08-10). The OSM audit found 40 km/h ramp signs
+# map-matched onto 高速/高架 mainlines; no safety cap catches a wrong-and-low
+# tag on a straight road. No real G/S expressway is posted below this.
+GS_OSM_MIN_KPH = 60
+
 # Noise-tolerant narrow-band (≤2 lane) confirmation (route 3d3 seg 16 / 3d1 seg 29).
 # A single directional debounce timer resets on ANY raw-count change, so on a
 # genuine 2-lane ramp with brief 3↔4 occlusion spikes the demotion window keeps
@@ -885,16 +890,39 @@ class SpeedLimitMiddleware:
     except Exception:
       return False
 
-  def _osm_base_active(self, now: float) -> bool:
-    """Toggle ON + fresh, plausible OSM maxspeed → OSM replaces base inference.
+  def _osm_gate(self, now: float, gs_mode: bool) -> tuple[bool, str]:
+    """Decide whether the posted OSM maxspeed may serve as the base inference.
+
+    Returns (trusted, reason). reason is '' when trusted, otherwise the FIRST
+    failing condition in the fixed order below, so telemetry is deterministic.
 
     Freshness is 2 query intervals (~10 s): one missed/None query keeps the
     limit, a sustained loss falls back to vision inference. 30 km/h floor
     rejects implausible tags (same floor as MIN_SPEED_LIMIT in update()).
+
+    In China — and whenever the country is not yet known, which must fail safe
+    rather than fall through to the permissive path — the posted value is
+    trusted only on a confirmed G/S expressway at >= GS_OSM_MIN_KPH. That
+    excludes both audited map-matching failure modes: viaduct tags landing on
+    the surface road beneath (no G/S ref) and ramp signs landing on the
+    mainline (below the floor). Requiring gs_mode inherits every G/S release
+    guard — the <=2-lane release, the margin rule, gs_lane_drop and the
+    continuous-absence timer — at no extra cost.
+    See docs/superpowers/specs/2026-08-10-osm-gs-maxspeed-design.md
     """
-    return (self.osm_integration_enabled
-            and self.last_osm_speed_kph >= 30.0
-            and now - self.last_osm_speed_t <= 2.0 * self._osm_query_interval)
+    if not self.osm_integration_enabled:
+      return False, 'disabled'
+    if self.last_osm_speed_kph < 30.0:
+      return False, 'no_data'
+    if now - self.last_osm_speed_t > 2.0 * self._osm_query_interval:
+      return False, 'stale'
+    if self.country and self.country != 'cn':
+      return True, ''                       # non-CN: unchanged, as shipped
+    if not (gs_mode and is_gs_expressway_ref(self.last_way_ref)):
+      return False, 'not_gs'
+    if self.last_osm_speed_kph < GS_OSM_MIN_KPH:
+      return False, 'low_value'
+    return True, ''
 
   def _update_reactive_cap(self, a_y_meas, v_ego: float, threshold: float,
                            now: float, dt: float,
@@ -1411,7 +1439,8 @@ class SpeedLimitMiddleware:
     # entirely (vision stays the fallback; safety caps below still min() over
     # it). The G/S bookkeeping above keeps ticking — its hold is simply not
     # consulted while OSM carries the expressway's real limit.
-    osm_base = self._osm_base_active(now)
+    osm_trusted, osm_reject_reason = self._osm_gate(now, gs_mode)
+    osm_base = osm_trusted
     if osm_base:
       inferred_speed = int(round(self.last_osm_speed_kph))
       self.inference_mode = 'osm'

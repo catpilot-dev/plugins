@@ -2772,6 +2772,7 @@ class TestOsmBaseActive:
 
   def _arm(self, mw, kph=100.0, age=0.0):
     import time as _t
+    mw.country = 'us'          # non-CN: gate is the pre-2026-08-10 behaviour
     mw.osm_integration_enabled = True
     mw.last_osm_speed_kph = kph
     mw.last_osm_speed_t = _t.monotonic() - age
@@ -2780,26 +2781,26 @@ class TestOsmBaseActive:
     import time as _t
     mw = self._make_middleware(sld)
     self._arm(mw)
-    assert mw._osm_base_active(_t.monotonic()) is True
+    assert mw._osm_gate(_t.monotonic(), gs_mode=False)[0] is True
 
   def test_inactive_when_toggle_off(self, sld):
     import time as _t
     mw = self._make_middleware(sld)
     self._arm(mw)
     mw.osm_integration_enabled = False
-    assert mw._osm_base_active(_t.monotonic()) is False
+    assert mw._osm_gate(_t.monotonic(), gs_mode=False)[0] is False
 
   def test_inactive_when_stale(self, sld):
     import time as _t
     mw = self._make_middleware(sld)
     self._arm(mw, age=11.0)  # > 2 × 5 s query interval
-    assert mw._osm_base_active(_t.monotonic()) is False
+    assert mw._osm_gate(_t.monotonic(), gs_mode=False)[0] is False
 
   def test_inactive_when_implausibly_low(self, sld):
     import time as _t
     mw = self._make_middleware(sld)
     self._arm(mw, kph=20.0)  # < 30 km/h plausibility floor
-    assert mw._osm_base_active(_t.monotonic()) is False
+    assert mw._osm_gate(_t.monotonic(), gs_mode=False)[0] is False
 
 
 class TestOsmBaseSelection:
@@ -2820,6 +2821,7 @@ class TestOsmBaseSelection:
 
   def _arm(self, mw, kph):
     import time as _t
+    mw.country = 'us'          # non-CN: gate is the pre-2026-08-10 behaviour
     mw.osm_integration_enabled = True
     mw.last_osm_speed_kph = kph
     mw.last_osm_speed_t = _t.monotonic()
@@ -3078,3 +3080,86 @@ class TestCountryField:
       pdd.return_value.__truediv__.return_value.exists.return_value = False
       mw.update()
     assert mw.country == 'cn'
+
+
+class TestOsmGsGate:
+  """CN: a posted OSM maxspeed is trusted only on a confirmed G/S expressway."""
+
+  def _mw(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def _arm_cn(self, mw, kph, way_ref):
+    import time as _t
+    mw.country = 'cn'
+    mw.osm_integration_enabled = True
+    mw.last_osm_speed_kph = kph
+    mw.last_osm_speed_t = _t.monotonic()
+    mw.last_way_ref = way_ref
+
+  def test_gs_expressway_is_trusted(self, sld):
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 100.0, 'G1503')
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (True, '')
+
+  def test_ramp_sign_on_expressway_rejected(self, sld):
+    """Audit: 40 km/h ramp signs mis-attributed onto 高速/高架 mainlines."""
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 40.0, 'G1503')
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'low_value')
+
+  def test_viaduct_tag_on_surface_road_rejected(self, sld):
+    """Audit: an elevated deck's 80 written onto the arterial beneath it."""
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 80.0, '')          # 华夏中路 etc. carry no G/S ref
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'not_gs')
+
+  def test_three_digit_guodao_rejected(self, sld):
+    """G312 is an ordinary surface highway, not a controlled-access expressway."""
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 80.0, 'G312')
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'not_gs')
+
+  def test_gs_released_rejects_even_with_ref(self, sld):
+    """Exiting onto a ≤2-lane ramp releases gs_mode; the posted 100 must not hold."""
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 100.0, 'G1503')
+    assert mw._osm_gate(_t.monotonic(), gs_mode=False) == (False, 'not_gs')
+
+  def test_unknown_country_uses_strict_gate(self, sld):
+    """Before the first GPS fix an opted-in CN user must not get the open gate."""
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 80.0, '')
+    mw.country = ''
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'not_gs')
+
+  def test_non_cn_ignores_gs_entirely(self, sld):
+    """US/EU regression guard: any way, no G/S ref, still trusted."""
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 80.0, '')
+    mw.country = 'us'
+    assert mw._osm_gate(_t.monotonic(), gs_mode=False) == (True, '')
+
+  def test_reason_precedence_disabled_beats_not_gs(self, sld):
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 80.0, '')
+    mw.osm_integration_enabled = False
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'disabled')
+
+  def test_reason_precedence_stale_beats_not_gs(self, sld):
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 80.0, '')
+    mw.last_osm_speed_t = _t.monotonic() - 11.0
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'stale')
