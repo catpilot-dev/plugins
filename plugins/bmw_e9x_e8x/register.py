@@ -148,7 +148,7 @@ def on_vehicle_settings(items, CP):
 
   items.append(toggle_item(
     "Resume Button Repurposed",
-    "Short press: resume (disengaged) or toggle speed limit confirm (engaged). Long press: cycle follow distance.",
+    "Short press: resume (disengaged) or toggle speed limit confirm (engaged). Long press: cycle driving Personality.",
     initial_state=True,
     enabled=False,
   ))
