@@ -1,35 +1,28 @@
 # BMW E9x / E8x
 
-Teaches openpilot how to drive a BMW E8x or E9x — the car interface that lets
-the system read the car's sensors, steer it, and work its cruise control.
+Unofficial support of openpilot on BMW E8x and E9x platforms.
 
-## What it does
+Built on the community port by **dzid** and the
+[BMW-E8x-E9x openpilot project](https://github.com/BMW-E8x-E9x/openpilot/wiki),
+which worked out the CAN messages, the cruise-stalk control and the steering
+conversion this plugin relies on. Their wiki is still the reference for the
+hardware side.
 
-openpilot ships with support for a fixed set of cars. This plugin adds the
-BMW E8x/E9x family to that list. With the plugin enabled and the car
-fingerprinted, openpilot can:
+## Before anything else: this is a hardware conversion
 
-- **Steer** the car through the aftermarket Ocelot stepper servo on the
-  hydraulic rack, using a lateral controller written specifically for this
-  rack (it holds an angle with no motor torque, unlike the electric racks
-  most cars have). The steering feel and tuning have their own deep-dive in
-  [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md).
-- **Control cruise** by emulating presses of the cruise stalk. On a car with
-  Dynamic Cruise Control (DCC) it nudges the set-speed up and down to hit
-  openpilot's target speed and to slow for lead cars and curves.
-- **Follow lane changes** — because the plugin reports the turn-signal stalk
-  to openpilot, the stock nudge lane-change behaviour works normally.
-- **Show the car** — the Driving settings panel shows the BMW emblem and the
-  detected model, and (optionally) coolant and oil temperature are drawn on
-  the driving screen.
+These cars have no factory driver assistance for openpilot to build on, so
+nothing here works on a stock car. You need:
 
-Steering and cruise are gated by the Panda safety model (compiled C running
-on the Panda itself), which enforces torque and rate limits independently of
-the software above it.
+- an aftermarket **Ocelot stepper servo** on the steering rack, for steering;
+- **DIY cruise-control wiring**, for engaging and setting speed;
+- a comma device, wired to PT-CAN and F-CAN.
+
+Fitting all that is the real project — the plugin is the software half.
+Start with the [project wiki](https://github.com/BMW-E8x-E9x/openpilot/wiki).
 
 ## Supported cars
 
-Detection is **VIN-based** — the plugin reads the model code from the VIN
+Detection is **VIN-based**: the plugin reads the model code from the VIN
 rather than probing for CAN fingerprints.
 
 | Platform | Cars it covers |
@@ -37,45 +30,63 @@ rather than probing for CAN fingerprints.
 | BMW E82 | 1-Series coupe / convertible (E82 / E88), 2004–13 |
 | BMW E90 | 3-Series sedan / wagon / coupe / convertible (E90 / E91 / E92 / E93), 2005–11 |
 
-Both need the DIY cruise-control wiring and, for steering, the Ocelot stepper
-servo installed — this is a hardware conversion, not a plug-and-play harness.
-Cruise control needs a minimum speed of 30 km/h.
+## What it does
 
-## How to turn it on and off
+With the plugin enabled and the car recognized, openpilot can:
 
-**Settings → Plugins → "BMW E9x/E8x Car Interface"** — the master toggle.
-When it is on, BMW is registered as a supported car and openpilot will
-fingerprint the vehicle at startup. When it is off, BMW is not in the system
-at all.
+- **Steer.** The hydraulic rack on these cars holds its angle when the motor
+  goes quiet, unlike the electric racks openpilot was built around, so the
+  plugin uses a lateral controller written specifically for it. How it behaves
+  and how it's tuned is a topic of its own —
+  see [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md).
+- **Work the cruise control** by emulating presses of the cruise stalk. On a
+  car with Dynamic Cruise Control (DCC) it nudges the set speed up and down to
+  follow openpilot's target and to slow for lead cars and curves.
+- **Change lanes** normally — the plugin reports the turn-signal stalk, so
+  openpilot's usual nudge lane change works.
+- **Show the car** — the Driving panel carries the BMW emblem and the detected
+  model, and coolant and oil temperature can be drawn on the driving screen.
 
-Two BMW-specific options appear in **Settings → Driving** (in the vehicle
-section that shows only when a BMW is detected):
+Cruise control needs at least **30 km/h**; that's the car's own limit, not the
+plugin's.
 
-- **Temperature Overlay** — coolant and oil temperature at the bottom-right
-  of the driving screen, colour-coded blue/green/yellow/red from cold to
-  critical. On by default.
-- **Resume Button Repurposed** — a note, not a toggle: on this car the
-  cruise-stalk resume button does double duty. A short press resumes cruise
+## Settings
+
+**Settings → Plugins → "BMW E9x/E8x Car Interface"** is the master switch.
+With it on, BMW is a recognized car and openpilot fingerprints the vehicle at
+startup; with it off, BMW isn't in the system at all.
+
+When a BMW is detected, the vehicle section of **Settings → Driving** adds:
+
+- **Temperature Overlay** — coolant and oil temperature at the bottom right of
+  the driving screen, coloured blue through red from cold to critical. On by
+  default.
+- **Resume Button Repurposed** — a note rather than a toggle. On this car the
+  cruise stalk's resume button does double duty: a short press resumes cruise
   when disengaged, or confirms/cancels a detected speed limit when engaged; a
   long press cycles the follow distance.
 
-There is also a **cruise-ceiling memory** (on by default): when you re-engage
-cruise within the same drive, it restores the set-speed ceiling you last
-dialled in instead of resetting to the default.
+**Cruise-ceiling memory** is on by default: re-engaging cruise within a drive
+restores the set-speed ceiling you last dialled in instead of resetting.
 
 ## Status and limits
 
-- **This is a hardware-mod car**, not an officially supported openpilot
-  vehicle. It depends on an added stepper servo and cruise wiring.
+This is a community port of an unsupported car. Treat it accordingly.
+
 - **DCC is the tested cruise path.** Normal cruise control (NCC) and the
-  ACC-module variants are recognised but are less exercised.
-- **Cruise below 30 km/h is not available** — the car's own cruise minimum.
-- The lateral controller is custom and has been tuned on the E90; see
-  [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md) for what is and isn't
-  settled.
+  ACC-module variants are recognized but much less exercised.
+- **Tuned on an E90.** The E82 shares the software but has seen far less road
+  time.
+- **Panda safety is written but not yet active.** The plugin ships a Panda
+  safety model (`safety/bmw.h`) defining a TX allow-list and torque and rate
+  limits, and it is what *should* enforce those limits independently of the
+  software above it. It is not currently wired into the Panda's dispatch
+  registry, so today those limits are enforced only by the plugin's own
+  controller, in software. See [DESIGN.md](DESIGN.md).
+- **No cruise below 30 km/h**, per the car.
 
 ## More
 
-Architecture, the DCC cruise-stalk machinery, fingerprinting, hooks, params,
-and telemetry are in [DESIGN.md](DESIGN.md). The lateral controller is
-documented separately in [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md).
+Architecture, the DCC cruise-stalk machinery, fingerprinting, hooks, params
+and telemetry are in [DESIGN.md](DESIGN.md). The lateral controller has its
+own deep-dive in [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md).
