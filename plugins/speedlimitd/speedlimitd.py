@@ -4,8 +4,9 @@ Speed Limit Middleware — publishes one speedLimitState message at 5 Hz.
 
 Base inference picks ONE source, in this order:
   1. OSM posted maxspeed — only when OsmDataIntegration is ON and _osm_gate()
-     opens. In China, and before the country is known, that gate additionally
-     requires a confirmed G/S expressway ref and >= GS_OSM_MIN_KPH. See
+     opens. In China, and before the country is resolved (no GPS fix yet),
+     that gate additionally requires a confirmed G/S expressway ref and
+     >= GS_OSM_MIN_KPH. See
      docs/superpowers/specs/2026-08-10-osm-gs-maxspeed-design.md
   2. G/S expressway table — sticky promote from the OSM road class ('gs_osm')
   3. Vision lane-count table ('lane_count')
@@ -799,8 +800,15 @@ class SpeedLimitMiddleware:
     # (cn → OFF, elsewhere → ON), user-controlled thereafter.
     self.osm_integration_enabled: bool = False
     self._osm_default_resolved: bool = False
-    # GPS-detected country code, '' until the first valid fix. Read by the OSM
-    # gate, which treats '' as strict-CN (fail safe before the fix lands).
+    # GPS-detected country code. '' means one of TWO things — distinguish them
+    # with self.country_detected, never by testing this field's truthiness:
+    #   country_detected False → no valid fix yet, country genuinely unknown.
+    #   country_detected True  → a fix landed and matched no bounding box.
+    #     Only au/cn/de ship a speed table, so this is the permanent steady
+    #     state everywhere else (US, UK, FR, JP, CA...) — resolved, and
+    #     definitively not China.
+    # The OSM gate is strict-CN only in the first case (fail safe before the
+    # fix lands); see _osm_gate.
     self.country: str = ''
     self.last_osm_speed_kph: float = 0.0   # 0 = no usable OSM maxspeed held
     self.last_osm_speed_t: float = 0.0     # monotonic time it was stored
@@ -921,14 +929,30 @@ class SpeedLimitMiddleware:
     limit, a sustained loss falls back to vision inference. 30 km/h floor
     rejects implausible tags (same floor as MIN_SPEED_LIMIT in update()).
 
-    In China — and whenever the country is not yet known, which must fail safe
-    rather than fall through to the permissive path — the posted value is
+    In China — and whenever the country is not yet RESOLVED, which must fail
+    safe rather than fall through to the permissive path — the posted value is
     trusted only on a confirmed G/S expressway at >= GS_OSM_MIN_KPH. That
     excludes both audited map-matching failure modes: viaduct tags landing on
     the surface road beneath (no G/S ref) and ramp signs landing on the
     mainline (below the floor). Requiring gs_mode inherits every G/S release
     guard — the <=2-lane release, the margin rule, gs_lane_drop and the
     continuous-absence timer — at no extra cost.
+
+    The permissive branch keys on self.country_detected, NOT on self.country
+    being truthy. self.country == '' conflates two distinct states and only
+    one of them is "unknown":
+      - country_detected False: no GPS fix yet. Genuinely unresolved, so a
+        driver who happens to be in China must not get the open gate. Strict.
+      - country_detected True with country '': a fix landed and matched no
+        bounding box. Only au/cn/de ship a bbox, so this is the normal steady
+        state for a US, UK, French, Japanese or Canadian driver. The cn bbox
+        spans lat 18-54 / lon 73-135 and covers the whole country, so a fix
+        that misses it proves the car is NOT in China — non-CN, permissive,
+        exactly the pre-2026-08-10 behaviour. Testing self.country truthiness
+        here would leave the strict CN grammar (^[GS]...) applied forever to
+        every region without a speed table, where no way ref can ever match
+        it: the gate would never open and the feature would be dead while its
+        toggle still read ON.
 
     Reads _osm_gate_ref, NOT last_way_ref: the ref must age together with
     last_osm_speed_kph on the same TTL (see _osm_gate_ref's __init__
@@ -942,7 +966,7 @@ class SpeedLimitMiddleware:
       return False, 'no_data'
     if now - self.last_osm_speed_t > 2.0 * self._osm_query_interval:
       return False, 'stale'
-    if self.country and self.country != 'cn':
+    if self.country_detected and self.country != 'cn':
       return True, ''                       # non-CN: unchanged, as shipped
     if not (gs_mode and is_gs_expressway_ref(self._osm_gate_ref)):
       return False, 'not_gs'

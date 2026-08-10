@@ -2772,6 +2772,7 @@ class TestOsmBaseActive:
 
   def _arm(self, mw, kph=100.0, age=0.0):
     import time as _t
+    mw.country_detected = True  # a GPS fix has landed: country is RESOLVED
     mw.country = 'us'          # non-CN: gate is the pre-2026-08-10 behaviour
     mw.osm_integration_enabled = True
     mw.last_osm_speed_kph = kph
@@ -2821,6 +2822,7 @@ class TestOsmBaseSelection:
 
   def _arm(self, mw, kph):
     import time as _t
+    mw.country_detected = True  # a GPS fix has landed: country is RESOLVED
     mw.country = 'us'          # non-CN: gate is the pre-2026-08-10 behaviour
     mw.osm_integration_enabled = True
     mw.last_osm_speed_kph = kph
@@ -3094,6 +3096,7 @@ class TestOsmGsGate:
 
   def _arm_cn(self, mw, kph, way_ref):
     import time as _t
+    mw.country_detected = True   # a GPS fix has landed: country is RESOLVED
     mw.country = 'cn'
     mw.osm_integration_enabled = True
     mw.last_osm_speed_kph = kph
@@ -3140,6 +3143,7 @@ class TestOsmGsGate:
     import time as _t
     mw = self._mw(sld)
     self._arm_cn(mw, 80.0, '')
+    mw.country_detected = False   # no fix yet: UNRESOLVED, not "resolved as non-CN"
     mw.country = ''
     assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'not_gs')
 
@@ -3148,7 +3152,7 @@ class TestOsmGsGate:
     import time as _t
     mw = self._mw(sld)
     self._arm_cn(mw, 80.0, '')
-    mw.country = 'us'
+    mw.country = 'us'            # _arm_cn already set country_detected True
     assert mw._osm_gate(_t.monotonic(), gs_mode=False) == (True, '')
 
   def test_reason_precedence_disabled_beats_not_gs(self, sld):
@@ -3192,6 +3196,106 @@ class TestOsmGsGate:
     mw = self._mw(sld)
     self._arm_cn(mw, 59.0, 'G1503')
     assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'low_value')
+
+
+class TestOsmGateCountryResolution:
+  """The strict G/S gate is CN-only — it must key on RESOLVED-ness, not on
+  self.country being a non-empty string.
+
+  Only au/cn/de ship a speed_tables/*.toml with a bbox, so country_from_gps()
+  returns None everywhere else and the assignment site latches
+  country_detected=True with country=''. If the gate tested `self.country and
+  ...`, that permanent '' would route every US/UK/FR/JP/CA driver down the
+  China branch forever, where no way ref can match ^[GS](\\d{1,2}|\\d{4})$ —
+  the gate would never open while its toggle still read ON.
+  """
+
+  def _mw_with_gps(self, sld, lat, lon):
+    """Middleware whose update() runs the REAL GPS-detection block against a
+    valid fix at (lat, lon) — country_from_gps is not stubbed, so the bbox
+    tables decide, exactly as on the car."""
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    gps = MagicMock()
+    gps.flags = 1              # valid fix
+    gps.latitude = lat
+    gps.longitude = lon
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': True, 'livePose': False}
+    sm.update = MagicMock()
+    sm.__getitem__ = MagicMock(side_effect=lambda k: gps if k == 'gpsLocationExternal' else MagicMock())
+    mw.sm = sm
+    return mw
+
+  def test_us_fix_opens_gate_on_non_gs_way(self, sld):
+    """Mountain View, CA (37.4, -122.1): matches no bbox, so country stays ''
+    while country_detected latches True. The driver is provably not in China,
+    so a fresh posted 105 km/h on a plain US way with no G/S ref must be
+    trusted — the pre-2026-08-10 behaviour.
+
+    Regression guard for the whole finding: this fails if the gate goes back
+    to testing self.country truthiness.
+    """
+    import time as _t
+    mw = self._mw_with_gps(sld, 37.4, -122.1)
+    with patch('config.write_plugin_param'), \
+         patch('config.plugin_data_dir') as pdd:
+      pdd.return_value.__truediv__.return_value.exists.return_value = False
+      mw.update()
+
+    # Resolution HAPPENED but matched nothing: the two-state '' case.
+    assert mw.country_detected is True
+    assert mw.country == ''
+    # ...and the region default armed the toggle ON (cn → '0', else → '1').
+    assert mw.osm_integration_enabled is True
+
+    mw.last_osm_speed_kph = 105.0
+    mw.last_osm_speed_t = _t.monotonic()
+    mw._osm_gate_ref = ''       # US ways carry no Chinese G/S ref, ever
+    assert mw._osm_gate(_t.monotonic(), gs_mode=False) == (True, '')
+
+  def test_cn_fix_still_uses_strict_gate(self, sld):
+    """Companion: Beijing (39.9, 116.4) resolves to 'cn', so the same
+    non-G/S way is rejected. Proves the US case above is not the gate
+    going permissive for everyone."""
+    import time as _t
+    mw = self._mw_with_gps(sld, 39.9, 116.4)
+    with patch('config.write_plugin_param'), \
+         patch('config.plugin_data_dir') as pdd:
+      pdd.return_value.__truediv__.return_value.exists.return_value = False
+      mw.update()
+
+    assert mw.country_detected is True
+    assert mw.country == 'cn'
+
+    mw.osm_integration_enabled = True   # cn default is OFF; opt the driver in
+    mw.last_osm_speed_kph = 80.0
+    mw.last_osm_speed_t = _t.monotonic()
+    mw._osm_gate_ref = ''
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'not_gs')
+
+  def test_before_first_fix_gate_is_strict(self, sld):
+    """The fail-safe boot window must survive the fix: with no GPS fix yet,
+    country_detected is False and the gate stays strict even though country
+    is '' — the driver might be in China."""
+    import time as _t
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+
+    assert mw.country_detected is False    # boot state: UNRESOLVED
+    assert mw.country == ''
+
+    mw.osm_integration_enabled = True      # toggle armed
+    mw.last_osm_speed_kph = 80.0           # fresh, plausible posted limit
+    mw.last_osm_speed_t = _t.monotonic()
+    mw._osm_gate_ref = ''                  # non-G/S way
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'not_gs')
 
 
 class TestGsGateSharedStateIsolation:
@@ -3289,6 +3393,7 @@ class TestOsmGateTelemetry:
   def test_publishes_reject_reason_for_low_value(self, sld):
     import time as _t
     mw = self._mw_for_update(sld)
+    mw.country_detected = True
     mw.country = 'cn'
     mw.osm_integration_enabled = True
     mw.last_osm_speed_kph = 40.0
@@ -3312,6 +3417,7 @@ class TestOsmGateTelemetry:
   def test_publishes_trusted_with_empty_reason(self, sld):
     import time as _t
     mw = self._mw_for_update(sld)
+    mw.country_detected = True
     mw.country = 'cn'
     mw.osm_integration_enabled = True
     mw.last_osm_speed_kph = 100.0
