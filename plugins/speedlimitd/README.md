@@ -62,55 +62,22 @@ Two things you control while driving:
 
 A small white label under the sign names the source:
 
-- **OSM** — a posted speed limit read from OpenStreetMap map data. In China this
-  appears only on G/S expressways, where the map data has been verified.
+- **OSM** — a posted speed limit read from OpenStreetMap map data.
 - **VISION** — inferred from what the camera sees (lane count, road type) or
   lowered by a curve/lateral-acceleration safety cap. This is the normal label
   on ordinary roads.
 - **YOLO** — read directly off a road sign. Not active yet; sign reading is
   still in development.
 
-## Using OpenStreetMap's posted speed limits (optional)
+## Limitations
 
-*Mapd/OSM Data Integration*, in the plugin's settings, lets speedlimitd use
-the actual posted speed limit from the offline map data instead of guessing
-it from lane count and road type.
-
-- **When it's on and the map has a fresh, plausible limit for the road you're
-  on**, that number becomes the limit — the camera-based lane-count guess
-  steps aside. The camera's curve and cornering caps still apply on top, and
-  the car always obeys whichever number is lowest, exactly as above.
-- **When it's off, or the map has nothing usable** — no tiles downloaded, no
-  limit tagged on that road, GPS not locked, or the reading has gone stale —
-  it falls straight back to reading the road with the camera, the same as
-  before this feature existed.
-- **Default: off in China, on everywhere else.** This is set automatically
-  the first time the car ever gets a GPS fix, based on where you are — in
-  China the map's posted numbers are often wrong or missing, but they're
-  reliable in most other places. After that first fix it's entirely up to
-  you: flip it either way in the plugin's settings and it stays that way.
-- **Map tiles come from Connect.** This only works where you've downloaded
-  offline map tiles for your area through the Connect app. If the toggle is
-  on but there's no tile data for where you're driving, the Driving settings
-  panel shows a yellow warning under the toggle: *"No offline map tiles for
-  your area — download them in Connect."* Download the tiles in Connect and
-  the warning clears.
-- **Turning it off restores exactly the previous behavior** — nothing else
-  about how speedlimitd works changes.
-
-## Honest limits
-
-- **It's an assist, not a chauffeur.** It's a cap and a suggestion. You are
-  still driving and still responsible for the speed you travel at.
+- **It's an assist.** It's a cap and a suggestion. You are still driving and
+  still responsible for the speed you travel at.
 - **No high-definition map.** It has no lane-level HD map and no radar/lidar
   road model. Everything comes from offline tiles plus the camera.
-- **The camera can be fooled.** On some roads — especially where a parallel
-  carriageway runs alongside yours, or in construction zones — the model can
-  miscount lanes for a few seconds and briefly show the wrong limit (too low,
-  occasionally too high). When it reads low, the gas pedal overrides it; the
-  design deliberately errs toward the cautious (lower) number.
-- It's tuned for and geo-detects **China, Germany, and Australia**; elsewhere
-  it falls back to a conservative default.
+- **The camera can be fooled.** When it reads low, the gas pedal overrides it;
+  the design deliberately errs toward the cautious (lower) number.
+- It's tuned and tested in **Shanghai, China** only.
 
 ## More
 
