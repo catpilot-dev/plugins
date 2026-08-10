@@ -34,7 +34,7 @@ device.
 
 ## Turning things on and off
 
-<img src="docs/plugins_panel.png" width="66%" alt="Settings → Plugins panel" />
+<img src="docs/plugins_panel.png" width="49%" alt="Settings → Plugins panel" /> <img src="docs/driving_panel.png" width="49%" alt="Settings → Driving panel" />
 
 - **Settings → Plugins** — one toggle per plugin.
 - Feature-level switches live in their own panels: for example, the
