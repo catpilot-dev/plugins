@@ -1,7 +1,7 @@
 # Model Selector
 
 Browse, download, and switch between openpilot driving and driver-monitoring
-models — right on the device, no SSH.
+models.
 
 ## What it does
 
@@ -12,8 +12,7 @@ active:
 - **Driving model** — the neural net that actually steers and paces the car
   (lateral and longitudinal). Swapping it is the one that changes how the car
   drives.
-- **Driver-monitoring model** — the net that watches your attention/eyes.
-  Swapping it changes how driver monitoring behaves, not how the car drives.
+- **Driver-monitoring model** — swapping it changes how driver monitoring behaves.
 
 It can also reach out to the [openpilot](https://github.com/commaai/openpilot)
 GitHub repo, find newer models that comma has published, and download them for
