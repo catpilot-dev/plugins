@@ -165,7 +165,19 @@ check of this feature — on a G/S expressway, `OSM` means the posted tag passed
 gate, `VISION` means it was rejected or absent.
 
 `YOLO` will not appear until sign vision is wired (`yolo_speed` is permanently 0); it
-is included for forward compatibility.
+is included for forward compatibility. Sign vision is actively being built by the YOLO
+team, so the label is the seam they will light up — no UI change should be needed on
+their side beyond assigning `self.yolo_speed`.
+
+### Docstring accuracy (in scope)
+
+The module docstring at `speedlimitd.py:3-9` advertises a live three-tier cascade —
+"1. YOLO speed sign detection", "2. mapd suggestedSpeed" — and neither has a runtime
+path: `yolo_speed` is never assigned, and `mapdSuggested` exists only in
+`slot0.capnp`. With the YOLO team about to integrate against this module, a docstring
+that describes tiers as shipped when they are placeholders is an active hazard. Correct
+it to state the real cascade (safety caps → OSM maxspeed → G/S table → lane count) and
+mark YOLO/mapd explicitly as not-yet-wired. Documentation only; no behaviour change.
 
 ### Rendering
 
