@@ -189,9 +189,9 @@ Outside China, OSM replaces the base only when **all** of:
   window. One missed/`None` query keeps the limit; a sustained loss (two
   consecutive misses) falls back to vision.
 
-In China — and while the country is not yet known — two further conditions
-apply on top of these. All of it is now one predicate, `_osm_gate`; see the
-next section.
+In China — and until the first GPS fix has *resolved* a country — two further
+conditions apply on top of these. All of it is now one predicate, `_osm_gate`;
+see the next section.
 
 ### OSM maxspeed gate (CN, 2026-08-10)
 
@@ -201,11 +201,23 @@ the ≤2-lane vision-cap bypass, display rounding and telemetry, so those four
 cannot drift apart.
 
 Outside China the gate is toggle + 30 km/h floor + 10 s freshness, exactly as
-shipped 2026-08-07. In China — and whenever `self.country` is still `''`, which
-fails safe rather than falling through to the permissive path — the posted value
-must additionally sit on a confirmed G/S expressway (`gs_mode` true **and**
+shipped 2026-08-07. In China — and until the first GPS fix has resolved a
+country (`country_detected` still `False`), which fails safe rather than
+falling through to the permissive path — the posted value must additionally sit
+on a confirmed G/S expressway (`gs_mode` true **and**
 `is_gs_expressway_ref(self._osm_gate_ref)`) and be at least `GS_OSM_MIN_KPH`
 (60).
+
+**The test is `country_detected`, NOT `self.country` being non-empty** — do not
+"simplify" it back. `country_from_gps` only matches the bboxes it has tables for
+(`cn`, `de`, `au`), so a fix in the US, UK, France, Japan or Canada resolves to
+`country == ''` **permanently**, with `country_detected` `True`. Keying the
+permissive branch on the string being non-empty therefore applied the
+China-only G/S restriction to most of the world forever — no US/EU way ref
+matches `^[GS](\d{1,2}|\d{4})$`, so the gate never opened while the toggle still
+read as ON. A resolved-but-unmatched country is *definitively not China* (the CN
+bbox spans lat 18-54, lon 73-135) and takes the permissive path; only the
+genuinely unresolved boot window is strict.
 
 `_osm_gate_ref` is a gate-scoped mirror of the matched way ref, not
 `last_way_ref` itself. It's written alongside `last_osm_speed_kph` in the same
