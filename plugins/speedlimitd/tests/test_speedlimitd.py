@@ -2800,7 +2800,7 @@ class TestOsmBaseActive:
     import time as _t
     mw = self._make_middleware(sld)
     self._arm(mw, kph=20.0)  # < 30 km/h plausibility floor
-    assert mw._osm_gate(_t.monotonic(), gs_mode=False)[0] is False
+    assert mw._osm_gate(_t.monotonic(), gs_mode=False) == (False, 'no_data')
 
 
 class TestOsmBaseSelection:
@@ -3163,3 +3163,28 @@ class TestOsmGsGate:
     self._arm_cn(mw, 80.0, '')
     mw.last_osm_speed_t = _t.monotonic() - 11.0
     assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'stale')
+
+  def test_no_match_query_does_not_wobble_the_gate(self, sld):
+    """A single 5 s tile gap must not drop a held G/S ref and flip the gate.
+
+    last_way_ref is now held (not cleared) on a no-match _ingest_osm_result,
+    paired with the already-held last_osm_speed_kph — both age together on
+    the 10 s speed TTL rather than the ref dropping out a query early.
+    """
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 100.0, 'G1503')
+    mw._ingest_osm_result(None)          # one no-match query
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (True, '')
+
+  def test_gs_min_kph_boundary_exactly_60_trusted(self, sld):
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 60.0, 'G1503')
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (True, '')
+
+  def test_gs_min_kph_boundary_59_rejected(self, sld):
+    import time as _t
+    mw = self._mw(sld)
+    self._arm_cn(mw, 59.0, 'G1503')
+    assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'low_value')

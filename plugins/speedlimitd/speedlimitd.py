@@ -1048,7 +1048,13 @@ class SpeedLimitMiddleware:
       elif self.last_road_id != prev_road_id:
         self.last_osm_speed_kph = 0.0
     else:
-      self.last_way_ref = ''
+      # last_way_ref: held, not cleared (2026-08-10). _osm_gate pairs the ref
+      # with last_osm_speed_kph, so clearing one input while holding the
+      # other would let a single no-match tile query flip the G/S trust
+      # decision even though the speed is still within its 10 s TTL. Bounded,
+      # not indefinite: the gate still closes when the speed itself goes
+      # stale at 10 s, and a real exit onto a ramp MATCHES that way and
+      # overwrites the ref rather than leaving it held.
       self.last_road_name = ''
       self.last_osm_hwtype = ''
 
