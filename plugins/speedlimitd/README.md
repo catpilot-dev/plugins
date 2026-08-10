@@ -69,6 +69,22 @@ A small white label under the sign names the source:
 - **YOLO** — read directly off a road sign. Not active yet; sign reading is
   still in development.
 
+## Using OSM speed limits
+
+*Mapd/OSM Data Integration*, in **Settings → Driving**, lets speedlimitd take
+the posted limit straight from the offline map instead of inferring one from
+lane count and road type. The curve and cornering caps still apply on top, and
+the car still obeys whichever number is lowest.
+
+- **Default: off in China, on elsewhere** — set once, at the first GPS fix.
+  After that it's yours to change and it stays where you put it.
+- **In China it's used only on G/S expressways**, where the map data has been
+  verified; everywhere else on Chinese roads the camera decides.
+- **Needs offline map tiles** for your area, downloaded through Connect. If
+  they're missing, the toggle shows a yellow warning and speedlimitd simply
+  keeps reading the road with the camera — as it does whenever the map has
+  nothing fresh and plausible to offer.
+
 ## Limitations
 
 - **It's an assist.** It's a cap and a suggestion. You are still driving and
