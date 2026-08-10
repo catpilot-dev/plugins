@@ -3270,3 +3270,63 @@ class TestGsGateSharedStateIsolation:
     clock['t'] += 10.0
     mw.update()
     assert mw._sl_pub.send.call_args[0][0]['inferenceMode'] == 'lane_count'
+
+
+class TestOsmGateTelemetry:
+  def _mw_for_update(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def test_publishes_reject_reason_for_low_value(self, sld):
+    import time as _t
+    mw = self._mw_for_update(sld)
+    mw.country = 'cn'
+    mw.osm_integration_enabled = True
+    mw.last_osm_speed_kph = 40.0
+    mw.last_osm_speed_t = _t.monotonic()
+    mw.last_way_ref = 'G1503'
+    mw._osm_gate_ref = 'G1503'  # _osm_gate reads this, not last_way_ref
+    mw._params_last_read_t = _t.monotonic()
+    # Hold gs_mode open: 4 lanes, freshly seen, no release latched.
+    mw.lane_count_stable = 4
+    mw._gs_last_seen_t = _t.monotonic()
+    mw._gs_limit_kph = 100
+    mw._gs_force_release = False
+    mw._gs_absent_since = None
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['osmTrusted'] is False
+    assert pub['osmRejectReason'] == 'low_value'
+    assert pub['osmSpeedLimit'] == 40.0      # still reported for telemetry
+    assert pub['inferenceMode'] != 'osm'
+
+  def test_publishes_trusted_with_empty_reason(self, sld):
+    import time as _t
+    mw = self._mw_for_update(sld)
+    mw.country = 'cn'
+    mw.osm_integration_enabled = True
+    mw.last_osm_speed_kph = 100.0
+    mw.last_osm_speed_t = _t.monotonic()
+    mw.last_way_ref = 'G1503'
+    mw._osm_gate_ref = 'G1503'  # _osm_gate reads this, not last_way_ref
+    mw._params_last_read_t = _t.monotonic()
+    # Hold gs_mode open: 4 lanes, freshly seen, no release latched.
+    mw.lane_count_stable = 4
+    mw._gs_last_seen_t = _t.monotonic()
+    mw._gs_limit_kph = 100
+    mw._gs_force_release = False
+    mw._gs_absent_since = None
+    mw.update()
+    pub = mw._sl_pub.send.call_args[0][0]
+    assert pub['osmTrusted'] is True
+    assert pub['osmRejectReason'] == ''
+    assert pub['inferenceMode'] == 'osm'

@@ -1616,6 +1616,11 @@ class SpeedLimitMiddleware:
       # OSM Data Integration telemetry
       'osmSpeedLimit': round(self.last_osm_speed_kph, 1),
       'osmTilesMissing': self._osm_tiles_missing,
+      # Gate outcome (2026-08-10). osmSpeedLimit above stays unconditional, so
+      # an rlog records what OSM claimed even when the gate rejected it —
+      # 'low_value' counts measure how live the ramp-sign mis-attribution is.
+      'osmTrusted': osm_trusted,
+      'osmRejectReason': osm_reject_reason,
     })
 
 
