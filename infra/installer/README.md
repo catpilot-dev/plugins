@@ -23,6 +23,11 @@ path (`/` resolves via the bundled `stable` pointer file).
 Error responses use HTTP 409 because the setup screen displays a 409 body
 verbatim to the user.
 
+Release branches are named `release-vX.Y.Z`; the bare `vX.Y.Z` name is reserved
+for the git tag, because a tag outranks a same-named branch in git's ref
+resolution. Users still type the version (`/v0.11.1`) — the Worker adds the
+prefix.
+
 ## Deploy
 
 Templates and the stable pointer live in `assets/` and ship inside the Worker

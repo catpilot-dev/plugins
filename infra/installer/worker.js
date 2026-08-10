@@ -80,7 +80,10 @@ export default {
     } else if (path === "/dev") {
       branch = "dev";
     } else if (/^\/v\d+\.\d+\.\d+$/.test(path)) {
-      branch = path.slice(1);
+      // Users type the version; the branch carries a release- prefix so the
+      // bare vX.Y.Z name can be a tag without shadowing it (a tag outranks a
+      // branch of the same name in git's ref resolution).
+      branch = `release-${path.slice(1)}`;
     } else {
       // 409 bodies are displayed verbatim by the device's setup screen.
       return new Response("Unknown catpilot channel. Use install.catpilot.dev, /dev, or /vX.Y.Z", { status: 409 });
