@@ -323,7 +323,15 @@ class TestOnRenderOverlay:
     assert mock_draw_text.call_count == 2
 
   def test_alpha_confirmed_vs_unconfirmed(self, overlay, mock_openpilot, content_rect):
-    """Confirmed = alpha 255, unconfirmed = alpha 128."""
+    """Confirmed = alpha 255, unconfirmed = alpha 128 — on the SIGN RING.
+
+    Asserts the FIRST rl.Color call, which is the red outer ring
+    (_draw_speed_limit_sign draws it before anything else). Membership in the
+    full colour list is not a valid check any more: the source label under the
+    sign draws an unconditional rl.Color(255, 255, 255, 255), so 255 is always
+    present and the confirmed case would pass even if the ring's alpha were
+    hard-wired to 128.
+    """
     pyray_mock = sys.modules['pyray']
     for confirmed, expected_alpha in [(True, 255), (False, 128)]:
       overlay._sl_data = {'speedLimit': 60.0, 'source': 1, 'confirmed': confirmed}
@@ -337,7 +345,10 @@ class TestOnRenderOverlay:
       overlay._sl_data = {'speedLimit': 60.0, 'source': 1, 'confirmed': confirmed}
       overlay.on_render_overlay(None, content_rect)
 
-      assert expected_alpha in color_alphas, f"Expected alpha {expected_alpha} in {color_alphas}"
+      assert color_alphas, "sign was not drawn at all"
+      assert color_alphas[0] == expected_alpha, (
+        f"ring alpha {color_alphas[0]}, expected {expected_alpha} "
+        f"(confirmed={confirmed}); all colour alphas: {color_alphas}")
 
 
 class TestDrawPositioning:
