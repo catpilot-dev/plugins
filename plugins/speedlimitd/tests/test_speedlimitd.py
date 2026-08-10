@@ -3010,3 +3010,26 @@ class TestOsmTilesMissingWritePath:
 
     tiles_missing_calls = [c for c in calls if c[1] == 'OsmTilesMissing']
     assert tiles_missing_calls == []
+
+
+class TestCountryField:
+  def _make_middleware(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    return mw
+
+  def test_country_defaults_to_empty_string(self, sld):
+    mw = self._make_middleware(sld)
+    assert mw.country == ''
+
+  def test_resolve_osm_default_reads_country(self, sld):
+    """cn → OFF, anything else → ON (unchanged behaviour, new field name)."""
+    mw = self._make_middleware(sld)
+    mw.country = 'cn'
+    with patch('config.write_plugin_param') as wp, \
+         patch('config.plugin_data_dir') as pdd:
+      pdd.return_value.__truediv__.return_value.exists.return_value = False
+      mw._resolve_osm_default(mw.country)
+      assert wp.call_args[0][2] == '0'

@@ -782,7 +782,9 @@ class SpeedLimitMiddleware:
     # (cn → OFF, elsewhere → ON), user-controlled thereafter.
     self.osm_integration_enabled: bool = False
     self._osm_default_resolved: bool = False
-    self._osm_default_country: str | None = None
+    # GPS-detected country code, '' until the first valid fix. Read by the OSM
+    # gate, which treats '' as strict-CN (fail safe before the fix lands).
+    self.country: str = ''
     self.last_osm_speed_kph: float = 0.0   # 0 = no usable OSM maxspeed held
     self.last_osm_speed_t: float = 0.0     # monotonic time it was stored
     self._osm_tiles_missing: bool = False
@@ -864,7 +866,7 @@ class SpeedLimitMiddleware:
     self.osm_integration_enabled = read_plugin_param(
       'speedlimitd', 'OsmDataIntegration', '') == '1'
 
-  def _resolve_osm_default(self, country: str | None) -> bool:
+  def _resolve_osm_default(self, country: str) -> bool:
     """One-time region default for OsmDataIntegration (first GPS fix).
 
     China → OFF (OSM maxspeed unreliable there); anywhere else → ON.
@@ -1099,9 +1101,9 @@ class SpeedLimitMiddleware:
             except FileNotFoundError:
               pass
           self.country_detected = True
-          self._osm_default_country = country
+          self.country = country or ''
         if not self._osm_default_resolved:
-          self._osm_default_resolved = self._resolve_osm_default(self._osm_default_country)
+          self._osm_default_resolved = self._resolve_osm_default(self.country)
 
     # --- Query OSM tiles at 0.2 Hz ---
     if self._gps_valid and now - self._osm_last_query_t >= self._osm_query_interval:
