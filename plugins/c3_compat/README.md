@@ -1,7 +1,8 @@
 # Comma 3 Compatibility
 
 Keeps the [comma three](https://github.com/commaai/hardware/tree/master/comma_three)
-(2021, code name "tici") fully supported on current catpilot, whereas comma three moved to LTS in upstream v0.10.0 release. 
+(2021, code name "tici") fully supported on current catpilot, whereas upstream
+moved the comma three to LTS at the v0.10.0 release.
 
 On a comma three device this plugin is **enforced**: it is always on and greyed out in
 the Plugins panel, because the device will not run catpilot correctly without it.
@@ -13,9 +14,7 @@ the installer checks this and refuses with instructions otherwise. To get there,
 either:
 
 + flash AGNOS 12.8 via https://flash.comma.ai/, or
-+ install the latest supported stock openpilot (v0.10.0) — just pick the
-  standard openpilot option during device setup; a comma three is automatically
-  given the last release that supports it.
++ install the latest supported stock openpilot (v0.10.0) via https://openpilot.comma.ai
 
 **WARNING: flashing wipes all data on the device (drives, settings, pairing).**
 
