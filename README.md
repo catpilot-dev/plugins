@@ -34,6 +34,8 @@ device.
 
 ## Turning things on and off
 
+<img src="docs/plugins_panel.png" width="66%" alt="Settings → Plugins panel" />
+
 - **Settings → Plugins** — one toggle per plugin.
 - Feature-level switches live in their own panels: for example, the
   **Driving** panel has the "Lane Keeping" toggle, and the **Software**
