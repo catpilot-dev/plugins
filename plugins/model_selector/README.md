@@ -21,6 +21,8 @@ you.
 
 ## How to use it
 
+<img src="../../docs/software_panel.png" width="66%" alt="Settings → Software panel with the model selector rows" />
+
 Everything lives in **Settings → Software**. The plugin adds three rows:
 
 - **Driving Model** — shows the active driving model; tap **SELECT** to see
