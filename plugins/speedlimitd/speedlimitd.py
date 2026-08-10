@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """
-Speed Limit Middleware — merges mapd, YOLO, and road-type inference
-into a single SpeedLimitState message at 5 Hz.
+Speed Limit Middleware — publishes one speedLimitState message at 5 Hz.
 
-Three-tier priority:
-  1. YOLO speed sign detection (direct sign reading, highest confidence)
-  2. mapd suggestedSpeed (comprehensive: visionCurveSpeed + speed limit + road type)
-  3. Vision-inferred speed (lane count + road type, own fallback when mapd has no data)
+Base inference picks ONE source, in this order:
+  1. OSM posted maxspeed — only when OsmDataIntegration is ON and _osm_gate()
+     opens. In China, and before the country is known, that gate additionally
+     requires a confirmed G/S expressway ref and >= GS_OSM_MIN_KPH. See
+     docs/superpowers/specs/2026-08-10-osm-gs-maxspeed-design.md
+  2. G/S expressway table — sticky promote from the OSM road class ('gs_osm')
+  3. Vision lane-count table ('lane_count')
+
+Safety caps (predicted-curvature and reactive measured-a_y) then min() over
+the base and can only ever lower it.
+
+NOT WIRED — do not read these as live inputs:
+  - YOLO sign reading: self.yolo_speed is never assigned (permanently 0), so
+    the tier-1 branch in update() is unreachable. Sign vision is in
+    development; assigning yolo_speed is the only hook it needs.
+  - mapd suggestedSpeed: no runtime path. 'mapdSuggested' survives only in
+    cereal/slot0.capnp, which is itself out of sync with what is published.
 """
 import math
 import os

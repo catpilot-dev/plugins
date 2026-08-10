@@ -58,6 +58,18 @@ Two things you control while driving:
 - **Show or hide the sign.** *Show Speed Limit Sign* in the plugin's settings
   turns the on-screen sign on or off (enforcement is unaffected).
 
+### Where the limit came from
+
+A small white label under the sign names the source:
+
+- **OSM** — a posted speed limit read from OpenStreetMap map data. In China this
+  appears only on G/S expressways, where the map data has been verified.
+- **VISION** — inferred from what the camera sees (lane count, road type) or
+  lowered by a curve/lateral-acceleration safety cap. This is the normal label
+  on ordinary roads.
+- **YOLO** — read directly off a road sign. Not active yet; sign reading is
+  still in development.
+
 ## Using OpenStreetMap's posted speed limits (optional)
 
 *Mapd/OSM Data Integration*, in the plugin's settings, lets speedlimitd use

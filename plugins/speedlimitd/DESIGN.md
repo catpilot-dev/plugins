@@ -177,9 +177,9 @@ underlying query always runs (it's also how G/S identity is read):
   `last_osm_speed_kph` resets to `0.0` — the held value belonged to the old
   road.
 
-### Freshness gate + floor (`_osm_base_active`)
+### Freshness gate + floor
 
-OSM replaces the base only when **all** of:
+Outside China, OSM replaces the base only when **all** of:
 
 - the toggle (`osm_integration_enabled`) is on,
 - `last_osm_speed_kph >= 30.0` — the same 30 km/h floor as `MIN_SPEED_LIMIT`,
@@ -189,10 +189,56 @@ OSM replaces the base only when **all** of:
   window. One missed/`None` query keeps the limit; a sustained loss (two
   consecutive misses) falls back to vision.
 
+In China — and while the country is not yet known — two further conditions
+apply on top of these. All of it is now one predicate, `_osm_gate`; see the
+next section.
+
+### OSM maxspeed gate (CN, 2026-08-10)
+
+`_osm_gate(now, gs_mode) -> (trusted, reason)` is the single predicate deciding
+whether a posted OSM maxspeed replaces the base inference. It feeds arbitration,
+the ≤2-lane vision-cap bypass, display rounding and telemetry, so those four
+cannot drift apart.
+
+Outside China the gate is toggle + 30 km/h floor + 10 s freshness, exactly as
+shipped 2026-08-07. In China — and whenever `self.country` is still `''`, which
+fails safe rather than falling through to the permissive path — the posted value
+must additionally sit on a confirmed G/S expressway (`gs_mode` true **and**
+`is_gs_expressway_ref(last_way_ref)`) and be at least `GS_OSM_MIN_KPH` (60).
+
+This targets the two systematic map-matching failures found in the 2026-08-07
+audit, neither of which any safety cap can catch, since both are wrong numbers
+on straight roads:
+
+| Failure mode | Excluded by |
+| --- | --- |
+| Viaduct tag matched to the surface road beneath (华夏中路, 金海路, 申江路) | no G/S ref on the surface way |
+| 40 km/h ramp sign matched to a 高速/高架 mainline | the 60 km/h floor |
+
+Requiring `gs_mode` rather than the ref alone inherits every G/S release guard:
+the ≤2-lane release, the margin rule, `gs_lane_drop`, and the continuous-absence
+timer. A cleared `last_way_ref` (no tile match) therefore closes the gate at once
+rather than coasting on the 10 s freshness window.
+
+`osmTrusted` and `osmRejectReason` (`''｜disabled｜no_data｜stale｜not_gs｜low_value`)
+are published every tick, alongside the unconditional `osmSpeedLimit`, so rlogs
+record what OSM claimed even when it was rejected. The CN default for
+`OsmDataIntegration` remains OFF; `low_value` and `not_gs` rates are the evidence
+for ever revisiting that.
+
+*(Implementation note: the gate actually reads `_osm_gate_ref`, a copy of
+`last_way_ref` that ages together with `last_osm_speed_kph` on the same TTL,
+rather than `last_way_ref` itself — see the `_osm_gate` docstring in
+`speedlimitd.py`. `last_way_ref` clears immediately on a no-match query, which
+would otherwise close the gate on a momentary tile gap instead of riding out
+the freshness window like the rest of the gate does.)*
+
 ### Base-priority order
 
-In `update()`, `osm_base = self._osm_base_active(now)` is checked **before**
-`gs_mode`:
+In `update()`, `gs_mode` (the G/S sticky-hold release state) is computed
+first, then `osm_trusted, osm_reject_reason = self._osm_gate(now, gs_mode)`
+decides whether OSM replaces the base. `osm_base = osm_trusted` is then
+checked **before** `gs_mode` in the `if`/`elif` that picks `inferred_speed`:
 
 ```
 osm_base  → inferred_speed = round(last_osm_speed_kph);  inference_mode = 'osm'
@@ -254,13 +300,15 @@ purely for ui_mod's Driving-panel warning (see `plugins/ui_mod/DESIGN.md`).
 
 ### New publish fields
 
-`speedLimitState` gains two telemetry fields, published every cycle
-regardless of toggle state:
+`speedLimitState` gains telemetry fields, published every cycle regardless of
+toggle state:
 
 | Field | Meaning |
 |---|---|
 | `osmSpeedLimit` | `round(last_osm_speed_kph, 1)` — held OSM maxspeed in km/h, `0` when none/expired |
 | `osmTilesMissing` | last `OsmTileReader.tile_missing` reading |
+| `osmTrusted` | `_osm_gate`'s verdict (2026-08-10) — whether `osmSpeedLimit` is actually driving the base inference |
+| `osmRejectReason` | `''` when trusted, else the first failing gate condition: `disabled\|no_data\|stale\|not_gs\|low_value` |
 
 `inferenceMode` gains a third value, `'osm'` (OSM base active), alongside the
 existing `'gs_osm'` and `'lane_count'`.
@@ -418,6 +466,8 @@ with an older subset; the live dict is the authoritative payload:
 | `reactLatAccel` | filtered measured `|a_y|` (m/s²) |
 | `osmSpeedLimit` | held OSM maxspeed (km/h, 0 = none/expired) |
 | `osmTilesMissing` | no offline tile file for the current area |
+| `osmTrusted` | `_osm_gate` verdict — whether `osmSpeedLimit` is driving the base inference |
+| `osmRejectReason` | `''｜disabled｜no_data｜stale｜not_gs｜low_value` — why the gate rejected it, when it did |
 
 ## Configuration
 
