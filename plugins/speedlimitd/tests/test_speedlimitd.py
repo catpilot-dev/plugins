@@ -3099,6 +3099,7 @@ class TestOsmGsGate:
     mw.last_osm_speed_kph = kph
     mw.last_osm_speed_t = _t.monotonic()
     mw.last_way_ref = way_ref
+    mw._osm_gate_ref = way_ref     # _osm_gate reads this, not last_way_ref
 
   def test_gs_expressway_is_trusted(self, sld):
     import time as _t
@@ -3165,11 +3166,14 @@ class TestOsmGsGate:
     assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'stale')
 
   def test_no_match_query_does_not_wobble_the_gate(self, sld):
-    """A single 5 s tile gap must not drop a held G/S ref and flip the gate.
+    """A single 5 s tile gap must not drop the gate's held ref and flip it.
 
-    last_way_ref is now held (not cleared) on a no-match _ingest_osm_result,
-    paired with the already-held last_osm_speed_kph — both age together on
-    the 10 s speed TTL rather than the ref dropping out a query early.
+    _osm_gate_ref (which _osm_gate reads) is held — not cleared — on a
+    no-match _ingest_osm_result, paired with the already-held
+    last_osm_speed_kph: both age together on the 10 s speed TTL rather than
+    the ref dropping out a query early. last_way_ref itself DOES still clear
+    immediately (see TestGsGateSharedStateIsolation below) — only the
+    gate-private mirror is held, so gs_mode's release paths are unaffected.
     """
     import time as _t
     mw = self._mw(sld)
@@ -3188,3 +3192,81 @@ class TestOsmGsGate:
     mw = self._mw(sld)
     self._arm_cn(mw, 59.0, 'G1503')
     assert mw._osm_gate(_t.monotonic(), gs_mode=True) == (False, 'low_value')
+
+
+class TestGsGateSharedStateIsolation:
+  """Regression: _osm_gate_ref must be a private mirror, never a hold on the
+  shared last_way_ref / gs_mode state (2026-08-10, round-2 correction).
+
+  Round 1 of the wobble fix held last_way_ref ITSELF across a no-match
+  query. That silently froze four of gs_mode's five release paths (the
+  30 s sticky-ceiling refresh, the 10 s continuous-absence timer, the
+  lane-drop timer, and the margin rule) for the duration of any tile gap —
+  a safety regression on exactly the route-3de-seg-19 wide-ramp geometry the
+  margin rule exists for: on a wide ramp (lane_count_stable > 2) none of the
+  OTHER release paths fire either, so the expressway limit would never
+  release. _osm_gate_ref fixes the OSM-gate wobble without touching that
+  shared state; these tests pin last_way_ref's prompt-clear behaviour and
+  the release machinery it drives.
+  """
+
+  def _mw(self, sld):
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.update = MagicMock()
+    mw.sm = sm
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    return mw
+
+  def _result(self, **kw):
+    base = {'wayRef': '', 'wayName': '', 'speedLimit': 0.0, 'lanes': 0,
+            'roadContext': 1, 'roadName': '', 'highwayType': '', 'distance': 5.0}
+    base.update(kw)
+    return base
+
+  def test_no_match_still_clears_last_way_ref(self, sld):
+    """The shared field the G/S release machinery reads must clear on a
+    no-match query exactly as it did before 2026-08-10 — only the
+    gate-private _osm_gate_ref is held across the gap."""
+    mw = self._mw(sld)
+    mw._ingest_osm_result(self._result(wayRef='G1503', roadContext=0,
+                                       highwayType='motorway'))
+    assert mw.last_way_ref == 'G1503'
+    mw._ingest_osm_result(None)
+    assert mw.last_way_ref == ''                # cleared, bit-identical to pre-fix
+    assert mw._osm_gate_ref == 'G1503'           # gate-private mirror stays held
+
+  def test_sustained_no_match_starts_the_absence_run(self, sld, monkeypatch):
+    """The whole point of the round-2 rework: a tile gap on a WIDE ramp (no
+    other release path available) must still let the 10 s continuous-absence
+    path engage and eventually release gs_mode. If a future change holds
+    last_way_ref (shared state) instead of _osm_gate_ref, is_gs_now stays
+    True forever on a no-match run and _gs_absent_since never leaves None —
+    this test fails in exactly that case."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3                    # wide connector — NOT narrow,
+                                                 # so the lane<=2 release can't
+                                                 # paper over a frozen timer
+    clock = {'t': 4000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    # Establish a G/S hold.
+    mw._ingest_osm_result(self._result(wayRef='G1503', roadContext=0,
+                                       highwayType='motorway'))
+    mw.update()
+    assert mw._sl_pub.send.call_args[0][0]['inferenceMode'] == 'gs_osm'
+    assert mw._gs_absent_since is None
+    # Sustained no-tile-coverage gap (route 3de seg 19 geometry: wide ramp).
+    mw._ingest_osm_result(None)
+    clock['t'] += 5.0
+    mw.update()
+    assert mw._gs_absent_since is not None       # the absence run actually starts
+    # ...and given the full 10 s, gs_mode genuinely releases.
+    mw._ingest_osm_result(None)
+    clock['t'] += 10.0
+    mw.update()
+    assert mw._sl_pub.send.call_args[0][0]['inferenceMode'] == 'lane_count'

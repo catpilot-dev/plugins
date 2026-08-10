@@ -792,6 +792,15 @@ class SpeedLimitMiddleware:
     self.country: str = ''
     self.last_osm_speed_kph: float = 0.0   # 0 = no usable OSM maxspeed held
     self.last_osm_speed_t: float = 0.0     # monotonic time it was stored
+    # Mirrors last_way_ref but follows last_osm_speed_kph's HOLD semantics
+    # (held across a no-match query, not cleared) rather than last_way_ref's
+    # prompt-clear semantics. _osm_gate needs its two inputs — this and
+    # last_osm_speed_kph — to age together on the same 10 s TTL; the G/S
+    # release machinery (gs_mode, _eval_gs_margin_release) needs the raw
+    # last_way_ref to clear immediately on a no-match query so a tile gap
+    # doesn't stall the 30 s sticky ceiling, the absence timer, the lane-drop
+    # path or the margin rule. Two fields, two consumers, no shared state.
+    self._osm_gate_ref: str = ''
     self._osm_tiles_missing: bool = False
     self._osm_tiles_written: bool = False  # first status write flushes stale param
 
@@ -908,6 +917,11 @@ class SpeedLimitMiddleware:
     mainline (below the floor). Requiring gs_mode inherits every G/S release
     guard — the <=2-lane release, the margin rule, gs_lane_drop and the
     continuous-absence timer — at no extra cost.
+
+    Reads _osm_gate_ref, NOT last_way_ref: the ref must age together with
+    last_osm_speed_kph on the same TTL (see _osm_gate_ref's __init__
+    comment), whereas last_way_ref clears immediately on a no-match query so
+    the gs_mode release machinery above is unaffected by a tile gap.
     See docs/superpowers/specs/2026-08-10-osm-gs-maxspeed-design.md
     """
     if not self.osm_integration_enabled:
@@ -918,7 +932,7 @@ class SpeedLimitMiddleware:
       return False, 'stale'
     if self.country and self.country != 'cn':
       return True, ''                       # non-CN: unchanged, as shipped
-    if not (gs_mode and is_gs_expressway_ref(self.last_way_ref)):
+    if not (gs_mode and is_gs_expressway_ref(self._osm_gate_ref)):
       return False, 'not_gs'
     if self.last_osm_speed_kph < GS_OSM_MIN_KPH:
       return False, 'low_value'
@@ -1014,6 +1028,7 @@ class SpeedLimitMiddleware:
     if result and (result['wayRef'] or result['roadName'] or result.get('highwayType')):
       way_ref = result['wayRef']
       self.last_way_ref = way_ref
+      self._osm_gate_ref = way_ref
       self.last_road_name = result['roadName']
       self.last_osm_hwtype = result.get('highwayType', '')
 
@@ -1048,15 +1063,14 @@ class SpeedLimitMiddleware:
       elif self.last_road_id != prev_road_id:
         self.last_osm_speed_kph = 0.0
     else:
-      # last_way_ref: held, not cleared (2026-08-10). _osm_gate pairs the ref
-      # with last_osm_speed_kph, so clearing one input while holding the
-      # other would let a single no-match tile query flip the G/S trust
-      # decision even though the speed is still within its 10 s TTL. Bounded,
-      # not indefinite: the gate still closes when the speed itself goes
-      # stale at 10 s, and a real exit onto a ramp MATCHES that way and
-      # overwrites the ref rather than leaving it held.
+      self.last_way_ref = ''
       self.last_road_name = ''
       self.last_osm_hwtype = ''
+      # _osm_gate_ref is deliberately NOT cleared here (2026-08-10) — see its
+      # __init__ comment. last_way_ref above IS cleared immediately, exactly
+      # as before that date, so every gs_mode release path (sticky ceiling,
+      # absence timer, lane-drop, margin rule) keeps behaving bit-identically
+      # to the pre-2026-08-10 code on a tile gap.
 
     # Per-query margin-rule evaluation (route 3de seg 19). _ingest_osm_result is
     # the once-per-OSM-query hook (both on-device and in tests), so the
