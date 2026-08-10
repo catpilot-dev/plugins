@@ -1,12 +1,13 @@
 # UI Customizations (ui_mod)
 
 The catpilot look-and-feel: a branded home screen, the car emblem on the
-driving screen, and the extra Settings panels. It doesn't drive the car — it
-only changes what you see and gives you the switches for the other plugins.
+driving screen, and the extra Settings panels. 
 
 ## What you see
 
 ### Home screen (offroad)
+
+<img src="../../docs/catpilot_offroad.png" width="66%" alt="catpilot home screen: last-drive map, car emblem, drive statistics" />
 
 - **Left**: a map of your **last drive** — the GPS trace on a dark map, a
   green dot where you started and a red dot where you stopped, auto-zoomed to
