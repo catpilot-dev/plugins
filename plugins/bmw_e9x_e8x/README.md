@@ -4,21 +4,44 @@ Unofficial support of openpilot on BMW E8x and E9x platforms.
 
 Built on the community port by **dzid** and the
 [BMW-E8x-E9x openpilot project](https://github.com/BMW-E8x-E9x/openpilot/wiki),
-which worked out the CAN messages, the cruise-stalk control and the steering
-conversion this plugin relies on. Their wiki is still the reference for the
-hardware side.
+which worked out the StepperServoCAN steering actuator and the cruise-stalk
+emulation this plugin drives.
 
 ## Before anything else: this is a hardware conversion
 
 These cars have no factory driver assistance for openpilot to build on, so
-nothing here works on a stock car. You need:
+nothing here works on a stock car — the car needs the external steering
+actuator and cruise wiring fitted first. That build is documented in the
+[project wiki](https://github.com/BMW-E8x-E9x/openpilot/wiki); it is the real
+project, and this plugin is the software half.
 
-- an aftermarket **Ocelot stepper servo** on the steering rack, for steering;
-- **DIY cruise-control wiring**, for engaging and setting speed;
-- a comma device, wired to PT-CAN and F-CAN.
+## What this adds to the original port
 
-Fitting all that is the real project — the plugin is the software half.
-Start with the [project wiki](https://github.com/BMW-E8x-E9x/openpilot/wiki).
+Three things are meaningfully different here.
+
+**Curvature-based lateral control — the big one.** The original port steered
+with a torque controller, the pattern openpilot uses for the electric racks in
+supported cars. This car isn't one: it has a stepper servo on a *hydraulic*
+rack, which holds its angle on its own at zero torque and ignores small
+commands outright. A torque controller assumes the opposite — that the rack
+needs sustained effort to stay turned, and self-centers when you stop pushing.
+This plugin replaces it with a controller that works in curvature, computing
+the torque needed to move the wheels by the remaining curvature error and then
+letting stiction hold the angle. The result is far steadier tracking on this
+rack. [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md) is the full design.
+
+**Fine-tuned DCC cruise control.** Longitudinal control on a DCC car works by
+emulating cruise-stalk presses, which is fussy: the stalk message is shared
+with the steering-column module, so naive sending collides with the car's own
+traffic and drops commands. The plugin owns that message properly and shapes
+set-speed changes to openpilot's target, so slowing for lead cars and curves
+is smooth rather than steppy.
+
+**VIN-based fingerprinting.** Instead of guessing the car from CAN traffic —
+unreliable here, since E82 and E90 look alike on the bus — the plugin reads
+the model code straight from the VIN. Detection is deterministic, and the live
+CAN fingerprint is then used only for what it's good at: spotting which cruise
+ECU the car has.
 
 ## Supported cars
 
@@ -34,11 +57,8 @@ rather than probing for CAN fingerprints.
 
 With the plugin enabled and the car recognized, openpilot can:
 
-- **Steer.** The hydraulic rack on these cars holds its angle when the motor
-  goes quiet, unlike the electric racks openpilot was built around, so the
-  plugin uses a lateral controller written specifically for it. How it behaves
-  and how it's tuned is a topic of its own —
-  see [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md).
+- **Steer**, through the external actuator, using the curvature-based
+  controller described above.
 - **Work the cruise control** by emulating presses of the cruise stalk. On a
   car with Dynamic Cruise Control (DCC) it nudges the set speed up and down to
   follow openpilot's target and to slow for lead cars and curves.
