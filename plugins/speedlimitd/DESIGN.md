@@ -502,6 +502,10 @@ holds `urban`/`nonurban` road-class → `{multi, single}` limits, a
 `default_fallback`, a `lane_width_class` table (lane width → road-class vote),
 and the country `bbox`. Adding a country is a new TOML, no code change.
 
+Only `cn` is road-validated (Shanghai). `de` and `au` ship as reasonable
+table values but have never been driven — treat them as starting points, not
+tuned configurations, and say so if anyone reports behaviour there.
+
 ## Known modelV2 limitations
 
 - **Ghost lane lines on parallel carriageways.** On roads running beside a
