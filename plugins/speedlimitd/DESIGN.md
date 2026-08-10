@@ -42,8 +42,8 @@ message and handles the confirm/cancel tap.
 
 ## Source fusion — "lowest valid reading wins"
 
-Despite the plugin.json description and a stale module docstring that mention a
-three-tier OSM/YOLO/inference *priority*, the live logic (`update()`) is a
+Despite the plugin.json description, which still mentions a three-tier
+OSM/YOLO/inference *priority*, the live logic (`update()`) is a
 **`min()` over candidate speeds**, not a priority cascade. Each candidate is
 `(speed_kph, source_id, confidence)`; the lowest speed wins:
 
