@@ -46,6 +46,20 @@ ui_mod adds two panels to Settings:
 
 The Driving panel is the default panel Settings opens to.
 
+<img src="../../docs/driving_panel.png" width="66%" alt="Settings → Driving panel: personality plus a toggle per driving plugin" />
+
+*The Driving panel on a recognized BMW — the car's emblem and fingerprint sit
+above the per-plugin toggles.*
+
+## Supported devices
+
+ui_mod only loads on the **comma 3 (`tici`) and comma 3X (`tizi`)** — the
+manifest's `device_filter` excludes other devices. On a comma 4 (`mici`) the
+plugin is skipped entirely and you get the stock UI. This is a testing
+limitation, not a technical one: we have no comma 4 hardware to verify the UI
+on. Once one is available, support is enabled by adding `"mici"` to
+`device_filter` in `plugin.json`.
+
 ## How it's on/off
 
 ui_mod is a normal plugin: **Settings → Plugins → "UI Customizations"**. With
