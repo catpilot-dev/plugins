@@ -3033,3 +3033,48 @@ class TestCountryField:
       pdd.return_value.__truediv__.return_value.exists.return_value = False
       mw._resolve_osm_default(mw.country)
       assert wp.call_args[0][2] == '0'
+
+  def _mw_for_gps_update(self, sld, gps_flags=1, gps_lat=39.9, gps_lon=116.4):
+    """Build a middleware whose update() will run the real GPS-detection
+    block (sm.updated['gpsLocationExternal'] True, a valid-fix gps object)."""
+    import plugins.speedlimitd.speedlimitd as mod
+    with patch.object(mod.messaging, 'SubMaster'):
+      mw = mod.SpeedLimitMiddleware()
+    mw._sl_pub = MagicMock()
+    mw._cmd_sub = None
+    mw._lc_sub = None
+    gps = MagicMock()
+    gps.flags = gps_flags
+    gps.latitude = gps_lat
+    gps.longitude = gps_lon
+    sm = MagicMock()
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': True, 'livePose': False}
+    sm.update = MagicMock()
+    sm.__getitem__ = MagicMock(side_effect=lambda k: gps if k == 'gpsLocationExternal' else MagicMock())
+    mw.sm = sm
+    return mw
+
+  def test_gps_country_none_coerced_to_empty_string(self, sld):
+    """GPS fix outside every known bounding box → country_from_gps returns
+    None → self.country must be coerced to '' at the real assignment site
+    (speedlimitd.py:1104), never left as None."""
+    import plugins.speedlimitd.speedlimitd as mod
+    mw = self._mw_for_gps_update(sld)
+    with patch.object(mod, 'country_from_gps', return_value=None), \
+         patch('config.write_plugin_param'), \
+         patch('config.plugin_data_dir') as pdd:
+      pdd.return_value.__truediv__.return_value.exists.return_value = False
+      mw.update()
+    assert mw.country == ''
+    assert mw.country is not None
+
+  def test_gps_country_cn_sets_field(self, sld):
+    """Companion case: a resolved country ('cn') is passed straight through."""
+    import plugins.speedlimitd.speedlimitd as mod
+    mw = self._mw_for_gps_update(sld)
+    with patch.object(mod, 'country_from_gps', return_value='cn'), \
+         patch('config.write_plugin_param'), \
+         patch('config.plugin_data_dir') as pdd:
+      pdd.return_value.__truediv__.return_value.exists.return_value = False
+      mw.update()
+    assert mw.country == 'cn'
