@@ -204,7 +204,21 @@ Outside China the gate is toggle + 30 km/h floor + 10 s freshness, exactly as
 shipped 2026-08-07. In China — and whenever `self.country` is still `''`, which
 fails safe rather than falling through to the permissive path — the posted value
 must additionally sit on a confirmed G/S expressway (`gs_mode` true **and**
-`is_gs_expressway_ref(last_way_ref)`) and be at least `GS_OSM_MIN_KPH` (60).
+`is_gs_expressway_ref(self._osm_gate_ref)`) and be at least `GS_OSM_MIN_KPH`
+(60).
+
+`_osm_gate_ref` is a gate-scoped mirror of the matched way ref, not
+`last_way_ref` itself. It's written alongside `last_osm_speed_kph` in the same
+branch of `_ingest_osm_result`, so the gate's two inputs can never diverge in
+age: it follows `last_osm_speed_kph`'s HOLD semantics (written on a match,
+deliberately **not** cleared on a no-match tile query) rather than
+`last_way_ref`'s prompt-clear semantics. That's what stops a single missed
+tile query from flipping the trust decision and wobbling the enforced limit,
+without freezing the release paths below — `last_way_ref` itself keeps
+clearing immediately on a no-match, because the `gs_mode` release machinery
+depends on that prompt clear: the 30 s sticky ceiling, the absence timer, the
+lane-drop path, and the margin rule all key off it, and holding it would stall
+all four during a tile gap.
 
 This targets the two systematic map-matching failures found in the 2026-08-07
 audit, neither of which any safety cap can catch, since both are wrong numbers
@@ -217,21 +231,13 @@ on straight roads:
 
 Requiring `gs_mode` rather than the ref alone inherits every G/S release guard:
 the ≤2-lane release, the margin rule, `gs_lane_drop`, and the continuous-absence
-timer. A cleared `last_way_ref` (no tile match) therefore closes the gate at once
-rather than coasting on the 10 s freshness window.
+timer.
 
 `osmTrusted` and `osmRejectReason` (`''｜disabled｜no_data｜stale｜not_gs｜low_value`)
 are published every tick, alongside the unconditional `osmSpeedLimit`, so rlogs
 record what OSM claimed even when it was rejected. The CN default for
 `OsmDataIntegration` remains OFF; `low_value` and `not_gs` rates are the evidence
 for ever revisiting that.
-
-*(Implementation note: the gate actually reads `_osm_gate_ref`, a copy of
-`last_way_ref` that ages together with `last_osm_speed_kph` on the same TTL,
-rather than `last_way_ref` itself — see the `_osm_gate` docstring in
-`speedlimitd.py`. `last_way_ref` clears immediately on a no-match query, which
-would otherwise close the gate on a momentary tile gap instead of riding out
-the freshness window like the rest of the gate does.)*
 
 ### Base-priority order
 
