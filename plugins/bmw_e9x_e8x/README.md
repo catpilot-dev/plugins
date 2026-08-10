@@ -54,8 +54,9 @@ When a BMW is detected, the vehicle section of **Settings → Driving** adds:
   when disengaged, or confirms/cancels a detected speed limit when engaged; a
   long press cycles the driving Personality.
 
-- **Cruise Speed Memory** - re-engaging cruise within a drive restores the set-speed
-ceiling you last dialled in instead of resetting to 104km/h.
+- **Cruise Speed Memory** — re-engaging cruise within a drive restores the
+  set-speed ceiling you last dialled in, instead of resetting to openpilot's
+  default (40 km/h, or 105 km/h in experimental mode).
 
 ## Status and limits
 
