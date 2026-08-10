@@ -30,24 +30,36 @@ Three repos, two cadences:
 
 - `dev` — development, both repos. Served as the `/dev` installer channel;
   a device installed from `/dev` tracks `dev` for plugins updates too.
-- `vX.Y.Z` — one channel branch per catpilot release, in catpilot, plugins,
-  and COD. In catpilot it is frozen at release (fixes only in extremis). In
-  plugins/COD it **moves**: rolling releases are pushed to it until the next
-  major channel opens.
-- `YYYY.MM.DD` tags — mark each rolling release on the plugins/COD channel
-  branch. Tags are bookkeeping; devices follow the branch.
+- `release-vX.Y.Z` — one channel **branch** per catpilot release, in catpilot
+  and plugins. In catpilot it is frozen at release (fixes only in extremis);
+  in plugins it **moves**, carrying rolling releases until the next channel
+  opens. The `release-` prefix is not cosmetic: a git tag outranks a branch of
+  the same name in ref resolution, so a bare `vX.Y.Z` branch would be shadowed
+  by its own tag. Users still type `/v0.11.1` — the installer Worker adds the
+  prefix, and `first_boot_setup.sh` strips it back off to get the channel.
+- `vX.Y.Z` **tags** — the release point, in all three repos, and what the
+  GitHub Releases pages hang off. ⚠ In catpilot this name also exists as an
+  upstream commaai tag at a different commit; our tag is pushed to origin
+  without creating a local one, so the local upstream reference survives for
+  rebase work. Expect `git fetch` to report it as "would clobber existing tag"
+  — that rejection is protecting the upstream tag and is safe to ignore.
+- `YYYY.MM.DD` tags — mark each rolling release on the plugins channel branch.
+  Devices follow the branch; these are bookkeeping.
 
 ## Cutting a major release (upstream vX.Y.Z ships)
 
 1. Rebase catpilot on the upstream tag; verify on-car.
-2. Push catpilot branch `vX.Y.Z`; bump `OPENPILOT_VERSION` in
+2. Push catpilot branch `release-vX.Y.Z`; bump `OPENPILOT_VERSION` in
    `selfdrive/plugins/manifest.py` as part of the rebase.
-3. Push plugins branch `vX.Y.Z` (from dev, hook-contract-matched to the new
-   base); set every `plugin.json` version to `X.Y.Z`.
+3. Push plugins branch `release-vX.Y.Z` (from dev, hook-contract-matched to
+   the new base); set every `plugin.json` version to `X.Y.Z`.
 4. Cut COD GitHub release `vX.Y.Z` with a `cod-vX.Y.Z.tar.gz` asset.
-5. Move the installer stable pointer: edit `infra/installer/assets/stable`,
-   `wrangler deploy`.
-6. The previous channel branch stops receiving rolling updates.
+5. Move the installer stable pointer: write `release-vX.Y.Z` into
+   `infra/installer/assets/stable`, then `wrangler deploy`. Give it a minute:
+   edges serve the old pointer briefly, so never delete the previous branch
+   until the root path returns the new one consistently.
+6. Tag `vX.Y.Z` in all three repos and create the GitHub Releases.
+7. The previous channel branch stops receiving rolling updates.
 
 ## Cutting a rolling release (plugins / COD)
 
