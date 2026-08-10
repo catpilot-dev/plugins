@@ -9,7 +9,7 @@ within the ego lane: over roughly ten seconds the car drifts a little toward
 one lane line, then back toward the other. It stays inside the lane, but you
 can feel the sway, especially on the highway.
 
-This plugin watches the distance between the driver-side wheels and the
+This plugin watches the distance between the driver-side front wheel and the
 driver-side lane line and gently damps that wander: when the car starts
 drifting away from where the model itself has been holding the lane, it adds
 a small, bounded steering correction back. The result is the same lane
@@ -45,6 +45,12 @@ plugin pauses itself automatically in both cases and resumes on its own.
   in the new lane with no memory of the old one.
 - It is vehicle-agnostic: the only car-specific settings are the car's
   half-width and which side the driver sits on.
+- **You can see when it's working:** a green ring appears around the car
+  emblem on the driving screen whenever the plugin is anchored to the lane
+  line and openpilot is engaged. No ring means it's standing by — usually
+  because the line isn't clearly visible, or during a lane change.
+
+<img src="../../docs/speedlimitd_active.jpg" width="66%" alt="Driving screen with a green ring around the BMW emblem, top right" />
 
 ## More
 
