@@ -33,7 +33,7 @@ launch_chffrplus.sh
 The `.disabled` marker in the plugin's runtime dir is the only opt-out, and it
 gates the boot patch at the launcher (`[ ! -f …/.disabled ]`). On a comma three
 `install.sh` writes `.enforced` (`[[ -f /TICI ]]`), so the plugin is always-on
-and greyed out in the Plugins panel — see **Enforcement** below.
+and grayed out in the Plugins panel — see **Enforcement** below.
 
 ## Enforcement
 

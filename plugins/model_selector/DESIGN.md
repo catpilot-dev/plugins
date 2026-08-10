@@ -84,7 +84,7 @@ The swap **returns `requires_reboot: True`** and does not restart anything.
 Nothing changes until openpilot reloads modeld — i.e. **a reboot**. In the UI,
 activating a model raises a "Model swapped. Reboot to activate." dialog whose
 **Reboot** sets the `DoReboot` param; **Cancel** swaps the previous model back
-in immediately (so a cancelled activation is a no-op). Models older than
+in immediately (so a canceled activation is a no-op). Models older than
 `MIN_MODEL_DATE` are filtered out of every list, so they can't be selected.
 
 ## ONNX + PKL caching

@@ -4,7 +4,7 @@ Keeps the [comma three](https://github.com/commaai/hardware/tree/master/comma_th
 (2021, code name "tici") fully supported on current catpilot, whereas upstream
 moved the comma three to LTS at the v0.10.0 release.
 
-On a comma three device this plugin is **enforced**: it is always on and greyed out in
+On a comma three device this plugin is **enforced**: it is always on and grayed out in
 the Plugins panel, because the device will not run catpilot correctly without it.
 
 ## Prerequisite — AGNOS 12.8

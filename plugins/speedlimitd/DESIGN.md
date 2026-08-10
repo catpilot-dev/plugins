@@ -504,7 +504,7 @@ and the country `bbox`. Adding a country is a new TOML, no code change.
 
 Only `cn` is road-validated (Shanghai). `de` and `au` ship as reasonable
 table values but have never been driven — treat them as starting points, not
-tuned configurations, and say so if anyone reports behaviour there.
+tuned configurations, and say so if anyone reports behavior there.
 
 ## Known modelV2 limitations
 

@@ -246,7 +246,7 @@ bmw_e9x_e8x/
   `steerActuatorDelay` is the effective single timing knob — details in
   LATERAL_CONTROLLER.md §2.
 - **DCC is the exercised cruise path.** NCC and the ACC-module variants are
-  recognised and wired but far less tested; the `Footnote` strings in
+  recognized and wired but far less tested; the `Footnote` strings in
   `values.py` flag this.
 - **Hardware-dependent.** Steering needs the Ocelot stepper servo
   (`STEPPER_SERVO_CAN` flag); without it, only longitudinal/DCC is available.
