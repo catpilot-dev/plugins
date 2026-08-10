@@ -7,6 +7,8 @@ Built on the community port by **dzid** and the
 which worked out the StepperServoCAN steering actuator and the cruise-stalk
 emulation this plugin drives.
 
+<img src="../../docs/bmw_e9x_onroad.jpg" width="49%" alt="Driving an E90: BMW emblem and coolant/oil temperature on the driving screen" /> <img src="../../docs/driving_panel.png" width="49%" alt="Settings → Driving with the BMW emblem and detected model" />
+
 ## Hardware retrofit
 
 The car needs CAN bus wiring and an external steering actuator based on
@@ -33,8 +35,8 @@ the model code and variants straight from the VIN. Detection is deterministic.
 
 | Platform | Cars it covers |
 |---|---|
-| BMW E82 | 1-Series coupe / convertible (E82 / E88), 2004–13 |
-| BMW E90 | 3-Series sedan / wagon / coupe / convertible (E90 / E91 / E92 / E93), 2005–11 |
+| BMW E8x | 1-Series coupe / convertible (E82 / E88), 2004–13 |
+| BMW E9x | 3-Series sedan / wagon / coupe / convertible (E90 / E91 / E92 / E93), 2005–11 |
 
 ## Settings
 
@@ -47,14 +49,13 @@ When a BMW is detected, the vehicle section of **Settings → Driving** adds:
 - **Temperature Overlay** — coolant and oil temperature at the bottom right of
   the driving screen, coloured blue through red from cold to critical. On by
   default.
-- **Resume Button Repurposed** — a note rather than a toggle. On this car the
+- **Resume Button Repurposed** — On this car the
   cruise stalk's resume button does double duty: a short press resumes cruise
   when disengaged, or confirms/cancels a detected speed limit when engaged; a
-  long press cycles the follow distance.
+  long press cycles the driving Personality.
 
-**Cruise Speed Memory**, further down the same panel, is on by default and not
-user-toggleable: re-engaging cruise within a drive restores the set-speed
-ceiling you last dialled in instead of resetting.
+- **Cruise Speed Memory** - re-engaging cruise within a drive restores the set-speed
+ceiling you last dialled in instead of resetting to 104km/h.
 
 ## Status and limits
 
