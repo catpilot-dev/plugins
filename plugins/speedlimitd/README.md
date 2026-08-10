@@ -50,6 +50,11 @@ Two things you control while driving:
   screen to toggle enforcement. The sign is shown at **half brightness** when
   it's only a suggestion and at **full brightness** when it's actively capping
   your cruise speed. It starts confirmed (active) as soon as you go onroad.
+
+| Enforcing | Suggestion only |
+|-----------|-----------------|
+| <img src="../../docs/speedlimitd_active.jpg" alt="Speed limit sign at full brightness, cruise capped to the limit" /> | <img src="../../docs/speedlimitd_inactive.jpg" alt="Speed limit sign dimmed, cruise left at the driver's setting" /> |
+| Sign at full brightness. The 100 limit is confirmed, so MAX drops to 105 and the car is held there. | Sign dimmed. The same 100 limit is known but not enforced, so MAX stays at your own 120. |
 - **Show or hide the sign.** *Show Speed Limit Sign* in the plugin's settings
   turns the on-screen sign on or off (enforcement is unaffected).
 
