@@ -1675,6 +1675,21 @@ class TestLaneCountFirstInference:
     assert not sld.is_gs_expressway_ref('G12345')  # 5-digit
     assert not sld.is_gs_expressway_ref('X5')
 
+  def test_is_gs_expressway_ref_multi_ref(self, sld):
+    # OSM joins concurrent designations on one carriageway with ';'. ANY part
+    # matching the expressway grammar wins — the S20 ring in 'G1503;S20' is
+    # unambiguously a controlled-access expressway even though it also
+    # carries a concurrent G1503 designation.
+    assert sld.is_gs_expressway_ref('G1503;S20')
+    assert sld.is_gs_expressway_ref('G1503; S20')   # whitespace after ';'
+    assert sld.is_gs_expressway_ref('G312;S20')     # concurrency: expressway part governs
+    # bare 3-digit guodao is still excluded when no part is an expressway.
+    assert not sld.is_gs_expressway_ref('G312')
+    assert not sld.is_gs_expressway_ref('G312;X601')
+    # existing behaviour must not regress.
+    assert not sld.is_gs_expressway_ref('')
+    assert sld.is_gs_expressway_ref('S20')
+
   # --- Test 1: THE 3d0 regression scenario ------------------
 
   def test_3d0_stacked_way_churn_limit_constant_80(self, sld):

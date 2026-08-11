@@ -698,8 +698,17 @@ def is_gs_expressway_ref(way_ref: str) -> bool:
 
   1–2 digit and 4-digit G/S refs are expressways; a 3-digit ref is an ordinary
   guodao/shengdao surface highway and is deliberately excluded.
+
+  OSM joins concurrent designations sharing one carriageway with ';', e.g.
+  'G1503;S20' (ring expressway also signed as a spur) or 'G312;S20' (an
+  ordinary guodao concurrent with the S20 expressway). The ref is split on
+  ';' (each part stripped of surrounding whitespace) and matched against the
+  same grammar; ANY part matching wins. A carriageway is unambiguously an
+  expressway if even one of its concurrent designations is one — the 3-digit
+  exclusion still applies per-part, so a bare 'G312' (no expressway part)
+  stays False while 'G312;S20' is True.
   """
-  return bool(_GS_EXPRESSWAY_RE.match(way_ref))
+  return any(_GS_EXPRESSWAY_RE.match(part.strip()) for part in way_ref.split(';'))
 
 
 def lane_count_limit(lane_count: int) -> int:
