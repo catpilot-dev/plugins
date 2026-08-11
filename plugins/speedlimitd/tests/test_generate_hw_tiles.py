@@ -1,10 +1,16 @@
-"""Tests for the offline_hw tile generator — binning, filtering, capnp output."""
+"""Tests for the offline_hw tile generator — binning, filtering, capnp output.
+
+generate_hw_tiles.py only imports argparse/math/os/re/sys at module level —
+capnp is imported lazily inside write_tiles() — so the pure-function tests
+(highway filter, binning, maxspeed/maxspeed:lanes parsing) run with no capnp
+present. Only TestWriteTiles actually builds/reads a capnp tile, so the
+capnp gate is scoped to that class alone via an autouse fixture, instead of
+skipping the whole module.
+"""
 import os
 import sys
 
 import pytest
-
-capnp = pytest.importorskip('capnp')
 
 PKG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 TOOLS_DIR = os.path.join(PKG_DIR, 'tools')
@@ -62,6 +68,10 @@ class TestBinning:
 
 
 class TestWriteTiles:
+  @pytest.fixture(autouse=True)
+  def _require_capnp(self):
+    pytest.importorskip('capnp')
+
   def test_written_tile_readable_by_osm_query(self, gen, tmp_path, monkeypatch):
     # Full round trip: generate → write → query via OsmTileReader
     monkeypatch.setenv('MEDIA_DIR', str(tmp_path))
