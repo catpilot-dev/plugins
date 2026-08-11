@@ -61,16 +61,28 @@ def parse_maxspeed_lanes(value) -> float:
   across the carriageway, e.g. '100|80|80|80'; an entry may be empty when a
   lane's limit isn't individually specified, e.g. '100||80'. Each non-empty
   entry is parsed with parse_maxspeed (so unit handling/formats stay
-  identical to the scalar tag) and the result collapses to the MINIMUM
-  parsed value, never the maximum: speedlimitd commands a single speed and
-  has no notion of which lane the car occupies, so taking the fastest lane's
-  limit could over-command a car sitting in a slower-limited lane, while the
-  minimum can never do that. Returns 0.0 if no entry is parseable.
+  identical to the scalar tag) and the result collapses to the MAXIMUM
+  parsed value, deliberately not the minimum: the rest of speedlimitd's
+  OSM path already targets the mainline limit (the G/S expressway table
+  returns 100-120 for a motorway), so collapsing to the slowest lane would
+  make the OSM path read MORE conservative than the vision fallback it
+  replaces — the displayed limit would visibly drop the moment OSM data
+  appeared, which reads as a regression, not a safety feature. A
+  '100|80|80|80' gantry posts a road limit of 100 with lower limits on the
+  slower lanes; that headline mainline number is what the sign should show,
+  and holding the car at 80 in the fast lane while traffic flows at 100 is
+  itself a hazard, not a neutral conservative choice.
+
+  Accepted tradeoff: the returned value can exceed the limit of the specific
+  lane the car actually occupies (speedlimitd has no notion of which lane
+  that is). This is bounded downstream by the driver confirm tap, the
+  curvature/lateral-accel safety caps, and gas override — it is not left
+  unchecked. Returns 0.0 if no entry is parseable.
   """
   if not value:
     return 0.0
   speeds = [s for s in (parse_maxspeed(part.strip()) for part in str(value).split('|')) if s]
-  return min(speeds) if speeds else 0.0
+  return max(speeds) if speeds else 0.0
 
 
 def resolve_way_maxspeed(tags) -> float:
@@ -81,7 +93,7 @@ def resolve_way_maxspeed(tags) -> float:
   `maxspeed:lanes:forward` when `maxspeed:lanes` itself is absent — one-way
   carriageways commonly carry only the forward variant. See
   parse_maxspeed_lanes for why the per-lane fallback collapses to the
-  minimum. Returns 0.0 when nothing is parseable.
+  maximum (mainline) lane value. Returns 0.0 when nothing is parseable.
   """
   scalar = parse_maxspeed(tags.get('maxspeed'))
   if scalar:

@@ -131,14 +131,16 @@ class TestMaxspeedParse:
 
 
 class TestMaxspeedLanesParse:
-  def test_multi_lane_collapses_to_minimum(self, gen):
-    # 100|80|80|80 -> the slowest posted lane (80), never the fastest: a
-    # single commanded speed must not over-command a car sitting in a
-    # slower-limited lane.
-    assert gen.parse_maxspeed_lanes('100|80|80|80') == pytest.approx(80 / 3.6)
+  def test_multi_lane_collapses_to_maximum(self, gen):
+    # 100|80|80|80 -> the mainline (fastest posted) lane, 100: speedlimitd's
+    # OSM path already targets the mainline limit elsewhere (the G/S
+    # expressway table returns 100-120 for a motorway), so collapsing to
+    # the slowest lane would make this path read MORE conservative than
+    # the vision fallback it replaces.
+    assert gen.parse_maxspeed_lanes('100|80|80|80') == pytest.approx(100 / 3.6)
 
   def test_unspecified_middle_lane_skipped(self, gen):
-    assert gen.parse_maxspeed_lanes('100||80') == pytest.approx(80 / 3.6)
+    assert gen.parse_maxspeed_lanes('100||80') == pytest.approx(100 / 3.6)
 
   def test_single_lane(self, gen):
     assert gen.parse_maxspeed_lanes('80') == pytest.approx(80 / 3.6)
@@ -149,7 +151,7 @@ class TestMaxspeedLanesParse:
     assert gen.parse_maxspeed_lanes('|') == 0.0
 
   def test_mph_lane_value_converts(self, gen):
-    assert gen.parse_maxspeed_lanes('65 mph|55 mph') == pytest.approx(55 * 1.609344 / 3.6)
+    assert gen.parse_maxspeed_lanes('65 mph|55 mph') == pytest.approx(65 * 1.609344 / 3.6)
 
 
 class TestResolveWayMaxspeed:
@@ -157,7 +159,7 @@ class TestResolveWayMaxspeed:
     assert gen.resolve_way_maxspeed({'maxspeed': '100'}) == pytest.approx(100 / 3.6)
 
   def test_lanes_fallback_when_scalar_absent(self, gen):
-    assert gen.resolve_way_maxspeed({'maxspeed:lanes': '100|80|80|80'}) == pytest.approx(80 / 3.6)
+    assert gen.resolve_way_maxspeed({'maxspeed:lanes': '100|80|80|80'}) == pytest.approx(100 / 3.6)
 
   def test_scalar_wins_over_lanes(self, gen):
     tags = {'maxspeed': '100', 'maxspeed:lanes': '60|60|60|60'}
@@ -165,7 +167,7 @@ class TestResolveWayMaxspeed:
 
   def test_lanes_forward_used_when_lanes_absent(self, gen):
     assert gen.resolve_way_maxspeed(
-        {'maxspeed:lanes:forward': '100|80|80|80'}) == pytest.approx(80 / 3.6)
+        {'maxspeed:lanes:forward': '100|80|80|80'}) == pytest.approx(100 / 3.6)
 
   def test_nothing_tagged_returns_zero(self, gen):
     assert gen.resolve_way_maxspeed({}) == 0.0
