@@ -40,8 +40,8 @@ def is_drivable_highway(highway: str) -> bool:
 def parse_maxspeed(value) -> float:
   """Parse an OSM maxspeed tag to m/s. Returns 0.0 if unparseable.
 
-  Stored for format parity with pfeifer tiles; speedlimitd ignores it
-  (maxspeed tags are sparse/stale in China).
+  speedlimitd consumes this value as its base inference when the OSM Data
+  Integration toggle is on.
   """
   if not value:
     return 0.0
@@ -52,6 +52,42 @@ def parse_maxspeed(value) -> float:
   if 'mph' in str(value):
     kph = kph * 1.609344
   return kph / 3.6
+
+
+def parse_maxspeed_lanes(value) -> float:
+  """Collapse an OSM maxspeed:lanes (or maxspeed:lanes:forward) tag to m/s.
+
+  These tags carry one entry per lane, pipe-separated and left-to-right
+  across the carriageway, e.g. '100|80|80|80'; an entry may be empty when a
+  lane's limit isn't individually specified, e.g. '100||80'. Each non-empty
+  entry is parsed with parse_maxspeed (so unit handling/formats stay
+  identical to the scalar tag) and the result collapses to the MINIMUM
+  parsed value, never the maximum: speedlimitd commands a single speed and
+  has no notion of which lane the car occupies, so taking the fastest lane's
+  limit could over-command a car sitting in a slower-limited lane, while the
+  minimum can never do that. Returns 0.0 if no entry is parseable.
+  """
+  if not value:
+    return 0.0
+  speeds = [s for s in (parse_maxspeed(part.strip()) for part in str(value).split('|')) if s]
+  return min(speeds) if speeds else 0.0
+
+
+def resolve_way_maxspeed(tags) -> float:
+  """Resolve a way's posted speed limit from its OSM tags, in m/s.
+
+  Prefers the scalar `maxspeed` tag. Falls back to the per-lane
+  `maxspeed:lanes` tag when the scalar is absent or unparseable (0.0), and to
+  `maxspeed:lanes:forward` when `maxspeed:lanes` itself is absent — one-way
+  carriageways commonly carry only the forward variant. See
+  parse_maxspeed_lanes for why the per-lane fallback collapses to the
+  minimum. Returns 0.0 when nothing is parseable.
+  """
+  scalar = parse_maxspeed(tags.get('maxspeed'))
+  if scalar:
+    return scalar
+  lanes_value = tags.get('maxspeed:lanes') or tags.get('maxspeed:lanes:forward')
+  return parse_maxspeed_lanes(lanes_value)
 
 
 def _tile_key(lat: float, lon: float) -> tuple[float, float]:
@@ -172,7 +208,7 @@ def extract_ways_from_pbf(pbf_path: str, bbox: tuple | None = None) -> list[dict
         'name': w.tags.get('name', ''),
         'ref': w.tags.get('ref', ''),
         'highway': highway,
-        'maxspeed': parse_maxspeed(w.tags.get('maxspeed')),
+        'maxspeed': resolve_way_maxspeed(w.tags),
         'lanes': lanes,
         'oneway': w.tags.get('oneway', '') in ('yes', '1', 'true'),
         'nodes': nodes,
