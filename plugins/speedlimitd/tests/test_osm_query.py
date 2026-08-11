@@ -94,22 +94,45 @@ class TestHighwayType:
 class TestHwTileDirPreference:
   LAT, LON = 31.3137, 121.5395
 
-  def test_hw_tile_preferred_over_pfeifer_tile(self, osm_query):
+  def test_downloaded_tile_preferred_over_hw_tile(self, osm_query):
+    """Downloaded (upstream) tiles win, even though they lack highwayType.
+
+    Deliberate 2026-08-11 reversal: the downloaded stream refreshes with
+    upstream OSM as edits are accepted, while offline_hw is only as fresh as
+    the last manual regeneration. Staying on the upstream stream is the simple
+    long-term-compatible choice; the cost is that highwayType reads '' and
+    road-class inference falls back to the vision lane-count votes.
+    """
     reader = osm_query.OsmTileReader()
     ways_kwargs = {'nodes': [(31.3136, 121.5394), (31.3202, 121.5394)]}
-    # pfeifer tile: no highwayType
+    # downloaded tile: no highwayType, but upstream-fresh
     _write_tile(reader.schema, osm_query._tile_path(self.LAT, self.LON),
-                [{'name': 'old', **ways_kwargs}])
-    # hw tile: same tile coords in the offline_hw dir
+                [{'name': 'downloaded', **ways_kwargs}])
+    # self-generated tile: same coords, carries highwayType — must NOT win
     _write_tile(reader.schema, osm_query._hw_tile_path(self.LAT, self.LON),
-                [{'name': 'new', 'highwayType': 'tertiary', **ways_kwargs}])
+                [{'name': 'self_generated', 'highwayType': 'tertiary', **ways_kwargs}])
     for _ in range(100):
       result = reader.query(self.LAT, self.LON)
       if result is not None:
         break
       time.sleep(0.02)
     assert result is not None
-    assert result['roadName'] == 'new'
+    assert result['roadName'] == 'downloaded'
+    assert result['highwayType'] == ''
+
+  def test_falls_back_to_hw_tile_when_no_downloaded_tile(self, osm_query):
+    """offline_hw still covers areas the downloaded set lacks."""
+    reader = osm_query.OsmTileReader()
+    _write_tile(reader.schema, osm_query._hw_tile_path(self.LAT, self.LON),
+                [{'name': 'self_generated', 'highwayType': 'tertiary',
+                  'nodes': [(31.3136, 121.5394), (31.3202, 121.5394)]}])
+    for _ in range(100):
+      result = reader.query(self.LAT, self.LON)
+      if result is not None:
+        break
+      time.sleep(0.02)
+    assert result is not None
+    assert result['roadName'] == 'self_generated'
     assert result['highwayType'] == 'tertiary'
 
   def test_falls_back_to_pfeifer_tile_when_no_hw_tile(self, osm_query):
