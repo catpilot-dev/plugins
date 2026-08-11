@@ -8,7 +8,7 @@ very different costs**, chosen by driving state:
 | State | On tap | Cost on the UI thread |
 |---|---|---|
 | Offroad | GPU readback → PNG → `/data/media/screenshots/` | one readback stall + format convert (harmless parked) |
-| Onroad | publish `bookmarkButton` — nothing else | one msgq publish (~µs) |
+| Onroad | trigger the UI's own Bookmark action — nothing else | one msgq publish (~µs) |
 
 Onroad, the plugin deliberately does **not** produce the image. It only marks
 the moment; Connect-on-Device's background screenshot worker reconstructs the
@@ -53,7 +53,15 @@ Tap detection and capture are split across the two hooks so the readback (or
 publish) happens after `end_drawing()` returns — the offroad readback then at
 least doesn't delay the *current* frame's completion.
 
-`_send_bookmark()` publishes `bookmarkButton`; feedbackd turns that into a
+`_send_bookmark()` calls the stock UI's `_on_bookmark_clicked()`, found by
+walking `gui_app._nav_stack` for the widget that defines it (both `MainLayout`
+and `MiciMainLayout` do). It deliberately does **not** open its own socket:
+the UI process already owns the only `bookmarkButton` publisher, msgq accepts
+a second publisher in the same process silently, and the *first* publisher's
+next `send()` then raises `MultiplePublishersError` — which killed the UI on
+the next press of the stock Bookmark button. One publisher, one code path.
+
+From there the stock path takes over: feedbackd turns `bookmarkButton` into a
 `userBookmark` event in the drive's log. `userBookmark` has qlog decimation 1
 (`services.py`), so every tap is present in the small qlog — this is what
 makes cheap offline discovery possible.
@@ -122,8 +130,19 @@ deleted before extraction loses its pending captures, by design.
 - **Two taps in the same second** → same filename; second render overwrites
   the first (the 1 s cooldown makes this rare; the live path had the same
   property).
+- **Stock bookmark handler missing** (UI internals changed) → the onroad tap
+  is a silent no-op rather than a crash; `_send_bookmark()` returns False.
+  Regression-tested in `tests/test_capture.py`.
 
 ## History
+
+Until 2026-08-11 the onroad path published `bookmarkButton` from a PubMaster
+of its own. Because the UI already owns that publisher, the plugin's socket
+silently hijacked the queue and the stock Bookmark button's next send raised
+`MultiplePublishersError`, taking the UI process down: black screen for the
+few seconds the manager needed to restart it, and a TAKE CONTROL IMMEDIATELY
+/ System Lagging alert on a moving car (route `000003ef` seg 24, 09:58:41).
+The plugin now drives the stock action instead of publishing.
 
 Through v0.11.1 the plugin did the full GPU readback + PNG save onroad as
 well, sending the bookmark *in addition to* the file. The onroad readback

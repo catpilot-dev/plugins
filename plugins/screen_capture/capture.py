@@ -1,10 +1,11 @@
 """Screen capture plugin — dim camera icon tap zone at bottom center.
 
 Offroad: saves PNG screenshot to /data/media/screenshots/ (GUI documentation).
-Onroad:  sends bookmarkButton only (→ userBookmark in rlog). No GPU readback,
-         no disk write — a tap costs one msgq publish, so it can never stall
-         the driving UI. COD's background screenshot worker later renders the
-         exact HUD frame offline with full fidelity and drops it into
+Onroad:  triggers the UI's own Bookmark action (→ userBookmark in rlog). No
+         GPU readback, no disk write, and no publisher of its own — a tap
+         costs one msgq publish, so it can never stall the driving UI. COD's
+         background screenshot worker later renders the exact HUD frame
+         offline with full fidelity and drops it into
          /data/media/screenshots/ where bookmark rows pick it up.
 """
 import os
@@ -31,7 +32,6 @@ _icon_y = 0
 _flash_remaining = 0
 _last_capture = 0.0
 _capture_pending = False   # set by pre_end_drawing, consumed by post_end_drawing
-_pm = None  # cereal PubMaster for bookmarkButton
 
 
 def _ensure_init():
@@ -113,18 +113,27 @@ def _save_png():
 
 
 def _send_bookmark():
-    """Send bookmarkButton event → feedbackd → userBookmark in rlog."""
-    global _pm
+    """Bookmark the moment using the UI's own publisher.
+
+    Never open a bookmarkButton socket here. The UI process already owns the
+    only publisher for that topic (MainLayout creates it at startup), and
+    msgq silently accepts a second publisher in the same process, then makes
+    the *first* one's next send() raise MultiplePublishersError. That killed
+    the UI — black screen plus a TAKE CONTROL IMMEDIATELY alert on a moving
+    car — the next time the driver pressed the stock Bookmark button.
+
+    Driving the stock action instead means one publisher, one code path.
+    """
     try:
-        if _pm is None:
-            from cereal import messaging
-            _pm = messaging.PubMaster(['bookmarkButton'])
-        from cereal import messaging
-        msg = messaging.new_message('bookmarkButton')
-        msg.valid = True
-        _pm.send('bookmarkButton', msg)
+        from openpilot.system.ui.lib.application import gui_app
+        for widget in getattr(gui_app, '_nav_stack', ()):
+            handler = getattr(widget, '_on_bookmark_clicked', None)
+            if callable(handler):
+                handler()
+                return True
     except Exception:
         pass
+    return False
 
 
 def on_pre_end_drawing(default):
