@@ -422,7 +422,7 @@ class BreakawayEstimator:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd /home/oxygen/catpilot-dev/plugins && PYTHONPATH=.:plugins/bmw_e9x_e8x uv run pytest plugins/bmw_e9x_e8x/tests/test_rack_motion.py -v`
-Expected: PASS, 19 passed
+Expected: PASS, 20 passed
 
 - [ ] **Step 5: Commit**
 
