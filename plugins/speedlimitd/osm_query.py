@@ -177,7 +177,18 @@ class OsmTileReader:
     if self.schema is None:
       return None
 
-    # Prefer the self-generated tile (has highwayType) when it exists
+    # Prefer the self-generated tile (has highwayType) when it exists.
+    #
+    # This was briefly reversed to prefer the downloaded tiles, on the argument
+    # that they refresh with upstream OSM on their own while offline_hw is only
+    # as fresh as the last manual regeneration. Reverted 2026-08-12 on evidence:
+    # the upstream tile builder drops `maxspeed:lanes` exactly as our generator
+    # used to, so a downloaded tile can NEVER carry a per-lane limit no matter
+    # how fresh it is. On the S20 (外环高速) corridor OSM tags 104 of 106 ways
+    # per-lane and only 2 with a scalar maxspeed, and both tile sets showed the
+    # same ~12-18 tagged ways out of 156-293. Freshness cannot fix a tag class
+    # the builder discards — only our own generator reads it. Do not swap this
+    # back without first confirming upstream tiles carry maxspeed:lanes.
     hw_path = _hw_tile_path(lat, lon)
     pf_path = _tile_path(lat, lon)
     if os.path.exists(hw_path):
