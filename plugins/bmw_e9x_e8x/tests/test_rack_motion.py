@@ -86,3 +86,76 @@ def test_stale_samples_are_evicted():
 
 def test_sign_convention_constant_is_negative():
     assert TORQUE_TO_ANGLE_SIGN == -1.0
+
+
+from bmw.rack_motion import (BreakawayEstimator, BREAKAWAY_SEED_FRAC,
+                             BREAKAWAY_MIN_FRAC, BREAKAWAY_MAX_FRAC, SUSTAIN_RATIO)
+
+
+def test_seed_is_the_measured_knee_not_the_old_friction_constant():
+    # Measured knee 2.0-2.75 Nm at STEER_MAX=12 -> 0.167-0.229 frac.
+    # The old FRICTION was 0.05. The seed must not be that.
+    assert 0.15 <= BREAKAWAY_SEED_FRAC <= 0.25
+    assert BreakawayEstimator().breakaway_frac == BREAKAWAY_SEED_FRAC
+
+
+def test_no_observation_leaves_seed_untouched():
+    est = BreakawayEstimator()
+    for _ in range(50):
+        est.update(0.30, moving_with_torque=False)
+    assert est.breakaway_frac == BREAKAWAY_SEED_FRAC
+    assert est.observations == 0
+
+
+def test_records_torque_at_the_stationary_to_moving_transition():
+    est = BreakawayEstimator()
+    est.update(0.30, moving_with_torque=False)
+    est.update(0.30, moving_with_torque=True)      # transition
+    assert est.observations == 1
+    assert est.breakaway_frac > BREAKAWAY_SEED_FRAC
+
+
+def test_sustained_motion_records_only_once():
+    est = BreakawayEstimator()
+    est.update(0.30, moving_with_torque=False)
+    for _ in range(20):
+        est.update(0.30, moving_with_torque=True)
+    assert est.observations == 1
+
+
+def test_converges_toward_repeated_observations():
+    est = BreakawayEstimator()
+    for _ in range(60):
+        est.update(0.30, moving_with_torque=False)
+        est.update(0.30, moving_with_torque=True)
+    assert abs(est.breakaway_frac - 0.30) < 0.02
+
+
+def test_observation_is_clamped_to_sane_range():
+    est = BreakawayEstimator()
+    for _ in range(200):
+        est.update(0.95, moving_with_torque=False)
+        est.update(0.95, moving_with_torque=True)
+    assert est.breakaway_frac <= BREAKAWAY_MAX_FRAC + 1e-9
+
+
+def test_sign_is_ignored_only_magnitude_matters():
+    a = BreakawayEstimator()
+    b = BreakawayEstimator()
+    a.update(+0.30, False); a.update(+0.30, True)
+    b.update(-0.30, False); b.update(-0.30, True)
+    assert abs(a.breakaway_frac - b.breakaway_frac) < 1e-9
+
+
+def test_sustain_is_a_fraction_of_breakaway():
+    est = BreakawayEstimator()
+    assert abs(est.sustain_frac - SUSTAIN_RATIO * est.breakaway_frac) < 1e-9
+    assert est.sustain_frac < est.breakaway_frac
+
+
+def test_reset_restores_seed():
+    est = BreakawayEstimator()
+    est.update(0.30, False); est.update(0.30, True)
+    est.reset()
+    assert est.breakaway_frac == BREAKAWAY_SEED_FRAC
+    assert est.observations == 0

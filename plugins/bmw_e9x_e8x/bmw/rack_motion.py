@@ -94,3 +94,59 @@ class RackMotion:
       return False
     expected_sign = TORQUE_TO_ANGLE_SIGN * (1.0 if torque_frac > 0.0 else -1.0)
     return abs(r) >= threshold_deg_s and (r * expected_sign) > 0.0
+
+
+# Seed = measured knee midpoint. Route 3f2 ramp ticks: stuck fraction first
+# falls below 50% at 2.50-2.75 Nm (strict action-freshness gate) or
+# 2.00-2.25 Nm (permissive gate). 2.4 Nm / STEER_MAX 12 = 0.20 frac.
+# The old FRICTION = 0.05 (0.6 Nm) was roughly 4x too low.
+BREAKAWAY_SEED_FRAC = 0.20
+
+# Clamps. MIN keeps a pathological low observation from disabling the gates
+# that consume this; MAX keeps a stuck-rack episode from ratcheting the
+# estimate into the authority cap.
+BREAKAWAY_MIN_FRAC = 0.05
+BREAKAWAY_MAX_FRAC = 0.40
+
+# EMA weight per observed breakaway. At 0.10 the estimate reaches ~90% of a
+# step change in ~22 observations; route 3f2 offers roughly 40 qualifying
+# transitions per hour of driving, so this tracks conditions across a drive
+# without chasing a single anomalous release.
+BREAKAWAY_ALPHA = 0.10
+
+# Static friction exceeds kinetic: at the instant of release the applied
+# torque already exceeds what sustains motion. Measured on route 3f2 —
+# breakaway 2.5-2.9 Nm, sustained unwinding motion at 1.25-1.5 Nm.
+SUSTAIN_RATIO = 0.5
+
+
+class BreakawayEstimator:
+  """Online estimate of the rack's breakaway torque, in torque fraction.
+
+  Records the applied torque at each observed stationary -> moving transition
+  and low-passes it. Never needs to know tyre pressure, surface or temperature:
+  it re-measures the threshold on every push under whatever conditions apply.
+  """
+
+  def __init__(self, seed_frac=BREAKAWAY_SEED_FRAC):
+    self._seed = float(seed_frac)
+    self.breakaway_frac = float(seed_frac)
+    self.observations = 0
+    self._was_moving = False
+
+  def reset(self):
+    self.breakaway_frac = self._seed
+    self.observations = 0
+    self._was_moving = False
+
+  def update(self, torque_frac, moving_with_torque):
+    moving = bool(moving_with_torque)
+    if moving and not self._was_moving and torque_frac != 0.0:
+      obs = min(max(abs(float(torque_frac)), BREAKAWAY_MIN_FRAC), BREAKAWAY_MAX_FRAC)
+      self.breakaway_frac += BREAKAWAY_ALPHA * (obs - self.breakaway_frac)
+      self.observations += 1
+    self._was_moving = moving
+
+  @property
+  def sustain_frac(self):
+    return SUSTAIN_RATIO * self.breakaway_frac
