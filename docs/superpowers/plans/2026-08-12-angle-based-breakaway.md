@@ -1106,7 +1106,7 @@ git commit -m "docs(bmw): record angle-breakaway on-car A/B results"
 - **Relaxing `STEP_MAX`.** The angle feedback licenses a faster ramp — slow ramping was the mitigation for having no stop condition. Do not do both in one change; the A/B would be uninterpretable.
 - **`T_CAP_BASE_NM = 2.0`.** Sits inside the measured breakaway range, so on near-straight roads the authority cap may land at roughly the threshold itself. Worth investigating separately.
 
-## Task 3 result
+## Task 3 result (pre-fix baseline)
 
 Ran `plugins/bmw_e9x_e8x/tests/replay_rack_motion.py` on the C3 against all 51 segments of route `000003f2--a4bbab4676--`, exactly as specified in Task 3 Step 2. No constants in `rack_motion.py` were changed — none were tuned to make a gate pass, per instruction.
 
@@ -1192,3 +1192,93 @@ motion threshold used      : 2.0 deg/s
 4. **FAIL.** Final breakaway estimate = 0.055 frac (0.66 Nm), required 0.15–0.25 frac (1.8–3.0 Nm). This is at the `BREAKAWAY_MIN_FRAC = 0.05` clamp floor — without the clamp the raw EMA would have gone lower still. Off by roughly 3–4x low.
 
 Three of four gates fail. Root-cause analysis, evidence, and recommendation are in `.superpowers/sdd/2026-08-12-angle-based-breakaway/task-3-report.md` — summary: `steeringAngleDeg` updates in a stairstep pattern (the CAN source updates slower than the 100 Hz `carState` rate), which makes the windowed least-squares rate hover near the 2 deg/s `MOTION_THRESHOLD_DEG_S` even while the rack is genuinely stationary. Each spurious crossing is treated as a stationary→moving transition by `BreakawayEstimator`, recording whatever torque happens to be applied at that instant (often small) as a "breakaway" observation. This biases `breakaway_frac` down over hundreds of noise-driven observations, which in turn lowers the `stalled` threshold (`breakaway_frac * 0.5`) used by the harness, which flags more ticks as stalled — a self-reinforcing loop that plausibly explains both the gate-3 and gate-4 failures. No constant was changed to chase these gates; that decision is deferred to the plan owner.
+
+## Task 3 result (fix round)
+
+Coordinator independently verified the staircase finding (`steeringAngleDeg` changes on 8.3% of ticks overall, but 78.7% during the segment-10 release window vs 1.2% on a quiet stretch; median dwell 2 ticks; true quantum 0.04395°) and approved both proposed fixes, plus approved not touching `MOTION_THRESHOLD_DEG_S`, `BREAKAWAY_MIN_FRAC`, `BREAKAWAY_SEED_FRAC` or `WINDOW_S`.
+
+Applied, exactly as specified:
+
+- **Fix 1** (`plugins/bmw_e9x_e8x/bmw/rack_motion.py`): added `MOTION_CONFIRM_TICKS = 4`; `BreakawayEstimator` now requires 4 consecutive confirmed-moving ticks before recording an observation, and records the torque at the onset of the run (not at confirmation). Added 3 new tests; extended 6 pre-existing tests that previously supplied only 1-2 moving ticks (see task-3-report.md fix-round section for the exact list and why each needed it — none had their assertions weakened).
+- **Fix 2** (`plugins/bmw_e9x_e8x/tests/replay_rack_motion.py`): added `RELEASE_CONFIRM_S = 0.5`; a stall ending now opens a 0.5s pending-confirmation window, and the episode counts as a release if the rate exceeds 10 deg/s at any point inside it. The reported warning time is still onset-to-stall-end, not onset-to-confirmation. A fresh stall onset cancels any unresolved pending release.
+
+Re-ran the identical command against all 51 segments of route `000003f2--a4bbab4676--`:
+
+```
+PYTHONPATH=/data/openpilot:/tmp/rack_pkg python /tmp/replay_rack_motion.py \
+  /data/media/0/realdata/000003f2--a4bbab4676-- 0 50
+```
+
+Full output, verbatim:
+
+```
+seg  0: stalls=0 releases=0 breakaway=0.200
+seg  1: stalls=2 releases=0 breakaway=0.110
+seg  2: stalls=2 releases=0 breakaway=0.110
+seg  3: stalls=2 releases=0 breakaway=0.110
+seg  4: stalls=2 releases=0 breakaway=0.110
+seg  5: stalls=2 releases=0 breakaway=0.110
+seg  6: stalls=2 releases=0 breakaway=0.110
+seg  7: stalls=13 releases=0 breakaway=0.063
+seg  8: stalls=36 releases=5 breakaway=0.072
+seg  9: stalls=64 releases=5 breakaway=0.093
+seg 10: stalls=85 releases=8 breakaway=0.075
+seg 11: stalls=113 releases=8 breakaway=0.067
+seg 12: stalls=131 releases=8 breakaway=0.070
+seg 13: stalls=131 releases=8 breakaway=0.070
+seg 14: stalls=142 releases=8 breakaway=0.074
+seg 15: stalls=157 releases=8 breakaway=0.064
+seg 16: stalls=159 releases=9 breakaway=0.057
+seg 17: stalls=159 releases=9 breakaway=0.057
+seg 18: stalls=193 releases=14 breakaway=0.075
+seg 19: stalls=233 releases=16 breakaway=0.064
+seg 20: stalls=256 releases=16 breakaway=0.053
+seg 21: stalls=299 releases=23 breakaway=0.062
+seg 22: stalls=329 releases=27 breakaway=0.090
+seg 23: stalls=338 releases=27 breakaway=0.075
+seg 24: stalls=345 releases=27 breakaway=0.069
+seg 25: stalls=361 releases=27 breakaway=0.065
+seg 26: stalls=381 releases=27 breakaway=0.071
+seg 27: stalls=390 releases=27 breakaway=0.068
+seg 28: stalls=417 releases=27 breakaway=0.099
+seg 29: stalls=432 releases=27 breakaway=0.082
+seg 30: stalls=448 releases=27 breakaway=0.075
+seg 31: stalls=476 releases=28 breakaway=0.062
+seg 32: stalls=492 releases=29 breakaway=0.056
+seg 33: stalls=501 releases=31 breakaway=0.063
+seg 34: stalls=549 releases=35 breakaway=0.079
+seg 35: stalls=568 releases=37 breakaway=0.065
+seg 36: stalls=591 releases=37 breakaway=0.059
+seg 37: stalls=607 releases=37 breakaway=0.059
+seg 38: stalls=648 releases=41 breakaway=0.060
+seg 39: stalls=681 releases=44 breakaway=0.055
+seg 40: stalls=681 releases=44 breakaway=0.055
+seg 41: stalls=681 releases=44 breakaway=0.055
+seg 42: stalls=681 releases=44 breakaway=0.055
+seg 43: stalls=688 releases=44 breakaway=0.054
+seg 44: stalls=688 releases=44 breakaway=0.054
+seg 45: stalls=688 releases=44 breakaway=0.054
+seg 46: stalls=688 releases=44 breakaway=0.054
+seg 47: stalls=688 releases=44 breakaway=0.054
+seg 48: stalls=688 releases=44 breakaway=0.054
+seg 49: stalls=688 releases=44 breakaway=0.054
+seg 50: stalls=688 releases=44 breakaway=0.054
+
+=== AGGREGATE ===
+push ticks              : 86723
+stall episodes flagged  : 688
+releases after a stall  : 44
+mean warning before release: 0.47 s
+flagged fraction of pushes : 44.6%
+final breakaway estimate   : 0.054 frac (0.65 Nm) from 562 observations
+motion threshold used      : 2.0 deg/s
+```
+
+**Acceptance gates (fix round):**
+
+1. **FAIL, but the failure mode changed.** The segment-10 release is now correctly counted — a per-tick replay of the fixed logic (uncommitted debug script) shows `RELEASE CONFIRMED at t=663.912 rate=10.08 warning=0.171s (onset 663.531 -> end 663.702)`, which sits inside the brief's cited 663.9-664.5 window. Fix 2 solved the non-detection bug. But the warning is 0.171s, still well under the required 0.5s. This is not an outlier: collecting the warning time for all 44 confirmed releases route-wide gives min=0.009s, median=0.200s, max=3.609s, with only 12/44 (27%) at or above 0.5s and 26/44 (59%) under 0.3s. The segment-10 episode sits almost exactly at the population median. Cause: the harness's own `stalled`/`stalled_since` bookkeeping in `replay_rack_motion.py` still reads the raw, non-debounced `rm.is_moving_with_torque(out)` result every tick -- Fix 1's `MOTION_CONFIRM_TICKS` debounce lives only inside `BreakawayEstimator`, so it never touches how `stalled_since` gets fragmented by brief single-tick blips in the harness's own state machine. In the segment-10 trace, `stalled_since` resets 3 times in the 3 seconds before the true release (659.303, 659.832, 662.661, 663.531) even though the rack is stalled essentially continuously through that period -- only the *last* fragment's duration is counted as warning.
+2. **PASS, weakly.** Mean warning before release = 0.47s >= 0.3s. Given the distribution above (median 0.200s, 59% of episodes under 0.3s, right-skewed by a handful of 0.6-3.6s outliers), the mean is not a representative summary of a "typical" episode's warning time -- more than half of episodes individually fail the 0.3s bar that the mean clears.
+3. **FAIL, effectively unchanged.** 44.6% (was 44.4%), required <=25%.
+4. **FAIL, effectively unchanged.** 0.054 frac / 0.65 Nm (was 0.055 / 0.66), required 0.15-0.25 frac / 1.8-3.0 Nm. Still pinned at the `BREAKAWAY_MIN_FRAC` clamp floor.
+
+**Why Fix 1 barely moved gates 3/4:** a follow-up diagnostic (uncommitted) instrumented the debounced edge directly. Of the runs where the rate crosses the 2 deg/s threshold and gets fully tracked (n=547, one segment run), the median run length is 13 ticks (130ms) and 92.9% already clear the 4-tick/40ms debounce -- so the debounce filters very little. This makes sense in hindsight: `WINDOW_S = 0.16s` is 16 ticks, so a single real angle-quantum step keeps contributing to the windowed LSQ slope for up to 16 ticks as it ages out of the trailing window -- the window's own memory, not raw sensor noise, is what gives these excursions their >100ms lifetime, comfortably past a 4-tick debounce. Separately, the torque recorded at confirmed transitions (n=572) has median 0.041 frac (0.49 Nm), p95 0.133 frac (1.6 Nm), and 98.4% below the 0.20 frac seed -- nowhere near the 0.15-0.25 frac / 1.8-3.0 Nm range a real static-friction breakaway would show. A sanity check holding `breakaway_frac` fixed at the 0.20 seed (instead of letting it evolve) gives a flagged-stall fraction of only 6.8%, comfortably under the gate-3 bar -- confirming the 44.6% is a consequence of `breakaway_frac` decaying toward its floor (driven by the many low-torque confirmed observations), which lowers the `stalled` threshold, which flags more ticks, which feeds more low-torque observations back in. The debounce targeted run *length*; the contamination is in run *torque magnitude*, on ordinary continuous low-authority steering (lane tracking, gentle curve following) that the edge-detector cannot distinguish from a genuine stuck-then-broke-free transition. No constant was changed to chase gates 3/4; see the fix-round section of the task-3 report for candidate next steps (not applied).

@@ -119,6 +119,14 @@ BREAKAWAY_ALPHA = 0.10
 # breakaway 2.5-2.9 Nm, sustained unwinding motion at 1.25-1.5 Nm.
 SUSTAIN_RATIO = 0.5
 
+# Motion must persist this many consecutive samples before it counts as a
+# breakaway. At low rates the LSQ slope oscillates across MOTION_THRESHOLD_DEG_S
+# because the angle quantum (0.04395 deg) is coarse relative to the motion —
+# route 3f2 shows those artifacts are 1-2 ticks wide while genuine motion runs
+# for seconds. 4 ticks = 40 ms at 100 Hz filters them without delaying a real
+# release meaningfully.
+MOTION_CONFIRM_TICKS = 4
+
 
 class BreakawayEstimator:
   """Online estimate of the rack's breakaway torque, in torque fraction.
@@ -132,29 +140,40 @@ class BreakawayEstimator:
     self._seed = float(seed_frac)
     self.breakaway_frac = float(seed_frac)
     self.observations = 0
-    self._was_moving = False
     self._armed = False
+    self._moving_run = 0
+    self._onset_torque = 0.0
+    self._was_confirmed = False
 
   def reset(self):
     self.breakaway_frac = self._seed
     self.observations = 0
-    self._was_moving = False
     self._armed = False
+    self._moving_run = 0
+    self._onset_torque = 0.0
+    self._was_confirmed = False
 
   def update(self, torque_frac, moving_with_torque):
     moving = bool(moving_with_torque)
+    if moving:
+      if self._moving_run == 0:
+        self._onset_torque = torque_frac
+      self._moving_run += 1
+    else:
+      self._moving_run = 0
+    confirmed = self._moving_run >= MOTION_CONFIRM_TICKS
     # Engagement can happen mid-turn with the wheel already moving. Without
     # this gate that first sample would look like a stationary -> moving
     # transition and record a sustain-level torque as if it were breakaway,
     # biasing the estimate low. Require an actual stationary sample before
     # edge detection arms.
-    if moving and not self._was_moving and self._armed and torque_frac != 0.0:
-      obs = min(max(abs(float(torque_frac)), BREAKAWAY_MIN_FRAC), BREAKAWAY_MAX_FRAC)
+    if confirmed and not self._was_confirmed and self._armed and self._onset_torque != 0.0:
+      obs = min(max(abs(float(self._onset_torque)), BREAKAWAY_MIN_FRAC), BREAKAWAY_MAX_FRAC)
       self.breakaway_frac += BREAKAWAY_ALPHA * (obs - self.breakaway_frac)
       self.observations += 1
     if not moving:
       self._armed = True
-    self._was_moving = moving
+    self._was_confirmed = confirmed
 
   @property
   def sustain_frac(self):

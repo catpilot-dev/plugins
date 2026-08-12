@@ -110,7 +110,8 @@ def test_no_observation_leaves_seed_untouched():
 def test_records_torque_at_the_stationary_to_moving_transition():
     est = BreakawayEstimator()
     est.update(0.30, moving_with_torque=False)
-    est.update(0.30, moving_with_torque=True)      # transition
+    for _ in range(4):
+        est.update(0.30, moving_with_torque=True)   # transition, confirmed at tick 4
     assert est.observations == 1
     assert est.breakaway_frac > BREAKAWAY_SEED_FRAC
 
@@ -127,7 +128,8 @@ def test_converges_toward_repeated_observations():
     est = BreakawayEstimator()
     for _ in range(60):
         est.update(0.30, moving_with_torque=False)
-        est.update(0.30, moving_with_torque=True)
+        for _ in range(4):
+            est.update(0.30, moving_with_torque=True)   # confirm each cycle
     assert abs(est.breakaway_frac - 0.30) < 0.02
 
 
@@ -135,15 +137,20 @@ def test_observation_is_clamped_to_sane_range():
     est = BreakawayEstimator()
     for _ in range(200):
         est.update(0.95, moving_with_torque=False)
-        est.update(0.95, moving_with_torque=True)
+        for _ in range(4):
+            est.update(0.95, moving_with_torque=True)   # confirm each cycle
     assert est.breakaway_frac <= BREAKAWAY_MAX_FRAC + 1e-9
 
 
 def test_sign_is_ignored_only_magnitude_matters():
     a = BreakawayEstimator()
     b = BreakawayEstimator()
-    a.update(+0.30, False); a.update(+0.30, True)
-    b.update(-0.30, False); b.update(-0.30, True)
+    a.update(+0.30, False)
+    for _ in range(4):
+        a.update(+0.30, True)
+    b.update(-0.30, False)
+    for _ in range(4):
+        b.update(-0.30, True)
     assert abs(a.breakaway_frac - b.breakaway_frac) < 1e-9
 
 
@@ -164,7 +171,8 @@ def test_reset_restores_seed():
 def test_first_ever_sample_moving_is_not_counted_as_a_breakaway():
     """Engaging mid-turn with the wheel already moving must not record."""
     est = BreakawayEstimator()
-    est.update(0.15, moving_with_torque=True)
+    for _ in range(4):
+        est.update(0.15, moving_with_torque=True)   # confirmed, but never armed
     assert est.observations == 0
     assert est.breakaway_frac == BREAKAWAY_SEED_FRAC
 
@@ -175,14 +183,47 @@ def test_arming_requires_seeing_the_rack_stationary_first():
     est.update(0.15, moving_with_torque=True)
     assert est.observations == 0
     est.update(0.15, moving_with_torque=False)   # arms here
-    est.update(0.15, moving_with_torque=True)
+    for _ in range(4):
+        est.update(0.15, moving_with_torque=True)   # confirmed at tick 4
     assert est.observations == 1
 
 
 def test_reset_disarms_the_edge_detector():
     est = BreakawayEstimator()
     est.update(0.30, moving_with_torque=False)
-    est.update(0.30, moving_with_torque=True)
+    for _ in range(4):
+        est.update(0.30, moving_with_torque=True)
     est.reset()
-    est.update(0.15, moving_with_torque=True)
+    for _ in range(4):
+        est.update(0.15, moving_with_torque=True)   # confirmed, but disarmed by reset
     assert est.observations == 0
+
+
+def test_short_motion_blip_is_not_a_breakaway():
+    """1-2 tick threshold-grazing artifacts must not be recorded."""
+    est = BreakawayEstimator()
+    est.update(0.30, moving_with_torque=False)     # arm
+    est.update(0.30, moving_with_torque=True)
+    est.update(0.30, moving_with_torque=True)      # only 2 ticks, below confirm
+    est.update(0.30, moving_with_torque=False)
+    assert est.observations == 0
+
+
+def test_sustained_motion_is_recorded_once_after_confirmation():
+    est = BreakawayEstimator()
+    est.update(0.30, moving_with_torque=False)     # arm
+    for _ in range(20):
+        est.update(0.30, moving_with_torque=True)
+    assert est.observations == 1
+
+
+def test_records_the_torque_at_onset_not_after_confirmation():
+    """Torque ramps while we confirm; the breakaway value is the onset one."""
+    est = BreakawayEstimator()
+    est.update(0.30, moving_with_torque=False)     # arm
+    est.update(0.30, moving_with_torque=True)      # onset torque = 0.30
+    for _ in range(10):
+        est.update(0.90, moving_with_torque=True)  # torque climbs afterwards
+    assert est.observations == 1
+    # EMA of seed 0.20 toward the clamped onset 0.30, alpha 0.10 -> 0.21
+    assert abs(est.breakaway_frac - 0.21) < 1e-9

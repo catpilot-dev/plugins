@@ -20,6 +20,13 @@ from cereal import log
 
 from bmw.rack_motion import RackMotion, BreakawayEstimator, MOTION_THRESHOLD_DEG_S
 
+# A stall can end with the rack already moving fast (a sharp correction) or
+# accelerating smoothly from rest (a normal breakaway) -- the latter is often
+# still under 10 deg/s on the exact tick the stall ends. Give the rate a
+# short window after the stall ends to cross the fast-motion bar before
+# deciding whether the episode counts as a confirmed release.
+RELEASE_CONFIRM_S = 0.5
+
 
 def read_segment(path):
     """Yield (t, steering_angle_deg, torque_frac, action) at carState rate."""
@@ -57,10 +64,16 @@ def replay(prefix, lo, hi):
     for n in range(lo, hi + 1):
         rm = RackMotion()
         stalled_since = None
+        # A stall that just ended waits here, as (onset_t, end_t, deadline_t),
+        # for the rate to confirm a fast release within RELEASE_CONFIRM_S of
+        # the stall ending. end_t (not the confirmation moment) is what gets
+        # reported as the release time, so the warning measures onset-to-end.
+        pending = None
         for t, ang, out, action, pressed, v in read_segment(f"{prefix}{n}/rlog.zst"):
             rm.update(t, ang)
             if pressed or v < 5.0 or action != 'ramp':
                 stalled_since = None
+                pending = None
                 continue
             push_ticks += 1
             moving = rm.is_moving_with_torque(out)
@@ -71,11 +84,22 @@ def replay(prefix, lo, hi):
                 if stalled_since is None:
                     stalled_since = t
                     stalls += 1
+                    # A fresh stall means the rack never actually got away --
+                    # whatever pending confirmation was in flight wasn't a
+                    # clean release, so it doesn't get credited.
+                    pending = None
             else:
-                if stalled_since is not None and abs(rm.rate_deg_s) > 10.0:
-                    releases += 1
-                    early_total += (t - stalled_since)
+                if stalled_since is not None:
+                    pending = (stalled_since, t, t + RELEASE_CONFIRM_S)
                 stalled_since = None
+            if pending is not None:
+                onset_t, end_t, deadline_t = pending
+                if abs(rm.rate_deg_s) > 10.0:
+                    releases += 1
+                    early_total += (end_t - onset_t)
+                    pending = None
+                elif t >= deadline_t:
+                    pending = None
         print(f"seg {n:2d}: stalls={stalls} releases={releases} breakaway={est.breakaway_frac:.3f}")
     print("\n=== AGGREGATE ===")
     print(f"push ticks              : {push_ticks}")
