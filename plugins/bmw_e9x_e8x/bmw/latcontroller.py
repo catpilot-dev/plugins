@@ -184,19 +184,19 @@ def on_lat_controller_init(result, lac, CP):
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
 
-  # AngleBudget param (file-backed; cache it — a per-CAN-tick read would be
-  # 100 opens/second). See BUDGET_DEG in the constants block below.
-  _param_cache = {'t': 0.0, 'on': False}
-
-  def _budget_enabled():
-    now = time.monotonic()
-    if now - _param_cache['t'] >= 5.0:
-      _param_cache['t'] = now
-      try:
-        _param_cache['on'] = read_plugin_param('bmw_e9x_e8x', 'AngleBudget', '') == '1'
-      except Exception:
-        _param_cache['on'] = False
-    return _param_cache['on']
+  # AngleBudget param — read ONCE here, not per-tick or on any periodic
+  # cache-expiry (review fix, Important 4): this used to re-check a 5 s cache
+  # every CAN tick, which still means a Path.read_text() on controlsd's 100 Hz
+  # RT thread whenever the cache lapsed — under eMMC contention that read can
+  # cost a control frame, and the toggle-off default path paid for the
+  # monotonic-clock check on every tick for no benefit. The on-car A/B
+  # procedure already restarts the process to flip the toggle (see
+  # LATERAL_CONTROLLER.md), so a restart-to-apply read is sufficient; no live
+  # reload is needed. See BUDGET_DEG in the constants block below.
+  try:
+    _angle_budget_on = read_plugin_param('bmw_e9x_e8x', 'AngleBudget', '') == '1'
+  except Exception:
+    _angle_budget_on = False
 
   # Decision cadence & CAN-rate spreading — both subscribe to model_action_t
   # per tick, sized to one half of the model's action horizon so exactly two
@@ -299,8 +299,13 @@ def on_lat_controller_init(result, lac, CP):
   # over. Human-style: push harder until the wheel moves, then stop pushing and
   # ease off. 2 deg is 0.11 deg of front wheel (curvature 0.00070 /m, ~1440 m
   # radius) — a real steering input, and 45 quanta of the 0.04395 deg angle
-  # signal, so no noise can spend it. Route 3f2 seg 10: spent at 2.8 Nm against
-  # the 3.75 Nm the ramp actually reached.
+  # signal, so no noise can spend it. 0.04395 deg is the confirmed quantum —
+  # NOT 0.0879 (the deleted v1 rack_motion.py's ANGLE_LSB_DEG, itself
+  # inferred by counting 169 distinct observed values over one segment,
+  # exactly 2x too coarse): observed level gaps are integer multiples of
+  # 0.04395, and that file's own MOTION_CONFIRM_TICKS comment already used
+  # 0.04395 for the true quantum without reconciling the two. Route 3f2 seg
+  # 10: spent at 2.8 Nm against the 3.75 Nm the ramp actually reached.
   BUDGET_DEG = 2.0
 
   # Relax-dwell (2026-07-12, route 3a0 seg 8): in a measured deep curve, an
@@ -376,8 +381,14 @@ def on_lat_controller_init(result, lac, CP):
     # Push budget. Deltas only — steeringAngleDeg carries a constant ~-1.58 deg
     # physical alignment offset which cancels against the captured reference.
     # getattr guard: CS is a stub in some test paths.
+    # Gated on `active` (review fix): update() runs regardless of engagement
+    # and the decision state machine (which sets state['action']) is not
+    # itself gated on active, so without this, driver steering while
+    # disengaged/hands-on would accrue into push_moved and a push could begin
+    # already spent. CS.steeringPressed is NOT usable as a substitute gate on
+    # this car — it is a voice-control button ORed with gasPressed.
     _angle = float(getattr(CS, 'steeringAngleDeg', 0.0))
-    if state['action'] == 'ramp':
+    if active and state['action'] == 'ramp':
       if state['push_ref'] is None:
         state['push_ref'] = _angle
       state['push_moved'] = _angle - state['push_ref']
@@ -386,7 +397,7 @@ def on_lat_controller_init(result, lac, CP):
       state['push_moved'] = 0.0
     # Torque is NEGATIVE for left, angle POSITIVE for left, so the product of
     # push_moved and -torque is positive when the wheel moved the way we asked.
-    state['budget_spent'] = (_budget_enabled()
+    state['budget_spent'] = (_angle_budget_on
                              and abs(state['push_moved']) >= BUDGET_DEG
                              and state['push_moved'] * -state['torque'] > 0.0)
 
@@ -668,10 +679,26 @@ def on_lat_controller_init(result, lac, CP):
           # rack; unwinding is free (self-aligning torque does it). A symmetric
           # STEP_MAX is right while ramping blind, but afterwards it needed
           # 0.65 s to unwind route 3f2 seg 10 while the overshoot took 0.4 s.
+          # The budget lets the controller stop pushing and let go — it must
+          # NEVER let it push harder, in either direction (review fix, this
+          # replaced a sign-blind |target|>|torque| comparison that either
+          # froze on an overshoot reversal — the controller giving up mid-turn,
+          # the invariant the module-level SAFETY ARCHITECTURE note forbids —
+          # or, when the counter-target had smaller magnitude, applied no cap
+          # at all, up to a single-decision Δ0.578 frac swing). Same-side
+          # target: clamp toward torque, never past it (freeze, don't push
+          # harder). Then shed toward zero unthrottled — that's free, SAT does
+          # it for us — and allow at most one step_max past zero, since
+          # anything past zero is a NEW push in the other direction and gets
+          # rate-limited like any other.
           if state['budget_spent']:
-            if abs(target_frac) > abs(state['torque']):
-              target_frac = state['torque']          # no more pushing
-            step = target_frac - state['torque']     # ease off unthrottled
+            if target_frac * state['torque'] > 0.0:
+              target_frac = math.copysign(min(abs(target_frac), abs(state['torque'])),
+                                          state['torque'])
+            lo = min(0.0, state['torque']) - step_max
+            hi = max(0.0, state['torque']) + step_max
+            target_frac = float(np.clip(target_frac, lo, hi))
+            step = target_frac - state['torque']
           else:
             step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
           target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))

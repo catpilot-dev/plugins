@@ -297,9 +297,15 @@ This document is the canonical reference for the lateral controller registered b
 > **Why a budget, not a detection threshold.** 2 degrees is not trying to
 > detect breakaway — whether the movement was creep through stiction or the
 > rack actually breaking free is irrelevant to it — it is an *authority
-> budget*: how much wheel movement the controller may cause open-loop before
-> feedback must take over. That framing needs no margin against false
-> positives/negatives the way a detector would. Physically 2 degrees of
+> budget*: how much wheel movement **one push** may cause open-loop before
+> feedback must take over for that push. This is a bound **per push, not per
+> event or per drive** — each time `action` re-enters `'ramp'` after having
+> left it, `push_ref` re-arms from wherever the wheel currently is (see
+> below) and a fresh 2 degrees is available; a curve negotiated as several
+> distinct pushes (interleaved with holds, `cancel_tol`, `relax_dwell`, or a
+> disengagement) can accumulate open-loop travel well past 2 degrees in
+> total. That framing needs no margin against false positives/negatives the
+> way a detector would. Physically 2 degrees of
 > steering wheel is 0.11 degrees of front wheel (curvature 0.00070 /m,
 > roughly 1440 m radius, about 80% of the actual curve in route 3f2 seg 10,
 > robust across steerRatio 18-21) — a real steering input — and 45 quanta of
@@ -320,16 +326,38 @@ This document is the canonical reference for the lateral controller registered b
 > ramping blind into an unknown plant response, but it is the wrong rate
 > limit for shedding torque once the plant has already told you it moved: on
 > route 3f2 seg 10 the symmetric clamp needed 0.65 s to unwind an overshoot
-> that took only 0.4 s to build. Once `state['budget_spent']` is true, the
-> target is capped at the current torque (never higher — "no more pushing")
-> and the step to reach it is applied in one decision, unclamped.
+> that took only 0.4 s to build. Once `state['budget_spent']` is true: a
+> same-direction target is clamped toward (never past) the current torque —
+> stop pushing harder, don't freeze on it, either; shedding toward zero is
+> unthrottled; and past zero (an overshoot reversal, a new push the other
+> way) is allowed at most one `step_max` beyond zero in that single decision,
+> the same rate limit any other push gets. **Review fix (2026-08-12,
+> post-merge):** the first cut of this compared `abs(target_frac)` against
+> `abs(state['torque'])` with no sign check, which on a reversal either froze
+> torque at its wrong-direction value (the controller giving up mid-turn —
+> forbidden by this file's own SAFETY ARCHITECTURE contract) or, when the
+> counter-target was smaller in magnitude, applied no cap at all (up to a
+> single-decision Δ0.578 frac / 6.9 Nm swing — exactly what `STEP_MAX` exists
+> to prevent). Caught in review before deployment; never shipped.
 >
-> **`AngleBudget` param** (default **off**) gates the whole mechanism —
-> `_budget_enabled()` reads it from the plugin's file-backed param store,
-> cached 5 s (a per-CAN-tick file read would be 100 opens/second). With the
+> **`AngleBudget` param** (default **off**) gates the whole mechanism, read
+> **once** at controller construction into a plain local (not re-read
+> per-tick or on a cache timer — a first cut cached it 5 s, but any
+> `Path.read_text()` on controlsd's 100 Hz RT thread risks costing a control
+> frame under eMMC contention; the on-car A/B procedure already restarts the
+> process to flip the toggle, so a restart-to-apply read is enough). With the
 > param off, `state['budget_spent']` is always `False` and every decision
 > takes the pre-existing symmetric-`STEP_MAX` path unchanged — behaviour is
 > bit-identical to before this date.
+>
+> **Gated on `active`** (review fix): the angle-capture block runs every CAN
+> tick regardless of engagement, and the decision state machine that sets
+> `state['action']` is not itself gated on `active` — without this, steering
+> input while disengaged (hands-on override, manual parking, etc.) would
+> accrue into `push_moved`, and a push beginning right after re-engagement
+> could start already spent. `CS.steeringPressed` is **not** a usable
+> substitute gate on this car — it is a voice-control button ORed with
+> `gasPressed`, not a hands-on-wheel signal.
 >
 > Uses `CS.steeringAngleDeg` (positive = LEFT; torque fraction is negative =
 > LEFT, the opposite sign convention — the code multiplies `push_moved` by
