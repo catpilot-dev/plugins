@@ -351,6 +351,33 @@ def test_reset_restores_seed():
     est.reset()
     assert est.breakaway_frac == BREAKAWAY_SEED_FRAC
     assert est.observations == 0
+
+
+def test_first_ever_sample_moving_is_not_counted_as_a_breakaway():
+    """Engaging mid-turn with the wheel already moving must not record."""
+    est = BreakawayEstimator()
+    est.update(0.15, moving_with_torque=True)
+    assert est.observations == 0
+    assert est.breakaway_frac == BREAKAWAY_SEED_FRAC
+
+
+def test_arming_requires_seeing_the_rack_stationary_first():
+    est = BreakawayEstimator()
+    est.update(0.15, moving_with_torque=True)
+    est.update(0.15, moving_with_torque=True)
+    assert est.observations == 0
+    est.update(0.15, moving_with_torque=False)   # arms here
+    est.update(0.15, moving_with_torque=True)
+    assert est.observations == 1
+
+
+def test_reset_disarms_the_edge_detector():
+    est = BreakawayEstimator()
+    est.update(0.30, moving_with_torque=False)
+    est.update(0.30, moving_with_torque=True)
+    est.reset()
+    est.update(0.15, moving_with_torque=True)
+    assert est.observations == 0
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -400,18 +427,27 @@ class BreakawayEstimator:
     self.breakaway_frac = float(seed_frac)
     self.observations = 0
     self._was_moving = False
+    self._armed = False
 
   def reset(self):
     self.breakaway_frac = self._seed
     self.observations = 0
     self._was_moving = False
+    self._armed = False
 
   def update(self, torque_frac, moving_with_torque):
     moving = bool(moving_with_torque)
-    if moving and not self._was_moving and torque_frac != 0.0:
+    # Warm-up gate: only count a transition once the rack has been SEEN
+    # stationary. The controller constructs this at engagement, and the driver
+    # can engage mid-turn with the wheel already moving — recording that as a
+    # breakaway would capture the SUSTAIN torque (about half of breakaway) and
+    # bias the estimate low, the exact failure this feature exists to remove.
+    if moving and not self._was_moving and self._armed and torque_frac != 0.0:
       obs = min(max(abs(float(torque_frac)), BREAKAWAY_MIN_FRAC), BREAKAWAY_MAX_FRAC)
       self.breakaway_frac += BREAKAWAY_ALPHA * (obs - self.breakaway_frac)
       self.observations += 1
+    if not moving:
+      self._armed = True      # arm AFTER the check, so one sample cannot both arm and fire
     self._was_moving = moving
 
   @property
@@ -422,7 +458,7 @@ class BreakawayEstimator:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd /home/oxygen/catpilot-dev/plugins && PYTHONPATH=.:plugins/bmw_e9x_e8x uv run pytest plugins/bmw_e9x_e8x/tests/test_rack_motion.py -v`
-Expected: PASS, 20 passed
+Expected: PASS, 23 passed
 
 - [ ] **Step 5: Commit**
 
