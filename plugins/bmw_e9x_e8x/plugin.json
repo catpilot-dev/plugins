@@ -17,6 +17,10 @@
     "TemperatureOverlay": {
       "default": true,
       "description": "Show coolant and oil temperature on the onroad HUD"
+    },
+    "AngleBudget": {
+      "default": false,
+      "description": "Stop pushing and ease off once the wheel has moved 2 degrees"
     }
   },
   "cereal": {

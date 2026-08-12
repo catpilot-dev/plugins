@@ -45,6 +45,17 @@ _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
+# bmw.latcontroller does `from config import read_plugin_param` at module scope
+# (push-budget param helper) — on device the shared plugins/ dir (config.py,
+# services.py, ...) is already on sys.path; replicate that here or the import
+# raises ModuleNotFoundError at collection time and takes every test in this
+# file (and test_hooks.py, which also loads bmw.latcontroller) down with it.
+# Same fix, same reason, as speedlimitd/tests/test_speedlimitd.py's
+# _PLUGINS_DIR insert.
+_PLUGINS_DIR = os.path.dirname(_PLUGIN_DIR)
+if _PLUGINS_DIR not in sys.path:
+  sys.path.insert(0, _PLUGINS_DIR)
+
 from test_helpers import install_all_mocks
 
 
@@ -107,8 +118,9 @@ def _set_measured(fake_sm, v, kappa_meas):
   fake_sm.lp.angularVelocityDevice.z = kappa_meas * v
 
 
-def _call_update(lac, desired_curvature, lat_delay=0.2, v_ego=20.0, active=True):
-  CS = SimpleNamespace(vEgo=v_ego)
+def _call_update(lac, desired_curvature, lat_delay=0.2, v_ego=20.0, active=True,
+                 steering_angle_deg=0.0):
+  CS = SimpleNamespace(vEgo=v_ego, steeringAngleDeg=steering_angle_deg)
   return lac.update(active, CS, None, None, False, desired_curvature, False, lat_delay)
 
 
@@ -311,3 +323,82 @@ class TestNonCancelPaths:
     state['tick_count'] = 999
     _call_update(lac, 0.001, v_ego=v)
     assert state['action'] not in _CANCELS
+
+
+# ============================================================
+# (4) Push budget — task-1-brief Step 2. Human-style: push harder until the
+# wheel actually moves, then stop pushing harder and ease off. `_drive` pins
+# state['torque']/state['action'] each tick (as the existing tests above do)
+# while feeding a steering-angle trajectory through the new steeringAngleDeg
+# plumbing (Step 1).
+# ============================================================
+
+def _drive(lac, sm, state, angles, torque=-0.30, desired=0.002):
+    """Hold a commanded torque while feeding a steering-angle trajectory."""
+    for a in angles:
+        state['torque'] = torque
+        state['action'] = 'ramp'
+        _set_measured(sm, 20.0, 0.001)
+        _call_update(lac, desired, steering_angle_deg=a)
+
+
+def test_budget_unspent_while_the_wheel_barely_moves(monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    monkeypatch.setattr(mod, 'read_plugin_param', lambda *a, **k: '1')
+    _drive(lac, sm, state, [0.0, 0.4, 0.8, 1.2, 1.5, 1.8])
+    assert state['budget_spent'] is False
+
+
+def test_budget_spent_after_two_degrees_in_the_commanded_direction(monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    monkeypatch.setattr(mod, 'read_plugin_param', lambda *a, **k: '1')
+    # Negative torque commands LEFT; LEFT is POSITIVE steering angle.
+    _drive(lac, sm, state, [0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
+    assert state['budget_spent'] is True
+
+
+def test_movement_opposing_the_command_does_not_spend_it(monkeypatch):
+    """Camber or a bump moving the wheel the wrong way is not our doing."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    monkeypatch.setattr(mod, 'read_plugin_param', lambda *a, **k: '1')
+    _drive(lac, sm, state, [0.0, -0.5, -1.0, -1.5, -2.0, -2.5])
+    assert state['budget_spent'] is False
+
+
+def test_reference_resets_when_the_push_ends(monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    monkeypatch.setattr(mod, 'read_plugin_param', lambda *a, **k: '1')
+    _drive(lac, sm, state, [0.0, 1.0, 2.0, 3.0])
+    assert state['budget_spent'] is True
+    state['action'] = 'hold_zero'
+    _set_measured(sm, 20.0, 0.001)
+    _call_update(lac, 0.002, steering_angle_deg=3.0)
+    assert state['budget_spent'] is False
+    _drive(lac, sm, state, [3.0, 3.5])          # new push from 3.0
+    assert state['budget_spent'] is False
+
+
+def test_offset_cancels(monkeypatch):
+    """A constant alignment offset must not change when the budget is spent."""
+    for base in (0.0, -1.58, +7.3):
+        lac, sm, mod, state = _make_controller(monkeypatch)
+        monkeypatch.setattr(mod, 'read_plugin_param', lambda *a, **k: '1')
+        _drive(lac, sm, state, [base + 0.5 * i for i in range(5)])
+        assert state['budget_spent'] is True
+
+
+def test_toggle_off_never_spends_the_budget(monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    monkeypatch.setattr(mod, 'read_plugin_param', lambda *a, **k: '0')
+    _drive(lac, sm, state, [0.0 + 0.5 * i for i in range(10)])
+    assert state['budget_spent'] is False
+
+
+def test_missing_steering_angle_degrades_safely(monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    CS = SimpleNamespace(vEgo=20.0)          # no steeringAngleDeg
+    for _ in range(20):
+        _set_measured(sm, 20.0, 0.001)
+        out = lac.update(True, CS, None, None, False, 0.002, False, 0.2)
+    assert out is not None
+    assert state['budget_spent'] is False

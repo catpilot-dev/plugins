@@ -284,6 +284,71 @@ This document is the canonical reference for the lateral controller registered b
 > § 8 below use `HOLD_KAPPA_BP`/curvature language in places where that is
 > now historical — the live gate is `HOLD_AY_BP` as described here.**
 
+> **2026-08-12 — push budget (route 3f2 seg 10: "wound to breakaway, then
+> overshot").** The controller now remembers the steering angle when a push
+> (`action == 'ramp'`) begins and tracks how far the wheel has moved from that
+> reference. Once it has moved `BUDGET_DEG = 2.0` degrees **in the commanded
+> direction**, the per-decision `STEP_MAX` clamp stops applying: the target
+> can no longer command *more* torque than currently held, and the step to
+> get there is unclamped — the P law sheds torque as fast as it asks instead
+> of at the ramping rate. Human-style: **push harder until the wheel
+> actually moves, then stop pushing harder and ease off.**
+>
+> **Why a budget, not a detection threshold.** 2 degrees is not trying to
+> detect breakaway — whether the movement was creep through stiction or the
+> rack actually breaking free is irrelevant to it — it is an *authority
+> budget*: how much wheel movement the controller may cause open-loop before
+> feedback must take over. That framing needs no margin against false
+> positives/negatives the way a detector would. Physically 2 degrees of
+> steering wheel is 0.11 degrees of front wheel (curvature 0.00070 /m,
+> roughly 1440 m radius, about 80% of the actual curve in route 3f2 seg 10,
+> robust across steerRatio 18-21) — a real steering input — and 45 quanta of
+> the 0.04395 degree angle signal, so no signal noise can spend it.
+>
+> **Route 3f2 seg 10 numbers.** The controller wound torque 0.11 to 0.313
+> frac over 1.2 s into a rack delivering only 0-21% of the commanded motion,
+> then the rack broke free and the wheel swung to 24.8 degrees. The budget is
+> spent at t=663.87 with torque at 2.8 Nm, against the 3.75 Nm peak the ramp
+> actually reached at t=664.30 — i.e. it would have capped the overshoot
+> roughly 0.43 s and about 1.0 Nm earlier. It does *not* fire during the
+> preceding 1.4 s stall (which accumulated only 1.63 degrees of movement), so
+> ordinary creep against stiction is unaffected.
+>
+> **Asymmetric `STEP_MAX` once spent.** Winding torque up is fought by the
+> rack (stiction); winding it down is free (self-aligning torque does it).
+> The existing speed-scaled `STEP_MAX` clamp is the right rate limit while
+> ramping blind into an unknown plant response, but it is the wrong rate
+> limit for shedding torque once the plant has already told you it moved: on
+> route 3f2 seg 10 the symmetric clamp needed 0.65 s to unwind an overshoot
+> that took only 0.4 s to build. Once `state['budget_spent']` is true, the
+> target is capped at the current torque (never higher — "no more pushing")
+> and the step to reach it is applied in one decision, unclamped.
+>
+> **`AngleBudget` param** (default **off**) gates the whole mechanism —
+> `_budget_enabled()` reads it from the plugin's file-backed param store,
+> cached 5 s (a per-CAN-tick file read would be 100 opens/second). With the
+> param off, `state['budget_spent']` is always `False` and every decision
+> takes the pre-existing symmetric-`STEP_MAX` path unchanged — behaviour is
+> bit-identical to before this date.
+>
+> Uses `CS.steeringAngleDeg` (positive = LEFT; torque fraction is negative =
+> LEFT, the opposite sign convention — the code multiplies `push_moved` by
+> `-torque` to test "moved the way we asked"). The signal carries a constant
+> ~-1.58 degree physical alignment offset, cancelled by working only in
+> deltas from the captured reference (`push_ref`), never the absolute angle
+> — verified the budget fires identically regardless of a -1.58 or a +7.3
+> degree constant offset. The reference resets to `None` (a fresh push
+> re-arms from wherever the wheel is) whenever `action` leaves `'ramp'`.
+> `getattr(CS, 'steeringAngleDeg', 0.0)` degrades safely (budget never
+> spends) if the field is ever absent from `CS`. Telemetry gains
+> `push_moved`, `budget_spent` (§ 9).
+>
+> **Replaces the v1 design** (`bmw/rack_motion.py`: a `RackMotion` rate
+> estimator plus a `BreakawayEstimator` that learned the rack's breakaway
+> torque online from edge-detected angular-rate transitions), deleted this
+> date — offline validation on route 3f2 refuted it before it ever shipped
+> behind a toggle. See § 11.
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -586,6 +651,8 @@ Published each livePose tick:
 | `hold_cap` | cap on held torque (P value implied by the fixed `HOLD_CAP_DRIFT_M` reference, frac — independent of the deleted tolerance) |
 | `relax_ticks` | consecutive ticks of overshoot-side error while deep in a curve (dwell counter) |
 | `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
+| `push_moved` | (2026-08-12) signed degrees moved from `push_ref` since the current push began (0 when not ramping) |
+| `budget_spent` | (2026-08-12) `True` once `push_moved` has reached `BUDGET_DEG` in the commanded direction (always `False` with `AngleBudget` off) |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 
@@ -610,6 +677,7 @@ These were tried, deployed, and reverted. Each appears here so future maintainer
 | Stiction-gated steering-angle FF (linear in \|steer\|, 20°/0.10 Nm·deg⁻¹) | Over-pushed in route 31d seg 8 right turn: 50% over-rotation, 6.22 Nm torque, sustained cancel_jerk oscillation. SAT physics aren't linear in steering angle alone — needs multi-regime (v×κ grid) calibration, not single-route fit. | commit 2c67a97 | e81f1c0 |
 | Hysteresis-on-κ_des (`KD_HYST_GAP = 0.003`, `KD_GATE = 0.006`) | 95% sign-flip reduction in offline check, but route 322 had 32% time `\|offset\|>0.5 m` and 44-second frozen-κ_des stretches — controller faithfully tracked a held biased reference → drift. Structural failure of holding the reference without a position-feedback layer. | commit daef207 | 96945fc (replaced with box-on-delta_err) |
 | Suggesting external sensor fusion (HD map, radar, lidar, IMU) for vision noise | Out of project scope by design — see [vision-only constraint](§10). | (recurring; do not propose) |
+| Online breakaway-torque estimator + angular-rate edge detector (`bmw/rack_motion.py`: `RackMotion`, `BreakawayEstimator`) | Never deployed — killed by offline validation on route 3f2. Rate thresholding produced 1-2 tick false-motion blips at exactly the low rates that mattered; a debounce did not fix it. The estimator's own observations had a median torque of 0.041 frac — the controller's own median push, not a breakaway signature — so it measured "torque present when the wheel happens to move" and collapsed to its clamp floor. Replaced by the fixed 2-degree open-loop push budget (no online learning, no rate threshold) — see the 2026-08-12 entry above. | commits 5bb33b4..dd3d2a2 | 2026-08-12 (this commit) |
 
 ---
 
