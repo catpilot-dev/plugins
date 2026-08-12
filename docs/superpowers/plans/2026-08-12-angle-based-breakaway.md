@@ -1105,3 +1105,90 @@ git commit -m "docs(bmw): record angle-breakaway on-car A/B results"
 - **Inner steering-rate / angle-space cascade.** The full restructure where the outer loop hands down a desired increment and an inner loop servos it. Revisit only after Task 7 shows the observer is trustworthy on the car.
 - **Relaxing `STEP_MAX`.** The angle feedback licenses a faster ramp — slow ramping was the mitigation for having no stop condition. Do not do both in one change; the A/B would be uninterpretable.
 - **`T_CAP_BASE_NM = 2.0`.** Sits inside the measured breakaway range, so on near-straight roads the authority cap may land at roughly the threshold itself. Worth investigating separately.
+
+## Task 3 result
+
+Ran `plugins/bmw_e9x_e8x/tests/replay_rack_motion.py` on the C3 against all 51 segments of route `000003f2--a4bbab4676--`, exactly as specified in Task 3 Step 2. No constants in `rack_motion.py` were changed — none were tuned to make a gate pass, per instruction.
+
+Full command:
+
+```
+PYTHONPATH=/data/openpilot:/tmp/rack_pkg python /tmp/replay_rack_motion.py \
+  /data/media/0/realdata/000003f2--a4bbab4676-- 0 50
+```
+
+(`/tmp/rack_pkg` on the device is a minimal `bmw/` package containing only `rack_motion.py`, copied there because `/data/plugins-runtime/bmw_e9x_e8x/bmw/rack_motion.py` does not exist on the device — the runtime deploy predates Tasks 1–2 and was not redeployed for this task, per the read-only guardrail on `/data/plugins-runtime`. The imported `rack_motion.py` is byte-identical to the committed one, confirmed via the smoke-test import succeeding and matching the module's own constants in the printed output.)
+
+Full output, verbatim:
+
+```
+seg  0: stalls=0 releases=0 breakaway=0.200
+seg  1: stalls=2 releases=0 breakaway=0.110
+seg  2: stalls=2 releases=0 breakaway=0.110
+seg  3: stalls=2 releases=0 breakaway=0.110
+seg  4: stalls=2 releases=0 breakaway=0.110
+seg  5: stalls=2 releases=0 breakaway=0.110
+seg  6: stalls=2 releases=0 breakaway=0.110
+seg  7: stalls=13 releases=0 breakaway=0.063
+seg  8: stalls=36 releases=1 breakaway=0.073
+seg  9: stalls=64 releases=1 breakaway=0.091
+seg 10: stalls=85 releases=1 breakaway=0.077
+seg 11: stalls=113 releases=1 breakaway=0.067
+seg 12: stalls=131 releases=1 breakaway=0.069
+seg 13: stalls=131 releases=1 breakaway=0.069
+seg 14: stalls=142 releases=1 breakaway=0.074
+seg 15: stalls=157 releases=1 breakaway=0.064
+seg 16: stalls=159 releases=1 breakaway=0.057
+seg 17: stalls=159 releases=1 breakaway=0.057
+seg 18: stalls=192 releases=2 breakaway=0.075
+seg 19: stalls=232 releases=3 breakaway=0.064
+seg 20: stalls=255 releases=3 breakaway=0.053
+seg 21: stalls=298 releases=5 breakaway=0.062
+seg 22: stalls=330 releases=6 breakaway=0.079
+seg 23: stalls=340 releases=6 breakaway=0.069
+seg 24: stalls=348 releases=6 breakaway=0.067
+seg 25: stalls=364 releases=6 breakaway=0.064
+seg 26: stalls=384 releases=6 breakaway=0.072
+seg 27: stalls=393 releases=6 breakaway=0.069
+seg 28: stalls=419 releases=6 breakaway=0.110
+seg 29: stalls=434 releases=6 breakaway=0.086
+seg 30: stalls=450 releases=6 breakaway=0.073
+seg 31: stalls=478 releases=6 breakaway=0.062
+seg 32: stalls=494 releases=7 breakaway=0.057
+seg 33: stalls=503 releases=7 breakaway=0.063
+seg 34: stalls=550 releases=8 breakaway=0.082
+seg 35: stalls=570 releases=8 breakaway=0.065
+seg 36: stalls=593 releases=8 breakaway=0.059
+seg 37: stalls=608 releases=8 breakaway=0.060
+seg 38: stalls=649 releases=9 breakaway=0.060
+seg 39: stalls=682 releases=9 breakaway=0.055
+seg 40: stalls=682 releases=9 breakaway=0.055
+seg 41: stalls=682 releases=9 breakaway=0.055
+seg 42: stalls=682 releases=9 breakaway=0.055
+seg 43: stalls=689 releases=9 breakaway=0.055
+seg 44: stalls=689 releases=9 breakaway=0.055
+seg 45: stalls=689 releases=9 breakaway=0.055
+seg 46: stalls=689 releases=9 breakaway=0.055
+seg 47: stalls=689 releases=9 breakaway=0.055
+seg 48: stalls=689 releases=9 breakaway=0.055
+seg 49: stalls=689 releases=9 breakaway=0.055
+seg 50: stalls=689 releases=9 breakaway=0.055
+
+=== AGGREGATE ===
+push ticks              : 86723
+stall episodes flagged  : 689
+releases after a stall  : 9
+mean warning before release: 0.79 s
+flagged fraction of pushes : 44.4%
+final breakaway estimate   : 0.055 frac (0.66 Nm) from 606 observations
+motion threshold used      : 2.0 deg/s
+```
+
+**Acceptance gates:**
+
+1. **FAIL.** Segment 10 contributed **zero** releases (its running total stays at 1, carried in from segment 8; the per-tick trace shows no `RELEASE` event fires anywhere in segment 10). The physical release the brief cites (rack unwinding from ~663.7s to ~664.3s, angle running from ~3° to ~16.7° at up to 39°/s) is real and present in the log, but the harness's release-counting logic checks `abs(rate) > 10 deg/s` only on the single tick where `stalled` first flips to `False` — and at a genuine breakaway the rate crosses the 2 deg/s "moving" threshold gradually (it was ~2.1 deg/s at that exact tick), so the check almost always misses. By the time the rate has built up to >10 deg/s a few ticks later, `stalled_since` has already been cleared. Measuring by hand instead (last stall onset before the release to release onset): the nearest continuous stall run before 663.7s starts at 663.531s, giving ~0.17 s of warning — also below the 0.5 s bar. Gate 1 fails on both readings.
+2. **PASS.** Mean warning before release = 0.79 s ≥ 0.3 s. (Caveat: this average is computed over only 9 counted releases, and gate 1's finding means the counting logic under-counts real releases and may not be representative of a "typical" release event — see analysis in the task-3 report.)
+3. **FAIL.** Flagged fraction of push ticks = 44.4%, required ≤ 25%. Off by roughly 1.8x.
+4. **FAIL.** Final breakaway estimate = 0.055 frac (0.66 Nm), required 0.15–0.25 frac (1.8–3.0 Nm). This is at the `BREAKAWAY_MIN_FRAC = 0.05` clamp floor — without the clamp the raw EMA would have gone lower still. Off by roughly 3–4x low.
+
+Three of four gates fail. Root-cause analysis, evidence, and recommendation are in `.superpowers/sdd/2026-08-12-angle-based-breakaway/task-3-report.md` — summary: `steeringAngleDeg` updates in a stairstep pattern (the CAN source updates slower than the 100 Hz `carState` rate), which makes the windowed least-squares rate hover near the 2 deg/s `MOTION_THRESHOLD_DEG_S` even while the rack is genuinely stationary. Each spurious crossing is treated as a stationary→moving transition by `BreakawayEstimator`, recording whatever torque happens to be applied at that instant (often small) as a "breakaway" observation. This biases `breakaway_frac` down over hundreds of noise-driven observations, which in turn lowers the `stalled` threshold (`breakaway_frac * 0.5`) used by the harness, which flags more ticks as stalled — a self-reinforcing loop that plausibly explains both the gate-3 and gate-4 failures. No constant was changed to chase these gates; that decision is deferred to the plan owner.
