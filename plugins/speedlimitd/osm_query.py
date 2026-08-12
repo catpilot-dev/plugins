@@ -177,29 +177,14 @@ class OsmTileReader:
     if self.schema is None:
       return None
 
-    # Prefer the DOWNLOADED tile; fall back to the self-generated one only
-    # where the downloaded set has no coverage.
-    #
-    # Reversed 2026-08-11 (was: self-generated first, for its highwayType).
-    # The downloaded stream tracks upstream OSM — as our surveyed speed limits
-    # are accepted into OSM they arrive here on their own, whereas offline_hw
-    # is only ever as fresh as the last manual regeneration and silently
-    # shadows a newer downloaded tile for the same area. Staying on the
-    # upstream stream is the simple choice that keeps working long-term.
-    #
-    # Accepted cost: downloaded tiles carry no highwayType, so `osmHwType`
-    # reads '' and speedlimitd's road-class inference falls back to its vision
-    # lane-count votes (see infer_speed_from_road_type's osm_type argument).
-    # A per-field merge of the two sets is NOT possible — osm_reader.capnp has
-    # no way ID, so there is no key to join a way in one tile to the same way
-    # in the other.
+    # Prefer the self-generated tile (has highwayType) when it exists
     hw_path = _hw_tile_path(lat, lon)
     pf_path = _tile_path(lat, lon)
-    if os.path.exists(pf_path):
-      path = pf_path
-      self.tile_missing = False
-    elif os.path.exists(hw_path):
+    if os.path.exists(hw_path):
       path = hw_path
+      self.tile_missing = False
+    elif os.path.exists(pf_path):
+      path = pf_path
       self.tile_missing = False
     else:
       # Neither tile file exists — area not covered by downloaded tiles.
