@@ -28,10 +28,6 @@ if _PLUGIN_DIR not in sys.path:
 
 import numpy as np
 
-import time
-
-from config import read_plugin_param
-
 # SAFETY ARCHITECTURE (2026-07-28): the lateral controller NEVER gives up in a
 # turn — its contract is to track the commanded curvature, always. Keeping
 # lateral acceleration within ISO 11270 / comfort limits is handled at the
@@ -189,11 +185,23 @@ def on_lat_controller_init(result, lac, CP):
   # every CAN tick, which still means a Path.read_text() on controlsd's 100 Hz
   # RT thread whenever the cache lapsed — under eMMC contention that read can
   # cost a control frame, and the toggle-off default path paid for the
-  # monotonic-clock check on every tick for no benefit. The on-car A/B
-  # procedure already restarts the process to flip the toggle (see
-  # LATERAL_CONTROLLER.md), so a restart-to-apply read is sufficient; no live
-  # reload is needed. See BUDGET_DEG in the constants block below.
+  # monotonic-clock check on every tick for no benefit. Applying or rolling
+  # back the toggle therefore requires restarting controlsd (an offroad
+  # reboot, not a UI restart) — see LATERAL_CONTROLLER.md § 12, "To toggle
+  # AngleBudget", for the exact procedure and how to verify from telemetry
+  # that a restart actually took. See BUDGET_DEG in the constants block below.
+  #
+  # Import at function scope, not module scope (review fix, Important 2):
+  # every other config.read_plugin_param consumer in this repo does this
+  # (bmw/carstate.py's _load_steer_angle_offset, speedlimitd's _read_params)
+  # so a missing config.py only defaults this one param off instead of
+  # failing the whole hook module's import — install.sh copies config.py to
+  # the plugins-runtime root as a separate, later step, so a partial deploy
+  # can transiently be missing it. A module-scope import failing here would
+  # silently fall the car back to stock LatControlTorque, which is worse
+  # than just defaulting the toggle off.
   try:
+    from config import read_plugin_param
     _angle_budget_on = read_plugin_param('bmw_e9x_e8x', 'AngleBudget', '') == '1'
   except Exception:
     _angle_budget_on = False
@@ -299,13 +307,10 @@ def on_lat_controller_init(result, lac, CP):
   # over. Human-style: push harder until the wheel moves, then stop pushing and
   # ease off. 2 deg is 0.11 deg of front wheel (curvature 0.00070 /m, ~1440 m
   # radius) — a real steering input, and 45 quanta of the 0.04395 deg angle
-  # signal, so no noise can spend it. 0.04395 deg is the confirmed quantum —
-  # NOT 0.0879 (the deleted v1 rack_motion.py's ANGLE_LSB_DEG, itself
-  # inferred by counting 169 distinct observed values over one segment,
-  # exactly 2x too coarse): observed level gaps are integer multiples of
-  # 0.04395, and that file's own MOTION_CONFIRM_TICKS comment already used
-  # 0.04395 for the true quantum without reconciling the two. Route 3f2 seg
-  # 10: spent at 2.8 Nm against the 3.75 Nm the ramp actually reached.
+  # signal, so no noise can spend it (0.04395 is the confirmed quantum; see
+  # LATERAL_CONTROLLER.md § 11 for the reconciliation against the deleted v1
+  # rack_motion.py's differently-inferred value). Route 3f2 seg 10: spent at
+  # 2.8 Nm against the 3.75 Nm the ramp actually reached.
   BUDGET_DEG = 2.0
 
   # Relax-dwell (2026-07-12, route 3a0 seg 8): in a measured deep curve, an
@@ -706,6 +711,27 @@ def on_lat_controller_init(result, lac, CP):
         state['target_frac'] = target_frac
         state['ramp_step'] = (target_frac - state['torque']) / spread_frames
         state['ramp_frames'] = spread_frames
+        if active and state['action'] == 'ramp':
+          # Re-arm the push budget every decision (review fix, Critical 1).
+          # push_ref used to be captured only on the first tick of a push and
+          # then held for the push's entire lifetime — so once budget_spent
+          # latched true, it stayed true for as long as action == 'ramp'
+          # (which is exactly as long as |delta_err| > HOLD_BAND), pinning
+          # the same-side clamp and locking the push out of torque authority
+          # for the rest of the turn: the "controller gives up mid-turn"
+          # state this file's SAFETY ARCHITECTURE header forbids. A driver
+          # does not stop pushing forever after one 2-degree movement — they
+          # ease off, feel whether the wheel is still moving, and push again
+          # if not. Re-measuring the reference at this same cadence (the one
+          # that just set target_frac/ramp_step/ramp_frames above) gives
+          # exactly that stepping behaviour: each ~model_action_t/2 decision
+          # gets its own fresh BUDGET_DEG allowance, so a push that spends
+          # the budget and then sticks (wheel static) recovers full torque
+          # authority at the very next decision, while a push whose wheel
+          # keeps moving fast keeps re-spending it decision after decision.
+          # Gated on active/action=='ramp' exactly like the capture above,
+          # for the same disengagement reason.
+          state['push_ref'] = _angle
 
     # Apply per-frame ramp step. Panda enforces wire-rate (STEER_DELTA_UP)
     # downstream; large ramp_step (Δ > 5 Nm spread over 50 frames) gets

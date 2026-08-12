@@ -13,12 +13,17 @@ Deliberately NOT imported from the plugin tree: the deployed runtime under
 /data/plugins-runtime predates this feature (its bmw_lat_control payloads
 carry no push_moved/budget_spent keys at all -- confirmed empirically before
 writing this script), and the point of this script is an INDEPENDENT replica
-to sanity-check the shipped rule, not a call-through to it. The rule itself
-is five lines, reproduced verbatim in spirit below:
+to approximate the shipped rule, not a call-through to it. This is a
+simplified reading, not a verbatim one -- see find_pushes()'s docstring for
+where it diverges (latching vs. the controller's per-tick re-evaluation, the
+steeringPressed/vEgo prefilter, and a reference held for a push's whole
+lifetime vs. the controller's per-decision re-arm added in the 2026-08-12
+review fix). The approximation:
 
     push_ref = steeringAngleDeg on the first tick of a run where action ==
     'ramp'; push_moved = steeringAngleDeg - push_ref each tick thereafter;
-    spent = abs(push_moved) >= BUDGET_DEG and push_moved * -torque > 0.0.
+    spent = abs(push_moved) >= BUDGET_DEG and push_moved * -torque > 0.0,
+    latched true for the rest of the run once crossed.
 
 Sign convention (see bmw/latcontroller.py): steeringAngleDeg positive =
 LEFT, torque (the controller's `output`, a fraction of STEER_MAX) negative =
@@ -122,11 +127,22 @@ def build_ticks(seg_path):
 
 
 def find_pushes(ticks):
-  """The rule, verbatim: a push is a run of ticks with action == 'ramp'.
+  """An approximation of the rule, not verbatim: a push is a run of ticks
+  with action == 'ramp'.
 
-  Latches on first crossing -- once spent, later same-push ticks don't
-  re-evaluate the spend condition (only the first crossing is "when it
-  spent").
+  Diverges from the shipped controller (bmw/latcontroller.py) three ways:
+    - Latches on first crossing -- once spent, later same-push ticks don't
+      re-evaluate the spend condition (only the first crossing is "when it
+      spent"), whereas the controller recomputes `budget_spent` fresh every
+      CAN tick from the current push_moved/torque.
+    - `ticks` already has steeringPressed / vEgo<5.0 rows dropped (see
+      build_ticks) -- the controller's push-budget block has no such filter.
+    - `push['ref']` is captured once per continuous 'ramp' run and held for
+      its whole lifetime; the shipped controller (2026-08-12 review fix)
+      instead re-arms the reference every decision cadence, so this script
+      can report "spent" in a window where the live controller would
+      already have re-armed and not spent. Read its numbers as a
+      conservative sanity check, not an exact replica.
   """
   pushes = []
   push = None

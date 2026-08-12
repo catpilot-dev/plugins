@@ -327,12 +327,13 @@ This document is the canonical reference for the lateral controller registered b
 > limit for shedding torque once the plant has already told you it moved: on
 > route 3f2 seg 10 the symmetric clamp needed 0.65 s to unwind an overshoot
 > that took only 0.4 s to build. Once `state['budget_spent']` is true: a
-> same-direction target is clamped toward (never past) the current torque —
-> stop pushing harder, don't freeze on it, either; shedding toward zero is
-> unthrottled; and past zero (an overshoot reversal, a new push the other
-> way) is allowed at most one `step_max` beyond zero in that single decision,
-> the same rate limit any other push gets. **Review fix (2026-08-12,
-> post-merge):** the first cut of this compared `abs(target_frac)` against
+> same-direction target asking for *more* torque is clamped to (never past)
+> the current torque — stop pushing harder, freeze there; a same-direction
+> target asking for *less* sheds toward zero unthrottled; and past zero (an
+> overshoot reversal, a new push the other way) is never frozen — it is
+> allowed at most one `step_max` beyond zero in that single decision, the
+> same rate limit any other push gets. **Review fix (2026-08-12,
+> pre-merge):** the first cut of this compared `abs(target_frac)` against
 > `abs(state['torque'])` with no sign check, which on a reversal either froze
 > torque at its wrong-direction value (the controller giving up mid-turn —
 > forbidden by this file's own SAFETY ARCHITECTURE contract) or, when the
@@ -344,11 +345,15 @@ This document is the canonical reference for the lateral controller registered b
 > **once** at controller construction into a plain local (not re-read
 > per-tick or on a cache timer — a first cut cached it 5 s, but any
 > `Path.read_text()` on controlsd's 100 Hz RT thread risks costing a control
-> frame under eMMC contention; the on-car A/B procedure already restarts the
-> process to flip the toggle, so a restart-to-apply read is enough). With the
-> param off, `state['budget_spent']` is always `False` and every decision
-> takes the pre-existing symmetric-`STEP_MAX` path unchanged — behaviour is
-> bit-identical to before this date.
+> frame under eMMC contention). Because the read is one-shot, applying or
+> rolling back the toggle requires restarting **controlsd** itself — an
+> offroad reboot of the device; a UI-only restart (`pkill -f
+> 'selfdrive.ui.ui'`) does not reload it, since `on_lat_controller_init` runs
+> in controlsd, not the UI process. See § 12 ("To toggle `AngleBudget`") for
+> the exact procedure and how to verify from telemetry that a restart
+> actually applied it. With the param off, `state['budget_spent']` is always
+> `False` and every decision takes the pre-existing symmetric-`STEP_MAX` path
+> unchanged — behaviour is bit-identical to before this date.
 >
 > **Gated on `active`** (review fix): the angle-capture block runs every CAN
 > tick regardless of engagement, and the decision state machine that sets
@@ -705,7 +710,7 @@ These were tried, deployed, and reverted. Each appears here so future maintainer
 | Stiction-gated steering-angle FF (linear in \|steer\|, 20°/0.10 Nm·deg⁻¹) | Over-pushed in route 31d seg 8 right turn: 50% over-rotation, 6.22 Nm torque, sustained cancel_jerk oscillation. SAT physics aren't linear in steering angle alone — needs multi-regime (v×κ grid) calibration, not single-route fit. | commit 2c67a97 | e81f1c0 |
 | Hysteresis-on-κ_des (`KD_HYST_GAP = 0.003`, `KD_GATE = 0.006`) | 95% sign-flip reduction in offline check, but route 322 had 32% time `\|offset\|>0.5 m` and 44-second frozen-κ_des stretches — controller faithfully tracked a held biased reference → drift. Structural failure of holding the reference without a position-feedback layer. | commit daef207 | 96945fc (replaced with box-on-delta_err) |
 | Suggesting external sensor fusion (HD map, radar, lidar, IMU) for vision noise | Out of project scope by design — see [vision-only constraint](§10). | (recurring; do not propose) |
-| Online breakaway-torque estimator + angular-rate edge detector (`bmw/rack_motion.py`: `RackMotion`, `BreakawayEstimator`) | Never deployed — killed by offline validation on route 3f2. Rate thresholding produced 1-2 tick false-motion blips at exactly the low rates that mattered; a debounce did not fix it. The estimator's own observations had a median torque of 0.041 frac — the controller's own median push, not a breakaway signature — so it measured "torque present when the wheel happens to move" and collapsed to its clamp floor. Replaced by the fixed 2-degree open-loop push budget (no online learning, no rate threshold) — see the 2026-08-12 entry above. | commits 5bb33b4..dd3d2a2 | 2026-08-12 (this commit) |
+| Online breakaway-torque estimator + angular-rate edge detector (`bmw/rack_motion.py`: `RackMotion`, `BreakawayEstimator`) | Never deployed — killed by offline validation on route 3f2. Rate thresholding produced 1-2 tick false-motion blips at exactly the low rates that mattered; a debounce did not fix it. The estimator's own observations had a median torque of 0.041 frac — the controller's own median push, not a breakaway signature — so it measured "torque present when the wheel happens to move" and collapsed to its clamp floor. Replaced by the fixed 2-degree open-loop push budget (no online learning, no rate threshold) — see the 2026-08-12 entry above. Its `ANGLE_LSB_DEG = 0.0879` angle quantum was also wrong, exactly 2× too coarse — inferred by counting 169 distinct observed values over one segment, when the confirmed quantum is `0.04395`° (observed level gaps are integer multiples of it, and this same file's own `MOTION_CONFIRM_TICKS` comment already used 0.04395 for the true quantum without ever reconciling the two). `BUDGET_DEG` in the push budget uses the confirmed 0.04395° value (45 quanta of headroom). | commits 5bb33b4..dd3d2a2 | 2026-08-12 (this commit) |
 
 ---
 
@@ -746,6 +751,29 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 
 ### If lateral acceleration feels too high in curves:
 - This is **no longer a lateral-controller tuning problem** (2026-07-28). The lateral controller tracks the commanded curvature and does not limit `a_y`. Lower the curve-speed target in **speedlimitd** (curve-speed capping) — it owns `vEgo`, hence `a_y = v²·κ`. Recipes for the old in-controller ISO cancel guard (`LATERAL_ACCEL_BP` / `LATERAL_JERK_BP` / `BMW_LATERAL_*`) are obsolete; that machinery was removed.
+
+### To toggle `AngleBudget` (the push-budget mechanism, 2026-08-12 entry):
+- It is read **once**, in `on_lat_controller_init`, which runs inside
+  **controlsd** — not the UI. A UI restart (`pkill -f 'selfdrive.ui.ui'`)
+  does not reload it; comparing the toggle that way A/Bs the feature against
+  itself and reads as "does nothing."
+- Write the param, then restart controlsd via an **offroad reboot**:
+  ```bash
+  ssh c3 'echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/AngleBudget'
+  ssh c3 'sudo reboot'   # offroad only
+  ```
+- **Verify it took**: pull `bmw_lat_control` telemetry from the drive's rlog
+  (§ 14 has the read/decode snippet) and confirm the payload dicts carry the
+  `push_moved` / `budget_spent` keys and that `budget_spent` goes `True` at
+  least once during the drive. If those keys are absent, or `budget_spent`
+  never latches despite real steering pushes, controlsd was never restarted
+  onto the new value — the drive doesn't count.
+- **Rollback is the identical procedure**: write `0` (or remove the param
+  file) and offroad-reboot again.
+- **`BUDGET_DEG` is a source constant** in `latcontroller.py`, not a runtime
+  param — there is nothing to write for it. Changing it is a code edit, a
+  redeploy (`install.sh`), a `__pycache__` clear, and the same
+  offroad-reboot restart above.
 
 ---
 

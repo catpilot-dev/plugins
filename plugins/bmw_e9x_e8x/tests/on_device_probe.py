@@ -16,6 +16,14 @@ from types import SimpleNamespace
 sys.path.insert(0, '/data/openpilot')
 PLUGIN_DIR = os.environ.get('BMW_PLUGIN_DIR', '/data/plugins-runtime/bmw_e9x_e8x')
 sys.path.insert(0, PLUGIN_DIR)
+# bmw.latcontroller does `from config import read_plugin_param` — config.py
+# lives at the plugins-runtime root (install.sh copies it there as a shared
+# module), not inside PLUGIN_DIR, so it needs its own sys.path entry or
+# exec_module raises ModuleNotFoundError. Mirrors tests/test_helpers.py's
+# _PLUGINS_DIR insert (review fix, Important 1).
+_PLUGINS_DIR = os.path.dirname(PLUGIN_DIR)
+if _PLUGINS_DIR not in sys.path:
+  sys.path.insert(0, _PLUGINS_DIR)
 
 import numpy as np
 import cereal.messaging as messaging

@@ -10,14 +10,19 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from unittest.mock import MagicMock
 
-# bmw.latcontroller does `from config import read_plugin_param` at module scope
-# (push-budget param helper) — on device the shared plugins/ dir (config.py,
-# services.py, ...) is already on sys.path; replicate that here or the import
-# raises ModuleNotFoundError at collection time. Lives here (not in
-# test_latcontroller.py) because both test_latcontroller.py AND test_hooks.py
-# import bmw.latcontroller, and both already import this module — a fix that
-# lived in only one of them left the other broken when run in isolation
-# (review fix, Minor 10). Same fix, same reason, as
+# bmw.latcontroller does `from config import read_plugin_param` inside
+# on_lat_controller_init (function scope, review fix Important 2 — every
+# other config.read_plugin_param consumer in this repo imports it at call
+# time, not module scope, so a missing config.py just defaults the param off
+# instead of failing the whole hook module's import) — on device the shared
+# plugins/ dir (config.py, services.py, ...) is already on sys.path;
+# replicate that here or the import raises ModuleNotFoundError the first
+# time a test constructs a controller (and tests that monkeypatch
+# config.read_plugin_param need the real `config` module importable at all).
+# Lives here (not in test_latcontroller.py) because both test_latcontroller.py
+# AND test_hooks.py import bmw.latcontroller, and both already import this
+# module — a fix that lived in only one of them left the other broken when
+# run in isolation (review fix, Minor 10). Same fix, same reason, as
 # speedlimitd/tests/test_speedlimitd.py's _PLUGINS_DIR insert.
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PLUGIN_DIR not in sys.path:

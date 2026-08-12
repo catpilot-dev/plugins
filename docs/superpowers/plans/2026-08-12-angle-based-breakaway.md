@@ -286,18 +286,41 @@ Append the output to this plan file as `## Task 2 result` and commit.
 
 ### Task 3: On-car A/B — REQUIRES THE CAR, stop here for the user
 
-Deploy with the toggle OFF, drive a route with straights and curves, then enable and drive the same route:
+**`AngleBudget` is read once, in `on_lat_controller_init`, which runs inside
+controlsd — not the UI.** Restarting the UI does not reload it: writing the
+param and then `pkill`-ing `selfdrive.ui.ui` leaves controlsd running the
+value it read at its own last start, so an A/B done that way compares the
+feature against itself and reads as "it does nothing." Deploy with the
+toggle OFF, drive a route with straights and curves, then flip it and
+restart **controlsd** — the safe way to do that on a real car is an
+**offroad reboot** of the device:
 
 ```bash
 ssh c3 'echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/AngleBudget'
-ssh c3 "pkill -f 'selfdrive.ui.ui'"     # verify a NEW pid/etime; the old python.*ui_main pattern matches nothing on 0.11.x
+ssh c3 'sudo reboot'     # offroad only — restarts controlsd along with everything else
 ```
+
+**Verify the toggle actually took before trusting the drive**: pull the
+`bmw_lat_control` telemetry topic from the drive's rlog (see
+`LATERAL_CONTROLLER.md` § 14 for the read/decode snippet) and confirm the
+payloads carry the `push_moved` / `budget_spent` keys (present since
+2026-08-12) and that `budget_spent` goes `True` at least once during the
+drive. If those keys are absent, or `budget_spent` never latches despite
+real steering pushes, controlsd was never restarted onto the new param value
+— the drive doesn't count; redo the restart before re-driving.
 
 Compare: wheel-rate std on straights, residual p2p in curves, torque sign reversals per minute, peak `output`, max curvature overshoot, `budget_spent` occupancy, lane-offset distribution.
 
 **The straight-line metrics are the veto** — route 395's lesson is that offline churn metrics are blind to small-correction phase lag, and the driver's seat is the authoritative sensor.
 
-Rollback is the toggle: `echo -n 0 > .../AngleBudget`. If the excursion is still larger than wanted, the knob is `BUDGET_DEG` 2.0 → 1.0, which fires ~0.3 s and ~0.8 Nm earlier.
+**Rollback is the identical procedure**: write `0` (or remove the param
+file) and offroad-reboot again — a UI restart cannot roll it back either,
+for the same reason it cannot apply it. If the excursion is still larger
+than wanted, the knob is `BUDGET_DEG` 2.0 → 1.0, which fires ~0.3 s and
+~0.8 Nm earlier — but `BUDGET_DEG` is a **source constant** in
+`latcontroller.py`, not a runtime param: changing it means a code edit, a
+redeploy (`install.sh`), a `__pycache__` clear, and the same offroad-reboot
+restart above, not a param write.
 
 ---
 
