@@ -147,6 +147,15 @@ def on_vehicle_settings(items, CP):
   ))
 
   items.append(toggle_item(
+    "Steering Push Budget",
+    "Stop increasing steering torque once the wheel has moved 2° within one "
+    "control decision, then release it freely (stuck-rack anti-windup). "
+    "Applies from the next drive.",
+    _read_param('AngleBudget') == '1',
+    callback=lambda state: _write_param('AngleBudget', '1' if state else '0'),
+  ))
+
+  items.append(toggle_item(
     "Resume Button Repurposed",
     "Short press: resume (disengaged) or toggle speed limit confirm (engaged). Long press: cycle driving Personality.",
     initial_state=True,

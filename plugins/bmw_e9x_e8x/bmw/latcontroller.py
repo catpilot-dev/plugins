@@ -186,10 +186,14 @@ def on_lat_controller_init(result, lac, CP):
   # RT thread whenever the cache lapsed — under eMMC contention that read can
   # cost a control frame, and the toggle-off default path paid for the
   # monotonic-clock check on every tick for no benefit. Applying or rolling
-  # back the toggle therefore requires restarting controlsd (an offroad
-  # reboot, not a UI restart) — see LATERAL_CONTROLLER.md § 12, "To toggle
-  # AngleBudget", for the exact procedure and how to verify from telemetry
-  # that a restart actually took. See BUDGET_DEG in the constants block below.
+  # back the toggle therefore requires a fresh controlsd — and controlsd is an
+  # onroad-only process, so in practice that means THE NEXT DRIVE: flip the
+  # Driving-panel "Steering Push Budget" toggle (register.py
+  # on_vehicle_settings) while parked. A UI restart does not apply it; a
+  # mid-drive flip applies at the next offroad->onroad cycle. See
+  # LATERAL_CONTROLLER.md § 12 for the procedure and the telemetry check
+  # (push_moved/budget_spent present) that the drive picked it up. See
+  # BUDGET_DEG in the constants block below.
   #
   # Import at function scope, not module scope (review fix, Important 2):
   # every other config.read_plugin_param consumer in this repo does this

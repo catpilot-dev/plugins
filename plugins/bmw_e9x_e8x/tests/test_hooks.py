@@ -210,3 +210,59 @@ class TestCruiseCeilingMemory:
     helper = SimpleNamespace(v_cruise_kph=105, v_cruise_kph_last=80, v_cruise_cluster_kph=105)
     register.on_cruise_initialized(None, helper, None)
     assert helper.v_cruise_kph == 80
+
+
+# ============================================================
+# Vehicle Settings (ui.vehicle_settings hook)
+# ============================================================
+
+class TestVehicleSettingsAngleBudget:
+  """The Driving-panel toggle that arms the push budget for the NEXT drive.
+
+  controlsd is an onroad-only process (process_config: iscar includes
+  `started`), so on_lat_controller_init re-reads AngleBudget at every drive
+  start — flipping this toggle while parked is the whole A/B procedure.
+  """
+
+  def _rows(self, monkeypatch, param_dir):
+    import register
+
+    def fake_toggle_item(title, description, initial_state=False, callback=None, enabled=True):
+      return SimpleNamespace(title=title, description=description,
+                             initial_state=initial_state, callback=callback,
+                             enabled=enabled)
+
+    lv = MagicMock()
+    lv.toggle_item = fake_toggle_item
+    monkeypatch.setitem(sys.modules, 'openpilot.system.ui.widgets.list_view', lv)
+    return register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
+
+  def _budget_row(self, monkeypatch, param_dir):
+    rows = [r for r in self._rows(monkeypatch, param_dir)
+            if r.title == 'Steering Push Budget']
+    assert len(rows) == 1
+    return rows[0]
+
+  def test_default_is_off(self, mock_deps, monkeypatch, param_dir):
+    # No param file: the row must be OFF. Guards the == '1' predicate — the
+    # adjacent TemperatureOverlay row uses != '0' (default-ON), and copying
+    # that here would silently arm the feature on fresh installs.
+    row = self._budget_row(monkeypatch, param_dir)
+    assert row.initial_state is False
+
+  def test_reflects_existing_param(self, mock_deps, monkeypatch, param_dir):
+    (param_dir / 'AngleBudget').write_text('1')
+    row = self._budget_row(monkeypatch, param_dir)
+    assert row.initial_state is True
+
+  def test_callback_writes_the_param(self, mock_deps, monkeypatch, param_dir):
+    row = self._budget_row(monkeypatch, param_dir)
+    row.callback(True)
+    assert (param_dir / 'AngleBudget').read_text() == '1'
+    row.callback(False)
+    assert (param_dir / 'AngleBudget').read_text() == '0'
+
+  def test_non_bmw_gets_no_rows(self, mock_deps, monkeypatch, param_dir):
+    import register
+    items = register.on_vehicle_settings([], SimpleNamespace(brand='toyota'))
+    assert items == []
