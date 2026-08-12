@@ -133,18 +133,27 @@ class BreakawayEstimator:
     self.breakaway_frac = float(seed_frac)
     self.observations = 0
     self._was_moving = False
+    self._armed = False
 
   def reset(self):
     self.breakaway_frac = self._seed
     self.observations = 0
     self._was_moving = False
+    self._armed = False
 
   def update(self, torque_frac, moving_with_torque):
     moving = bool(moving_with_torque)
-    if moving and not self._was_moving and torque_frac != 0.0:
+    # Engagement can happen mid-turn with the wheel already moving. Without
+    # this gate that first sample would look like a stationary -> moving
+    # transition and record a sustain-level torque as if it were breakaway,
+    # biasing the estimate low. Require an actual stationary sample before
+    # edge detection arms.
+    if moving and not self._was_moving and self._armed and torque_frac != 0.0:
       obs = min(max(abs(float(torque_frac)), BREAKAWAY_MIN_FRAC), BREAKAWAY_MAX_FRAC)
       self.breakaway_frac += BREAKAWAY_ALPHA * (obs - self.breakaway_frac)
       self.observations += 1
+    if not moving:
+      self._armed = True
     self._was_moving = moving
 
   @property

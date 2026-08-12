@@ -159,3 +159,30 @@ def test_reset_restores_seed():
     est.reset()
     assert est.breakaway_frac == BREAKAWAY_SEED_FRAC
     assert est.observations == 0
+
+
+def test_first_ever_sample_moving_is_not_counted_as_a_breakaway():
+    """Engaging mid-turn with the wheel already moving must not record."""
+    est = BreakawayEstimator()
+    est.update(0.15, moving_with_torque=True)
+    assert est.observations == 0
+    assert est.breakaway_frac == BREAKAWAY_SEED_FRAC
+
+
+def test_arming_requires_seeing_the_rack_stationary_first():
+    est = BreakawayEstimator()
+    est.update(0.15, moving_with_torque=True)
+    est.update(0.15, moving_with_torque=True)
+    assert est.observations == 0
+    est.update(0.15, moving_with_torque=False)   # arms here
+    est.update(0.15, moving_with_torque=True)
+    assert est.observations == 1
+
+
+def test_reset_disarms_the_edge_detector():
+    est = BreakawayEstimator()
+    est.update(0.30, moving_with_torque=False)
+    est.update(0.30, moving_with_torque=True)
+    est.reset()
+    est.update(0.15, moving_with_torque=True)
+    assert est.observations == 0
