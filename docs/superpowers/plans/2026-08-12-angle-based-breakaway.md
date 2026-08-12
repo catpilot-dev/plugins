@@ -88,11 +88,24 @@ def test_stationary_reads_zero_rate():
     assert abs(rm.rate_deg_s) < 0.55
 
 
-def test_constant_offset_cancels():
-    """A physical alignment offset must not change the measured rate."""
+def test_constant_offset_cancels_exactly_without_quantisation():
+    """The algorithm is offset-immune: differencing removes any constant.
+
+    Quantisation is off here so this tests the property itself. With it on,
+    an offset that is not a whole number of LSBs (-1.58 / 0.0879 = 17.97)
+    shifts the sampling phase, so cancellation is exact only in exact
+    arithmetic — see the companion test below.
+    """
+    a = _feed(RackMotion(), 12.0, start_angle=0.0, quantise=False).rate_deg_s
+    b = _feed(RackMotion(), 12.0, start_angle=-1.58, quantise=False).rate_deg_s
+    assert abs(a - b) < 1e-9
+
+
+def test_constant_offset_cancels_within_quantisation_noise():
+    """With LSB quantisation the residual is bounded by the noise floor."""
     a = _feed(RackMotion(), 12.0, start_angle=0.0).rate_deg_s
     b = _feed(RackMotion(), 12.0, start_angle=-1.58).rate_deg_s
-    assert abs(a - b) < 1e-6
+    assert abs(a - b) < 0.55          # ANGLE_LSB_DEG / WINDOW_S
 
 
 def test_is_moving_threshold():
@@ -240,7 +253,7 @@ class RackMotion:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd /home/oxygen/catpilot-dev/plugins && PYTHONPATH=.:plugins/bmw_e9x_e8x uv run pytest plugins/bmw_e9x_e8x/tests/test_rack_motion.py -v`
-Expected: PASS, 10 passed
+Expected: PASS, 11 passed
 
 - [ ] **Step 5: Commit**
 
