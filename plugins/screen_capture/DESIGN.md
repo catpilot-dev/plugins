@@ -86,10 +86,22 @@ cap), and once nothing is pending, cycles self-skip on a cheap work signature
 ### Exact tap time and naming
 
 The tap's absolute time is computed exactly, not estimated:
-`userBookmark.logMonoTime` is converted mono→wall against the same segment's
-first fixed `gpsLocationExternal` (both clocks advance together). This
-deliberately avoids `create_time + offset`, which inherits the route's
-GPS-fix lag — observed at 45 s on a real cold start.
+`userBookmark.logMonoTime` is converted mono→wall against the `unixTimestampMillis`
+of the *closest* fixed `gpsLocationExternal` in the same segment. GPS is the only
+absolute clock in the log that can be trusted — the device RTC boots months stale
+(`initData.wallTimeNanos` records that stale value), and the two clocks agree to
+within 0.2 s once NTP has run. Measured on a real drive, GPS-vs-mono holds to
+±20 ms within a segment and drifts ~25 ms over 16 minutes.
+
+A segment with no fix of its own falls back to a route-wide anchor — any fix from
+anywhere in the drive, since `logMonoTime` is boot-relative and continuous across
+segments. That still dates the tap to ~40 ms.
+
+A drive with no fix at all produces **no capture**. There is no estimate-from-
+`create_time` path: `create_time` dates a route from its *first GPS fix*, which
+lags the drive's true start by 21-45 s on real cold starts, so a PNG named from it
+is wrong to the user and outside the 2 s window that matches it back to its own
+bookmark row. Those taps are marked `no_gps_time` and skipped.
 
 The PNG is named `capture_YYYYMMDD_HHMMSS.png` in the **drive location's
 local time** (route GPS longitude → `round(lng/15)`, the same convention as
@@ -121,8 +133,9 @@ deleted before extraction loses its pending captures, by design.
 
 ## Failure modes
 
-- **No GPS fix in the tap's segment** → no exact epoch; naming and matching
-  fall back to `create_time + offset` (carries the fix lag).
+- **No GPS fix in the tap's segment** → dated from the route-wide anchor
+  (~40 ms). A drive that never got a fix yields no capture at all
+  (`no_gps_time`) rather than a wrongly-dated one.
 - **Render failure** (missing fcamera, corrupt log) → retried up to 3 times,
   then marked `failed` in `hud_capture_state`; never retried forever.
 - **Route not yet enriched** (no `gps_time`) → skipped until the route list
