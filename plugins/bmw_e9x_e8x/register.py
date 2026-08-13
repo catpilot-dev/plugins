@@ -132,12 +132,46 @@ def _write_param(key, value):
     f.write(value)
 
 
+_angle_budget_pub = None
+
+
+def _publish_angle_budget(enabled):
+  """Hot-apply the AngleBudget toggle to the running controlsd.
+
+  The param file (written by _set_angle_budget) is the persistent state that
+  controlsd reads at every drive start; this bus message is the live override
+  for the drive in progress (latcontroller polls the 'angle_budget' topic at
+  livePose rate). The pub is created eagerly at panel construction — not at
+  first flip — so the socket exists before controlsd's lazy subscriber ever
+  polls; a pub created only on first flip would hit the ZMQ slow-joiner race
+  and that flip would be silently lost.
+  """
+  global _angle_budget_pub
+  try:
+    if _angle_budget_pub is None:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+      _angle_budget_pub = PluginPub('angle_budget')
+    _angle_budget_pub.send({'enabled': bool(enabled)})
+  except Exception:
+    pass
+
+
+def _set_angle_budget(state):
+  _write_param('AngleBudget', '1' if state else '0')
+  _publish_angle_budget(state)
+
+
 def on_vehicle_settings(items, CP):
   """Hook callback: populate Vehicle panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
     return items
 
   from openpilot.system.ui.widgets.list_view import toggle_item
+
+  # Create the hot-toggle pub now and resync current state (covers a UI
+  # restart mid-drive: the rebound socket triggers controlsd's subscriber to
+  # reconnect, and this send restores the live state it may have missed).
+  _publish_angle_budget(_read_param('AngleBudget') == '1')
 
   items.append(toggle_item(
     "Temperature Overlay",
@@ -150,9 +184,9 @@ def on_vehicle_settings(items, CP):
     "Steering Push Budget",
     "Stop increasing steering torque once the wheel has moved 2° within one "
     "control decision, then release it freely (stuck-rack anti-windup). "
-    "Applies from the next drive.",
+    "Applies within a second, including mid-drive.",
     _read_param('AngleBudget') == '1',
-    callback=lambda state: _write_param('AngleBudget', '1' if state else '0'),
+    callback=_set_angle_budget,
   ))
 
   items.append(toggle_item(

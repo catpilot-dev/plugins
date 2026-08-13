@@ -28,6 +28,11 @@ if _PLUGIN_DIR not in sys.path:
 
 import numpy as np
 
+# Hot-toggle bus socket for the Driving-panel "Steering Push Budget" switch
+# (published by register.py, polled in update()'s livePose branch). Module
+# scope so tests can point it at a temp path.
+_BUDGET_BUS_SOCKET = '/tmp/plugin_bus/angle_budget'
+
 # SAFETY ARCHITECTURE (2026-07-28): the lateral controller NEVER gives up in a
 # turn — its contract is to track the commanded curvature, always. Keeping
 # lateral acceleration within ISO 11270 / comfort limits is handled at the
@@ -185,15 +190,16 @@ def on_lat_controller_init(result, lac, CP):
   # every CAN tick, which still means a Path.read_text() on controlsd's 100 Hz
   # RT thread whenever the cache lapsed — under eMMC contention that read can
   # cost a control frame, and the toggle-off default path paid for the
-  # monotonic-clock check on every tick for no benefit. Applying or rolling
-  # back the toggle therefore requires a fresh controlsd — and controlsd is an
-  # onroad-only process, so in practice that means THE NEXT DRIVE: flip the
-  # Driving-panel "Steering Push Budget" toggle (register.py
-  # on_vehicle_settings) while parked. A UI restart does not apply it; a
-  # mid-drive flip applies at the next offroad->onroad cycle. See
-  # LATERAL_CONTROLLER.md § 12 for the procedure and the telemetry check
-  # (push_moved/budget_spent present) that the drive picked it up. See
-  # BUDGET_DEG in the constants block below.
+  # monotonic-clock check on every tick for no benefit. This init-time read
+  # is the BOOT state only: the Driving-panel "Steering Push Budget" toggle
+  # (register.py on_vehicle_settings) hot-applies mid-drive by publishing on
+  # the 'angle_budget' plugin-bus topic, polled in update()'s livePose branch
+  # into state['budget_on'] — tmpfs + memory, no file I/O on the RT thread
+  # (2026-08-13). The param file stays authoritative across drives (controlsd
+  # is onroad-only and re-reads it every drive start); the bus message only
+  # overrides the drive in progress. See LATERAL_CONTROLLER.md § 12 for the
+  # procedure and the telemetry check (budget_on/push_moved/budget_spent)
+  # that a drive picked it up. See BUDGET_DEG in the constants block below.
   #
   # Import at function scope, not module scope (review fix, Important 2):
   # every other config.read_plugin_param consumer in this repo does this
@@ -378,6 +384,8 @@ def on_lat_controller_init(result, lac, CP):
     'hold_f': 0.0,                # debug: lateral-accel hold factor [0,1] (gated on v²·|kappa_des|)
     'hold_cap': 0.0,              # debug: cap on held torque (P value at the HOLD_CAP_DRIFT_M reference drift, frac)
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
+    'budget_on': _angle_budget_on,   # live toggle state (init = param; bus overrides mid-drive)
+    'budget_sub': None,              # lazy PluginSub for the 'angle_budget' hot-toggle topic
     'push_ref': None,        # steering angle when this push began (deg)
     'push_moved': 0.0,       # debug: signed deg moved since then
     'budget_spent': False,   # debug: 2 deg moved in the commanded direction
@@ -406,13 +414,35 @@ def on_lat_controller_init(result, lac, CP):
       state['push_moved'] = 0.0
     # Torque is NEGATIVE for left, angle POSITIVE for left, so the product of
     # push_moved and -torque is positive when the wheel moved the way we asked.
-    state['budget_spent'] = (_angle_budget_on
+    state['budget_spent'] = (state['budget_on']
                              and abs(state['push_moved']) >= BUDGET_DEG
                              and state['push_moved'] * -state['torque'] > 0.0)
 
     _sm.update(0)
     lp = _sm['livePose']
     livepose_updated = _sm.updated['livePose']
+
+    # Hot toggle (2026-08-13): the Driving-panel "Steering Push Budget" switch
+    # publishes {'enabled': bool} on the 'angle_budget' plugin-bus topic
+    # (register.py, which also persists the param for the next drive's
+    # init-time read). Polled here at livePose rate, not per CAN tick; the
+    # exists-stat and the ZMQ recv are both /tmp (tmpfs) + memory — no eMMC
+    # I/O on the RT thread, unlike the param-file re-read this replaces.
+    # Same lazy-subscriber pattern as carstate's steer_angle_offset topic.
+    # A mid-drive flip lands within ~1 livePose tick and takes control
+    # effect at the next decision — bounded, same as a natural per-decision
+    # spend/un-spend transition.
+    if livepose_updated:
+      try:
+        if state['budget_sub'] is None and os.path.exists(_BUDGET_BUS_SOCKET):
+          from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+          state['budget_sub'] = PluginSub(['angle_budget'])
+        if state['budget_sub'] is not None:
+          _bmsg = state['budget_sub'].drain('angle_budget')
+          if _bmsg is not None:
+            state['budget_on'] = bool(_bmsg[1].get('enabled', state['budget_on']))
+      except Exception:
+        pass
 
     # livePose tick (20 Hz): update measured + desired every tick; plant-
     # inversion decision only every action_cadence_ticks (= model_action_t/2,
@@ -784,6 +814,7 @@ def on_lat_controller_init(result, lac, CP):
           'relax_ticks': int(state['relax_ticks']),
           'push_moved': float(state['push_moved']),
           'budget_spent': bool(state['budget_spent']),
+          'budget_on': bool(state['budget_on']),
         }
         state['lat_pub'].send(payload)
       except Exception:

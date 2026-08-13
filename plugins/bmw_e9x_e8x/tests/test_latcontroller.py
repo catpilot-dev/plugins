@@ -630,3 +630,69 @@ def test_budget_unspent_large_target_still_step_max_limited(monkeypatch):
     assert state['budget_spent'] is False
     assert state['target_frac'] == pytest.approx(-0.280769, abs=1e-5)
     assert state['torque'] == pytest.approx(-0.208077, abs=1e-5)
+
+
+# ============================================================
+# Hot toggle via the 'angle_budget' plugin-bus topic (2026-08-13)
+# ============================================================
+
+class _FakeBudgetSub:
+  def __init__(self, msgs):
+    self._msgs = list(msgs)
+
+  def drain(self, topic=None):
+    return self._msgs.pop(0) if self._msgs else None
+
+
+class TestBudgetHotToggle:
+  def test_bus_enable_applies_mid_drive(self, monkeypatch):
+    # Init with the toggle OFF; a bus message flips it on without restart.
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    assert state['budget_on'] is False
+    state['budget_sub'] = _FakeBudgetSub([('angle_budget', {'enabled': True})])
+    _set_measured(sm, 20.0, 0.001)
+    _call_update(lac, 0.002, steering_angle_deg=0.0)
+    assert state['budget_on'] is True
+
+  def test_bus_disable_stops_budget_spending(self, monkeypatch):
+    # Init ON, spend the budget with a 2.5-deg jump inside one decision
+    # window (per-decision re-arm makes slow multi-decision crawls unspendable
+    # by design), then disable over the bus: the SAME jump pattern must stop
+    # spending.
+    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
+    _drive(lac, sm, state, [0.0, 2.5])
+    assert state['budget_spent'] is True
+    state['budget_sub'] = _FakeBudgetSub([('angle_budget', {'enabled': False})])
+    _drive(lac, sm, state, [5.0, 7.5, 10.0, 12.5])
+    assert state['budget_on'] is False
+    assert state['budget_spent'] is False
+
+  def test_no_publisher_keeps_init_state(self, monkeypatch, tmp_path):
+    import bmw.latcontroller as mod_direct
+    monkeypatch.setattr(mod_direct, '_BUDGET_BUS_SOCKET',
+                        str(tmp_path / 'nonexistent_socket'))
+    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
+    for _ in range(10):
+      _set_measured(sm, 20.0, 0.001)
+      _call_update(lac, 0.002, steering_angle_deg=0.0)
+    assert state['budget_sub'] is None
+    assert state['budget_on'] is True
+
+  def test_malformed_bus_message_is_ignored(self, monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
+    state['budget_sub'] = _FakeBudgetSub([('angle_budget', {})])  # no 'enabled' key
+    _set_measured(sm, 20.0, 0.001)
+    _call_update(lac, 0.002, steering_angle_deg=0.0)
+    assert state['budget_on'] is True   # default falls back to current state
+
+  def test_telemetry_carries_budget_on(self, monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    payloads = []
+    state['lat_pub'] = SimpleNamespace(send=payloads.append)
+    _set_measured(sm, 20.0, 0.001)
+    _call_update(lac, 0.002, steering_angle_deg=0.0)
+    assert payloads and payloads[-1]['budget_on'] is False
+    state['budget_sub'] = _FakeBudgetSub([('angle_budget', {'enabled': True})])
+    _set_measured(sm, 20.0, 0.001)
+    _call_update(lac, 0.002, steering_angle_deg=0.0)
+    assert payloads[-1]['budget_on'] is True

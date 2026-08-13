@@ -345,15 +345,13 @@ This document is the canonical reference for the lateral controller registered b
 > **once** at controller construction into a plain local (not re-read
 > per-tick or on a cache timer — a first cut cached it 5 s, but any
 > `Path.read_text()` on controlsd's 100 Hz RT thread risks costing a control
-> frame under eMMC contention). Because the read is one-shot, applying or
-> rolling back the toggle requires a
-> new controlsd start — and controlsd is an onroad-only process, so this
-> simply means **the next drive** (flip the Driving-panel "Steering Push
-> Budget" toggle while parked). A UI-only restart (`pkill -f
-> 'selfdrive.ui.ui'`) does not reload it, since `on_lat_controller_init` runs
-> in controlsd, not the UI process. See § 12 ("To toggle `AngleBudget`") for
-> the exact procedure and how to verify from telemetry that the drive
-> actually picked it up. With the param off, `state['budget_spent']` is always
+> frame under eMMC contention). The init read is the **boot state**; the
+> Driving-panel "Steering Push Budget" toggle **hot-applies mid-drive** via
+> the `angle_budget` plugin-bus topic, polled at livePose rate into
+> `state['budget_on']` (tmpfs + memory — still no file I/O on the RT
+> thread). The param file the toggle also writes is what each later drive's
+> init read picks up. See § 12 ("To toggle `AngleBudget`") for the
+> procedure and how to verify from telemetry which state a drive ran in. With the param off, `state['budget_spent']` is always
 > `False` and every decision takes the pre-existing symmetric-`STEP_MAX` path
 > unchanged — behaviour is bit-identical to before this date.
 >
@@ -688,6 +686,7 @@ Published each livePose tick:
 | `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
 | `push_moved` | (2026-08-12) signed degrees moved from `push_ref` since the current push began (0 when not ramping) |
 | `budget_spent` | (2026-08-12) `True` once `push_moved` has reached `BUDGET_DEG` in the commanded direction (always `False` with `AngleBudget` off) |
+| `budget_on` | (2026-08-13) live toggle state — init-time param read, overridden mid-drive by the `angle_budget` bus topic; labels each tick's A/B leg |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 
@@ -755,31 +754,33 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - This is **no longer a lateral-controller tuning problem** (2026-07-28). The lateral controller tracks the commanded curvature and does not limit `a_y`. Lower the curve-speed target in **speedlimitd** (curve-speed capping) — it owns `vEgo`, hence `a_y = v²·κ`. Recipes for the old in-controller ISO cancel guard (`LATERAL_ACCEL_BP` / `LATERAL_JERK_BP` / `BMW_LATERAL_*`) are obsolete; that machinery was removed.
 
 ### To toggle `AngleBudget` (the push-budget mechanism, 2026-08-12 entry):
-- **Normal way (2026-08-13): the "Steering Push Budget" toggle in the
-  Driving panel** (BMW vehicle-settings rows, `register.py
-  on_vehicle_settings`). Flip it **while parked**; it applies **from the
-  next drive**. Why that works with a read-once param: the param is read in
-  `on_lat_controller_init`, which runs inside **controlsd**, and controlsd
-  is an **onroad-only process** (`process_config.py`: its `iscar` condition
-  includes `started`) — it starts fresh at every ignition, re-reading the
-  param each drive. No reboot needed; flipping it mid-drive does nothing
-  until the next drive.
-- Manual fallback (same effect):
-  ```bash
-  ssh c3 'echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/AngleBudget'
-  # then just start the next drive; an offroad reboot also works but is unnecessary
-  ```
-- A UI restart (`pkill -f 'selfdrive.ui.ui'`) does **not** apply it —
-  wrong process; and a toggle flipped **mid-drive** does not apply until
-  the car cycles offroad→onroad.
-- **Verify it took**: pull `bmw_lat_control` telemetry from the drive's rlog
-  (§ 14 has the read/decode snippet) and confirm the payload dicts carry the
-  `push_moved` / `budget_spent` keys and that `budget_spent` goes `True` at
-  least once during the drive. If those keys are absent, or `budget_spent`
-  never latches despite real steering pushes, the drive started before the
-  toggle was flipped — the drive doesn't count.
-- **Rollback is the identical procedure**: flip the toggle off while
-  parked (or write `0` / remove the param file); next drive is stock.
+- **The "Steering Push Budget" toggle in the Driving panel is HOT
+  (2026-08-13)**: flipping it applies **within about a second, mid-drive
+  included**. Two paths carry it:
+  1. **Live**: the toggle callback publishes `{'enabled': bool}` on the
+     `angle_budget` plugin-bus topic (`register.py`); `latcontroller`
+     polls it at livePose rate into `state['budget_on']` (tmpfs + memory
+     only — no file I/O on the RT thread). The pub is created eagerly at
+     panel construction to dodge the ZMQ slow-joiner race.
+  2. **Persistent**: the same callback writes the `AngleBudget` param
+     file, which controlsd (an onroad-only process — fresh start every
+     ignition) reads at each drive start. So the toggle's state survives
+     across drives with or without the bus.
+- Manual fallback: `echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/AngleBudget`
+  applies **from the next drive** (the file path has no live carrier —
+  only the panel toggle hot-applies).
+- **A/B within a single drive is now valid**: drive a stretch, flip at a
+  landmark on a straight (avoid flipping mid-curve — enabling during an
+  active fast push can clamp it immediately; bounded but muddies the
+  comparison), drive the matched stretch. `bus_logger` records the
+  `angle_budget` topic into the rlog, timestamping every flip, and the
+  `bmw_lat_control` payload carries `budget_on` per tick — so each rlog
+  segment self-labels which leg it was.
+- **Verify a drive/leg counted**: `bmw_lat_control` telemetry (§ 14 decode
+  snippet) must carry `budget_on`/`push_moved`/`budget_spent`; `budget_on`
+  tells you the live state tick by tick.
+- **Rollback**: flip the toggle off — takes effect within a second; the
+  param file it writes keeps later drives off too.
 - **`BUDGET_DEG` is a source constant** in `latcontroller.py`, not a runtime
   param — there is nothing to write for it. Changing it is a code edit, a
   redeploy (`install.sh`), and a `__pycache__` clear before the next drive.

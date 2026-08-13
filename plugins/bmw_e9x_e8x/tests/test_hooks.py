@@ -266,3 +266,64 @@ class TestVehicleSettingsAngleBudget:
     import register
     items = register.on_vehicle_settings([], SimpleNamespace(brand='toyota'))
     assert items == []
+
+
+class TestAngleBudgetHotPublish:
+  """The toggle callback hot-applies over the plugin bus AND persists."""
+
+  def _capture_pub(self, monkeypatch):
+    import register
+    sends = []
+
+    class FakePub:
+      def __init__(self, topic):
+        assert topic == 'angle_budget'
+      def send(self, data):
+        sends.append(data)
+
+    pb = MagicMock()
+    pb.PluginPub = FakePub
+    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', pb)
+    monkeypatch.setattr(register, '_angle_budget_pub', None)  # fresh pub per test
+    return sends
+
+  def _rows(self, monkeypatch):
+    import register
+
+    def fake_toggle_item(title, description, initial_state=False, callback=None, enabled=True):
+      return SimpleNamespace(title=title, description=description,
+                             initial_state=initial_state, callback=callback,
+                             enabled=enabled)
+
+    lv = MagicMock()
+    lv.toggle_item = fake_toggle_item
+    monkeypatch.setitem(sys.modules, 'openpilot.system.ui.widgets.list_view', lv)
+    return register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
+
+  def test_panel_build_creates_pub_and_resyncs_current_state(self, mock_deps, monkeypatch, param_dir):
+    (param_dir / 'AngleBudget').write_text('1')
+    sends = self._capture_pub(monkeypatch)
+    self._rows(monkeypatch)
+    # Eager pub at construction (slow-joiner guard) resyncs the stored state.
+    assert sends == [{'enabled': True}]
+
+  def test_callback_publishes_and_persists(self, mock_deps, monkeypatch, param_dir):
+    sends = self._capture_pub(monkeypatch)
+    rows = [r for r in self._rows(monkeypatch) if r.title == 'Steering Push Budget']
+    assert len(rows) == 1
+    sends.clear()   # drop the construction-time resync
+    rows[0].callback(True)
+    assert (param_dir / 'AngleBudget').read_text() == '1'
+    assert sends == [{'enabled': True}]
+    rows[0].callback(False)
+    assert (param_dir / 'AngleBudget').read_text() == '0'
+    assert sends == [{'enabled': True}, {'enabled': False}]
+
+  def test_bus_failure_still_persists_the_param(self, mock_deps, monkeypatch, param_dir):
+    import register
+    pb = MagicMock()
+    pb.PluginPub = MagicMock(side_effect=RuntimeError('no zmq'))
+    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', pb)
+    monkeypatch.setattr(register, '_angle_budget_pub', None)
+    register._set_angle_budget(True)
+    assert (param_dir / 'AngleBudget').read_text() == '1'
