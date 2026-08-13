@@ -327,3 +327,57 @@ class TestAngleBudgetHotPublish:
     monkeypatch.setattr(register, '_angle_budget_pub', None)
     register._set_angle_budget(True)
     assert (param_dir / 'AngleBudget').read_text() == '1'
+
+
+class TestAngleBudgetHeartbeat:
+  """on_ui_state_tick republishes the param state at ~1 Hz — the mechanism
+  that makes the hot toggle reliable (ZMQ PUB drops edge-triggered sends to
+  not-yet-connected subscribers, and a UI restart loses the pub entirely)."""
+
+  def _arm(self, monkeypatch):
+    import register
+    sends = []
+
+    class FakePub:
+      def __init__(self, topic):
+        assert topic == 'angle_budget'
+      def send(self, data):
+        sends.append(data)
+
+    pb = MagicMock()
+    pb.PluginPub = FakePub
+    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', pb)
+    monkeypatch.setattr(register, '_angle_budget_pub', None)
+    monkeypatch.setattr(register, '_angle_budget_hb_t', 0.0)
+    return register, sends
+
+  def test_heartbeat_publishes_current_param_state(self, mock_deps, monkeypatch, param_dir):
+    register, sends = self._arm(monkeypatch)
+    (param_dir / 'AngleBudget').write_text('1')
+    register.on_ui_state_tick(None, None)
+    assert sends == [{'enabled': True}]
+
+  def test_heartbeat_throttles_to_1hz(self, mock_deps, monkeypatch, param_dir):
+    register, sends = self._arm(monkeypatch)
+    register.on_ui_state_tick(None, None)
+    register.on_ui_state_tick(None, None)   # immediately after -> throttled
+    assert len(sends) == 1
+
+  def test_heartbeat_tracks_manual_param_edits(self, mock_deps, monkeypatch, param_dir):
+    """echo 1 > .../AngleBudget hot-applies via the heartbeat, no UI touch."""
+    register, sends = self._arm(monkeypatch)
+    register.on_ui_state_tick(None, None)
+    assert sends[-1] == {'enabled': False}
+    (param_dir / 'AngleBudget').write_text('1')
+    monkeypatch.setattr(register, '_angle_budget_hb_t', 0.0)   # advance the clock
+    register.on_ui_state_tick(None, None)
+    assert sends[-1] == {'enabled': True}
+
+  def test_plugin_json_registers_the_heartbeat_hook(self):
+    import json as _json
+    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'plugin.json')) as f:
+      manifest = _json.load(f)
+    hook = manifest['hooks']['ui.state_tick']
+    assert hook['module'] == 'register'
+    assert hook['function'] == 'on_ui_state_tick'

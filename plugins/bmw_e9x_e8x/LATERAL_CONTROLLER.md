@@ -757,18 +757,23 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - **The "Steering Push Budget" toggle in the Driving panel is HOT
   (2026-08-13)**: flipping it applies **within about a second, mid-drive
   included**. Two paths carry it:
-  1. **Live**: the toggle callback publishes `{'enabled': bool}` on the
-     `angle_budget` plugin-bus topic (`register.py`); `latcontroller`
-     polls it at livePose rate into `state['budget_on']` (tmpfs + memory
-     only — no file I/O on the RT thread). The pub is created eagerly at
-     panel construction to dodge the ZMQ slow-joiner race.
+  1. **Live**: the `angle_budget` plugin-bus topic, polled by
+     `latcontroller` at livePose rate into `state['budget_on']` (tmpfs +
+     memory only — no file I/O on the RT thread). The toggle callback
+     sends immediately (snappy in the common case), but the *guarantee*
+     is the **1 Hz heartbeat** (`register.py on_ui_state_tick`, hook
+     `ui.state_tick`): ZMQ PUB silently drops edge-triggered sends to a
+     not-yet-connected subscriber, so an edge alone can be lost (slow
+     joiner, UI restart). The heartbeat republishes the param-file state
+     every second, so any divergence heals within ~1 s.
   2. **Persistent**: the same callback writes the `AngleBudget` param
      file, which controlsd (an onroad-only process — fresh start every
      ignition) reads at each drive start. So the toggle's state survives
      across drives with or without the bus.
 - Manual fallback: `echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/AngleBudget`
-  applies **from the next drive** (the file path has no live carrier —
-  only the panel toggle hot-applies).
+  **also hot-applies within ~1 s** — the heartbeat reads the param file,
+  so file edits are picked up while the UI is running. (Without a running
+  UI there is no publisher, and a file edit applies at the next drive.)
 - **A/B within a single drive is now valid**: drive a stretch, flip at a
   landmark on a straight (avoid flipping mid-curve — enabling during an
   active fast push can clamp it immediately; bounded but muddies the

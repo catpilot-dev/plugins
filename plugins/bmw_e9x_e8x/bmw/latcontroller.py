@@ -412,37 +412,52 @@ def on_lat_controller_init(result, lac, CP):
     else:
       state['push_ref'] = None
       state['push_moved'] = 0.0
-    # Torque is NEGATIVE for left, angle POSITIVE for left, so the product of
-    # push_moved and -torque is positive when the wheel moved the way we asked.
-    state['budget_spent'] = (state['budget_on']
-                             and abs(state['push_moved']) >= BUDGET_DEG
-                             and state['push_moved'] * -state['torque'] > 0.0)
-
     _sm.update(0)
     lp = _sm['livePose']
     livepose_updated = _sm.updated['livePose']
 
     # Hot toggle (2026-08-13): the Driving-panel "Steering Push Budget" switch
-    # publishes {'enabled': bool} on the 'angle_budget' plugin-bus topic
-    # (register.py, which also persists the param for the next drive's
-    # init-time read). Polled here at livePose rate, not per CAN tick; the
-    # exists-stat and the ZMQ recv are both /tmp (tmpfs) + memory — no eMMC
-    # I/O on the RT thread, unlike the param-file re-read this replaces.
-    # Same lazy-subscriber pattern as carstate's steer_angle_offset topic.
-    # A mid-drive flip lands within ~1 livePose tick and takes control
-    # effect at the next decision — bounded, same as a natural per-decision
-    # spend/un-spend transition.
+    # publishes {'enabled': bool} on the 'angle_budget' plugin-bus topic; a
+    # 1 Hz heartbeat from the UI (register.py on_ui_state_tick) re-sends the
+    # current state so slow-joiner drops, UI restarts, and even manual param
+    # edits all converge within ~1 s. Polled here at livePose rate, not per
+    # CAN tick; the exists-stat and the ZMQ recv are both /tmp (tmpfs) +
+    # memory — no eMMC I/O on the RT thread, unlike the param-file re-read
+    # this replaces. Same lazy-subscriber pattern as carstate's
+    # steer_angle_offset topic, including drop-and-reopen when the socket
+    # file disappears (publisher process gone). Bounded local drain (newest
+    # wins) instead of PluginSub.drain(): a flooded queue can hold up to
+    # RCVHWM messages and one tick must not pay unbounded json.loads calls.
     if livepose_updated:
       try:
+        if state['budget_sub'] is not None and not os.path.exists(_BUDGET_BUS_SOCKET):
+          try:
+            state['budget_sub'].close()
+          except Exception:
+            pass
+          state['budget_sub'] = None
         if state['budget_sub'] is None and os.path.exists(_BUDGET_BUS_SOCKET):
           from openpilot.selfdrive.plugins.plugin_bus import PluginSub
           state['budget_sub'] = PluginSub(['angle_budget'])
         if state['budget_sub'] is not None:
-          _bmsg = state['budget_sub'].drain('angle_budget')
+          _bmsg = None
+          for _ in range(8):
+            _m = state['budget_sub'].recv()
+            if _m is None:
+              break
+            if _m[0] == 'angle_budget':
+              _bmsg = _m
           if _bmsg is not None:
             state['budget_on'] = bool(_bmsg[1].get('enabled', state['budget_on']))
       except Exception:
         pass
+
+    # Torque is NEGATIVE for left, angle POSITIVE for left, so the product of
+    # push_moved and -torque is positive when the wheel moved the way we asked.
+    # Computed after the bus poll so a flip takes effect on the same tick.
+    state['budget_spent'] = (state['budget_on']
+                             and abs(state['push_moved']) >= BUDGET_DEG
+                             and state['push_moved'] * -state['torque'] > 0.0)
 
     # livePose tick (20 Hz): update measured + desired every tick; plant-
     # inversion decision only every action_cadence_ticks (= model_action_t/2,

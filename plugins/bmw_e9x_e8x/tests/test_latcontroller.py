@@ -38,6 +38,7 @@ import math
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -636,12 +637,31 @@ def test_budget_unspent_large_target_still_step_max_limited(monkeypatch):
 # Hot toggle via the 'angle_budget' plugin-bus topic (2026-08-13)
 # ============================================================
 
+@pytest.fixture(autouse=True)
+def _isolate_budget_socket(monkeypatch, tmp_path):
+  """Keep every test off the real /tmp/plugin_bus path: a live UI on the C3
+  (or a stray socket on a dev box) must never make the suite attach a real
+  subscriber. Tests that need the socket to exist re-patch it themselves."""
+  import bmw.latcontroller as _mod
+  monkeypatch.setattr(_mod, '_BUDGET_BUS_SOCKET', str(tmp_path / 'no_socket'))
+
+
+def _touch_budget_socket():
+  """Create the (test-patched) socket path so an injected fake sub survives
+  the close-on-missing-socket branch."""
+  import bmw.latcontroller as _mod
+  open(_mod._BUDGET_BUS_SOCKET, 'w').close()
+
+
 class _FakeBudgetSub:
   def __init__(self, msgs):
     self._msgs = list(msgs)
 
-  def drain(self, topic=None):
+  def recv(self):
     return self._msgs.pop(0) if self._msgs else None
+
+  def close(self):
+    pass
 
 
 class TestBudgetHotToggle:
@@ -649,6 +669,7 @@ class TestBudgetHotToggle:
     # Init with the toggle OFF; a bus message flips it on without restart.
     lac, sm, mod, state = _make_controller(monkeypatch)
     assert state['budget_on'] is False
+    _touch_budget_socket()
     state['budget_sub'] = _FakeBudgetSub([('angle_budget', {'enabled': True})])
     _set_measured(sm, 20.0, 0.001)
     _call_update(lac, 0.002, steering_angle_deg=0.0)
@@ -662,6 +683,7 @@ class TestBudgetHotToggle:
     lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
     _drive(lac, sm, state, [0.0, 2.5])
     assert state['budget_spent'] is True
+    _touch_budget_socket()
     state['budget_sub'] = _FakeBudgetSub([('angle_budget', {'enabled': False})])
     _drive(lac, sm, state, [5.0, 7.5, 10.0, 12.5])
     assert state['budget_on'] is False
@@ -680,13 +702,58 @@ class TestBudgetHotToggle:
 
   def test_malformed_bus_message_is_ignored(self, monkeypatch):
     lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
+    _touch_budget_socket()
     state['budget_sub'] = _FakeBudgetSub([('angle_budget', {})])  # no 'enabled' key
     _set_measured(sm, 20.0, 0.001)
     _call_update(lac, 0.002, steering_angle_deg=0.0)
     assert state['budget_on'] is True   # default falls back to current state
 
+  def test_lazy_subscriber_creation_pins_import_path_and_topic(self, monkeypatch, tmp_path):
+    """Mutation-proof the creation branch: a typo in the plugin_bus import
+    path, the PluginSub topic list, or the message filter must fail HERE
+    (the except-pass guard otherwise ships a permanently dead feature)."""
+    import bmw.latcontroller as mod_direct
+    sock = tmp_path / 'angle_budget'
+    sock.write_text('')                       # socket "exists" -> creation runs
+    monkeypatch.setattr(mod_direct, '_BUDGET_BUS_SOCKET', str(sock))
+
+    constructed = []
+
+    class FakeSub:
+      def __init__(self, topics):
+        constructed.append(topics)
+        self._q = [('angle_budget', {'enabled': True})]
+
+      def recv(self):
+        return self._q.pop(0) if self._q else None
+
+      def close(self):
+        pass
+
+    fake_mod = MagicMock()
+    fake_mod.PluginSub = FakeSub
+    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', fake_mod)
+
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(sm, 20.0, 0.001)
+    _call_update(lac, 0.002, steering_angle_deg=0.0)
+    assert constructed == [['angle_budget']]
+    assert state['budget_on'] is True
+
+  def test_subscriber_closed_when_socket_disappears(self, monkeypatch, tmp_path):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    closed = []
+    state['budget_sub'] = SimpleNamespace(recv=lambda: None,
+                                          close=lambda: closed.append(True))
+    # autouse fixture points _BUDGET_BUS_SOCKET at a nonexistent path
+    _set_measured(sm, 20.0, 0.001)
+    _call_update(lac, 0.002, steering_angle_deg=0.0)
+    assert closed == [True]
+    assert state['budget_sub'] is None
+
   def test_telemetry_carries_budget_on(self, monkeypatch):
     lac, sm, mod, state = _make_controller(monkeypatch)
+    _touch_budget_socket()
     payloads = []
     state['lat_pub'] = SimpleNamespace(send=payloads.append)
     _set_measured(sm, 20.0, 0.001)

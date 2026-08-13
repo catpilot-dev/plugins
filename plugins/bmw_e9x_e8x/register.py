@@ -133,6 +133,7 @@ def _write_param(key, value):
 
 
 _angle_budget_pub = None
+_angle_budget_hb_t = 0.0
 
 
 def _publish_angle_budget(enabled):
@@ -141,10 +142,11 @@ def _publish_angle_budget(enabled):
   The param file (written by _set_angle_budget) is the persistent state that
   controlsd reads at every drive start; this bus message is the live override
   for the drive in progress (latcontroller polls the 'angle_budget' topic at
-  livePose rate). The pub is created eagerly at panel construction — not at
-  first flip — so the socket exists before controlsd's lazy subscriber ever
-  polls; a pub created only on first flip would hit the ZMQ slow-joiner race
-  and that flip would be silently lost.
+  livePose rate). A single edge-triggered send is NOT reliable on its own —
+  ZMQ PUB drops messages with no connected subscriber (slow joiner), so the
+  1 Hz heartbeat in on_ui_state_tick is what actually guarantees delivery;
+  the immediate send here only makes a flip feel instant when the subscriber
+  is already connected (the common case).
   """
   global _angle_budget_pub
   try:
@@ -159,6 +161,27 @@ def _publish_angle_budget(enabled):
 def _set_angle_budget(state):
   _write_param('AngleBudget', '1' if state else '0')
   _publish_angle_budget(state)
+
+
+def on_ui_state_tick(_, sm=None):
+  """Hook callback (ui.state_tick, UI process, every UI frame): 1 Hz
+  heartbeat of the AngleBudget state onto the 'angle_budget' bus topic.
+
+  This is what makes the hot toggle RELIABLE, per the plugin bus's own
+  contract ("late joiners miss nothing — publishers send state at regular
+  Hz"): it heals every one-shot race in one mechanism — controlsd starting
+  after a flip (slow joiner), a UI restart mid-drive (rebound socket), and
+  even a manual `echo 1 > .../AngleBudget` (the heartbeat reads the param
+  file, so file edits hot-apply within ~1 s too). Runs on the UI thread —
+  a 1 Hz param-file read is fine here; it is the RT control thread that
+  must never touch the filesystem.
+  """
+  global _angle_budget_hb_t
+  import time
+  now = time.monotonic()
+  if now - _angle_budget_hb_t >= 1.0:
+    _angle_budget_hb_t = now
+    _publish_angle_budget(_read_param('AngleBudget') == '1')
 
 
 def on_vehicle_settings(items, CP):

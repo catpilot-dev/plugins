@@ -44,6 +44,11 @@
       "function": "on_vehicle_settings",
       "priority": 50
     },
+    "ui.state_tick": {
+      "module": "register",
+      "function": "on_ui_state_tick",
+      "priority": 60
+    },
     "ui.render_overlay": {
       "module": "ui_overlay",
       "function": "on_render_overlay",
