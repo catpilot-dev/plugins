@@ -539,7 +539,20 @@ def test_budget_clamp_same_direction_easing_is_unthrottled(monkeypatch):
     smaller in magnitude than the -0.30 held torque, with hold_f == 0 so
     held_target stays out of the way — v²·|desired| = 400·0.0008 = 0.32 <
     HOLD_AY_BP[0] = 0.5); -0.0008 preserves both properties while clearing
-    HOLD_BAND_ENTER (|delta_err| ≈ 0.00213 rad)."""
+    HOLD_BAND_ENTER (|delta_err| ≈ 0.00213 rad).
+
+    Independent derivation of the expected numbers (review fix, Important 2
+    -- these were originally transcribed from a controller run rather than
+    derived, which made them circular as a pin; re-derived by hand here from
+    the production formula so they stand on their own):
+
+        δ_err   = atan(0.0008·2.66)          = 0.00212800
+        κ_scale = 1.0 (below first breakpoint)
+        target  = 1.0·1.0·400·(-0.002128)/12 = -0.0709333  (T_CAP_SLOPE_BASE=1.0, STEER_MAX=12)
+        hold_f  = 0 (400·0.0008 = 0.32 < HOLD_AY_BP[0]=0.5) -> held_target = 0
+        t_cap   = (2.0+0.8512)/12 = 0.2376 -> no clip; budget lo/hi -0.3808/+0.0808 -> no clip
+        torque  = -0.30 + 0.2290667/10       = -0.27709333  (spread_frames=10)
+    """
     lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
     _prime_and_decide(lac, sm, state, torque=-0.30, v=20.0, desired=-0.0008,
                       measured=0.0, push_angle=2.5)
@@ -843,17 +856,45 @@ def test_beyond_enter_leaves_rest(monkeypatch):
 
 
 def test_correcting_continues_below_enter_until_settle(monkeypatch):
-  """Leave rest at 0.0018, then hold err at 0.0012 (below HOLD_BAND_ENTER but
-  above HOLD_BAND, the settle point): must NOT snap back to holding -- the
-  correction continues (this next tick lands in cancel_tol, since 0.0012 is
-  also the 1.2*HOLD_BAND boundary; at_rest carries forward unchanged, still
-  False -- see the section docstring)."""
+  """Leave rest at 0.0018, then hold err below HOLD_BAND_ENTER but above the
+  HOLD_BAND settle point: must NOT snap back to holding.
+
+  Two sub-cases, in separate controllers so neither's decision path can mask
+  the other (review fix, Important 1):
+
+  Case 1 -- err=0.0012, the cancel_tol boundary (1.2*HOLD_BAND). cancel_tol
+  fires first (it's HOLD_BAND boundary hygiene on an in-flight push ramp,
+  <=, unrelated to this state machine) and resets tick_count to 0, which
+  makes the cadence condition read false THIS tick -- so the hysteresis
+  decision block (where at_rest is written) never runs, and at_rest merely
+  carries forward its prior value. That is a real, worth-pinning interaction
+  (a regression that made cancel_tol stop preempting here would matter), but
+  by itself it does NOT exercise the settle branch's own comparison -- a
+  mutant that widens the settle branch from `<= HOLD_BAND` to `<= _enter`
+  still passes this case, because the branch is never reached.
+
+  Case 2 -- err=0.0014: strictly above the cancel_tol gate (0.0012, so
+  cancel_tol does NOT preempt) and strictly below HOLD_BAND_ENTER (0.0015).
+  This is the case that actually reaches and evaluates the settle
+  comparison: unmutated, 0.0014 > HOLD_BAND (0.001) so it stays correcting
+  (ramp); under the rejected single-threshold-widening mutation (settle
+  branch changed to `<= _enter` = 0.0015), 0.0014 would incorrectly settle.
+  """
+  # Case 1: cancel_tol boundary.
   lac, sm, mod, state = _make_controller(monkeypatch)
   _drive_to(lac, sm, state, 0.0018)
   assert state['at_rest'] is False
   _drive_to(lac, sm, state, 0.0012)
+  assert state['action'] == 'cancel_tol'
   assert state['at_rest'] is False
-  assert state['action'] not in ('hold_zero', 'hold_curve')
+
+  # Case 2: the settle branch itself, isolated from cancel_tol.
+  lac2, sm2, mod2, state2 = _make_controller(monkeypatch)
+  _drive_to(lac2, sm2, state2, 0.0018)
+  assert state2['at_rest'] is False
+  _drive_to(lac2, sm2, state2, 0.0014)
+  assert state2['at_rest'] is False
+  assert state2['action'] == 'ramp'
 
 
 def test_settle_returns_to_rest(monkeypatch):
@@ -872,7 +913,16 @@ def test_killswitch_reproduces_legacy_single_threshold(monkeypatch):
   """HoldHysteresis='0': both thresholds collapse to HOLD_BAND, reproducing
   the legacy single-comparison decision-for-decision. This is the
   legacy-identity pin: err 0.0012 (> HOLD_BAND) must RAMP, err 0.0008
-  (<= HOLD_BAND) must hold -- exactly the pre-hysteresis behaviour."""
+  (<= HOLD_BAND) must hold, and err exactly HOLD_BAND (the boundary itself)
+  must hold too -- legacy was `abs(delta_err) <= HOLD_BAND`, a <=, so
+  equality is on-target. (Review fix, Minor 4: the doc claims this test pins
+  "including the boundary case"; it didn't until this third construction was
+  added -- 0.0012/0.0008 both sit strictly off the boundary.)
+
+  The boundary value itself: `desired = tan(HOLD_BAND)/L` round-trips through
+  `atan(desired*L)` to bit-exact 0.001 at this L (verified: no float-precision
+  hair to chase here), so this asserts the exact `<=` behaviour directly
+  rather than approximately."""
   lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=False)
   _drive_to(lac, sm, state, 0.0012)
   assert state['at_rest'] is False
@@ -882,6 +932,13 @@ def test_killswitch_reproduces_legacy_single_threshold(monkeypatch):
   _drive_to(lac2, sm2, state2, 0.0008)
   assert state2['at_rest'] is True
   assert state2['action'] in ('hold_zero', 'hold_curve')
+
+  lac3, sm3, mod3, state3 = _make_controller(monkeypatch, hold_hyst=False)
+  boundary_err = 0.001   # == HOLD_BAND in latcontroller.py
+  _drive_to(lac3, sm3, state3, boundary_err)
+  assert state3['delta_err'] == boundary_err   # bit-exact, see docstring
+  assert state3['at_rest'] is True
+  assert state3['action'] in ('hold_zero', 'hold_curve')
 
 
 def test_default_is_enabled(monkeypatch):
@@ -895,3 +952,24 @@ def test_default_is_enabled(monkeypatch):
   _drive_to(lac, sm, state, 0.0012)
   assert state['at_rest'] is True
   assert state['action'] in ('hold_zero', 'hold_curve')
+
+
+def test_hb_enter_telemetry_reflects_killswitch(monkeypatch):
+  """Review fix, Minor 3: `hb_enter` is documented as each drive's A/B
+  self-label (LATERAL_CONTROLLER.md: 0.0015 = hysteresis active, 0.001 =
+  kill-switched). Hardcoding `float(HOLD_BAND_ENTER)` in the payload would
+  pass every other test in this file (none of them read `hb_enter`) while
+  silently mislabeling every kill-switched drive. Pin both legs directly
+  from the published telemetry payload, not from the internal `_enter`
+  local."""
+  lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=False)
+  payloads = []
+  state['lat_pub'] = SimpleNamespace(send=payloads.append)
+  _drive_to(lac, sm, state, 0.0008)
+  assert payloads and payloads[-1]['hb_enter'] == pytest.approx(0.001)
+
+  lac2, sm2, mod2, state2 = _make_controller(monkeypatch, hold_hyst=True)
+  payloads2 = []
+  state2['lat_pub'] = SimpleNamespace(send=payloads2.append)
+  _drive_to(lac2, sm2, state2, 0.0008)
+  assert payloads2 and payloads2[-1]['hb_enter'] == pytest.approx(0.0015)

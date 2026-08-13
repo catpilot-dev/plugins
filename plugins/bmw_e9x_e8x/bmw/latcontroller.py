@@ -867,6 +867,7 @@ def on_lat_controller_init(result, lac, CP):
           'hold_cap': float(state['hold_cap']),
           'hold_band': float(HOLD_BAND),                      # stiction hold trigger (rad)
           'hb_enter': float(HOLD_BAND_ENTER if _hold_hyst_on else HOLD_BAND),  # leave-rest threshold (rad); drive self-label: 0.0015=hysteresis, 0.001=kill-switched, absent=old build
+          'at_rest': bool(state['at_rest']),                  # hysteresis decision state (observable even when action is cancel_tol/idle, where action is not a proxy for it)
           'relax_ticks': int(state['relax_ticks']),
           'push_moved': float(state['push_moved']),
           'budget_spent': bool(state['budget_spent']),
