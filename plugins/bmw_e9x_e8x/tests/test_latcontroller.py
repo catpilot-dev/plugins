@@ -81,7 +81,7 @@ class FakeSubMaster:
     return self.lp
 
 
-def _make_controller(monkeypatch, wheelbase=2.66, angle_budget=None):
+def _make_controller(monkeypatch, wheelbase=2.66, angle_budget=None, hold_hyst=None):
   """Load bmw.latcontroller and construct a controller instance wired to a
   FakeSubMaster. Returns (lac, fake_sm, mod, state).
 
@@ -97,16 +97,31 @@ def _make_controller(monkeypatch, wheelbase=2.66, angle_budget=None):
   attribute to patch — same pattern as
   speedlimitd/tests/test_speedlimitd.py's `monkeypatch.setattr(config,
   'read_plugin_param', ...)`).
+
+  hold_hyst: if not None, patches the same config.read_plugin_param so
+  HoldHysteresis reads as '1' (True) or '0' (False) — also read exactly once
+  at construction. angle_budget and hold_hyst go through the same
+  read_plugin_param call, so the stub dispatches on the param key rather than
+  returning one value for every key (2026-08-13 — the original angle_budget-
+  only stub ignored the key entirely, which would have made HoldHysteresis
+  silently inherit whatever angle_budget was set to). Either kwarg left None
+  falls through to the `default` argument production passes (''), i.e. the
+  real unpatched-param behaviour for that key.
   """
   import cereal.messaging as messaging
   fake_sm = FakeSubMaster([])
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
 
   import bmw.latcontroller as mod
-  if angle_budget is not None:
+  if angle_budget is not None or hold_hyst is not None:
     import config
-    monkeypatch.setattr(config, 'read_plugin_param',
-                        lambda *a, **k: '1' if angle_budget else '0')
+    def _param_stub(plugin_id, key, default=''):
+      if key == 'AngleBudget' and angle_budget is not None:
+        return '1' if angle_budget else '0'
+      if key == 'HoldHysteresis' and hold_hyst is not None:
+        return '1' if hold_hyst else '0'
+      return default
+    monkeypatch.setattr(config, 'read_plugin_param', _param_stub)
 
   CP = SimpleNamespace(wheelbase=wheelbase, steerActuatorDelay=0.4)
   lac = SimpleNamespace()
@@ -511,16 +526,29 @@ def test_budget_clamp_same_direction_harder_freezes(monkeypatch):
 def test_budget_clamp_same_direction_easing_is_unthrottled(monkeypatch):
     """Case B: easing off in the same direction goes straight to the P-law's
     (smaller-magnitude) target in one decision, not stepped at STEP_MAX like
-    a normal ramp."""
+    a normal ramp.
+
+    desired moved from -0.0005 to -0.0008 (2026-08-13, entry/settle
+    hysteresis): with hysteresis default ON, -0.0005 produces
+    |delta_err| ≈ 0.00133 rad, which is > HOLD_BAND (0.001, the legacy single
+    threshold this value used to clear) but < HOLD_BAND_ENTER (0.0015) — from
+    this test's fresh controller (state['at_rest'] starts True), that no
+    longer leaves rest, so the decision lands in the hold branch instead of
+    the ramp/easing branch this test exists to exercise. The specific error
+    magnitude here was always incidental to the test's intent (a P-target
+    smaller in magnitude than the -0.30 held torque, with hold_f == 0 so
+    held_target stays out of the way — v²·|desired| = 400·0.0008 = 0.32 <
+    HOLD_AY_BP[0] = 0.5); -0.0008 preserves both properties while clearing
+    HOLD_BAND_ENTER (|delta_err| ≈ 0.00213 rad)."""
     lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _prime_and_decide(lac, sm, state, torque=-0.30, v=20.0, desired=-0.0005,
+    _prime_and_decide(lac, sm, state, torque=-0.30, v=20.0, desired=-0.0008,
                       measured=0.0, push_angle=2.5)
     assert state['budget_spent'] is True
-    assert state['target_frac'] == pytest.approx(-0.044333, abs=1e-5)
-    assert state['torque'] == pytest.approx(-0.274433, abs=1e-5)
+    assert state['target_frac'] == pytest.approx(-0.070933, abs=1e-5)
+    assert state['torque'] == pytest.approx(-0.277093, abs=1e-5)
     # A STEP_MAX(20 m/s)=0.080769-clamped ramp would have moved torque by
     # only step_max/spread_frames = 0.0080769 this tick; the actual movement
-    # is over 3x that, proving the step was not throttled.
+    # is well over 2x that, proving the step was not throttled.
     step_max_over_spread_frames = 0.080769 / 10
     assert abs(state['torque'] - (-0.30)) > step_max_over_spread_frames
 
@@ -763,3 +791,107 @@ class TestBudgetHotToggle:
     _set_measured(sm, 20.0, 0.001)
     _call_update(lac, 0.002, steering_angle_deg=0.0)
     assert payloads[-1]['budget_on'] is True
+
+
+# ============================================================
+# Entry/settle hysteresis on the HOLD_BAND rest band (2026-08-13, route 3f4
+# data). One shared threshold made the controller flicker across the
+# boundary ~89x/min on straights (error noise sigma = 0.00081 rad); leaving
+# rest now requires clearing HOLD_BAND_ENTER (0.0015), settling back still
+# only needs HOLD_BAND (0.001) -- the settle point is unchanged.
+#
+# _drive_to(lac, sm, state, E) places delta_err at exactly E rad (measured
+# pinned to 0, so delta_err == delta_des == atan(desired*L); desired is
+# chosen as tan(E)/L so atan(tan(E)) round-trips to E) and forces the cadence
+# decision to run this tick (tick_count = 999). Every scenario below was
+# verified against the real controller before being pinned here -- see
+# hysteresis-report.md for the derivation, including the one case
+# (E=0.0012 continuing a correction) where the decision that tick is
+# cancel_tol rather than a fresh hysteresis-branch evaluation: at_rest is
+# only ever written inside the cadence decision block, so when cancel_tol
+# preempts that block (it fires first, resets tick_count to 0, and the
+# cadence condition then reads false), at_rest simply keeps whatever value
+# the prior decision left it at -- which is exactly the "still correcting"
+# assertion this test makes, just reached by a different code path than the
+# plain else-branch case exercises on its own.
+# ============================================================
+
+def _drive_to(lac, sm, state, err_rad, v=20.0, wheelbase=2.66):
+  """Force delta_err to err_rad (measured=0) and run one cadence decision."""
+  desired = math.tan(err_rad) / wheelbase
+  _set_measured(sm, v, 0.0)
+  state['tick_count'] = 999
+  _call_update(lac, desired, v_ego=v)
+
+
+def test_between_settle_and_enter_from_rest_stays_holding(monkeypatch):
+  """err = 0.0012 sustained from a resting controller: legacy single
+  threshold (0.0012 > HOLD_BAND=0.001) would ramp; hysteresis's leave-rest
+  gate (HOLD_BAND_ENTER=0.0015) is not cleared, so it must stay holding."""
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _drive_to(lac, sm, state, 0.0012)
+  assert state['at_rest'] is True
+  assert state['action'] in ('hold_zero', 'hold_curve')
+
+
+def test_beyond_enter_leaves_rest(monkeypatch):
+  """err = 0.0018 sustained clears HOLD_BAND_ENTER (0.0015): leaves rest."""
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _drive_to(lac, sm, state, 0.0018)
+  assert state['at_rest'] is False
+  assert state['action'] == 'ramp'
+
+
+def test_correcting_continues_below_enter_until_settle(monkeypatch):
+  """Leave rest at 0.0018, then hold err at 0.0012 (below HOLD_BAND_ENTER but
+  above HOLD_BAND, the settle point): must NOT snap back to holding -- the
+  correction continues (this next tick lands in cancel_tol, since 0.0012 is
+  also the 1.2*HOLD_BAND boundary; at_rest carries forward unchanged, still
+  False -- see the section docstring)."""
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _drive_to(lac, sm, state, 0.0018)
+  assert state['at_rest'] is False
+  _drive_to(lac, sm, state, 0.0012)
+  assert state['at_rest'] is False
+  assert state['action'] not in ('hold_zero', 'hold_curve')
+
+
+def test_settle_returns_to_rest(monkeypatch):
+  """Continuing from the correcting state, dropping err to 0.0008 (at/below
+  the unchanged HOLD_BAND settle point) returns to rest."""
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _drive_to(lac, sm, state, 0.0018)
+  _drive_to(lac, sm, state, 0.0012)
+  assert state['at_rest'] is False
+  _drive_to(lac, sm, state, 0.0008)
+  assert state['at_rest'] is True
+  assert state['action'] in ('hold_zero', 'hold_curve')
+
+
+def test_killswitch_reproduces_legacy_single_threshold(monkeypatch):
+  """HoldHysteresis='0': both thresholds collapse to HOLD_BAND, reproducing
+  the legacy single-comparison decision-for-decision. This is the
+  legacy-identity pin: err 0.0012 (> HOLD_BAND) must RAMP, err 0.0008
+  (<= HOLD_BAND) must hold -- exactly the pre-hysteresis behaviour."""
+  lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=False)
+  _drive_to(lac, sm, state, 0.0012)
+  assert state['at_rest'] is False
+  assert state['action'] == 'ramp'
+
+  lac2, sm2, mod2, state2 = _make_controller(monkeypatch, hold_hyst=False)
+  _drive_to(lac2, sm2, state2, 0.0008)
+  assert state2['at_rest'] is True
+  assert state2['action'] in ('hold_zero', 'hold_curve')
+
+
+def test_default_is_enabled(monkeypatch):
+  """No param patched (angle_budget/hold_hyst both left None -> real
+  read_plugin_param, which sees no param file and returns the default ''):
+  hysteresis is active by default. err 0.0012 stays holding, the same
+  scenario that pins hysteresis-on behaviour in
+  test_between_settle_and_enter_from_rest_stays_holding above, here without
+  any monkeypatch at all."""
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _drive_to(lac, sm, state, 0.0012)
+  assert state['at_rest'] is True
+  assert state['action'] in ('hold_zero', 'hold_curve')

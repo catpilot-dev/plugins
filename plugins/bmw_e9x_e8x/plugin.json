@@ -21,6 +21,10 @@
     "AngleBudget": {
       "default": false,
       "description": "Stop pushing and ease off once the wheel has moved 2 degrees"
+    },
+    "HoldHysteresis": {
+      "default": true,
+      "description": "Hysteresis on the steering rest band: leave rest at 0.0015 rad error, settle at 0.001. Write 0 to disable (legacy single threshold)."
     }
   },
   "cereal": {

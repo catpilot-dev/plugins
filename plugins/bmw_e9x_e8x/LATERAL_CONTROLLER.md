@@ -382,6 +382,70 @@ This document is the canonical reference for the lateral controller registered b
 > date — offline validation on route 3f2 refuted it before it ever shipped
 > behind a toggle. See § 11.
 
+> **2026-08-13 — entry/settle hysteresis on the `HOLD_BAND` rest band (route
+> 3f4 data).** One shared threshold for both leaving rest and returning to it
+> made the controller flicker across the boundary constantly on straights:
+> route 3f4 (OFF leg, 20.3 min of clean engaged straight driving) measured
+> the error signal's band-passed noise at **σ = 0.00081 rad** — `HOLD_BAND`
+> (0.001 rad) is only **1.23σ**, well inside the noise core — so the
+> controller crossed the boundary **~89 times/min** and started **~22.6**
+> sub-breakaway ramp episodes/min: stepper activations that mostly commanded
+> torque below rack breakaway and barely moved the wheel.
+>
+> **The fix: split the threshold.**
+> - **Leave rest** only when `|delta_err| > HOLD_BAND_ENTER` (new, `0.0015`
+>   rad — clears the noise core with margin).
+> - **Return to rest** at `|delta_err| ≤ HOLD_BAND` (existing, `0.001` rad,
+>   **unchanged** — a growing `lane_keeping` position correction still lands
+>   exactly where it always has).
+>
+> New state `state['at_rest']` (`True` = holding, `False` = correcting)
+> replaces the single `if abs(delta_err) <= HOLD_BAND:` comparison that used
+> to gate `hold_zero`/`hold_curve` vs. the off-target branch: while resting,
+> only an error past `HOLD_BAND_ENTER` leaves rest; while correcting, only an
+> error at/below `HOLD_BAND` re-settles. The `cancel_tol` gate (`1.2 ×
+> HOLD_BAND`, § 8) is untouched — it is boundary hygiene for an in-flight
+> **push** ramp specifically, orthogonal to this rest/correcting state.
+>
+> **Replay: −63% activation episodes.** Plain widening of the single
+> threshold was measured and rejected — only **−18%** activations, and it
+> re-enters the **Phase-1 failure mode** (§ 2026-07-19 above): a
+> 0.0012–0.0021 rad tolerance band ate **44%** of the `lane_keeping` anchor's
+> commands on route 3bf. Splitting the threshold avoids that because the
+> *settle* point never moves — only entry gets harder, so a persistent
+> correction is never absorbed once its error is real.
+>
+> **Open-loop caveat**: this replay validates the *detector* — that
+> classifying deltas against `[HOLD_BAND, HOLD_BAND_ENTER]` cuts flicker —
+> not the closed-loop feel of the wider entry gate. On-car verification is
+> still pending; straight-line smoothness is the veto (see A/B guidance
+> below).
+>
+> **`HoldHysteresis` param, kill-switch polarity (opposite of `AngleBudget`):
+> default ON**, `'0'` rolls back to the legacy single threshold. Read once at
+> construction (same rationale as `AngleBudget`'s init-time read — no
+> per-tick/cached param-file re-read on the RT thread); **no bus topic, no
+> heartbeat, no hot toggle** — unlike `AngleBudget`'s mid-drive push-budget
+> switch, this doesn't need one: a restart-scoped kill-switch is enough,
+> since controlsd re-reads the param at every drive start. With the
+> kill-switch off, `HOLD_BAND_ENTER`'s effective value collapses to
+> `HOLD_BAND` and the state machine reduces *decision-for-decision* to the
+> legacy comparison, including the boundary case (`>` to leave, `<=` to
+> return) — pinned by `test_killswitch_reproduces_legacy_single_threshold` in
+> `tests/test_latcontroller.py`.
+>
+> **Telemetry** gains `hb_enter` (§ 9): the live leave-rest threshold in
+> effect this tick (`0.0015` with hysteresis on, `0.001` kill-switched). Also
+> doubles as each drive's self-label for A/B analysis — a build without this
+> change carries no `hb_enter` key at all.
+>
+> **A/B guidance**: compare against **route 3f4, segments 37–85** as the
+> baseline (same roads, same build minus this change). Flip `HoldHysteresis`
+> at a landmark on a straight, same as the `AngleBudget` A/B procedure (§
+> 12). **Straight-line feel is the veto** — if the wider entry gate reads as
+> sluggish re-centering or a wobblier rest band on-car, that overrides the
+> replay numbers.
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -645,9 +709,9 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 | state | when entered |
 |---|---|
 | `init` | controller construction |
-| `hold_zero` | `|delta_err| ≤ HOLD_BAND`, straight (`hold_f = 0`) — target 0, stiction holds |
-| `hold_curve` | `|delta_err| ≤ HOLD_BAND`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
-| `ramp` | active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
+| `hold_zero` | `state['at_rest']`, straight (`hold_f = 0`) — target 0, stiction holds |
+| `hold_curve` | `state['at_rest']`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
+| `ramp` | not `state['at_rest']` — active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
 | `relax_dwell` | overshoot-side error in a measured deep curve, within the 1 s dwell — target bridges at current (capped) torque |
 | `cancel_tol` | error fell into the on-target band (1.2× `HOLD_BAND`) mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights). **NOT an ISO cancel** — HOLD_BAND boundary hygiene; the only `cancel_`-named action still present |
 | ~~`cancel_accel`~~ | **removed 2026-07-28** — was: overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` → drain to 0 |
@@ -656,6 +720,7 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 
 Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`. Added: `hold_curve`. Telemetry gains `hold_f`.
 Removed 2026-07-28 (SAFETY ARCHITECTURE, top of doc): `cancel_accel`, `cancel_jerk` — the lateral controller no longer abandons a turn; `a_y` is bounded by speedlimitd.
+`hold_zero`/`hold_curve` vs. `ramp` are now decided by `state['at_rest']` (2026-08-13, entry/settle hysteresis — see the dated note above): leaving rest needs `|delta_err| > HOLD_BAND_ENTER` (0.0015 rad, or `HOLD_BAND` with the `HoldHysteresis` kill-switch off), returning needs `|delta_err| ≤ HOLD_BAND` (0.001, unchanged).
 
 ---
 
@@ -684,6 +749,7 @@ Published each livePose tick:
 | `hold_cap` | cap on held torque (P value implied by the fixed `HOLD_CAP_DRIFT_M` reference, frac — independent of the deleted tolerance) |
 | `relax_ticks` | consecutive ticks of overshoot-side error while deep in a curve (dwell counter) |
 | `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
+| `hb_enter` | (2026-08-13) live leave-rest threshold in effect this tick (rad) — `0.0015` with `HoldHysteresis` on, `0.001` kill-switched; also each drive's self-label (absent = pre-hysteresis build) |
 | `push_moved` | (2026-08-12) signed degrees moved from `push_ref` since the current push began (0 when not ramping) |
 | `budget_spent` | (2026-08-12) `True` once `push_moved` has reached `BUDGET_DEG` in the commanded direction (always `False` with `AngleBudget` off) |
 | `budget_on` | (2026-08-13) live toggle state — init-time param read, overridden mid-drive by the `angle_budget` bus topic; labels each tick's A/B leg |
@@ -790,6 +856,24 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   param — there is nothing to write for it. Changing it is a code edit, a
   redeploy (`install.sh`), and a `__pycache__` clear before the next drive.
 
+### To toggle `HoldHysteresis` (entry/settle hysteresis, 2026-08-13 entry):
+- **Not hot** — unlike `AngleBudget`, there is no bus topic or heartbeat.
+  The param is read once at controller construction, so a change only takes
+  effect at the **next drive start** (controlsd is onroad-only and re-reads
+  fresh each ignition).
+- Write the param: `echo -n 0 > /data/plugins-runtime/bmw_e9x_e8x/data/HoldHysteresis`
+  to roll back to the legacy single threshold; delete the file or write `1`
+  (or anything other than `0`) to re-enable — **default is ON** (opposite
+  polarity from `AngleBudget`).
+- **A/B across drives, not within one**: since it's restart-scoped, compare
+  whole drives rather than flipping mid-drive at a landmark. Baseline is
+  route 3f4 segments 37–85 (see the 2026-08-13 dated note above).
+- **Verify a drive picked it up**: `bmw_lat_control` telemetry's `hb_enter`
+  field is `0.0015` (hysteresis active), `0.001` (kill-switched), or absent
+  (pre-hysteresis build) — self-labels every tick of the drive.
+- **Rollback**: write `0` and restart the drive (ignition cycle); no
+  redeploy needed, it's a param not a source constant.
+
 ---
 
 ## 13. Code map (`bmw/latcontroller.py`)
@@ -801,7 +885,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | `update()` function | 360+ | Per-CAN-tick body, with livePose-gated heavy logic |
 | Plant horizon block | inside update | `model_action_t`, cadence/spread computed from `lat_delay` |
 | Hold-cap / hold-floor block | inside update | `hold_cap` (HOLD_CAP_DRIFT_M reference), `held_target`, sign-guard |
-| HOLD_BAND on-target check | inside update | Fixed stiction hold-retrigger threshold (no deadzone; § 5) |
+| HOLD_BAND / HOLD_BAND_ENTER on-target check | inside update | Entry/settle hysteresis on `state['at_rest']` (2026-08-13); stiction hold-retrigger threshold, not a deadzone (§ 5) |
 | cancel_tol | inside update | HOLD_BAND boundary hygiene — stops an in-flight push ramp on-target (the ISO overshoot-gated cancel_jerk / cancel_accel that used to sit here was removed 2026-07-28) |
 | Cadence decision | inside update | hold_zero / hold_curve / ramp / target_nm formula |
 | Ramp application | inside update | Per-CAN-tick torque ramp |

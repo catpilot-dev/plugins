@@ -216,6 +216,21 @@ def on_lat_controller_init(result, lac, CP):
   except Exception:
     _angle_budget_on = False
 
+  # HoldHysteresis kill-switch (2026-08-13, route 3f4 data) — read ONCE here,
+  # same rationale as AngleBudget above (no per-tick/cache re-read of a param
+  # file on the RT thread). Reuses the read_plugin_param already imported
+  # above rather than importing it a second time; if that import failed,
+  # read_plugin_param is undefined here too and this falls into the except
+  # branch, which is why the fallback also defaults hysteresis ON (opposite
+  # polarity from AngleBudget's off-by-default — this is the change under
+  # test, and '0' is the rollback). No bus topic, no heartbeat, no hot
+  # toggle: a restart-scoped kill-switch is enough; controlsd re-reads at
+  # every drive start. See HOLD_BAND_ENTER below and LATERAL_CONTROLLER.md.
+  try:
+    _hold_hyst_on = read_plugin_param('bmw_e9x_e8x', 'HoldHysteresis', '') != '0'
+  except Exception:
+    _hold_hyst_on = True
+
   # Decision cadence & CAN-rate spreading — both subscribe to model_action_t
   # per tick, sized to one half of the model's action horizon so exactly two
   # decision-and-ramp cycles fit within one horizon. This keeps the
@@ -351,6 +366,19 @@ def on_lat_controller_init(result, lac, CP):
   # where the old 0.0012–0.0021 rad tolerance ate 44% of the anchor's command.
   HOLD_BAND = 0.001        # rad of front-wheel-angle error treated as on-target
 
+  # Entry/settle hysteresis (2026-08-13, route 3f4 data). One shared threshold
+  # made the controller flicker across the band boundary ~89x/min on straights
+  # (error noise sigma = 0.00081 rad, so HOLD_BAND is only 1.23 sigma),
+  # starting ~22.6 sub-breakaway ramp episodes/min. Leaving rest now requires
+  # clearing the noise core (> HOLD_BAND_ENTER); settling back keeps the
+  # original tight point (<= HOLD_BAND), so a growing lane_keeping correction
+  # still lands at 0.001 — plain widening was measured on route 3f4 and
+  # rejected (-18% activations only, and it re-enters the Phase-1 regime
+  # where a 0.0012-0.0021 tolerance ate 44% of the anchor's commands).
+  # Replay: -63% activation episodes. Kill-switch: HoldHysteresis param
+  # ('0' disables -> both thresholds = HOLD_BAND -> exact legacy behaviour).
+  HOLD_BAND_ENTER = 0.0015
+
   # SAFETY ARCHITECTURE (2026-07-28): NO ISO accel/jerk cancel guard. It used
   # to live here (a κ-indexed BMW_LATERAL_JERK table + a commanded-a_y
   # accel_guard_threshold, both gated on an `overshooting` predicate, draining
@@ -389,6 +417,7 @@ def on_lat_controller_init(result, lac, CP):
     'push_ref': None,        # steering angle when this push began (deg)
     'push_moved': 0.0,       # debug: signed deg moved since then
     'budget_spent': False,   # debug: 2 deg moved in the commanded direction
+    'at_rest': True,   # hysteresis state: True = holding, False = correcting
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -655,7 +684,18 @@ def on_lat_controller_init(result, lac, CP):
         #   τ_Nm = T_CAP_SLOPE · v² · δ_err
         # On-target (|δ_err| ≤ HOLD_BAND) → stiction holds; no chatter at
         # the boundary (see the hold_curve / hold_zero branch below).
-        if abs(delta_err) <= HOLD_BAND:
+        # Entry/settle hysteresis: leave rest only past HOLD_BAND_ENTER,
+        # return only at/below HOLD_BAND. With the kill-switch off both
+        # thresholds are HOLD_BAND and this reduces exactly to the legacy
+        # per-decision comparison (leave on >, return on <=).
+        _enter = HOLD_BAND_ENTER if _hold_hyst_on else HOLD_BAND
+        if state['at_rest']:
+          if abs(delta_err) > _enter:
+            state['at_rest'] = False
+        else:
+          if abs(delta_err) <= HOLD_BAND:
+            state['at_rest'] = True
+        if state['at_rest']:
           # On-target. Low commanded a_y (hold_f=0 — straights and gentle-
           # slow curves): drain to 0, stiction holds. Higher commanded a_y
           # (hold_f→1): keep the torque that achieved on-target — it
@@ -826,6 +866,7 @@ def on_lat_controller_init(result, lac, CP):
           'hold_f': float(state['hold_f']),
           'hold_cap': float(state['hold_cap']),
           'hold_band': float(HOLD_BAND),                      # stiction hold trigger (rad)
+          'hb_enter': float(HOLD_BAND_ENTER if _hold_hyst_on else HOLD_BAND),  # leave-rest threshold (rad); drive self-label: 0.0015=hysteresis, 0.001=kill-switched, absent=old build
           'relax_ticks': int(state['relax_ticks']),
           'push_moved': float(state['push_moved']),
           'budget_spent': bool(state['budget_spent']),
