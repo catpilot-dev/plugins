@@ -973,3 +973,35 @@ def test_hb_enter_telemetry_reflects_killswitch(monkeypatch):
   state2['lat_pub'] = SimpleNamespace(send=payloads2.append)
   _drive_to(lac2, sm2, state2, 0.0008)
   assert payloads2 and payloads2[-1]['hb_enter'] == pytest.approx(0.0015)
+
+
+# ============================================================
+# FRICTION retirement (2026-08-13): the two epsilon-gates are DELETED.
+# These tests pin the deletions — restoring either conjunct fails here.
+# ============================================================
+
+class TestFrictionGatesDeleted:
+  def test_cancel_tol_fires_even_for_tiny_inflight_targets(self, monkeypatch):
+    """Pre-deletion, |target_frac| <= 0.05 blocked cancel_tol and tiny stale
+    ramps ran to completion. Now arrival hygiene applies to every push ramp."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(sm, 20.0, 0.0005)          # measured ~ desired: err in band
+    state['torque'] = 0.02
+    state['target_frac'] = 0.03              # tiny — the old gate blocked this
+    state['ramp_frames'] = 5
+    state['action'] = 'ramp'
+    state['tick_count'] = 0                  # not a cadence decision tick
+    _call_update(lac, 0.0005, steering_angle_deg=0.0)
+    assert state['action'] == 'cancel_tol'
+
+  def test_deep_relax_arms_even_with_tiny_held_torque(self, monkeypatch):
+    """Pre-deletion, |torque| <= 0.05 blocked the dwell from arming."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(sm, 9.0, 0.012)            # deep curve, |κ_meas| > 0.010
+    state['torque'] = 0.02                   # tiny — the old gate blocked this
+    state['action'] = 'hold_curve'
+    state['tick_count'] = 0
+    before = state['relax_ticks']
+    # overshoot-side error: desired same side but smaller than measured
+    _call_update(lac, 0.008, steering_angle_deg=0.0, v_ego=9.0)
+    assert state['relax_ticks'] == before + 1

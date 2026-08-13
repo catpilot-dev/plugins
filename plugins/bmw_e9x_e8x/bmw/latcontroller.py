@@ -118,11 +118,14 @@ def on_lat_controller_init(result, lac, CP):
   On-target trigger (Phase 2, 2026-07-22): HOLD_BAND = 0.001 rad, fixed —
   not the speed-adaptive kinematic DRIFT_M deadzone it replaced. It exists
   only to decide when the rack has arrived so the curvature hold can take
-  over; it is sized by rack breakaway (below it P commands less than
-  friction, so the wheel can't move anyway), not by allowed lateral drift.
-  modelV2 noise handling and lateral-drift correction now live upstream in
-  the lane_keeping plugin's position loop:
-    on_target = |δ_err| ≤ HOLD_BAND
+  over. It is simply a dead band of front-wheel error, sized at the error
+  signal's measured noise floor (~1σ; see the HOLD_BAND constant's comment
+  for the numbers — the old "sized by rack breakaway" story was a fiction
+  retired 2026-08-13), not by allowed lateral drift. modelV2 noise handling
+  and lateral-drift correction live upstream in the lane_keeping position
+  loop. Since 2026-08-13 entry and settle are split (hysteresis):
+    leave rest:   |δ_err| > HOLD_BAND_ENTER  (0.0015)
+    return:       |δ_err| ≤ HOLD_BAND        (0.001)
 
   Plant-inversion target torque, angle domain (linear tire regime). P acts
   on the FULL error — no tolerance subtraction (Phase 2: it was attenuating
@@ -131,7 +134,7 @@ def on_lat_controller_init(result, lac, CP):
     Clamp to ±T_CAP(v, δ):
       T_CAP_NM = min(STEER_MAX, T_CAP_BASE + T_CAP_SLOPE · v²·|δ_des|)
     Same slope drives both target and cap.
-    Sub-friction targets are commanded as-is (they don't move the rack —
+    Sub-breakaway targets are commanded as-is (they don't move the rack —
     a deliberate soft actuation deadband; stiction special-casing removed
     2026-07-03). BASE is the hydraulic rack's stiction floor. Hard stop at
     STEER_MAX (panda limit) preserves lane authority during transient
@@ -177,7 +180,7 @@ def on_lat_controller_init(result, lac, CP):
   low-pass + position loop), not by anything in this controller.
 
   No online adaptation: plant behavior is fully described by T_CAP_SLOPE,
-  T_CAP_BASE_NM, and FRICTION. Tune these offline from route data; there's
+  and T_CAP_BASE_NM. Tune these offline from route data; there's
   no scale_by_bin or shadow estimator anymore.
   """
   import math
@@ -345,25 +348,33 @@ def on_lat_controller_init(result, lac, CP):
   RELAX_DWELL_TICKS = 20      # livePose ticks (1.0 s at 20 Hz)
   RELAX_DWELL_KAPPA = 0.010   # |κ_meas| defining a deep curve (1/m)
 
-  # Rack breakaway torque fraction (stiction floor). 2026-07-03: no longer
-  # used to amplify sub-friction commands or emit reverse pulses (stiction
-  # special-casing removed — the pulses were churn, not correction; the
-  # straight-line wobble they targeted is modelV2 vision noise, now handled
-  # upstream by lane_keeping since Phase 2, 2026-07-22). Retained only as
-  # the cancel_tol boundary-hygiene threshold: ramps below this can't move
-  # the rack, so there is nothing to stop.
-  FRICTION = 0.05
+  # (FRICTION = 0.05 retired 2026-08-13. It claimed to be the rack's breakaway
+  # torque; the measured breakaway is 2.0-2.75 Nm — 4x higher — and is not a
+  # constant at all (it spans wider than the usable torque range across load,
+  # speed and surface; route 3f2 study). Its two surviving epsilon-gates —
+  # cancel_tol's |target_frac| > FRICTION and deep_relax's |torque| > FRICTION
+  # — were user-ruled redundant: the first was HOLD_BAND expressed in torque
+  # coordinates through the P gain, the second was vacuous under the
+  # deep-curve gate (SAT-scale torque ~0.19 frac in any |κ_meas| > 0.010
+  # curve). Breakaway is now OBSERVED, not predicted — see the push-budget
+  # machinery. Do not reintroduce a friction constant; nothing in this
+  # controller should pretend to model the rack.)
 
-  # Stiction hold trigger (Phase 2, 2026-07-22). Replaces the DRIFT_M kinematic
-  # deadzone, which existed only because there was no position feedback — that
-  # job now belongs to the lane_keeping position loop, which also owns modelV2
-  # noise. This band exists ONLY to decide when the rack is "on target" so the
-  # curvature hold can take over; it is sized by STICTION, not by drift: below
-  # the error where the P term commands less than rack breakaway
-  # (FRICTION·STEER_MAX / (T_CAP_SLOPE·kappa_scale·v²) ≈ 0.001 rad at 25 m/s)
-  # the wheel cannot move anyway. Small enough that it does not meaningfully
-  # attenuate the lane_keeping position correction — the Phase 1 failure mode,
-  # where the old 0.0012–0.0021 rad tolerance ate 44% of the anchor's command.
+  # Dead band of front-wheel error. It shall be a constant; 0.001 is a good
+  # choice. (User's definition, 2026-08-13 — this one line IS the design.)
+  # Why 0.001 is good, as measured footnotes, not derivation:
+  #   - It sits at ~1σ of the error signal's band-passed noise floor
+  #     (σ = 0.00081 rad on route 3f4's clean straights, 1.23σ; the 12-route
+  #     2026-07-19 study gave σ·L = 0.00099, 1.0σ). Resting tighter would be
+  #     resting on noise. The noise is speed-independent, which is why the
+  #     band is correctly FIXED rather than 1/v².
+  #   - At 25 m/s it tolerates 0.23 m/s² of lateral-accel error — about the
+  #     driver perception threshold.
+  #   - It is small enough not to attenuate the lane_keeping position
+  #     correction — the Phase 1 failure mode, where a 0.0012–0.0021 rad
+  #     tolerance ate 44% of the anchor's command (route 3bf).
+  # k_sigma is live telemetry: if a future model upgrade halves the wander,
+  # the telemetry itself will show this band has headroom to tighten.
   HOLD_BAND = 0.001        # rad of front-wheel-angle error treated as on-target
 
   # Entry/settle hysteresis (2026-08-13, route 3f4 data). One shared threshold
@@ -615,9 +626,12 @@ def on_lat_controller_init(result, lac, CP):
       # by the P-law reversing as it tracks back to κ_des.)
       # True exits (κ_des drops and stays) proceed after the dwell: cost is
       # ≤1 s of extra curvature (~0.2 m lateral at 9 m/s).
+      # (|torque| > FRICTION conjunct deleted 2026-08-13, user ruling: vacuous
+      # — a tracked |κ_meas| > 0.010 curve implies SAT-scale held torque. If
+      # torque somehow IS ~0 here, the dwell bridges at ~0, indistinguishable
+      # from not arming.)
       deep_relax = (abs(state['measured']) > RELAX_DWELL_KAPPA
                     and state['desired'] * state['measured'] > 0.0
-                    and abs(state['torque']) > FRICTION
                     and delta_err * delta_des < 0.0)
       state['relax_ticks'] = state['relax_ticks'] + 1 if deep_relax else 0
       dwelling = 0 < state['relax_ticks'] <= RELAX_DWELL_TICKS
@@ -634,8 +648,13 @@ def on_lat_controller_init(result, lac, CP):
       state['a_y_meas'] = a_y_meas
       state['jerk_pred'] = jerk_pred
 
+      # (|target_frac| > FRICTION conjunct deleted 2026-08-13, user ruling:
+      # redundant — it was HOLD_BAND in torque coordinates through the P gain.
+      # Consequence: terminal push ramps with small stale targets now drain to
+      # the held target on arrival instead of completing; less residual torque
+      # at rest entry.)
       if (state['action'] == 'ramp' and abs(delta_err) <= 1.2*HOLD_BAND
-            and state['ramp_frames'] > 0 and abs(state['target_frac']) > FRICTION):
+            and state['ramp_frames'] > 0):
         # cancel_tol — HOLD_BAND boundary hygiene, NOT an ISO cancel (this is
         # the only "cancel_"-named path left; it tracks the command tighter, it
         # does not abandon the turn). Error fell into the on-target band (1.2x
@@ -720,7 +739,7 @@ def on_lat_controller_init(result, lac, CP):
           # action at all). Nothing here shrinks the commanded curvature now.
           target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
           target_frac = target_nm / CCP.STEER_MAX
-          # Sub-friction targets are commanded as-is (breakaway ±FRICTION
+          # Sub-breakaway targets are commanded as-is (breakaway ±FRICTION
           # amplification removed 2026-07-03): commands below the rack's
           # breakaway torque don't move the wheel — an intentional soft
           # actuation deadband; the wheel moves once the P-term grows past

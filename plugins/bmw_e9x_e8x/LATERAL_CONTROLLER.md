@@ -74,6 +74,28 @@ This document is the canonical reference for the lateral controller registered b
 > or reverse-FRICTION drains are historical where they conflict with this note.
 > `FRICTION` remains only as the tolerance-cancel guard threshold.
 >
+> **2026-08-13 — `FRICTION` fully retired (user ruling).** The constant
+> claimed to be the rack's breakaway torque; the measured breakaway is
+> 2.0–2.75 Nm (4× higher) and is not a constant at all — route 3f2's
+> covariate study showed the knee spanning wider than the usable torque
+> range across lateral load, speed and surface. Its two surviving
+> ε-gates were deleted rather than re-tuned: `cancel_tol`'s
+> `|target_frac| > FRICTION` was algebraically redundant with `HOLD_BAND`
+> (the same threshold expressed in torque coordinates through the P gain,
+> agreeing only at 25 m/s and diverging as 1/v² elsewhere), and
+> `deep_relax`'s `|torque| > FRICTION` was vacuous under the deep-curve
+> gate (a tracked |κ_meas| > 0.010 curve implies SAT-scale held torque).
+> Behavioural consequence of the first deletion: terminal push ramps with
+> small stale targets now drain to the held target on arrival instead of
+> completing — less residual torque at rest entry. Breakaway is OBSERVED
+> (push-budget machinery), never predicted; `HOLD_BAND` is sized by the
+> measured noise floor, not by any rack property. Every FRICTION mention
+> below this date is historical. (`CP.lateralTuning.torque.friction = 0.16`
+> still exists in carParams — it feeds the stock `LatControlTorque` object
+> whose `update` this controller replaces; inert by construction, kept
+> as-is. `interface.py`'s unused `detect_stepper_override` also kept as-is
+> by the same ruling.)
+>
 > **Same date — curvature-dependent hold.** Inside the tolerance band the
 > target is `hold_f·torque` instead of 0, with
 > `hold_f = interp(|κ_des|, HOLD_KAPPA_BP=[0.004, 0.010], [0, 1])`. In a curve
