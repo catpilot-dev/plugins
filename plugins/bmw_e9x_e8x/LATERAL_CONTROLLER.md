@@ -629,6 +629,125 @@ This document is the canonical reference for the lateral controller registered b
 > appears). Do not re-propose a displacement budget; do not assume the
 > replacement exists.
 
+> **2026-08-15 — stall/breakaway v2: the displacement trip (`StallBreakaway`,
+> default OFF).** The successor to the retired push budget, and the answer to
+> the open problem the note above leaves standing. Replay-validated on routes
+> 3f2 (7 segs) and 3f4 (86 segs, 85 min); design record in
+> `.superpowers/sdd/2026-08-12-angle-based-breakaway/`.
+>
+> **v1's refutation, in one line:** every κ-derived signal *lags the rack by
+> the vehicle response*, so at release the "torque above base-P" surplus v1
+> armed on does not exist — the stall inflates `delta_err`, which inflates the
+> base law in lockstep with the windup (measured ±0.02 frac through the whole
+> frozen phase of 3f2 seg 10). Do not re-propose any arming predicate built on
+> a κ-space error.
+>
+> **The absolute-target attempt is also a dead end (do not retry).** An
+> intermediate design compared the wheel against the angle `κ_des` implies.
+> It needs the *vehicle model's* conversion, not a kinematic one — the
+> kinematic bicycle form understates the required steering angle by **+32% at
+> 20 m/s and +49% at 25** (slip factor `sf = −7.88e−4`), so a perfectly
+> tracking wheel reads 3–5° "past" a kinematic target in any curve at speed.
+> **User ruling: no upstream vehicle model here — too many unknown
+> parameters.** It also dragged in an online steering-angle-offset estimator,
+> a readiness gate, and an absolute angle-polarity assumption, all of which
+> are now gone.
+>
+> **The v2 principle.** *The stall context already proves the windup exists.*
+> Arming requires a rack frozen while the controller is pushing, so by the
+> time it breaks free there is nothing left to establish about whether torque
+> has wound up — and (user) the **tire-slip term is already balanced by the
+> stall condition**, which is why no absolute comparison is needed. The
+> release signature is then **displacement since breakaway + sweep rate**,
+> both measured against the wheel's own breakaway state.
+>
+> **No absolute convention anywhere — this is structural, not a comment.**
+> Every quantity is a *difference* of `steeringAngleDeg` samples, so the
+> constant ~−1.58° alignment offset cancels out and never has to be known or
+> estimated; and `sb_dir` is the **observed** motion direction over the
+> breakaway window, not a sign convention. The angle-polarity failure mode
+> the earlier review had to characterize and argue away is therefore
+> **eliminated by construction**: there is no polarity claim left in this
+> machine to be wrong about.
+>
+> **The machine** (100 Hz, in `update()` right after the `_angle` capture,
+> before the livePose branch):
+>
+> | state | entry | notes |
+> |---|---|---|
+> | 0 idle | — | |
+> | 1 armed (stall) | `action == 'ramp'` ∧ the `SB_FROZEN_TICKS`+1 angle ring spans `< 2·ANGLE_QUANTUM_DEG` | common and harmless — **926 arms / 85 min** on 3f4; arming alone does nothing |
+> | 2 episode | while armed, `≥ SB_MOVE_QUANTA` of advance inside `SB_MOVE_TICKS`; latches `sb_brk_angle = ring[-1]` and `sb_dir = ±1` (observed motion direction) | ends after `SB_EPISODE_TICKS`, or early on `hold_zero`/`hold_curve` |
+> | **TRIP** | in state 2, **all four**: not `relax_dwell`; `\|κ_des\| ≤ SB_TRIP_KAPPA_MAX`; `(angle − sb_brk_angle)·sb_dir ≥ SB_TRIP_DISP_DEG`; wheel rate over the 0.2 s window `≥ SB_TRIP_RATE_DPS` | one trip per episode; re-arming needs a fresh 0.4 s freeze |
+>
+> **Constants and their provenance** (module scope, `bmw/latcontroller.py`):
+>
+> | constant | value | provenance |
+> |---|---:|---|
+> | `ANGLE_QUANTUM_DEG` | 0.04395 | confirmed `steerAngleDeg` LSB (survives both retired mechanisms — see §11) |
+> | `SB_FROZEN_TICKS` | 40 | 0.4 s @ 100 Hz; ring is 41 long, span `< 2` quanta = frozen |
+> | `SB_MOVE_TICKS` | 20 | 0.2 s breakaway + rate window |
+> | `SB_MOVE_QUANTA` | 3 | ordinary creep is 1–2 quanta per window |
+> | `SB_EPISODE_TICKS` | 200 | 2 s max episode |
+> | `SB_TRIP_DISP_DEG` | **2.0** | **user-specified**: "additional 2 degrees of steering wheel motion" past the point the rack broke free |
+> | `SB_TRIP_RATE_DPS` | **30.0** | rate sweep on 3f4: `≥25` leaves **0.31 trips/min**, `≥30` leaves **0.153**, and adding the deep-curve gate brings it to **0.071/min**. Ordinary post-stick corrections cluster below 30 °/s; the 3f2 release sweeps **31–70** |
+> | `SB_TRIP_KAPPA_MAX` | **0.010** | the same value as the deep-curve doctrine threshold (`RELAX_DWELL_KAPPA`). Above it, SAT is strong enough to **self-arrest** a release — measured: hairpin segments tracked fine and *dominated* the false trips before this gate. The 3f2 lurch was a **mild** curve (`κ_des −0.0035`) where SAT could not arrest it |
+> | `SB_SHED_FRAMES` | 10 | drain to 0 over 100 ms |
+> | `SB_BLOCK_TICKS` | 50 | 0.5 s same-side push suppression |
+>
+> **Replay results.** 3f2 seg 10 trips **once, at t = 664.20, crossing at
+> 31 °/s, 0.30 s before the 24.8° peak**; every other 3f2 segment trips
+> **zero** times. 3f4 residue: **0.071 trips/min** (one per ~14 min) across
+> 85 min of ordinary driving.
+>
+> **The trip action.** `target_frac → 0`, `ramp_step = −torque/SB_SHED_FRAMES`,
+> `ramp_frames = SB_SHED_FRAMES` — an unthrottled drain to zero. Jerk-safe by
+> construction: reducing same-side torque while the wheel is already moving
+> that way cannot lurch. Then `sb_block = SB_BLOCK_TICKS` **suppresses
+> same-side pushes only** (`target_frac · (−sb_dir) > 0 → 0`, applied at the
+> very end of the ramp branch, after the step cap, **and only when the
+> decision is a `ramp`**) so the stale-error P law cannot immediately rebuild
+> the surplus. **Opposite-side correction passes through untouched** — this
+> must never block counter-steer. The controller may stop pushing; it never
+> gives up correcting (the standing SAFETY ARCHITECTURE law). The
+> `action == 'ramp'` gate is part of that: by the time the block runs, the
+> relax-dwell bridge may have replaced `target_frac` with a *hold* of the
+> current torque, and zeroing that is precisely the give-up-mid-turn failure
+> mode the dwell exists to prevent.
+>
+> **Shed-rate enforcement.** A cadence decision landing inside the shed window
+> recomputes `ramp_step` over `spread_frames` (~40 frames), stretching the
+> 100 ms drain to ~400 ms — a **6× slowdown of the one action the trip exists
+> to perform**, and the 3f2 event peaked **0.30 s after** the trip point, so
+> drain *rate* is the whole point. So while `sb_block` is up and the standing
+> torque is still a same-side push, the per-tick machine re-asserts the fast
+> drain whenever the in-flight ramp is not draining toward zero at least at
+> `|torque|/SB_SHED_FRAMES` per frame. It only ever *reduces* same-side
+> torque; an opposite-side counter-steer ramp already passes the drain test
+> and is never touched. This is also what makes the machine's placement
+> *before* the livePose branch safe.
+>
+> **Why the dwell gate stays**: `relax_dwell` exists precisely to bridge
+> modelV2's mid-turn `κ_des` dips (route 3a0 seg 8), and a dip is exactly the
+> condition under which a trip would be reading the reference rather than the
+> rack. It costs nothing and it is certified doctrine.
+>
+> **Param polarity.** `StallBreakaway`, **default OFF**, `'1'` enables. Read
+> once at controller construction, so it applies at the **next drive start**
+> (controlsd is onroad-only); no bus topic, no heartbeat, no hot toggle and
+> **no panel toggle** — a rare-event safety net does not need mid-drive
+> flipping, and the A/B is "did a windup release get caught", read from
+> telemetry rather than felt. There is no warm-up: with the param on, the
+> machine can arm from the first engaged tick.
+>
+> **Verification plan for the first enabled drive** (telemetry, §9):
+> `sb_state` excursions to 1 should be routine and harmless; `sb_trips` should
+> stay ≈ 0 on an ordinary drive (budget: **~0.071/min**, i.e. about one per
+> 14 min); and a trip should appear **only** on a genuine windup release —
+> cross-check each one against the angle trace for a fast sweep past the
+> breakaway point in a mild curve. A drive that accumulates trips at
+> ordinary-steering rates is a refutation, not a tuning opportunity — the same
+> standard that retired the push budget.
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -905,6 +1024,8 @@ Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`. Added: `hold_cu
 Removed 2026-07-28 (SAFETY ARCHITECTURE, top of doc): `cancel_accel`, `cancel_jerk` — the lateral controller no longer abandons a turn; `a_y` is bounded by speedlimitd.
 `hold_zero`/`hold_curve` vs. `ramp` are now decided by `state['at_rest']` (2026-08-13, entry/settle hysteresis — see the dated note above): leaving rest needs `|delta_err| > HOLD_BAND_ENTER` (0.0015 rad, or `HOLD_BAND` with the `HoldHysteresis` kill-switch off), returning needs `|delta_err| ≤ HOLD_BAND` (0.001, unchanged). Since 2026-08-14 rest is also left when the slow error persists — `|EMA(2 s) of delta_err| > HOLD_EMA_ESCAPE` (0.0012 rad, strict `>`, same kill-switch) — see the persistent-lean-escape note above.
 
+Stall/breakaway v2 (2026-08-15) adds **no action label**: a trip writes `target_frac`/`ramp_step`/`ramp_frames` directly and leaves `action` alone, so the shed appears in telemetry as `sb_trips` incrementing plus `target_frac → 0`, not as a new state. Its own state is published separately as `sb_state` (§ 9).
+
 ---
 
 ## 9. Telemetry (plugin_bus topic `bmw_lat_control`, 20 Hz)
@@ -934,6 +1055,10 @@ Published each livePose tick:
 | `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
 | `hb_enter` | (2026-08-13) live leave-rest threshold in effect this tick (rad) — `0.0015` with `HoldHysteresis` on, `0.001` kill-switched; also each drive's self-label (absent = pre-hysteresis build) |
 | `derr_ema` | (2026-08-14) slow (2 s, `HOLD_EMA_TAU`) EMA of `delta_err` (rad) — the lean signal behind the persistent-lean escape; `\|derr_ema\| > 0.0012` leaves rest |
+| `sb_state` | (2026-08-15) stall/breakaway v2 machine state — `0` idle, `1` armed (rack frozen while ramping), `2` breakaway episode. Excursions to 1 are routine and harmless |
+| `sb_trips` | (2026-08-15) cumulative trips this drive. Budget on ordinary driving: **≈ 0** (replay residue 0.071/min). A drive with many is a refutation |
+| `sb_block` | (2026-08-15) same-side push-suppression ticks left after a trip (counts down from `SB_BLOCK_TICKS` = 50 = 0.5 s) |
+| `sb_on` | (2026-08-15) `StallBreakaway` param as read at drive start — each drive's A/B self-label (absent = pre-v2 build) |
 
 Removed 2026-08-14 with the push-budget retirement (see the dated note in the header): `push_moved`, `budget_spent`, `budget_on`. Payloads from drives before that date still carry them; a build after it carries none of the three.
 
@@ -961,6 +1086,7 @@ These were tried, deployed, and reverted. Each appears here so future maintainer
 | Hysteresis-on-κ_des (`KD_HYST_GAP = 0.003`, `KD_GATE = 0.006`) | 95% sign-flip reduction in offline check, but route 322 had 32% time `\|offset\|>0.5 m` and 44-second frozen-κ_des stretches — controller faithfully tracked a held biased reference → drift. Structural failure of holding the reference without a position-feedback layer. | commit daef207 | 96945fc (replaced with box-on-delta_err) |
 | Suggesting external sensor fusion (HD map, radar, lidar, IMU) for vision noise | Out of project scope by design — see [vision-only constraint](§10). | (recurring; do not propose) |
 | 2-degree open-loop push budget (`BUDGET_DEG`, `AngleBudget` toggle: after one push moved the wheel 2° in the commanded direction, stop increasing torque and shed it unthrottled) | Deployed default-off, A/B'd on route 3f4, **refuted**. It clamped ~10 episodes/min at ordinary-steering torque (median 1.09 Nm at first spend, far below the 2.0–2.75 Nm rack breakaway it was chasing) and raised matched-curve tracking error **+44%**. Root cause is structural, not a bad threshold: the per-decision displacement distributions of ordinary steering and of the route 3f2 seg 10 windup release **overlap**, so no `BUDGET_DEG` is both invisible and protective. Deleted entirely 2026-08-14 (constant, param, `angle_budget` bus topic, panel toggle, `ui.state_tick` heartbeat, telemetry keys, tests, `replay_push_budget.py`). Do not re-propose a displacement-based bound; whatever replaces it must discriminate on rack **state**, not degrees moved. | commit 7afd501 | 2026-08-14 (this commit) |
+| Stall/breakaway **v1** — arming on "torque above the pure-P base law while the rack is frozen" | Killed by replay before any code shipped. Through the entire frozen phase of route 3f2 seg 10 the commanded torque tracks the base-P law within **±0.02 frac** (surplus peak +0.019): the stall inflates `delta_err`, which inflates the base law in lockstep with the windup. **Every κ-derived signal lags the rack by the vehicle response, so all of them are stale exactly at release** — the decisive surplus only appears mid-swing, after `κ_meas` catches up. Zero snaps on the motivating event. Replaced by the displacement trip (v2, dated note in the header), which needs no κ-space quantity at release at all: the stall context already proves the windup, so the signature is wheel travel past the breakaway point plus sweep rate. Do not re-propose any arming predicate built on a κ-space error. See `.superpowers/sdd/2026-08-12-angle-based-breakaway/stall-breakaway-v2-design.md`. | never deployed | 2026-08-14 |
 | Online breakaway-torque estimator + angular-rate edge detector (`bmw/rack_motion.py`: `RackMotion`, `BreakawayEstimator`) | Never deployed — killed by offline validation on route 3f2. Rate thresholding produced 1-2 tick false-motion blips at exactly the low rates that mattered; a debounce did not fix it. The estimator's own observations had a median torque of 0.041 frac — the controller's own median push, not a breakaway signature — so it measured "torque present when the wheel happens to move" and collapsed to its clamp floor. Replaced by the fixed 2-degree open-loop push budget (no online learning, no rate threshold) — see the 2026-08-12 entry above. Its `ANGLE_LSB_DEG = 0.0879` angle quantum was also wrong, exactly 2× too coarse — inferred by counting 169 distinct observed values over one segment, when the confirmed quantum is `0.04395`° (observed level gaps are integer multiples of it, and this same file's own `MOTION_CONFIRM_TICKS` comment already used 0.04395 for the true quantum without ever reconciling the two). `BUDGET_DEG` in the push budget uses the confirmed 0.04395° value (45 quanta of headroom). (The push budget that replaced it was itself retired 2026-08-14 — next row. The 0.04395° quantum finding survives both.) | commits 5bb33b4..dd3d2a2 | 2026-08-12 (this commit) |
 
 ---
@@ -1037,6 +1163,23 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - **Rollback**: write `0` and restart the drive (ignition cycle); no
   redeploy needed, it's a param not a source constant.
 
+### To toggle `StallBreakaway` (stall/breakaway v2 displacement trip, 2026-08-15 entry):
+- **Default OFF**, `'1'` enables — the opposite polarity to `HoldHysteresis`.
+- **Not hot**, same as above: read once at controller construction, so it
+  applies at the **next drive start**. There is deliberately no bus topic, no
+  heartbeat and **no panel toggle** — a rare-event safety net does not need
+  mid-drive flipping.
+- Enable: `echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/StallBreakaway`.
+  Disable: write anything else, or delete the file.
+- **Verify a drive picked it up**: `bmw_lat_control` telemetry's `sb_on` field
+  (absent = pre-v2 build). There is no warm-up gate: with the param on, the
+  machine can arm from the first engaged tick, so `sb_state` excursions to 1
+  should show up early and often.
+- **The A/B is telemetry, not feel**: the question is "did a windup release
+  get caught", so compare `sb_trips` (expect ≈ 0 per ordinary drive) and the
+  angle traces around any trip — not straight-line smoothness.
+- **Rollback**: delete the param and restart the drive.
+
 ---
 
 ## 13. Code map (`bmw/latcontroller.py`)
@@ -1052,6 +1195,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | cancel_tol | inside update | HOLD_BAND boundary hygiene — stops an in-flight push ramp on-target (the ISO overshoot-gated cancel_jerk / cancel_accel that used to sit here was removed 2026-07-28) |
 | Cadence decision | inside update | hold_zero / hold_curve / ramp / target_nm formula |
 | Ramp application | inside update | Per-CAN-tick torque ramp |
+| Stall/breakaway v2 | module scope (`SB_*`) + top of `update()` | Displacement trip machine (2026-08-15): ring / arm / breakaway / trip plus the shed-rate enforcement, all run before the livePose branch; the same-side block sits at the end of the ramp branch. No absolute-geometry helper — every comparison is a difference of angle samples |
 | Telemetry publish | inside update | `bmw_lat_control` topic via plugin_bus |
 
 ---

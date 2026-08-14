@@ -21,6 +21,10 @@
     "HoldHysteresis": {
       "default": true,
       "description": "Hysteresis on the steering rest band: leave rest at 0.0015 rad error, settle at 0.001. Write 0 to disable (legacy single threshold)."
+    },
+    "StallBreakaway": {
+      "default": false,
+      "description": "Shed steering torque when a stalled rack releases and crosses the commanded wheel angle. Write 1 to enable."
     }
   },
   "cereal": {
