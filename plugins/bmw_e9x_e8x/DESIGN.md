@@ -155,7 +155,18 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
   `STEPPER_STEERING_COMMAND` (F-CAN / AUX-CAN).
 - **Torque limits**: `TorqueMotorLimited`, max 12 Nm, **speed-scaled** down to
   8 Nm at 80 km/h and 4 Nm at 100 km/h; rate up ≤ 0.125 Nm/10 ms, rate down
-  ≤ 0.2 Nm/10 ms; RT delta 25 Nm/250 ms.
+  ≤ 1.0 Nm/10 ms (matches the flashed firmware; tightening to the controller's
+  0.2 needs on-car validation of the disengage/SoftOff decay path first);
+  RT delta 25 Nm/250 ms.
+- **Firmware build/flash** (2026-08-14): `safety/build_firmware.sh` injects the
+  plugin-owned `bmw.h` + `tests/test_bmw.py` into the firmware workspace
+  (`~/openpilot`, dzid26 fork with the F4-capable `OxygenLiu/panda`; panda
+  pinned at `a0848226`), runs the safety suite, builds
+  `panda-bmw-fw/board/obj/panda.bin.signed`, and restores the workspace tree —
+  no opendbc fork is maintained. Flash from the C3 with the stack stopped;
+  note the device lib's `Panda.flash()` hangs on F4 re-enumeration and
+  hardcodes H7 sector layout — call `Panda.flash_static(handle, code,
+  mcu_type=McuType.F4)` with the panda already in bootstub instead.
 - **RX checks** on brake, gas, speed and either cruise-status message, plus
   the stepper status.
 - `disable_forwarding = true`; cruise-engaged state is taken from the DCC/NCC
