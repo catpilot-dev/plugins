@@ -88,7 +88,9 @@ This document is the canonical reference for the lateral controller registered b
 > Behavioural consequence of the first deletion: terminal push ramps with
 > small stale targets now drain to the held target on arrival instead of
 > completing — less residual torque at rest entry. Breakaway is OBSERVED
-> (push-budget machinery), never predicted; `HOLD_BAND` is sized by the
+> (at that date, by the push-budget machinery — retired 2026-08-14, see the
+> dated note below; the ruling that it is observed, never predicted, stands),
+> never predicted; `HOLD_BAND` is sized by the
 > measured noise floor, not by any rack property. Every FRICTION mention
 > below this date is historical. (`CP.lateralTuning.torque.friction = 0.16`
 > still exists in carParams — it feeds the stock `LatControlTorque` object
@@ -307,7 +309,11 @@ This document is the canonical reference for the lateral controller registered b
 > now historical — the live gate is `HOLD_AY_BP` as described here.**
 
 > **2026-08-12 — push budget (route 3f2 seg 10: "wound to breakaway, then
-> overshot").** The controller now remembers the steering angle when a push
+> overshot"). SUPERSEDED — RETIRED 2026-08-14, see the retirement note at
+> the end of this header. Everything in this entry is historical: no
+> `BUDGET_DEG`, `AngleBudget` param, `angle_budget` bus topic, "Steering
+> Push Budget" toggle, or `push_moved`/`budget_spent`/`budget_on` telemetry
+> exists in the code any more.** The controller now remembers the steering angle when a push
 > (`action == 'ramp'`) begins and tracks how far the wheel has moved from that
 > reference. Once it has moved `BUDGET_DEG = 2.0` degrees **in the commanded
 > direction**, the per-decision `STEP_MAX` clamp stops applying: the target
@@ -463,8 +469,10 @@ This document is the canonical reference for the lateral controller registered b
 >
 > **A/B guidance**: compare against **route 3f4, segments 37–85** as the
 > baseline (same roads, same build minus this change). Flip `HoldHysteresis`
-> at a landmark on a straight, same as the `AngleBudget` A/B procedure (§
-> 12). **Straight-line feel is the veto** — if the wider entry gate reads as
+> at a landmark on a straight, same as the `AngleBudget` A/B procedure of
+> the day (§ 12 — that procedure was removed with the push budget on
+> 2026-08-14; `HoldHysteresis` is restart-scoped anyway, so compare whole
+> drives). **Straight-line feel is the veto** — if the wider entry gate reads as
 > sluggish re-centering or a wobblier rest band on-car, that overrides the
 > replay numbers.
 
@@ -524,6 +532,49 @@ This document is the canonical reference for the lateral controller registered b
 > can no longer sit uncorrected for an unbounded time), but how it *feels*,
 > and whether the left-hug actually goes away, needs the next drive.
 > Straight-line calm remains the veto.
+
+> **2026-08-14 — the 2-degree push budget is RETIRED (route 3f4 A/B
+> verdict).** The mechanism described in the 2026-08-12 entry above failed
+> its on-car A/B and has been **deleted entirely** — constant, param, bus
+> topic, panel toggle, telemetry keys and tests. What the A/B showed:
+>
+> - With the budget ON it clamped **~10 episodes/min** at ordinary-steering
+>   torque (median torque at first spend **1.09 Nm** — nowhere near the
+>   2.0–2.75 Nm rack breakaway it was meant to follow).
+> - Matched-curve tracking error rose **+44%**.
+> - The per-decision *displacement* distributions of normal steering and of
+>   the route 3f2 seg 10 lurch **overlap**, so no `BUDGET_DEG` value can be
+>   both invisible during ordinary driving and protective during a windup
+>   release. The premise — that degrees-moved-per-push separates the two —
+>   is refuted by the data, which is why this is a deletion and not a
+>   retune.
+>
+> **What was deleted**: `BUDGET_DEG`, the `AngleBudget` param (plugin.json
+> and the init-time read), the `angle_budget` plugin-bus topic and its
+> livePose-rate subscriber poll, the "Steering Push Budget" Vehicle-panel
+> toggle plus `_set_angle_budget`/`_publish_angle_budget`, the
+> `ui.state_tick` heartbeat hook (`on_ui_state_tick`) that existed only to
+> carry that toggle — hook entry included — the `push_ref`/`push_moved`/
+> `budget_spent`/`budget_on`/`budget_sub` state, the asymmetric clamp branch
+> (`STEP_MAX` is symmetric again for every decision, as before 2026-08-12),
+> the per-decision `push_ref` re-arm, the `push_moved`/`budget_spent`/
+> `budget_on` telemetry keys, and `tests/replay_push_budget.py`.
+>
+> **What was kept**: `_angle = float(getattr(CS, 'steeringAngleDeg', 0.0))`
+> in `update()` — one harmless line, retained because the angle stream is
+> the only usable rack-motion sensor on this car (`angRate` reads 0 through
+> the entire route 3f2 creep phase) and the successor work will need it.
+> **Deltas only**: the signal carries a constant ~−1.58° physical alignment
+> offset.
+>
+> **The open problem is NOT closed.** Route 3f2 seg 10 (6 s stall, hold-floor
+> ratchet, breakaway into a 24.8° swing) is still unmitigated; the successor
+> design — arming on stall *state* rather than displacement — went back for
+> revision on this date after offline replay refuted its arming predicate
+> (during the frozen phase the stall inflates `delta_err`, so the pure-P
+> base law tracks the wound-up torque within ±0.02 frac and no "surplus"
+> appears). Do not re-propose a displacement budget; do not assume the
+> replacement exists.
 
 ---
 
@@ -830,9 +881,8 @@ Published each livePose tick:
 | `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
 | `hb_enter` | (2026-08-13) live leave-rest threshold in effect this tick (rad) — `0.0015` with `HoldHysteresis` on, `0.001` kill-switched; also each drive's self-label (absent = pre-hysteresis build) |
 | `derr_ema` | (2026-08-14) slow (2 s, `HOLD_EMA_TAU`) EMA of `delta_err` (rad) — the lean signal behind the persistent-lean escape; `\|derr_ema\| > 0.0012` leaves rest |
-| `push_moved` | (2026-08-12) signed degrees moved from `push_ref` since the current push began (0 when not ramping) |
-| `budget_spent` | (2026-08-12) `True` once `push_moved` has reached `BUDGET_DEG` in the commanded direction (always `False` with `AngleBudget` off) |
-| `budget_on` | (2026-08-13) live toggle state — init-time param read, overridden mid-drive by the `angle_budget` bus topic; labels each tick's A/B leg |
+
+Removed 2026-08-14 with the push-budget retirement (see the dated note in the header): `push_moved`, `budget_spent`, `budget_on`. Payloads from drives before that date still carry them; a build after it carries none of the three.
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 
@@ -857,7 +907,8 @@ These were tried, deployed, and reverted. Each appears here so future maintainer
 | Stiction-gated steering-angle FF (linear in \|steer\|, 20°/0.10 Nm·deg⁻¹) | Over-pushed in route 31d seg 8 right turn: 50% over-rotation, 6.22 Nm torque, sustained cancel_jerk oscillation. SAT physics aren't linear in steering angle alone — needs multi-regime (v×κ grid) calibration, not single-route fit. | commit 2c67a97 | e81f1c0 |
 | Hysteresis-on-κ_des (`KD_HYST_GAP = 0.003`, `KD_GATE = 0.006`) | 95% sign-flip reduction in offline check, but route 322 had 32% time `\|offset\|>0.5 m` and 44-second frozen-κ_des stretches — controller faithfully tracked a held biased reference → drift. Structural failure of holding the reference without a position-feedback layer. | commit daef207 | 96945fc (replaced with box-on-delta_err) |
 | Suggesting external sensor fusion (HD map, radar, lidar, IMU) for vision noise | Out of project scope by design — see [vision-only constraint](§10). | (recurring; do not propose) |
-| Online breakaway-torque estimator + angular-rate edge detector (`bmw/rack_motion.py`: `RackMotion`, `BreakawayEstimator`) | Never deployed — killed by offline validation on route 3f2. Rate thresholding produced 1-2 tick false-motion blips at exactly the low rates that mattered; a debounce did not fix it. The estimator's own observations had a median torque of 0.041 frac — the controller's own median push, not a breakaway signature — so it measured "torque present when the wheel happens to move" and collapsed to its clamp floor. Replaced by the fixed 2-degree open-loop push budget (no online learning, no rate threshold) — see the 2026-08-12 entry above. Its `ANGLE_LSB_DEG = 0.0879` angle quantum was also wrong, exactly 2× too coarse — inferred by counting 169 distinct observed values over one segment, when the confirmed quantum is `0.04395`° (observed level gaps are integer multiples of it, and this same file's own `MOTION_CONFIRM_TICKS` comment already used 0.04395 for the true quantum without ever reconciling the two). `BUDGET_DEG` in the push budget uses the confirmed 0.04395° value (45 quanta of headroom). | commits 5bb33b4..dd3d2a2 | 2026-08-12 (this commit) |
+| 2-degree open-loop push budget (`BUDGET_DEG`, `AngleBudget` toggle: after one push moved the wheel 2° in the commanded direction, stop increasing torque and shed it unthrottled) | Deployed default-off, A/B'd on route 3f4, **refuted**. It clamped ~10 episodes/min at ordinary-steering torque (median 1.09 Nm at first spend, far below the 2.0–2.75 Nm rack breakaway it was chasing) and raised matched-curve tracking error **+44%**. Root cause is structural, not a bad threshold: the per-decision displacement distributions of ordinary steering and of the route 3f2 seg 10 windup release **overlap**, so no `BUDGET_DEG` is both invisible and protective. Deleted entirely 2026-08-14 (constant, param, `angle_budget` bus topic, panel toggle, `ui.state_tick` heartbeat, telemetry keys, tests, `replay_push_budget.py`). Do not re-propose a displacement-based bound; whatever replaces it must discriminate on rack **state**, not degrees moved. | commit 7afd501 | 2026-08-14 (this commit) |
+| Online breakaway-torque estimator + angular-rate edge detector (`bmw/rack_motion.py`: `RackMotion`, `BreakawayEstimator`) | Never deployed — killed by offline validation on route 3f2. Rate thresholding produced 1-2 tick false-motion blips at exactly the low rates that mattered; a debounce did not fix it. The estimator's own observations had a median torque of 0.041 frac — the controller's own median push, not a breakaway signature — so it measured "torque present when the wheel happens to move" and collapsed to its clamp floor. Replaced by the fixed 2-degree open-loop push budget (no online learning, no rate threshold) — see the 2026-08-12 entry above. Its `ANGLE_LSB_DEG = 0.0879` angle quantum was also wrong, exactly 2× too coarse — inferred by counting 169 distinct observed values over one segment, when the confirmed quantum is `0.04395`° (observed level gaps are integer multiples of it, and this same file's own `MOTION_CONFIRM_TICKS` comment already used 0.04395 for the true quantum without ever reconciling the two). `BUDGET_DEG` in the push budget uses the confirmed 0.04395° value (45 quanta of headroom). (The push budget that replaced it was itself retired 2026-08-14 — next row. The 0.04395° quantum finding survives both.) | commits 5bb33b4..dd3d2a2 | 2026-08-12 (this commit) |
 
 ---
 
@@ -899,52 +950,31 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 ### If lateral acceleration feels too high in curves:
 - This is **no longer a lateral-controller tuning problem** (2026-07-28). The lateral controller tracks the commanded curvature and does not limit `a_y`. Lower the curve-speed target in **speedlimitd** (curve-speed capping) — it owns `vEgo`, hence `a_y = v²·κ`. Recipes for the old in-controller ISO cancel guard (`LATERAL_ACCEL_BP` / `LATERAL_JERK_BP` / `BMW_LATERAL_*`) are obsolete; that machinery was removed.
 
-### To toggle `AngleBudget` (the push-budget mechanism, 2026-08-12 entry):
-- **The "Steering Push Budget" toggle in the Driving panel is HOT
-  (2026-08-13)**: flipping it applies **within about a second, mid-drive
-  included**. Two paths carry it:
-  1. **Live**: the `angle_budget` plugin-bus topic, polled by
-     `latcontroller` at livePose rate into `state['budget_on']` (tmpfs +
-     memory only — no file I/O on the RT thread). The toggle callback
-     sends immediately (snappy in the common case), but the *guarantee*
-     is the **1 Hz heartbeat** (`register.py on_ui_state_tick`, hook
-     `ui.state_tick`): ZMQ PUB silently drops edge-triggered sends to a
-     not-yet-connected subscriber, so an edge alone can be lost (slow
-     joiner, UI restart). The heartbeat republishes the param-file state
-     every second, so any divergence heals within ~1 s.
-  2. **Persistent**: the same callback writes the `AngleBudget` param
-     file, which controlsd (an onroad-only process — fresh start every
-     ignition) reads at each drive start. So the toggle's state survives
-     across drives with or without the bus.
-- Manual fallback: `echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/AngleBudget`
-  **also hot-applies within ~1 s** — the heartbeat reads the param file,
-  so file edits are picked up while the UI is running. (Without a running
-  UI there is no publisher, and a file edit applies at the next drive.)
-- **A/B within a single drive is now valid**: drive a stretch, flip at a
-  landmark on a straight (avoid flipping mid-curve — enabling during an
-  active fast push can clamp it immediately; bounded but muddies the
-  comparison), drive the matched stretch. `bus_logger` records the
-  `angle_budget` topic into the rlog, timestamping every flip, and the
-  `bmw_lat_control` payload carries `budget_on` per tick — so each rlog
-  segment self-labels which leg it was.
-- **Verify a drive/leg counted**: `bmw_lat_control` telemetry (§ 14 decode
-  snippet) must carry `budget_on`/`push_moved`/`budget_spent`; `budget_on`
-  tells you the live state tick by tick.
-- **Rollback**: flip the toggle off — takes effect within a second; the
-  param file it writes keeps later drives off too.
-- **`BUDGET_DEG` is a source constant** in `latcontroller.py`, not a runtime
-  param — there is nothing to write for it. Changing it is a code edit, a
-  redeploy (`install.sh`), and a `__pycache__` clear before the next drive.
+### ~~To toggle `AngleBudget` (the push-budget mechanism)~~ — GONE 2026-08-14
+- The push budget was **retired** (route 3f4 A/B; see the dated note in the
+  header and the §11 row). There is no `AngleBudget` param, no
+  `angle_budget` bus topic, no "Steering Push Budget" toggle and no
+  `ui.state_tick` heartbeat hook in this plugin any more — nothing to
+  toggle, nothing to write, no procedure to follow.
+- A leftover `AngleBudget` param file on a device is inert; delete it at
+  your convenience (`rm /data/plugins-runtime/bmw_e9x_e8x/data/AngleBudget`).
+- **The hot-toggle pattern itself is still the right one** should another
+  mid-drive-switchable knob appear here: panel toggle → immediate
+  `PluginPub` send **plus** a 1 Hz heartbeat republishing the param file
+  (ZMQ PUB drops edge-triggered sends to a not-yet-connected subscriber, so
+  the heartbeat is what makes it reliable), with the controller polling at
+  livePose rate — tmpfs + memory only, never a param-file read on the RT
+  thread. Git history around commits fbb899b / 7afd501 has the working
+  implementation.
 
 ### To toggle `HoldHysteresis` (entry/settle hysteresis, 2026-08-13 entry):
-- **Not hot** — unlike `AngleBudget`, there is no bus topic or heartbeat.
-  The param is read once at controller construction, so a change only takes
-  effect at the **next drive start** (controlsd is onroad-only and re-reads
-  fresh each ignition).
+- **Not hot** — there is no bus topic or heartbeat for it. The param is read
+  once at controller construction, so a change only takes effect at the
+  **next drive start** (controlsd is onroad-only and re-reads fresh each
+  ignition).
 - Write the param: `echo -n 0 > /data/plugins-runtime/bmw_e9x_e8x/data/HoldHysteresis`
   to roll back to the legacy single threshold; delete the file or write `1`
-  (or anything other than `0`) to re-enable — **default is ON** (opposite
-  polarity from `AngleBudget`).
+  (or anything other than `0`) to re-enable — **default is ON**.
 - **A/B across drives, not within one**: since it's restart-scoped, compare
   whole drives rather than flipping mid-drive at a landmark. Baseline is
   route 3f4 segments 37–85 (see the 2026-08-13 dated note above).

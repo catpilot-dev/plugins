@@ -28,11 +28,6 @@ if _PLUGIN_DIR not in sys.path:
 
 import numpy as np
 
-# Hot-toggle bus socket for the Driving-panel "Steering Push Budget" switch
-# (published by register.py, polled in update()'s livePose branch). Module
-# scope so tests can point it at a temp path.
-_BUDGET_BUS_SOCKET = '/tmp/plugin_bus/angle_budget'
-
 # SAFETY ARCHITECTURE (2026-07-28): the lateral controller NEVER gives up in a
 # turn — its contract is to track the commanded curvature, always. Keeping
 # lateral acceleration within ISO 11270 / comfort limits is handled at the
@@ -192,48 +187,31 @@ def on_lat_controller_init(result, lac, CP):
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
 
-  # AngleBudget param — read ONCE here, not per-tick or on any periodic
-  # cache-expiry (review fix, Important 4): this used to re-check a 5 s cache
-  # every CAN tick, which still means a Path.read_text() on controlsd's 100 Hz
-  # RT thread whenever the cache lapsed — under eMMC contention that read can
-  # cost a control frame, and the toggle-off default path paid for the
-  # monotonic-clock check on every tick for no benefit. This init-time read
-  # is the BOOT state only: the Driving-panel "Steering Push Budget" toggle
-  # (register.py on_vehicle_settings) hot-applies mid-drive by publishing on
-  # the 'angle_budget' plugin-bus topic, polled in update()'s livePose branch
-  # into state['budget_on'] — tmpfs + memory, no file I/O on the RT thread
-  # (2026-08-13). The param file stays authoritative across drives (controlsd
-  # is onroad-only and re-reads it every drive start); the bus message only
-  # overrides the drive in progress. See LATERAL_CONTROLLER.md § 12 for the
-  # procedure and the telemetry check (budget_on/push_moved/budget_spent)
-  # that a drive picked it up. See BUDGET_DEG in the constants block below.
+  # Plugin params are read ONCE here, never per-tick and never on a periodic
+  # cache expiry (review fix, Important 4): a Path.read_text() on controlsd's
+  # 100 Hz RT thread can cost a control frame under eMMC contention, and even
+  # a cache-timer check burns work on every tick for no benefit. The init read
+  # is the BOOT state; controlsd is onroad-only, so the param file is re-read
+  # at every drive start and stays authoritative across drives.
   #
   # Import at function scope, not module scope (review fix, Important 2):
   # every other config.read_plugin_param consumer in this repo does this
   # (bmw/carstate.py's _load_steer_angle_offset, speedlimitd's _read_params)
-  # so a missing config.py only defaults this one param off instead of
-  # failing the whole hook module's import — install.sh copies config.py to
-  # the plugins-runtime root as a separate, later step, so a partial deploy
-  # can transiently be missing it. A module-scope import failing here would
-  # silently fall the car back to stock LatControlTorque, which is worse
-  # than just defaulting the toggle off.
+  # so a missing config.py only defaults these params instead of failing the
+  # whole hook module's import — install.sh copies config.py to the
+  # plugins-runtime root as a separate, later step, so a partial deploy can
+  # transiently be missing it. A module-scope import failing here would
+  # silently fall the car back to stock LatControlTorque, which is worse than
+  # just defaulting a toggle.
+  #
+  # HoldHysteresis kill-switch (2026-08-13, route 3f4 data): default ON —
+  # '0' is the rollback to the legacy single threshold. No bus topic, no
+  # heartbeat, no hot toggle: a restart-scoped kill-switch is enough. If the
+  # import above failed, read_plugin_param is undefined here and the except
+  # branch defaults hysteresis ON, matching that polarity. See
+  # HOLD_BAND_ENTER below and LATERAL_CONTROLLER.md.
   try:
     from config import read_plugin_param
-    _angle_budget_on = read_plugin_param('bmw_e9x_e8x', 'AngleBudget', '') == '1'
-  except Exception:
-    _angle_budget_on = False
-
-  # HoldHysteresis kill-switch (2026-08-13, route 3f4 data) — read ONCE here,
-  # same rationale as AngleBudget above (no per-tick/cache re-read of a param
-  # file on the RT thread). Reuses the read_plugin_param already imported
-  # above rather than importing it a second time; if that import failed,
-  # read_plugin_param is undefined here too and this falls into the except
-  # branch, which is why the fallback also defaults hysteresis ON (opposite
-  # polarity from AngleBudget's off-by-default — this is the change under
-  # test, and '0' is the rollback). No bus topic, no heartbeat, no hot
-  # toggle: a restart-scoped kill-switch is enough; controlsd re-reads at
-  # every drive start. See HOLD_BAND_ENTER below and LATERAL_CONTROLLER.md.
-  try:
     _hold_hyst_on = read_plugin_param('bmw_e9x_e8x', 'HoldHysteresis', '') != '0'
   except Exception:
     _hold_hyst_on = True
@@ -335,16 +313,6 @@ def on_lat_controller_init(result, lac, CP):
   STEP_MAX_V  = [15.0, 28.0]     # vEgo breakpoints (m/s)
   STEP_MAX_BP = [0.10, 0.05]     # per-decision torque step cap (frac)
 
-  # Steering-wheel movement one open-loop push may cause before feedback takes
-  # over. Human-style: push harder until the wheel moves, then stop pushing and
-  # ease off. 2 deg is 0.11 deg of front wheel (curvature 0.00070 /m, ~1440 m
-  # radius) — a real steering input, and 45 quanta of the 0.04395 deg angle
-  # signal, so no noise can spend it (0.04395 is the confirmed quantum; see
-  # LATERAL_CONTROLLER.md § 11 for the reconciliation against the deleted v1
-  # rack_motion.py's differently-inferred value). Route 3f2 seg 10: spent at
-  # 2.8 Nm against the 3.75 Nm the ramp actually reached.
-  BUDGET_DEG = 2.0
-
   # Relax-dwell (2026-07-12, route 3a0 seg 8): in a measured deep curve, an
   # overshoot-side error must persist this long before the relax path may
   # command below current torque — bridges modelV2's transient mid-turn
@@ -360,9 +328,9 @@ def on_lat_controller_init(result, lac, CP):
   # — were user-ruled redundant: the first was HOLD_BAND expressed in torque
   # coordinates through the P gain, the second was vacuous under the
   # deep-curve gate (SAT-scale torque ~0.19 frac in any |κ_meas| > 0.010
-  # curve). Breakaway is now OBSERVED, not predicted — see the push-budget
-  # machinery. Do not reintroduce a friction constant; nothing in this
-  # controller should pretend to model the rack.)
+  # curve). Breakaway is OBSERVED, never predicted. Do not reintroduce a
+  # friction constant; nothing in this controller should pretend to model the
+  # rack.)
 
   # Dead band of front-wheel error. It shall be a constant; 0.001 is a good
   # choice. (User's definition, 2026-08-13 — this one line IS the design.)
@@ -443,11 +411,6 @@ def on_lat_controller_init(result, lac, CP):
     'hold_f': 0.0,                # debug: lateral-accel hold factor [0,1] (gated on v²·|kappa_des|)
     'hold_cap': 0.0,              # debug: cap on held torque (P value at the HOLD_CAP_DRIFT_M reference drift, frac)
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
-    'budget_on': _angle_budget_on,   # live toggle state (init = param; bus overrides mid-drive)
-    'budget_sub': None,              # lazy PluginSub for the 'angle_budget' hot-toggle topic
-    'push_ref': None,        # steering angle when this push began (deg)
-    'push_moved': 0.0,       # debug: signed deg moved since then
-    'budget_spent': False,   # debug: 2 deg moved in the commanded direction
     'at_rest': True,   # hysteresis state: True = holding, False = correcting
     'derr_ema': 0.0,   # slow (HOLD_EMA_TAU) EMA of delta_err, livePose rate
   }
@@ -456,69 +419,15 @@ def on_lat_controller_init(result, lac, CP):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 11
 
-    # Push budget. Deltas only — steeringAngleDeg carries a constant ~-1.58 deg
-    # physical alignment offset which cancels against the captured reference.
-    # getattr guard: CS is a stub in some test paths.
-    # Gated on `active` (review fix): update() runs regardless of engagement
-    # and the decision state machine (which sets state['action']) is not
-    # itself gated on active, so without this, driver steering while
-    # disengaged/hands-on would accrue into push_moved and a push could begin
-    # already spent. CS.steeringPressed is NOT usable as a substitute gate on
-    # this car — it is a voice-control button ORed with gasPressed.
+    # getattr guard: CS is a stub in some test paths. steeringAngleDeg carries
+    # a constant ~-1.58 deg alignment offset — deltas only, never the absolute.
+    # Currently unread: kept for the stall/breakaway work (the angle stream is
+    # the only usable rack-motion sensor here — angRate reads 0 through the
+    # whole route 3f2 creep phase).
     _angle = float(getattr(CS, 'steeringAngleDeg', 0.0))
-    if active and state['action'] == 'ramp':
-      if state['push_ref'] is None:
-        state['push_ref'] = _angle
-      state['push_moved'] = _angle - state['push_ref']
-    else:
-      state['push_ref'] = None
-      state['push_moved'] = 0.0
     _sm.update(0)
     lp = _sm['livePose']
     livepose_updated = _sm.updated['livePose']
-
-    # Hot toggle (2026-08-13): the Driving-panel "Steering Push Budget" switch
-    # publishes {'enabled': bool} on the 'angle_budget' plugin-bus topic; a
-    # 1 Hz heartbeat from the UI (register.py on_ui_state_tick) re-sends the
-    # current state so slow-joiner drops, UI restarts, and even manual param
-    # edits all converge within ~1 s. Polled here at livePose rate, not per
-    # CAN tick; the exists-stat and the ZMQ recv are both /tmp (tmpfs) +
-    # memory — no eMMC I/O on the RT thread, unlike the param-file re-read
-    # this replaces. Same lazy-subscriber pattern as carstate's
-    # steer_angle_offset topic, including drop-and-reopen when the socket
-    # file disappears (publisher process gone). Bounded local drain (newest
-    # wins) instead of PluginSub.drain(): a flooded queue can hold up to
-    # RCVHWM messages and one tick must not pay unbounded json.loads calls.
-    if livepose_updated:
-      try:
-        if state['budget_sub'] is not None and not os.path.exists(_BUDGET_BUS_SOCKET):
-          try:
-            state['budget_sub'].close()
-          except Exception:
-            pass
-          state['budget_sub'] = None
-        if state['budget_sub'] is None and os.path.exists(_BUDGET_BUS_SOCKET):
-          from openpilot.selfdrive.plugins.plugin_bus import PluginSub
-          state['budget_sub'] = PluginSub(['angle_budget'])
-        if state['budget_sub'] is not None:
-          _bmsg = None
-          for _ in range(8):
-            _m = state['budget_sub'].recv()
-            if _m is None:
-              break
-            if _m[0] == 'angle_budget':
-              _bmsg = _m
-          if _bmsg is not None:
-            state['budget_on'] = bool(_bmsg[1].get('enabled', state['budget_on']))
-      except Exception:
-        pass
-
-    # Torque is NEGATIVE for left, angle POSITIVE for left, so the product of
-    # push_moved and -torque is positive when the wheel moved the way we asked.
-    # Computed after the bus poll so a flip takes effect on the same tick.
-    state['budget_spent'] = (state['budget_on']
-                             and abs(state['push_moved']) >= BUDGET_DEG
-                             and state['push_moved'] * -state['torque'] > 0.0)
 
     # livePose tick (20 Hz): update measured + desired every tick; plant-
     # inversion decision only every action_cadence_ticks (= model_action_t/2,
@@ -816,59 +725,12 @@ def on_lat_controller_init(result, lac, CP):
           # slew is now ~0.33 frac/s (~4 Nm/s); the P-law reverses on
           # overshoot, speedlimitd handles curve-entry speed (a_y bound).
           step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
-          # Once the wheel has moved its 2 deg, stop pushing harder and shed
-          # torque at whatever rate the P law asks. Winding up is fought by the
-          # rack; unwinding is free (self-aligning torque does it). A symmetric
-          # STEP_MAX is right while ramping blind, but afterwards it needed
-          # 0.65 s to unwind route 3f2 seg 10 while the overshoot took 0.4 s.
-          # The budget lets the controller stop pushing and let go — it must
-          # NEVER let it push harder, in either direction (review fix, this
-          # replaced a sign-blind |target|>|torque| comparison that either
-          # froze on an overshoot reversal — the controller giving up mid-turn,
-          # the invariant the module-level SAFETY ARCHITECTURE note forbids —
-          # or, when the counter-target had smaller magnitude, applied no cap
-          # at all, up to a single-decision Δ0.578 frac swing). Same-side
-          # target: clamp toward torque, never past it (freeze, don't push
-          # harder). Then shed toward zero unthrottled — that's free, SAT does
-          # it for us — and allow at most one step_max past zero, since
-          # anything past zero is a NEW push in the other direction and gets
-          # rate-limited like any other.
-          if state['budget_spent']:
-            if target_frac * state['torque'] > 0.0:
-              target_frac = math.copysign(min(abs(target_frac), abs(state['torque'])),
-                                          state['torque'])
-            lo = min(0.0, state['torque']) - step_max
-            hi = max(0.0, state['torque']) + step_max
-            target_frac = float(np.clip(target_frac, lo, hi))
-            step = target_frac - state['torque']
-          else:
-            step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
+          step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
           target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
 
         state['target_frac'] = target_frac
         state['ramp_step'] = (target_frac - state['torque']) / spread_frames
         state['ramp_frames'] = spread_frames
-        if active and state['action'] == 'ramp':
-          # Re-arm the push budget every decision (review fix, Critical 1).
-          # push_ref used to be captured only on the first tick of a push and
-          # then held for the push's entire lifetime — so once budget_spent
-          # latched true, it stayed true for as long as action == 'ramp'
-          # (which is exactly as long as |delta_err| > HOLD_BAND), pinning
-          # the same-side clamp and locking the push out of torque authority
-          # for the rest of the turn: the "controller gives up mid-turn"
-          # state this file's SAFETY ARCHITECTURE header forbids. A driver
-          # does not stop pushing forever after one 2-degree movement — they
-          # ease off, feel whether the wheel is still moving, and push again
-          # if not. Re-measuring the reference at this same cadence (the one
-          # that just set target_frac/ramp_step/ramp_frames above) gives
-          # exactly that stepping behaviour: each ~model_action_t/2 decision
-          # gets its own fresh BUDGET_DEG allowance, so a push that spends
-          # the budget and then sticks (wheel static) recovers full torque
-          # authority at the very next decision, while a push whose wheel
-          # keeps moving fast keeps re-spending it decision after decision.
-          # Gated on active/action=='ramp' exactly like the capture above,
-          # for the same disengagement reason.
-          state['push_ref'] = _angle
 
     # Apply per-frame ramp step. Panda enforces wire-rate (STEER_DELTA_UP)
     # downstream; large ramp_step (Δ > 5 Nm spread over 50 frames) gets
@@ -918,9 +780,6 @@ def on_lat_controller_init(result, lac, CP):
           'derr_ema': float(state['derr_ema']),               # slow (2 s) error EMA driving the persistent-lean escape (rad)
           'at_rest': bool(state['at_rest']),                  # hysteresis decision state (observable even when action is cancel_tol/idle, where action is not a proxy for it)
           'relax_ticks': int(state['relax_ticks']),
-          'push_moved': float(state['push_moved']),
-          'budget_spent': bool(state['budget_spent']),
-          'budget_on': bool(state['budget_on']),
         }
         state['lat_pub'].send(payload)
       except Exception:

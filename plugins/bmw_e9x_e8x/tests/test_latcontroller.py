@@ -81,43 +81,37 @@ class FakeSubMaster:
     return self.lp
 
 
-def _make_controller(monkeypatch, wheelbase=2.66, angle_budget=None, hold_hyst=None):
+def _make_controller(monkeypatch, wheelbase=2.66, hold_hyst=None):
   """Load bmw.latcontroller and construct a controller instance wired to a
   FakeSubMaster. Returns (lac, fake_sm, mod, state).
 
-  angle_budget: if not None, patches config.read_plugin_param so AngleBudget
+  hold_hyst: if not None, patches config.read_plugin_param so HoldHysteresis
   reads as '1' (True) or '0' (False) — must happen BEFORE
   on_lat_controller_init runs, because the param is read exactly once at
   construction (review fix, Important 4: no more per-tick/cached re-read),
   so patching it *after* construction has no effect. Patches the `config`
   module's attribute, not `mod`'s (review fix, Important 2:
-  on_lat_controller_init now does `from config import read_plugin_param` at
+  on_lat_controller_init does `from config import read_plugin_param` at
   function scope, mirroring bmw/carstate.py and speedlimitd/speedlimitd.py,
-  so `bmw.latcontroller` no longer has a `read_plugin_param` module
-  attribute to patch — same pattern as
-  speedlimitd/tests/test_speedlimitd.py's `monkeypatch.setattr(config,
-  'read_plugin_param', ...)`).
+  so `bmw.latcontroller` has no `read_plugin_param` module attribute to
+  patch — same pattern as speedlimitd/tests/test_speedlimitd.py's
+  `monkeypatch.setattr(config, 'read_plugin_param', ...)`).
 
-  hold_hyst: if not None, patches the same config.read_plugin_param so
-  HoldHysteresis reads as '1' (True) or '0' (False) — also read exactly once
-  at construction. angle_budget and hold_hyst go through the same
-  read_plugin_param call, so the stub dispatches on the param key rather than
-  returning one value for every key (2026-08-13 — the original angle_budget-
-  only stub ignored the key entirely, which would have made HoldHysteresis
-  silently inherit whatever angle_budget was set to). Either kwarg left None
-  falls through to the `default` argument production passes (''), i.e. the
-  real unpatched-param behaviour for that key.
+  Every param this controller reads goes through that one call, so the stub
+  dispatches on the param KEY rather than returning one value for every key
+  (2026-08-13 — a key-blind stub would make one param silently inherit
+  another's test value). A kwarg left None falls through to the `default`
+  argument production passes (''), i.e. the real unpatched-param behaviour
+  for that key.
   """
   import cereal.messaging as messaging
   fake_sm = FakeSubMaster([])
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
 
   import bmw.latcontroller as mod
-  if angle_budget is not None or hold_hyst is not None:
+  if hold_hyst is not None:
     import config
     def _param_stub(plugin_id, key, default=''):
-      if key == 'AngleBudget' and angle_budget is not None:
-        return '1' if angle_budget else '0'
       if key == 'HoldHysteresis' and hold_hyst is not None:
         return '1' if hold_hyst else '0'
       return default
@@ -354,459 +348,6 @@ class TestNonCancelPaths:
 
 
 # ============================================================
-# (4) Push budget — task-1-brief Step 2, updated after code review (2026-08-12
-# fix round). Human-style: push harder until the wheel actually moves, then
-# stop pushing harder and ease off. `_drive` pins state['torque']/
-# state['action'] each tick (as the existing tests above do) while feeding a
-# steering-angle trajectory through the steeringAngleDeg plumbing (Step 1).
-#
-# angle_budget=True/False is now passed to _make_controller() at construction
-# time rather than monkeypatched afterward — the param is read exactly once
-# at construction (Important 4: no more per-tick cache), so a
-# post-construction monkeypatch.setattr(mod, 'read_plugin_param', ...) (the
-# original task-1 pattern, and also stale on the attribute path: Important 2
-# moved the import to function scope, so `mod` no longer has a
-# read_plugin_param attribute at all — config.read_plugin_param is now the
-# patch target) has no effect. See _make_controller's docstring.
-# ============================================================
-
-def _drive(lac, sm, state, angles, torque=-0.30, desired=0.002):
-    """Hold a commanded torque while feeding a steering-angle trajectory."""
-    for a in angles:
-        state['torque'] = torque
-        state['action'] = 'ramp'
-        _set_measured(sm, 20.0, 0.001)
-        _call_update(lac, desired, steering_angle_deg=a)
-
-
-def test_budget_unspent_while_the_wheel_barely_moves(monkeypatch):
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _drive(lac, sm, state, [0.0, 0.4, 0.8, 1.2, 1.5, 1.8])
-    assert state['budget_spent'] is False
-
-
-def test_budget_spent_after_two_degrees_in_the_commanded_direction(monkeypatch):
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    # Negative torque commands LEFT; LEFT is POSITIVE steering angle.
-    # Two calls, not a slow multi-step ramp (Critical 1 review fix): push_ref
-    # now re-arms every decision, and this harness's default lat_delay=0.2
-    # gives a 2-tick decision cadence, so a slow 0.5 deg/call crawl spread
-    # across many decisions never accumulates 2 deg within any single
-    # decision window anymore (by design — see
-    # test_budget_unspent_while_the_wheel_barely_moves and the C1-recovery
-    # test below). The must-spend case is 2+ degrees inside ONE decision.
-    _drive(lac, sm, state, [0.0, 2.5])
-    assert state['budget_spent'] is True
-
-
-def test_movement_opposing_the_command_does_not_spend_it(monkeypatch):
-    """Camber or a bump moving the wheel the wrong way is not our doing."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _drive(lac, sm, state, [0.0, -0.5, -1.0, -1.5, -2.0, -2.5])
-    assert state['budget_spent'] is False
-
-
-def test_reference_resets_when_the_push_ends(monkeypatch):
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    # Jump straight to +3 deg within one decision (Critical 1 review fix: see
-    # test_budget_spent_after_two_degrees_in_the_commanded_direction for why
-    # a slow multi-step climb no longer spends it) -- ends at the same 3.0
-    # deg the rest of this test already assumes the wheel is sitting at.
-    _drive(lac, sm, state, [0.0, 3.0])
-    assert state['budget_spent'] is True
-    state['action'] = 'hold_zero'
-    _set_measured(sm, 20.0, 0.001)
-    _call_update(lac, 0.002, steering_angle_deg=3.0)
-    assert state['budget_spent'] is False
-    _drive(lac, sm, state, [3.0, 3.5])          # new push from 3.0
-    assert state['budget_spent'] is False
-
-
-def test_offset_cancels(monkeypatch):
-    """A constant alignment offset must not change when the budget is spent."""
-    for base in (0.0, -1.58, +7.3):
-        lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-        # 2.5 deg within one decision (Critical 1 review fix -- see
-        # test_budget_spent_after_two_degrees_in_the_commanded_direction).
-        _drive(lac, sm, state, [base + 2.5 * i for i in range(2)])
-        assert state['budget_spent'] is True
-
-
-def test_toggle_off_never_spends_the_budget(monkeypatch):
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=False)
-    _drive(lac, sm, state, [0.0 + 0.5 * i for i in range(10)])
-    assert state['budget_spent'] is False
-
-
-def test_missing_steering_angle_degrades_safely(monkeypatch):
-    """Minor 9 (review): angle_budget=True so the getattr guard is actually
-    exercised — with the param left unpatched (real read_plugin_param sees no
-    file, defaults off), this test passed for the wrong reason: budget_spent
-    would be False regardless of whether the guard existed, since the AND
-    chain short-circuits on the toggle before ever reaching the angle."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    CS = SimpleNamespace(vEgo=20.0)          # no steeringAngleDeg
-    for _ in range(20):
-        _set_measured(sm, 20.0, 0.001)
-        out = lac.update(True, CS, None, None, False, 0.002, False, 0.2)
-    assert out is not None
-    assert state['budget_spent'] is False
-
-
-def test_budget_does_not_accrue_while_disengaged(monkeypatch):
-    """Important 3 (review): update() runs regardless of engagement, and the
-    decision state machine that sets state['action'] is not itself gated on
-    active — so without gating the capture on active, driver steering while
-    disengaged would accrue into push_moved and a push could begin already
-    spent. CS.steeringPressed is not a substitute gate on this car (it is a
-    voice-control button ORed with gasPressed)."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    for a in [0.0, 1.0, 2.0, 3.0, 4.0]:
-        state['torque'] = -0.30
-        state['action'] = 'ramp'
-        _set_measured(sm, 20.0, 0.001)
-        _call_update(lac, 0.002, steering_angle_deg=a, active=False)
-    assert state['push_ref'] is None
-    assert state['push_moved'] == 0.0
-    assert state['budget_spent'] is False
-
-
-# ============================================================
-# (5) Push-budget CLAMP — review fix (2026-08-12), Important 6. The 7 tests
-# above only ever assert on state['budget_spent']; none of them exercised the
-# clamp itself, and _drive's per-tick re-pin of state['torque'] would mask
-# any ramp effect even if they tried to. These four drive a REAL decision
-# (not _drive) through the sign-aware clamp and assert on state['target_frac']
-# and the resulting state['torque'] after one ramp tick — exactly the tests
-# that would have caught Criticals 1 and 2 in the original abs()-only
-# comparison: it either froze torque at its wrong-direction value on a
-# reversal (case C shape), or, when the counter-target had smaller magnitude,
-# applied no cap at all (case D shape — a Delta 0.547 frac swing here, the
-# same shape as the reported Delta 0.578 frac / 6.9 Nm route example).
-#
-# All four use v=20.0, wheelbase=2.66 (default), measured=0.0 (so
-# delta_err == delta_des and hold_f/held_target stay out of the way — hold_f
-# is 0 in cases A/B (v^2*|desired| < HOLD_AY_BP[0] = 0.5) and in C/D where
-# hold_f == 1, held_target sign-matches torque and is smaller in magnitude
-# than the P-computed target, so the pre-existing hold-floor is a no-op).
-# Expected numbers were derived by mirroring the production formula
-# (kappa_scale, target_nm, t_cap, hold-floor, then the budget clamp) in a
-# standalone script, cross-checked against the old (pre-fix) formula to
-# confirm each case actually discriminates buggy from fixed behaviour — see
-# task-1-report.md's fix-round section for the full derivation and the
-# old-vs-new numbers.
-# ============================================================
-
-def _prime_and_decide(lac, sm, state, *, torque, v, desired, measured, push_angle):
-    """Prime state for a fresh decision to fire this tick, with the push
-    budget already spent in the commanded (torque) direction, then call
-    update() once. Bypasses _drive's per-tick re-pin of torque so the ramp's
-    effect on state['torque'] is observable."""
-    state['torque'] = torque
-    state['target_frac'] = torque
-    state['ramp_frames'] = 0
-    state['action'] = 'ramp'
-    state['push_ref'] = 0.0
-    state['tick_count'] = 999
-    _set_measured(sm, v, measured)
-    _call_update(lac, desired, v_ego=v, steering_angle_deg=push_angle)
-
-
-def test_budget_clamp_same_direction_harder_freezes(monkeypatch):
-    """Case A: pushing harder in the same direction the budget was spent on
-    must freeze at the current torque, not follow the P-law further out."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _prime_and_decide(lac, sm, state, torque=-0.30, v=20.0, desired=-0.003,
-                      measured=0.0, push_angle=2.5)
-    assert state['budget_spent'] is True
-    assert state['target_frac'] == pytest.approx(-0.30, abs=1e-6)
-    assert state['torque'] == pytest.approx(-0.30, abs=1e-6)   # unmoved
-
-
-def test_budget_clamp_same_direction_easing_is_unthrottled(monkeypatch):
-    """Case B: easing off in the same direction goes straight to the P-law's
-    (smaller-magnitude) target in one decision, not stepped at STEP_MAX like
-    a normal ramp.
-
-    desired moved from -0.0005 to -0.0008 (2026-08-13, entry/settle
-    hysteresis): with hysteresis default ON, -0.0005 produces
-    |delta_err| ≈ 0.00133 rad, which is > HOLD_BAND (0.001, the legacy single
-    threshold this value used to clear) but < HOLD_BAND_ENTER (0.0015) — from
-    this test's fresh controller (state['at_rest'] starts True), that no
-    longer leaves rest, so the decision lands in the hold branch instead of
-    the ramp/easing branch this test exists to exercise. The specific error
-    magnitude here was always incidental to the test's intent (a P-target
-    smaller in magnitude than the -0.30 held torque, with hold_f == 0 so
-    held_target stays out of the way — v²·|desired| = 400·0.0008 = 0.32 <
-    HOLD_AY_BP[0] = 0.5); -0.0008 preserves both properties while clearing
-    HOLD_BAND_ENTER (|delta_err| ≈ 0.00213 rad).
-
-    Independent derivation of the expected numbers (review fix, Important 2
-    -- these were originally transcribed from a controller run rather than
-    derived, which made them circular as a pin; re-derived by hand here from
-    the production formula so they stand on their own):
-
-        δ_err   = atan(0.0008·2.66)          = 0.00212800
-        κ_scale = 1.0 (below first breakpoint)
-        target  = 1.0·1.0·400·(-0.002128)/12 = -0.0709333  (T_CAP_SLOPE_BASE=1.0, STEER_MAX=12)
-        hold_f  = 0 (400·0.0008 = 0.32 < HOLD_AY_BP[0]=0.5) -> held_target = 0
-        t_cap   = (2.0+0.8512)/12 = 0.2376 -> no clip; budget lo/hi -0.3808/+0.0808 -> no clip
-        torque  = -0.30 + 0.2290667/10       = -0.27709333  (spread_frames=10)
-    """
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _prime_and_decide(lac, sm, state, torque=-0.30, v=20.0, desired=-0.0008,
-                      measured=0.0, push_angle=2.5)
-    assert state['budget_spent'] is True
-    assert state['target_frac'] == pytest.approx(-0.070933, abs=1e-5)
-    assert state['torque'] == pytest.approx(-0.277093, abs=1e-5)
-    # A STEP_MAX(20 m/s)=0.080769-clamped ramp would have moved torque by
-    # only step_max/spread_frames = 0.0080769 this tick; the actual movement
-    # is well over 2x that, proving the step was not throttled.
-    step_max_over_spread_frames = 0.080769 / 10
-    assert abs(state['torque'] - (-0.30)) > step_max_over_spread_frames
-
-
-def test_budget_clamp_reversal_reaches_zero_and_one_step_past_not_frozen(monkeypatch):
-    """Case C: the P-law reversing (target flips sign vs standing torque),
-    counter-target BIGGER in magnitude than torque. The old sign-blind
-    |target|>|torque| check froze here — the controller giving up mid-turn,
-    the invariant the module's SAFETY ARCHITECTURE note forbids. Must instead
-    shed to zero and continue exactly one step_max past."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _prime_and_decide(lac, sm, state, torque=-0.15, v=20.0, desired=0.003,
-                      measured=0.0, push_angle=2.5)
-    assert state['budget_spent'] is True
-    step_max = 0.080769   # interp(20, [15,28], [0.10,0.05])
-    assert state['target_frac'] == pytest.approx(step_max, abs=1e-5)
-    assert state['target_frac'] != pytest.approx(-0.15)   # did NOT freeze
-    assert state['torque'] == pytest.approx(-0.126923, abs=1e-5)
-
-
-def test_budget_clamp_reversal_smaller_counter_target_is_still_bounded(monkeypatch):
-    """Case D: the P-law reversing with a counter-target SMALLER in magnitude
-    than torque — the old code's other failure mode. Since |target|>|torque|
-    was false, it skipped the freeze branch entirely and applied the raw,
-    unclamped step (a Delta 0.547 frac swing here — precisely what STEP_MAX
-    exists to prevent). Must bound to zero plus one step_max, same as case C."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _prime_and_decide(lac, sm, state, torque=-0.313, v=20.0, desired=0.0022,
-                      measured=0.0, push_angle=2.5)
-    assert state['budget_spent'] is True
-    step_max = 0.080769
-    assert state['target_frac'] == pytest.approx(step_max, abs=1e-5)
-    assert state['torque'] == pytest.approx(-0.273623, abs=1e-5)
-
-
-def test_budget_clamp_same_direction_harder_freezes_right_hand(monkeypatch):
-    """Minor (review): mirror of Case A with all signs flipped — every clamp
-    test above drives a LEFT (negative-torque) push; this pins the identical
-    freeze on a RIGHT (positive-torque, negative-angle) push, so a sign bug
-    that only shows up on one side of center can't hide behind an
-    all-one-direction suite."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _prime_and_decide(lac, sm, state, torque=0.30, v=20.0, desired=0.003,
-                      measured=0.0, push_angle=-2.5)
-    assert state['budget_spent'] is True
-    assert state['target_frac'] == pytest.approx(0.30, abs=1e-6)
-    assert state['torque'] == pytest.approx(0.30, abs=1e-6)    # unmoved
-
-
-def test_budget_recovers_after_wheel_goes_static(monkeypatch):
-    """Critical 1 (review fix): a spent push must not lock torque authority
-    out for the rest of the turn. Before this fix, push_ref cleared only
-    when action left 'ramp' — and action stays 'ramp' for as long as
-    |delta_err| > HOLD_BAND, so once budget_spent latched, the same-side
-    freeze pinned torque for the rest of the push (reproduced on the shipped
-    controller: budget spends at 1.74 Nm, the wheel re-sticks, and over 3 s
-    the controller adds 0.00 Nm — pinned below the 2.0-2.75 Nm rack
-    breakaway, unable to ever break the rack free again; with the toggle off
-    the same scenario ramps to 12 Nm). Two real decisions chained by hand
-    (not _prime_and_decide, which would re-prime push_ref=0.0 for both):
-    decision 1 spends the budget and freezes torque (same shape as Case A
-    above); decision 2 forces the next decision (tick_count>=cadence)
-    WITHOUT touching torque/action/push_ref, and keeps push_angle at the
-    same 2.5 deg — the wheel hasn't moved since decision 1 re-armed the
-    reference. That must both un-spend the budget and let the P-law ask for
-    (and get) more torque than decision 1's frozen value; before the fix,
-    push_ref would still read the original 0.0 here, push_moved would still
-    be 2.5, and budget_spent would still be True."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-
-    _prime_and_decide(lac, sm, state, torque=-0.30, v=20.0, desired=-0.003,
-                      measured=0.0, push_angle=2.5)
-    assert state['budget_spent'] is True
-    assert state['torque'] == pytest.approx(-0.30, abs=1e-6)      # frozen, as Case A
-    torque_after_spend = state['torque']
-
-    state['ramp_frames'] = 0
-    state['tick_count'] = 999
-    _set_measured(sm, 20.0, 0.0)
-    _call_update(lac, -0.003, v_ego=20.0, steering_angle_deg=2.5)
-
-    assert state['push_moved'] == pytest.approx(0.0, abs=1e-9)     # re-armed at 2.5, wheel static since
-    assert state['budget_spent'] is False                          # recovered, not still spent
-    assert abs(state['target_frac']) > abs(torque_after_spend)     # no longer frozen at -0.30
-    assert abs(state['torque']) > abs(torque_after_spend)          # torque actually climbed again
-
-
-def test_budget_unspent_large_target_still_step_max_limited(monkeypatch):
-    """Important 3 (review): every clamp test above primes budget_spent=True.
-    Changing the production check from `if state['budget_spent']:` to
-    `if _angle_budget_on:` would pass the entire rest of this suite while
-    silently removing STEP_MAX from every ramp decision whenever the toggle
-    is on, regardless of whether any push has actually spent its budget. Pin
-    the un-spent path explicitly: toggle on, wheel has barely moved (well
-    under BUDGET_DEG), a deep-curve target that would saturate all the way to
-    STEER_MAX if unclamped — the step this decision takes must still be
-    bounded to STEP_MAX, exactly like the toggle-off path.
-
-    torque=-0.20 (not 0.0) is load-bearing: with torque==0.0 the mutated
-    branch's `lo = min(0, torque) - step_max` / `hi = max(0, torque) +
-    step_max` collapses to exactly [-step_max, +step_max] around zero, the
-    same range the correct un-spent path produces — a zero-torque prime
-    can't tell the two apart. A nonzero same-direction torque makes the
-    mutated range asymmetric ([-0.28077, +0.08077] here) and wrong."""
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _prime_and_decide(lac, sm, state, torque=-0.20, v=20.0, desired=-0.02,
-                      measured=0.0, push_angle=0.1)
-    assert state['budget_spent'] is False
-    assert state['target_frac'] == pytest.approx(-0.280769, abs=1e-5)
-    assert state['torque'] == pytest.approx(-0.208077, abs=1e-5)
-
-
-# ============================================================
-# Hot toggle via the 'angle_budget' plugin-bus topic (2026-08-13)
-# ============================================================
-
-@pytest.fixture(autouse=True)
-def _isolate_budget_socket(monkeypatch, tmp_path):
-  """Keep every test off the real /tmp/plugin_bus path: a live UI on the C3
-  (or a stray socket on a dev box) must never make the suite attach a real
-  subscriber. Tests that need the socket to exist re-patch it themselves."""
-  import bmw.latcontroller as _mod
-  monkeypatch.setattr(_mod, '_BUDGET_BUS_SOCKET', str(tmp_path / 'no_socket'))
-
-
-def _touch_budget_socket():
-  """Create the (test-patched) socket path so an injected fake sub survives
-  the close-on-missing-socket branch."""
-  import bmw.latcontroller as _mod
-  open(_mod._BUDGET_BUS_SOCKET, 'w').close()
-
-
-class _FakeBudgetSub:
-  def __init__(self, msgs):
-    self._msgs = list(msgs)
-
-  def recv(self):
-    return self._msgs.pop(0) if self._msgs else None
-
-  def close(self):
-    pass
-
-
-class TestBudgetHotToggle:
-  def test_bus_enable_applies_mid_drive(self, monkeypatch):
-    # Init with the toggle OFF; a bus message flips it on without restart.
-    lac, sm, mod, state = _make_controller(monkeypatch)
-    assert state['budget_on'] is False
-    _touch_budget_socket()
-    state['budget_sub'] = _FakeBudgetSub([('angle_budget', {'enabled': True})])
-    _set_measured(sm, 20.0, 0.001)
-    _call_update(lac, 0.002, steering_angle_deg=0.0)
-    assert state['budget_on'] is True
-
-  def test_bus_disable_stops_budget_spending(self, monkeypatch):
-    # Init ON, spend the budget with a 2.5-deg jump inside one decision
-    # window (per-decision re-arm makes slow multi-decision crawls unspendable
-    # by design), then disable over the bus: the SAME jump pattern must stop
-    # spending.
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _drive(lac, sm, state, [0.0, 2.5])
-    assert state['budget_spent'] is True
-    _touch_budget_socket()
-    state['budget_sub'] = _FakeBudgetSub([('angle_budget', {'enabled': False})])
-    _drive(lac, sm, state, [5.0, 7.5, 10.0, 12.5])
-    assert state['budget_on'] is False
-    assert state['budget_spent'] is False
-
-  def test_no_publisher_keeps_init_state(self, monkeypatch, tmp_path):
-    import bmw.latcontroller as mod_direct
-    monkeypatch.setattr(mod_direct, '_BUDGET_BUS_SOCKET',
-                        str(tmp_path / 'nonexistent_socket'))
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    for _ in range(10):
-      _set_measured(sm, 20.0, 0.001)
-      _call_update(lac, 0.002, steering_angle_deg=0.0)
-    assert state['budget_sub'] is None
-    assert state['budget_on'] is True
-
-  def test_malformed_bus_message_is_ignored(self, monkeypatch):
-    lac, sm, mod, state = _make_controller(monkeypatch, angle_budget=True)
-    _touch_budget_socket()
-    state['budget_sub'] = _FakeBudgetSub([('angle_budget', {})])  # no 'enabled' key
-    _set_measured(sm, 20.0, 0.001)
-    _call_update(lac, 0.002, steering_angle_deg=0.0)
-    assert state['budget_on'] is True   # default falls back to current state
-
-  def test_lazy_subscriber_creation_pins_import_path_and_topic(self, monkeypatch, tmp_path):
-    """Mutation-proof the creation branch: a typo in the plugin_bus import
-    path, the PluginSub topic list, or the message filter must fail HERE
-    (the except-pass guard otherwise ships a permanently dead feature)."""
-    import bmw.latcontroller as mod_direct
-    sock = tmp_path / 'angle_budget'
-    sock.write_text('')                       # socket "exists" -> creation runs
-    monkeypatch.setattr(mod_direct, '_BUDGET_BUS_SOCKET', str(sock))
-
-    constructed = []
-
-    class FakeSub:
-      def __init__(self, topics):
-        constructed.append(topics)
-        self._q = [('angle_budget', {'enabled': True})]
-
-      def recv(self):
-        return self._q.pop(0) if self._q else None
-
-      def close(self):
-        pass
-
-    fake_mod = MagicMock()
-    fake_mod.PluginSub = FakeSub
-    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', fake_mod)
-
-    lac, sm, mod, state = _make_controller(monkeypatch)
-    _set_measured(sm, 20.0, 0.001)
-    _call_update(lac, 0.002, steering_angle_deg=0.0)
-    assert constructed == [['angle_budget']]
-    assert state['budget_on'] is True
-
-  def test_subscriber_closed_when_socket_disappears(self, monkeypatch, tmp_path):
-    lac, sm, mod, state = _make_controller(monkeypatch)
-    closed = []
-    state['budget_sub'] = SimpleNamespace(recv=lambda: None,
-                                          close=lambda: closed.append(True))
-    # autouse fixture points _BUDGET_BUS_SOCKET at a nonexistent path
-    _set_measured(sm, 20.0, 0.001)
-    _call_update(lac, 0.002, steering_angle_deg=0.0)
-    assert closed == [True]
-    assert state['budget_sub'] is None
-
-  def test_telemetry_carries_budget_on(self, monkeypatch):
-    lac, sm, mod, state = _make_controller(monkeypatch)
-    _touch_budget_socket()
-    payloads = []
-    state['lat_pub'] = SimpleNamespace(send=payloads.append)
-    _set_measured(sm, 20.0, 0.001)
-    _call_update(lac, 0.002, steering_angle_deg=0.0)
-    assert payloads and payloads[-1]['budget_on'] is False
-    state['budget_sub'] = _FakeBudgetSub([('angle_budget', {'enabled': True})])
-    _set_measured(sm, 20.0, 0.001)
-    _call_update(lac, 0.002, steering_angle_deg=0.0)
-    assert payloads[-1]['budget_on'] is True
-
-
-# ============================================================
 # Entry/settle hysteresis on the HOLD_BAND rest band (2026-08-13, route 3f4
 # data). One shared threshold made the controller flicker across the
 # boundary ~89x/min on straights (error noise sigma = 0.00081 rad); leaving
@@ -942,7 +483,7 @@ def test_killswitch_reproduces_legacy_single_threshold(monkeypatch):
 
 
 def test_default_is_enabled(monkeypatch):
-  """No param patched (angle_budget/hold_hyst both left None -> real
+  """No param patched (hold_hyst left None -> real
   read_plugin_param, which sees no param file and returns the default ''):
   hysteresis is active by default. err 0.0012 stays holding, the same
   scenario that pins hysteresis-on behaviour in
@@ -1117,3 +658,124 @@ class TestFrictionGatesDeleted:
     # overshoot-side error: desired same side but smaller than measured
     _call_update(lac, 0.008, steering_angle_deg=0.0, v_ego=9.0)
     assert state['relax_ticks'] == before + 1
+
+
+# ============================================================
+# STEP_MAX speed schedule (route 39b seg 18, 2026-07-09 — user safety call)
+# and the steeringAngleDeg getattr guard.
+#
+# Both properties used to be pinned only incidentally, by assertions inside
+# the steering-push tests deleted with that feature (2026-08-14). They are
+# live behaviour with no owner otherwise, so they are re-pinned here directly,
+# with no dependence on the retired mechanism.
+# ============================================================
+
+def _decide_from_zero(lac, sm, state, *, v, desired):
+  """Run ONE cadence decision from zero standing torque at speed v.
+
+  Zero torque is load-bearing: held = hold_f * torque = 0, so held_target is 0
+  and the hold-floor cannot touch target_frac (it needs target_frac *
+  held_target > 0). measured = 0 keeps the relax-dwell disarmed (it needs
+  |κ_meas| > RELAX_DWELL_KAPPA) and makes delta_err == delta_des.
+  """
+  state['torque'] = 0.0
+  state['target_frac'] = 0.0
+  state['ramp_frames'] = 0
+  state['action'] = 'idle'
+  state['tick_count'] = 999          # force the cadence decision this tick
+  _set_measured(sm, v, 0.0)
+  _call_update(lac, desired, v_ego=v)
+
+
+class TestStepMaxSpeedSchedule:
+  """`step_max = interp(vEgo, STEP_MAX_V=[15, 28], STEP_MAX_BP=[0.10, 0.05])`.
+
+  Route 39b seg 18 (2026-07-09): a slight highway left produced sudden
+  back-and-forth wheel motion. The user's ruling was that aggressive
+  per-decision steps are riskier at highway speed (lane margin is consumed
+  faster, less time to react), so the cap halves from 0.10 to 0.05 between
+  15 and 28 m/s while curves below 15 m/s keep full entry authority.
+  A constant `step_max = 0.10` — i.e. the schedule dropped — is exactly the
+  regression these three speeds catch.
+
+  Derivation of the expected numbers (from the constants, not from a
+  controller run). With measured = 0 and desired = -0.02:
+
+      delta_err = delta_des = atan(-0.02 * 2.66)     = -0.0531489 rad
+      kappa_scale = interp(0.02, [0.001, 0.01, 0.02], [1.0, 2.5, 3.0]) = 3.0
+      target_nm  = 1.0 * 3.0 * v^2 * delta_err        (T_CAP_SLOPE_BASE = 1.0)
+      t_cap_nm   = min(12, 2.0 + 3.0 * v^2 * 0.0531489)
+
+  At every speed here t_cap_nm saturates at STEER_MAX = 12 (t_cap_frac = 1.0)
+  and |target_nm / 12| >= 1.0, so the P target clips to -1.0 — far past any
+  step cap. From torque = 0 the decision is therefore `step = clip(-1.0, 0,
+  -step_max, +step_max) = -step_max` and `target_frac = -step_max`: the
+  commanded target IS the schedule value, so these assertions read the
+  schedule directly.
+
+      v = 15  ->  step_max = 0.10       (first breakpoint, flat below)
+      v = 20  ->  step_max = 0.10 + (20-15)/(28-15) * (0.05-0.10) = 0.0807692
+      v = 28  ->  step_max = 0.05       (second breakpoint, flat above)
+
+  The intermediate speed is what pins the INTERPOLATION rather than just the
+  two endpoints: a schedule replaced by `0.10 if v < 28 else 0.05` would pass
+  on 15 and 28 alone.
+
+  One CAN tick of ramp is then applied before update() returns:
+  spread_frames = action_cadence_ticks * 5, and with the harness's default
+  lat_delay = 0.2 -> model_action_t = 0.25 -> half = 0.125 s ->
+  action_cadence_ticks = round(2.5) = 2 (banker's rounding) -> 10 frames.
+  So state['torque'] lands on -step_max / 10.
+  """
+
+  DESIRED = -0.02      # deep target: P saturates, so the step cap is what binds
+
+  def test_full_step_at_and_below_the_first_breakpoint(self, monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _decide_from_zero(lac, sm, state, v=15.0, desired=self.DESIRED)
+    assert state['action'] == 'ramp'
+    assert state['target_frac'] == pytest.approx(-0.10, abs=1e-9)
+    assert state['torque'] == pytest.approx(-0.010, abs=1e-9)
+
+  def test_half_step_at_and_above_the_second_breakpoint(self, monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _decide_from_zero(lac, sm, state, v=28.0, desired=self.DESIRED)
+    assert state['action'] == 'ramp'
+    assert state['target_frac'] == pytest.approx(-0.05, abs=1e-9)
+    assert state['torque'] == pytest.approx(-0.005, abs=1e-9)
+
+  def test_interpolated_step_between_the_breakpoints(self, monkeypatch):
+    """20 m/s sits strictly inside the ramp: 0.10 - 5/13*0.05 = 0.0807692.
+    This is the case a two-level step function would get wrong."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _decide_from_zero(lac, sm, state, v=20.0, desired=self.DESIRED)
+    assert state['action'] == 'ramp'
+    assert state['target_frac'] == pytest.approx(-0.0807692307, abs=1e-9)
+    assert state['torque'] == pytest.approx(-0.00807692307, abs=1e-9)
+
+  def test_step_cap_shrinks_monotonically_with_speed(self, monkeypatch):
+    """The safety property in one assertion, independent of exact values: a
+    faster decision may never take a LARGER torque step than a slower one."""
+    steps = []
+    for v in (15.0, 20.0, 28.0):
+      lac, sm, mod, state = _make_controller(monkeypatch)
+      _decide_from_zero(lac, sm, state, v=v, desired=self.DESIRED)
+      steps.append(abs(state['target_frac']))
+    assert steps[0] > steps[1] > steps[2]
+
+
+class TestSteeringAngleGuard:
+  def test_missing_steering_angle_degrades_safely(self, monkeypatch):
+    """`_angle = float(getattr(CS, 'steeringAngleDeg', 0.0))` runs every CAN
+    tick before anything else in update(). It is not inside the telemetry
+    try/except, so a bare attribute access would propagate an AttributeError
+    straight out of the control loop on any CS lacking the field. Pin the
+    default: a CS stub without steeringAngleDeg must complete update()
+    normally, decision path and all."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    CS = SimpleNamespace(vEgo=20.0)          # no steeringAngleDeg
+    _set_measured(sm, 20.0, 0.001)
+    state['tick_count'] = 999                # force a full cadence decision
+    out = lac.update(True, CS, None, None, False, 0.008, False, 0.2)
+    assert out is not None
+    assert state['action'] == 'ramp'         # the decision really did run

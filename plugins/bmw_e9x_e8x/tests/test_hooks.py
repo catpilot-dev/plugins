@@ -216,13 +216,8 @@ class TestCruiseCeilingMemory:
 # Vehicle Settings (ui.vehicle_settings hook)
 # ============================================================
 
-class TestVehicleSettingsAngleBudget:
-  """The Driving-panel toggle that arms the push budget for the NEXT drive.
-
-  controlsd is an onroad-only process (process_config: iscar includes
-  `started`), so on_lat_controller_init re-reads AngleBudget at every drive
-  start — flipping this toggle while parked is the whole A/B procedure.
-  """
+class TestVehicleSettingsRows:
+  """The Vehicle-panel rows this plugin contributes (ui.vehicle_settings)."""
 
   def _rows(self, monkeypatch, param_dir):
     import register
@@ -237,147 +232,73 @@ class TestVehicleSettingsAngleBudget:
     monkeypatch.setitem(sys.modules, 'openpilot.system.ui.widgets.list_view', lv)
     return register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
 
-  def _budget_row(self, monkeypatch, param_dir):
-    rows = [r for r in self._rows(monkeypatch, param_dir)
-            if r.title == 'Steering Push Budget']
-    assert len(rows) == 1
-    return rows[0]
-
-  def test_default_is_off(self, mock_deps, monkeypatch, param_dir):
-    # No param file: the row must be OFF. Guards the == '1' predicate — the
-    # adjacent TemperatureOverlay row uses != '0' (default-ON), and copying
-    # that here would silently arm the feature on fresh installs.
-    row = self._budget_row(monkeypatch, param_dir)
-    assert row.initial_state is False
-
-  def test_reflects_existing_param(self, mock_deps, monkeypatch, param_dir):
-    (param_dir / 'AngleBudget').write_text('1')
-    row = self._budget_row(monkeypatch, param_dir)
-    assert row.initial_state is True
-
-  def test_callback_writes_the_param(self, mock_deps, monkeypatch, param_dir):
-    row = self._budget_row(monkeypatch, param_dir)
-    row.callback(True)
-    assert (param_dir / 'AngleBudget').read_text() == '1'
-    row.callback(False)
-    assert (param_dir / 'AngleBudget').read_text() == '0'
+  def test_exact_row_set(self, mock_deps, monkeypatch, param_dir):
+    """Retirement pin (2026-08-14): the 2-degree steering-push toggle failed
+    its route-3f4 A/B and was deleted with the feature. Pinned as an EXACT
+    row list rather than a not-in check so the retired row cannot return
+    under any title."""
+    titles = [r.title for r in self._rows(monkeypatch, param_dir)]
+    assert titles == ['Temperature Overlay', 'Resume Button Repurposed']
 
   def test_non_bmw_gets_no_rows(self, mock_deps, monkeypatch, param_dir):
     import register
     items = register.on_vehicle_settings([], SimpleNamespace(brand='toyota'))
     assert items == []
 
-
-class TestAngleBudgetHotPublish:
-  """The toggle callback hot-applies over the plugin bus AND persists."""
-
-  def _capture_pub(self, monkeypatch):
-    import register
-    sends = []
-
-    class FakePub:
-      def __init__(self, topic):
-        assert topic == 'angle_budget'
-      def send(self, data):
-        sends.append(data)
-
-    pb = MagicMock()
-    pb.PluginPub = FakePub
-    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', pb)
-    monkeypatch.setattr(register, '_angle_budget_pub', None)  # fresh pub per test
-    return sends
-
-  def _rows(self, monkeypatch):
-    import register
-
-    def fake_toggle_item(title, description, initial_state=False, callback=None, enabled=True):
-      return SimpleNamespace(title=title, description=description,
-                             initial_state=initial_state, callback=callback,
-                             enabled=enabled)
-
-    lv = MagicMock()
-    lv.toggle_item = fake_toggle_item
-    monkeypatch.setitem(sys.modules, 'openpilot.system.ui.widgets.list_view', lv)
-    return register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
-
-  def test_panel_build_creates_pub_and_resyncs_current_state(self, mock_deps, monkeypatch, param_dir):
-    (param_dir / 'AngleBudget').write_text('1')
-    sends = self._capture_pub(monkeypatch)
-    self._rows(monkeypatch)
-    # Eager pub at construction (slow-joiner guard) resyncs the stored state.
-    assert sends == [{'enabled': True}]
-
-  def test_callback_publishes_and_persists(self, mock_deps, monkeypatch, param_dir):
-    sends = self._capture_pub(monkeypatch)
-    rows = [r for r in self._rows(monkeypatch) if r.title == 'Steering Push Budget']
+  def _row(self, monkeypatch, param_dir, title):
+    rows = [r for r in self._rows(monkeypatch, param_dir) if r.title == title]
     assert len(rows) == 1
-    sends.clear()   # drop the construction-time resync
-    rows[0].callback(True)
-    assert (param_dir / 'AngleBudget').read_text() == '1'
-    assert sends == [{'enabled': True}]
-    rows[0].callback(False)
-    assert (param_dir / 'AngleBudget').read_text() == '0'
-    assert sends == [{'enabled': True}, {'enabled': False}]
+    return rows[0]
 
-  def test_bus_failure_still_persists_the_param(self, mock_deps, monkeypatch, param_dir):
+  def test_temperature_overlay_row_reflects_the_param(self, mock_deps, monkeypatch, param_dir):
+    """Default-ON polarity (`!= '0'`): absent file and '1' both read as on,
+    only an explicit '0' reads as off. The retired steering-push row used the
+    opposite (`== '1'`) predicate, so this pins that they did not get mixed up
+    when that row was removed from between them."""
+    assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is True
+    (param_dir / 'TemperatureOverlay').write_text('0')
+    assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is False
+    (param_dir / 'TemperatureOverlay').write_text('1')
+    assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is True
+
+  def test_toggle_callback_persists_via_write_param(self, mock_deps, monkeypatch, param_dir):
+    """`_write_param` is the only persistence path this plugin's panel has —
+    it creates the data dir and writes the file that `_read_param` (and the
+    plugin's own consumers) later read. A no-op `_write_param` leaves the row
+    working in the UI and silently loses every setting at restart, so pin the
+    round trip through a real callback: flip it, read the FILE back, and
+    confirm the rebuilt row reflects it."""
+    row = self._row(monkeypatch, param_dir, 'Temperature Overlay')
+
+    row.callback(False)
+    assert (param_dir / 'TemperatureOverlay').read_text() == '0'
+    assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is False
+
+    row.callback(True)
+    assert (param_dir / 'TemperatureOverlay').read_text() == '1'
+    assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is True
+
+  def test_write_param_creates_a_missing_data_dir(self, mock_deps, monkeypatch, tmp_path):
+    """`_write_param` does `os.makedirs(..., exist_ok=True)` — on a fresh
+    install /data/plugins/<id>/data does not exist yet, and without that the
+    first toggle would raise instead of persisting."""
     import register
-    pb = MagicMock()
-    pb.PluginPub = MagicMock(side_effect=RuntimeError('no zmq'))
-    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', pb)
-    monkeypatch.setattr(register, '_angle_budget_pub', None)
-    register._set_angle_budget(True)
-    assert (param_dir / 'AngleBudget').read_text() == '1'
+    monkeypatch.setattr(register, '_PLUGIN_DIR', str(tmp_path))
+    assert not (tmp_path / 'data').exists()
+    register._write_param('TemperatureOverlay', '0')
+    assert (tmp_path / 'data' / 'TemperatureOverlay').read_text() == '0'
+    assert register._read_param('TemperatureOverlay') == '0'
 
-
-class TestAngleBudgetHeartbeat:
-  """on_ui_state_tick republishes the param state at ~1 Hz — the mechanism
-  that makes the hot toggle reliable (ZMQ PUB drops edge-triggered sends to
-  not-yet-connected subscribers, and a UI restart loses the pub entirely)."""
-
-  def _arm(self, monkeypatch):
-    import register
-    sends = []
-
-    class FakePub:
-      def __init__(self, topic):
-        assert topic == 'angle_budget'
-      def send(self, data):
-        sends.append(data)
-
-    pb = MagicMock()
-    pb.PluginPub = FakePub
-    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', pb)
-    monkeypatch.setattr(register, '_angle_budget_pub', None)
-    monkeypatch.setattr(register, '_angle_budget_hb_t', 0.0)
-    return register, sends
-
-  def test_heartbeat_publishes_current_param_state(self, mock_deps, monkeypatch, param_dir):
-    register, sends = self._arm(monkeypatch)
-    (param_dir / 'AngleBudget').write_text('1')
-    register.on_ui_state_tick(None, None)
-    assert sends == [{'enabled': True}]
-
-  def test_heartbeat_throttles_to_1hz(self, mock_deps, monkeypatch, param_dir):
-    register, sends = self._arm(monkeypatch)
-    register.on_ui_state_tick(None, None)
-    register.on_ui_state_tick(None, None)   # immediately after -> throttled
-    assert len(sends) == 1
-
-  def test_heartbeat_tracks_manual_param_edits(self, mock_deps, monkeypatch, param_dir):
-    """echo 1 > .../AngleBudget hot-applies via the heartbeat, no UI touch."""
-    register, sends = self._arm(monkeypatch)
-    register.on_ui_state_tick(None, None)
-    assert sends[-1] == {'enabled': False}
-    (param_dir / 'AngleBudget').write_text('1')
-    monkeypatch.setattr(register, '_angle_budget_hb_t', 0.0)   # advance the clock
-    register.on_ui_state_tick(None, None)
-    assert sends[-1] == {'enabled': True}
-
-  def test_plugin_json_registers_the_heartbeat_hook(self):
+  def test_state_tick_hook_is_gone(self):
+    """Retirement pin (2026-08-14): `ui.state_tick` existed only to heartbeat
+    the retired steering-push hot toggle. With that feature gone there is
+    nothing to publish, so both the hook entry and its handler are deleted —
+    a re-added manifest entry pointing at a missing function would break
+    plugin load."""
     import json as _json
+    import register
     with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            'plugin.json')) as f:
       manifest = _json.load(f)
-    hook = manifest['hooks']['ui.state_tick']
-    assert hook['module'] == 'register'
-    assert hook['function'] == 'on_ui_state_tick'
+    assert 'ui.state_tick' not in manifest['hooks']
+    assert not hasattr(register, 'on_ui_state_tick')

@@ -132,58 +132,6 @@ def _write_param(key, value):
     f.write(value)
 
 
-_angle_budget_pub = None
-_angle_budget_hb_t = 0.0
-
-
-def _publish_angle_budget(enabled):
-  """Hot-apply the AngleBudget toggle to the running controlsd.
-
-  The param file (written by _set_angle_budget) is the persistent state that
-  controlsd reads at every drive start; this bus message is the live override
-  for the drive in progress (latcontroller polls the 'angle_budget' topic at
-  livePose rate). A single edge-triggered send is NOT reliable on its own —
-  ZMQ PUB drops messages with no connected subscriber (slow joiner), so the
-  1 Hz heartbeat in on_ui_state_tick is what actually guarantees delivery;
-  the immediate send here only makes a flip feel instant when the subscriber
-  is already connected (the common case).
-  """
-  global _angle_budget_pub
-  try:
-    if _angle_budget_pub is None:
-      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
-      _angle_budget_pub = PluginPub('angle_budget')
-    _angle_budget_pub.send({'enabled': bool(enabled)})
-  except Exception:
-    pass
-
-
-def _set_angle_budget(state):
-  _write_param('AngleBudget', '1' if state else '0')
-  _publish_angle_budget(state)
-
-
-def on_ui_state_tick(_, sm=None):
-  """Hook callback (ui.state_tick, UI process, every UI frame): 1 Hz
-  heartbeat of the AngleBudget state onto the 'angle_budget' bus topic.
-
-  This is what makes the hot toggle RELIABLE, per the plugin bus's own
-  contract ("late joiners miss nothing — publishers send state at regular
-  Hz"): it heals every one-shot race in one mechanism — controlsd starting
-  after a flip (slow joiner), a UI restart mid-drive (rebound socket), and
-  even a manual `echo 1 > .../AngleBudget` (the heartbeat reads the param
-  file, so file edits hot-apply within ~1 s too). Runs on the UI thread —
-  a 1 Hz param-file read is fine here; it is the RT control thread that
-  must never touch the filesystem.
-  """
-  global _angle_budget_hb_t
-  import time
-  now = time.monotonic()
-  if now - _angle_budget_hb_t >= 1.0:
-    _angle_budget_hb_t = now
-    _publish_angle_budget(_read_param('AngleBudget') == '1')
-
-
 def on_vehicle_settings(items, CP):
   """Hook callback: populate Vehicle panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
@@ -191,25 +139,11 @@ def on_vehicle_settings(items, CP):
 
   from openpilot.system.ui.widgets.list_view import toggle_item
 
-  # Create the hot-toggle pub now and resync current state (covers a UI
-  # restart mid-drive: the rebound socket triggers controlsd's subscriber to
-  # reconnect, and this send restores the live state it may have missed).
-  _publish_angle_budget(_read_param('AngleBudget') == '1')
-
   items.append(toggle_item(
     "Temperature Overlay",
     "Show coolant and oil temperature at the bottom-right corner of the onroad HUD.",
     _read_param('TemperatureOverlay') != '0',
     callback=lambda state: _write_param('TemperatureOverlay', '1' if state else '0'),
-  ))
-
-  items.append(toggle_item(
-    "Steering Push Budget",
-    "Stop increasing steering torque once the wheel has moved 2° within one "
-    "control decision, then release it freely (stuck-rack anti-windup). "
-    "Applies within a second, including mid-drive.",
-    _read_param('AngleBudget') == '1',
-    callback=_set_angle_budget,
   ))
 
   items.append(toggle_item(
