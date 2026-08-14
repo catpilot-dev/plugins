@@ -1,6 +1,6 @@
 """Hook handlers for UI customizations.
 
-Registers Driving, Vehicle, and Plugins settings panels, replaces PrimeWidget
+Registers the Driving and Plugins settings panels, replaces PrimeWidget
 with DriveStatsWidget, wires up ecosystem update badge, and provides the
 branded ExpButton for onroad HUD.
 """

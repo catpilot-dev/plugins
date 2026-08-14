@@ -217,7 +217,7 @@ class TestCruiseCeilingMemory:
 # ============================================================
 
 class TestVehicleSettingsRows:
-  """The Vehicle-panel rows this plugin contributes (ui.vehicle_settings)."""
+  """The Driving-panel rows this plugin contributes (ui.vehicle_settings)."""
 
   def _rows(self, monkeypatch, param_dir):
     import register
@@ -315,7 +315,7 @@ class TestVehicleSettingsRows:
     assert self._row(monkeypatch, param_dir, 'Stall Breakaway').initial_state is False
 
   def test_stall_breakaway_absent_for_non_bmw(self, mock_deps, monkeypatch, param_dir):
-    """This is a BMW rack behaviour; the hook runs for every brand's Vehicle
+    """This is a BMW rack behaviour; the hook runs for every brand's Driving
     panel, so the brand guard must keep the row off other cars."""
     import register
     items = register.on_vehicle_settings([], SimpleNamespace(brand='toyota'))

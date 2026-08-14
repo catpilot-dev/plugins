@@ -604,7 +604,7 @@ This document is the canonical reference for the lateral controller registered b
 >
 > **What was deleted**: `BUDGET_DEG`, the `AngleBudget` param (plugin.json
 > and the init-time read), the `angle_budget` plugin-bus topic and its
-> livePose-rate subscriber poll, the "Steering Push Budget" Vehicle-panel
+> livePose-rate subscriber poll, the "Steering Push Budget" Driving-panel
 > toggle plus `_set_angle_budget`/`_publish_angle_budget`, the
 > `ui.state_tick` heartbeat hook (`on_ui_state_tick`) that existed only to
 > carry that toggle — hook entry included — the `push_ref`/`push_moved`/

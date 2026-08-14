@@ -143,7 +143,7 @@ def _set_stall_breakaway(state):
 
 
 def on_vehicle_settings(items, CP):
-  """Hook callback: populate Vehicle panel with BMW-specific toggles."""
+  """Hook callback: populate the Driving panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
     return items
 

@@ -33,7 +33,7 @@ Colors: silver #A0A0A0 (most brands), Ford blue #003478, Chevrolet gold #C4A84D,
 
 ## icons/
 
-Monochrome icons for Vehicle panel heading. White on transparent.
+Monochrome icons for the Driving panel's vehicle heading. White on transparent.
 
 | Brand | Source |
 |-------|--------|
