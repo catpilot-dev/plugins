@@ -501,7 +501,8 @@ def on_lat_controller_init(result, lac, CP):
     # difference, and sb_dir is observed rather than assumed).
     # Runs before the livePose branch: a trip's shed can still be overridden
     # by a same-tick cadence decision, which is what the shed-rate
-    # enforcement below exists to undo.
+    # enforcement below exists to undo — except when that decision is a
+    # counter-steer, which always wins (see both sign gates below).
     if active:
       state['sb_ring'].append(_angle)
     else:
@@ -516,12 +517,26 @@ def on_lat_controller_init(result, lac, CP):
       # point, so drain RATE is the whole point. While the block is up and the
       # standing torque is still a same-side push, re-assert the fast drain
       # whenever the in-flight ramp is not draining toward zero at least that
-      # fast. Only ever REDUCES same-side torque; an opposite-side (counter-
-      # steer) ramp already satisfies the drain test and is never touched.
+      # fast.
       # Sign pairing: torque is OPPOSITE in sign to angle (torque negative =
       # left), so the push that drove the sb_dir motion has
       # torque * (-sb_dir) > 0.
-      if state['torque'] * (-state['sb_dir']) > 0.0:
+      #
+      # STAND DOWN FOR COUNTER-STEER (review finding (c), 2026-08-15). An
+      # earlier version of this comment claimed an opposite-side ramp "already
+      # satisfies the drain test and is never touched". That was FALSE: such a
+      # ramp passes the DIRECTION conjunct but a counter-steer spread over the
+      # normal ~40-frame cadence ramp has a per-frame step far below
+      # |torque|/SB_SHED_FRAMES, so it fails the MAGNITUDE conjunct, is
+      # misclassified as "not draining", and gets overwritten — and the
+      # overwrite sets target_frac = 0, destroying the correction's
+      # DESTINATION, not merely its rate. Measured: standing torque -0.27 with
+      # a fresh +0.20 counter-steer decision gives ramp_step +0.01175 vs a
+      # 0.027 drain bar. So the enforcement now explicitly yields whenever the
+      # in-flight ramp is headed to the opposite side: the controller may stop
+      # pushing, it must never give up correcting.
+      _to_counter = state['target_frac'] * (-state['sb_dir']) < 0.0
+      if state['torque'] * (-state['sb_dir']) > 0.0 and not _to_counter:
         _drain = abs(state['torque']) / SB_SHED_FRAMES
         _draining = (state['ramp_frames'] > 0
                      and state['ramp_step'] * state['torque'] < 0.0
@@ -556,7 +571,17 @@ def on_lat_controller_init(result, lac, CP):
           state['sb_dir'] = 1.0 if ring[-1] >= ring[-1 - SB_MOVE_TICKS] else -1.0
       elif state['sb_state'] == 2:
         state['sb_episode_ticks'] -= 1
-        _rate = abs(ring[-1] - ring[-1 - SB_MOVE_TICKS]) / (SB_MOVE_TICKS * DT_CAN_TICK) \
+        # SIGNED by the breakaway direction (review finding (b), 2026-08-15).
+        # An unsigned rate made the trip a REBOUND detector: a slow drift out
+        # (below the gate, so no trip) followed by a fast snap BACK toward the
+        # breakaway point reads as a fast crossing while displacement is still
+        # decaying through the 2 deg mark. Reviewer repro: 39 ticks outbound at
+        # 21.975 deg/s, then 20 return ticks at 30.765 deg/s -> tripped at
+        # displacement 2.197 deg while the wheel was travelling the WRONG way.
+        # Positive _rate now means "advancing in the direction it broke free",
+        # which is the only motion a release can produce. No effect on 3f2 —
+        # its sweep is in-direction throughout.
+        _rate = (ring[-1] - ring[-1 - SB_MOVE_TICKS]) * state['sb_dir'] / (SB_MOVE_TICKS * DT_CAN_TICK) \
                 if len(ring) > SB_MOVE_TICKS else 0.0
         if state['sb_episode_ticks'] <= 0 or state['action'] in ('hold_zero', 'hold_curve'):
           state['sb_state'] = 0
@@ -575,10 +600,23 @@ def on_lat_controller_init(result, lac, CP):
           # decrease with the wheel already moving that way) and suppress
           # same-side pushes for SB_BLOCK_TICKS so the stale-error P law
           # cannot immediately rebuild the surplus.
-          state['target_frac'] = 0.0
-          state['ramp_step'] = -state['torque'] / SB_SHED_FRAMES
-          state['ramp_frames'] = SB_SHED_FRAMES
-          state['sb_block'] = SB_BLOCK_TICKS
+          #
+          # THE SHED IS SIGN-GATED (review finding (c), 2026-08-15). It used
+          # to run unconditionally, so if the standing torque at the trip tick
+          # was already OPPOSITE-side — the controller counter-steering the
+          # release, exactly what it should be doing — the shed drained that
+          # correction to zero, contradicting the invariant asserted three
+          # lines down at the block. There is also nothing to shed in that
+          # case: the surplus this mechanism exists to dump is same-side
+          # torque. So with counter-steer (or zero) standing torque the event
+          # is still RECORDED (sb_trips increments, the episode closes — it
+          # happened, and the telemetry must show it) but nothing is drained
+          # and no block is armed.
+          if state['torque'] * (-state['sb_dir']) > 0.0:
+            state['target_frac'] = 0.0
+            state['ramp_step'] = -state['torque'] / SB_SHED_FRAMES
+            state['ramp_frames'] = SB_SHED_FRAMES
+            state['sb_block'] = SB_BLOCK_TICKS
           state['sb_trips'] += 1
           state['sb_state'] = 0
     else:

@@ -1163,3 +1163,137 @@ class TestStallBreakawayV2:
     assert state['sb_state'] == 0
     assert state['sb_block'] == 0
     assert len(state['sb_ring']) == 0
+
+  # ---- Action-half safety (review findings (b) and (c), 2026-08-15) ----
+  # The trip discrimination above decides WHETHER a release happened; these
+  # three pin what the machine is allowed to DO about it. The invariant they
+  # share is the standing SAFETY ARCHITECTURE law: the controller may stop
+  # pushing, it must never give up correcting.
+
+  def test_rebound_snap_back_no_trip(self, monkeypatch):
+    """FINDING (b) PIN — the rate conjunct must be SIGNED.
+
+    With an unsigned rate the trip doubled as a REBOUND detector: a slow
+    drift out (below the gate, so it never trips on the way out) followed by
+    a fast snap BACK toward the breakaway point reads as a fast crossing
+    while displacement is still decaying through the 2 deg mark. The wheel is
+    travelling the WRONG way — the opposite of a release — so it must not
+    trip.
+
+    Reviewer's repro, reproduced tick-for-tick:
+      39 outbound ticks at 5 quanta   -> 21.975 deg/s (sub-gate), displacement
+                                         reaches 8.3505 deg, no trip
+      then 20 return ticks at 7 quanta -> the 0.2 s window now holds pure
+                                         return motion: |rate| = 30.765 >= 30,
+                                         and displacement has decayed to
+                                         exactly 2.1975 deg, still >= 2.0
+    Both pre-fix conjuncts are satisfied on that single tick (j = 20 is the
+    only one where they overlap — j = 19 reads 28.1 deg/s, j = 21 is at
+    displacement 1.890), which is why the assertions below check it exactly.
+    """
+    lac, sm, mod, state = _sb_make(monkeypatch)
+    _sb_arm(lac)
+    for k in range(1, 40):
+      _sb_tick(lac, _SB_A0 + k * self.SLOW_STEP)
+    assert state['sb_state'] == 2
+    assert state['sb_dir'] == 1.0
+    assert state['sb_trips'] == 0                 # sub-gate on the way out
+    brk = state['sb_brk_angle']
+    out = _SB_A0 + 39 * self.SLOW_STEP
+    assert (out - brk) > mod.SB_TRIP_DISP_DEG
+
+    for j in range(1, 26):
+      _sb_tick(lac, out - j * self.FAST_STEP)
+      assert state['sb_trips'] == 0
+
+    # The pre-fix trip tick, spelled out: displacement still past the
+    # threshold, unsigned window rate past the gate — and the motion pointing
+    # back toward the breakaway point, which is what now rejects it.
+    at20 = out - 20 * self.FAST_STEP
+    win20 = at20 - out                            # 20 ticks earlier
+    assert (at20 - brk) >= mod.SB_TRIP_DISP_DEG
+    assert abs(win20) / (mod.SB_MOVE_TICKS * 0.01) >= mod.SB_TRIP_RATE_DPS
+    assert win20 * state['sb_dir'] < 0.0          # travelling the wrong way
+    assert state['sb_state'] == 2                 # episode was live throughout
+
+  def test_trip_with_standing_counter_steer_sheds_nothing(self, monkeypatch):
+    """FINDING (c) PIN — the shed must not drain a counter-steer.
+
+    If the standing torque at the trip tick is already OPPOSITE-side, the
+    controller is counter-steering the release: exactly what it should be
+    doing, and there is no same-side surplus to dump. Draining it would
+    contradict the invariant the block itself asserts. The event is still
+    recorded — it happened, and telemetry must show it — but nothing is
+    drained and no block is armed.
+    """
+    lac, sm, mod, state = _sb_make(monkeypatch)
+    _sb_arm(lac)
+    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
+    assert state['sb_dir'] == 1.0
+    for k in range(2, self.TRIP_K):
+      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
+    assert state['sb_trips'] == 0
+
+    # Standing torque is counter-steer (positive against sb_dir = +1), with a
+    # distinctive in-flight ramp so any tampering is visible.
+    state['torque'] = 0.3
+    state['target_frac'] = 0.5
+    state['ramp_step'] = 0.02
+    state['ramp_frames'] = 3
+    assert state['torque'] * (-state['sb_dir']) < 0.0
+
+    _sb_tick(lac, _SB_A0 + self.TRIP_K * self.FAST_STEP)
+
+    # The event is recorded...
+    assert state['sb_trips'] == 1
+    assert state['sb_state'] == 0
+    # ...but nothing was shed and no block armed.
+    assert state['target_frac'] == pytest.approx(0.5)
+    assert state['ramp_step'] == pytest.approx(0.02)
+    assert state['ramp_frames'] == 2               # only the normal ramp tick
+    assert state['torque'] == pytest.approx(0.32)  # still counter-steering
+    assert state['sb_block'] == 0
+
+  def test_enforcement_never_drains_counter_steer(self, monkeypatch):
+    """FINDING (c) PIN, second half — the shed-rate enforcement must yield.
+
+    The enforcement's `_draining` test has a DIRECTION conjunct and a
+    MAGNITUDE conjunct. A counter-steer ramp passes the first but fails the
+    second, because a correction spread over the normal ~40-frame cadence
+    ramp steps far slower than |torque|/SB_SHED_FRAMES. Pre-fix it was
+    therefore misclassified as "not draining" and overwritten — and the
+    overwrite set target_frac = 0, destroying the correction's DESTINATION,
+    not just its rate.
+
+    Reviewer's numbers: standing torque -0.27 with a fresh +0.20 counter-steer
+    gives ramp_step +0.01175 against a 0.027 drain bar.
+    """
+    lac, sm, mod, state = _sb_make(monkeypatch)
+    _sb_arm(lac)
+    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
+    state['torque'] = -0.3
+    for k in range(2, self.TRIP_K + 1):
+      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
+    assert state['sb_trips'] == 1
+    assert state['sb_block'] > 0
+    torque = state['torque']
+    assert torque < 0.0                            # same-side shed in progress
+
+    # A counter-steer decision lands mid-shed.
+    counter = 0.20
+    step = (counter - torque) / 40.0
+    state['target_frac'] = counter
+    state['ramp_step'] = step
+    state['ramp_frames'] = 40
+    # It is gentler than the shed bar — the exact misclassification.
+    assert abs(step) < abs(torque) / mod.SB_SHED_FRAMES
+
+    for i in range(3):
+      _sb_tick(lac, _SB_A0 + (self.TRIP_K + 1 + i) * self.FAST_STEP)
+      # The torque gate is still open (torque has not yet crossed zero), so
+      # the ONLY thing standing the enforcement down is the counter-steer
+      # test — which makes this a clean pin.
+      assert state['torque'] * (-state['sb_dir']) > 0.0
+      assert state['sb_block'] > 0
+      assert state['target_frac'] == pytest.approx(counter)
+      assert state['ramp_step'] == pytest.approx(step)
