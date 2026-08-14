@@ -171,12 +171,14 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
   the stepper status.
 - `disable_forwarding = true`; cruise-engaged state is taken from the DCC/NCC
   status messages.
-- **LKA two-stage disengagement** (2026-08-14): DCC engaging latches
-  `controls_allowed`; DCC dropping does NOT clear it (lateral continues while
-  the driver owns gas/brake). A human cancel press on F-CAN while DCC is
-  already off fully disengages. `brake_pressed` is deliberately not reported —
-  brake means "drop to LKA", not "kill steering". See
-  `.superpowers/sdd/2026-08-14-bmw-lka-mode/lka-mode-brief.md`.
+- **LKA mode** (2026-08-14): DCC engaging latches `controls_allowed`; DCC
+  dropping does NOT clear it (lateral continues while the driver owns
+  gas/brake), and `brake_pressed` is deliberately not reported — brake means
+  "drop to LKA", not "kill steering". Openpilot owns ALL disengagement
+  semantics (two-stage cancel etc.); panda follows it down via the stock
+  firmware heartbeat (`controls_allowed && !heartbeat_engaged` for 3 s clears
+  `controls_allowed`; lost heartbeat → SILENT) and enforces the torque limits.
+  See `.superpowers/sdd/2026-08-14-bmw-lka-mode/lka-mode-brief.md`.
 
 ## Hooks
 

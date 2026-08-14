@@ -23,9 +23,11 @@ the firmware workspace's opendbc tree, runs this suite there, builds the F4
 panda firmware, then restores the tree — no opendbc fork is maintained.
 
 LKA mode (2026-08-14): DCC engage latches controls_allowed; DCC drop no longer
-clears it; a human F-CAN cancel press while DCC is off fully disengages; brake
-never disengages at the panda level. Legacy brake/cruise-disengage tests below
-were updated to the new semantics; the TestLka* section covers the new paths.
+clears it; brake never disengages at the panda level. Openpilot owns ALL
+disengagement semantics — panda follows it down via the firmware heartbeat
+(controls_allowed && !heartbeat_engaged for 3 s clears controls_allowed) and
+enforces the torque limits. Legacy brake/cruise-disengage tests below were
+updated to the new semantics; the test_lka_* section covers the new paths.
 """
 
 import unittest
@@ -151,7 +153,6 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
       self._transmission_msg(8),                      # 0x1D2 - 5Hz (Drive position)
       self._dynamic_cruise_msg(engaged=False),        # 0x193 - 5Hz (Default: disabled, enable per-test as needed)
       self._stepper_status_msg(0, soft_off=False),    # 0x22F - 100Hz
-      self._cruise_stalk_msg(bus=BMW_F_CAN),          # 0x194 - 5Hz idle (in RX_CHECKS for LKA stage-2 cancel)
     ]
 
     # Send all messages to satisfy RX_CHECKS
@@ -635,11 +636,12 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
 
 
   # ============================================================
-  # LKA mode — two-stage disengagement (2026-08-14)
+  # LKA mode (2026-08-14)
   # DCC engage latches controls_allowed; DCC drop does NOT clear it (lateral
-  # continues while the driver owns gas/brake). Full disengage: a human cancel
-  # press RISING edge on F-CAN while DCC is off. Brake never disengages at the
-  # panda level. See catpilot plugins bmw_e9x_e8x lka-mode brief.
+  # continues while the driver owns gas/brake). Openpilot owns all
+  # disengagement (two-stage cancel etc.); panda follows via the firmware
+  # heartbeat (not exercisable from the rx hook, covered by panda main.c) and
+  # enforces torque limits. See catpilot plugins bmw_e9x_e8x lka-mode brief.
   # ============================================================
 
   def _enter_lka(self):
@@ -655,52 +657,21 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
     self.assertTrue(self.safety.get_controls_allowed(),
                     "controls must survive DCC drop (LKA mode)")
 
-  def test_lka_stage2_fcan_cancel_disengages(self):
-    """A cancel press on F-CAN while DCC is off fully disengages."""
+  def test_lka_cancel_never_disengages_panda(self):
+    """Stalk cancel on either bus never clears controls_allowed — openpilot
+    owns the two-stage cancel; panda follows via the heartbeat."""
     self._enter_lka()
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=BMW_F_CAN))
-    self.assertFalse(self.safety.get_controls_allowed())
+    for bus in (BMW_F_CAN, BMW_PT_CAN):
+      self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=bus))
+      self.assertTrue(self.safety.get_controls_allowed())
+      self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=False, bus=bus))
 
-  def test_lka_stage1_cancel_while_engaged_keeps_controls(self):
-    """Cancel pressed while DCC is engaged is stage 1: DCC drops, controls stay."""
-    self._send_all_bmw_rx_checks()
-    self.safety.safety_rx_hook(self._dynamic_cruise_msg(engaged=True))
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=BMW_F_CAN))
-    self.assertTrue(self.safety.get_controls_allowed())
-    # release; DCC reports disengaged (its response to the stage-1 press)
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=False, bus=BMW_F_CAN))
+  def test_lka_reengage_latch(self):
+    """A fresh DCC engagement latches controls again after any disengage."""
+    self._enter_lka()
+    self.safety.set_controls_allowed(0)  # e.g. heartbeat-mismatch disengage
     self.safety.safety_rx_hook(self._dynamic_cruise_msg(engaged=False))
-    self.assertTrue(self.safety.get_controls_allowed())
-    # a NEW press while in LKA is stage 2
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=BMW_F_CAN))
     self.assertFalse(self.safety.get_controls_allowed())
-
-  def test_lka_cancel_needs_rising_edge(self):
-    """Cancel held from stage 1 across the DCC drop must not cascade to OFF."""
-    self._send_all_bmw_rx_checks()
-    self.safety.safety_rx_hook(self._dynamic_cruise_msg(engaged=True))
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=BMW_F_CAN))
-    self.safety.safety_rx_hook(self._dynamic_cruise_msg(engaged=False))
-    # still held — level, not a new rising edge
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=BMW_F_CAN))
-    self.assertTrue(self.safety.get_controls_allowed())
-    # release then re-press: rising edge in LKA disengages
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=False, bus=BMW_F_CAN))
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=BMW_F_CAN))
-    self.assertFalse(self.safety.get_controls_allowed())
-
-  def test_lka_pt_can_cancel_ignored(self):
-    """PT-CAN 0x194 carries the gateway echo of our own TX — must not disengage."""
-    self._enter_lka()
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=BMW_PT_CAN))
-    self.assertTrue(self.safety.get_controls_allowed())
-
-  def test_lka_reengage_after_stage2(self):
-    """After full disengage, a fresh DCC engagement latches controls again."""
-    self._enter_lka()
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=True, bus=BMW_F_CAN))
-    self.assertFalse(self.safety.get_controls_allowed())
-    self.safety.safety_rx_hook(self._cruise_stalk_msg(cancel=False, bus=BMW_F_CAN))
     self.safety.safety_rx_hook(self._dynamic_cruise_msg(engaged=True))
     self.assertTrue(self.safety.get_controls_allowed())
 

@@ -46,19 +46,21 @@
 #define CAN_ACTUATOR_TQ_FAC 0.125
 
 static float bmw_speed = 0.0f;
-static bool bmw_cancel_prev = false;
 
 
 static void bmw_rx_hook(const CANPacket_t *msg) {
   int addr = msg->addr;
   int bus = msg->bus;
 
-  // LKA mode (two-stage disengagement): DCC engaging latches controls_allowed;
-  // DCC dropping does NOT clear it — lateral stays live while the driver owns
-  // gas/brake. Panda-side disengage paths: stage-2 cancel below, torque limits,
-  // and openpilot commanding steer mode 0. cruise_engaged_prev is the library
-  // global (kept for test introspection); pcm_cruise_check is deliberately not
-  // used because it clears controls_allowed on cruise disengage.
+  // LKA mode: DCC engaging latches controls_allowed; DCC dropping does NOT
+  // clear it — lateral stays live while the driver owns gas/brake. Openpilot
+  // owns ALL disengagement semantics (two-stage cancel etc.); panda follows it
+  // down via the existing heartbeat path (main.c: controls_allowed &&
+  // !heartbeat_engaged for 3 s clears controls_allowed; lost heartbeat goes
+  // SILENT). Panda's own enforcement here is the torque limits in the tx hook.
+  // cruise_engaged_prev is the library global (kept for test introspection);
+  // pcm_cruise_check is deliberately not used because it clears
+  // controls_allowed on cruise disengage.
   if (addr == BMW_DynamicCruiseControlStatus) { // VO544
     bool cruise_engaged = (((msg->data[5] >> 3) & 0x1U) == 1U);
     if (cruise_engaged && !cruise_engaged_prev) {
@@ -71,22 +73,6 @@ static void bmw_rx_hook(const CANPacket_t *msg) {
       controls_allowed = true;
     }
     cruise_engaged_prev = cruise_engaged;
-  }
-
-  // Stage-2 mirror: a human cancel press while DCC is already off fully
-  // disengages, independent of openpilot. F-CAN only: human stalk presses are
-  // rx'd on bus 1, our own TX'd stalk emulation is never self-received, and
-  // the PT-CAN gateway echo of our TX (bus 0) must not count as human.
-  // 0x194 must be in bmw_rx_checks — safety_rx_hook only forwards whitelisted
-  // addresses to this hook. Note: DCC status is 5 Hz, so a double-tap cancel
-  // faster than 200 ms reads as one stage-1 press. NCC (PT-CAN stalk) cars
-  // rely on the openpilot-side stage 2.
-  if ((addr == BMW_CruiseControlStalk) && (bus == (int)BMW_F_CAN)) {
-    bool cancel_pressed = (msg->data[2] & 0x10U) != 0U;
-    if (cancel_pressed && !bmw_cancel_prev && !cruise_engaged_prev) {
-      controls_allowed = false;
-    }
-    bmw_cancel_prev = cancel_pressed;
   }
 
   // BMW TransmissionDataDisplay not needed for safety
@@ -212,15 +198,6 @@ static safety_config bmw_init(uint16_t param) {
              {BMW_CruiseControlStatus, BMW_PT_CAN, 8, .frequency = 5U,
               .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
              { 0 }}},
-    // Cruise stalk: needed for the LKA stage-2 cancel (safety_rx_hook only
-    // forwards whitelisted addresses to the mode rx hook). SZL sends 0x194 at
-    // 5 Hz idle continuously. F-CAN on DCC cars, PT-CAN on NCC cars —
-    // alternatives so either satisfies the check.
-    {.msg = {{BMW_CruiseControlStalk, BMW_F_CAN, 4, .frequency = 5U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-             {BMW_CruiseControlStalk, BMW_PT_CAN, 4, .frequency = 5U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-             { 0 }}},
     {.msg = {{STEPPER_STEERING_STATUS,  BMW_F_CAN, 8, .ignore_counter = true, .frequency = 100U,
               .ignore_quality_flag = true, .ignore_checksum = true},
              {STEPPER_STEERING_STATUS,  BMW_AUX_CAN, 8, .ignore_counter = true, .frequency = 100U,
@@ -239,7 +216,6 @@ static safety_config bmw_init(uint16_t param) {
   };
 
   bmw_speed = 0.0f;
-  bmw_cancel_prev = false;
   cruise_engaged_prev = false;
 
   safety_config ret = BUILD_SAFETY_CFG(bmw_rx_checks, BMW_TX_MSGS);
