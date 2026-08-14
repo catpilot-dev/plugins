@@ -1297,3 +1297,33 @@ class TestStallBreakawayV2:
       assert state['sb_block'] > 0
       assert state['target_frac'] == pytest.approx(counter)
       assert state['ramp_step'] == pytest.approx(step)
+
+
+# ============================================================
+# LKA low-speed reference (2026-08-16). Below 30 km/h (lateral now runs to
+# standstill in LKA mode) the torque parameters keep 8.5 m/s as their
+# reference — but the MEASUREMENT must not: kappa_meas = yawRate / v_true,
+# else the loop settles at kappa_des * (8.5 / v_true) and cuts inside
+# low-speed turns (~2x over-curvature at 15 km/h).
+# ============================================================
+
+class TestLowSpeedLkaReference:
+  def test_kappa_meas_uses_true_speed_below_30kph(self, monkeypatch):
+    """kappa_meas divides yawRate by TRUE speed, not the 8.5 m/s gain floor."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(fake_sm, 5.0, 0.02)   # 18 km/h intersection turn
+    _call_update(lac, 0.02, v_ego=5.0)
+    assert state['measured'] == pytest.approx(0.02, rel=1e-6)
+
+  def test_torque_gains_keep_30kph_floor(self, monkeypatch):
+    """Identical kappa state at 5 and 8.5 m/s commands identical torque:
+    gains/caps reference max(v, 8.5) even though the measurement does not."""
+    torques = []
+    for v in (5.0, 8.5):
+      lac, fake_sm, mod, state = _make_controller(monkeypatch)
+      _set_measured(fake_sm, v, 0.005)
+      # kappa_des small enough that the P target stays below the per-decision
+      # step cap — otherwise both runs saturate at step_max and can't differ
+      _call_update(lac, 0.006, v_ego=v)
+      torques.append(state['torque'])
+    assert torques[0] == pytest.approx(torques[1], rel=1e-9)

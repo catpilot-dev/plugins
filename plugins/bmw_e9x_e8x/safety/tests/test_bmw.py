@@ -30,6 +30,12 @@ enforces the torque limits. Legacy brake/cruise-disengage tests below were
 updated to the new semantics; the test_lka_* section covers the new paths.
 """
 
+import pytest
+# Runs only inside the firmware workspace (injected there by
+# safety/build_firmware.sh); the plugins-repo dev machine has no opendbc.
+pytest.importorskip("opendbc.safety.tests.libsafety.libsafety_py",
+                    reason="requires the firmware workspace — run via safety/build_firmware.sh")
+
 import unittest
 import numpy as np
 from opendbc.car.structs import CarParams

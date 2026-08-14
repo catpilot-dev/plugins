@@ -663,11 +663,20 @@ def on_lat_controller_init(result, lac, CP):
       # noise-induced lag is now `lane_keeping`'s to own, per its position loop.
       state['desired'] = float(desired_curvature)
 
-      # 8.5 m/s = ~30 kph, BMW DCC minimum engagement speed. Below this the
-      # controller is never active, so the floor only protects κ_meas from
-      # div-by-near-zero during disengaged crawl.
-      v = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 8.5)
-      state['measured'] = float(lp.angularVelocityDevice.z) / v
+      # LKA mode (2026-08-14) runs lateral below DCC's 30 km/h floor down to
+      # standstill, so low speed is now LIVE territory — the two speed roles
+      # must split (user ruling 2026-08-16):
+      #   v_true — the MEASUREMENT divisor. κ_meas = yawRate / v_true must use
+      #     actual speed or the loop settles at κ_des·(8.5/v_true): ~2× inside
+      #     the corner at 15 km/h. Floored at 1.0 m/s only against
+      #     div-by-near-zero (controlsd drops latActive below 0.3 m/s anyway).
+      #   v — the TORQUE-PARAMETER reference. All gains/caps (P target, t_cap,
+      #     hold_cap, hold_factor gate, lookahead, step_max interp) keep
+      #     8.5 m/s ≈ 30 kph as their floor: below 30 the torque calibration
+      #     references 30 km/h rather than extrapolating v² toward zero.
+      v_true = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 1.0)
+      v = max(v_true, 8.5)
+      state['measured'] = float(lp.angularVelocityDevice.z) / v_true
 
       # Lateral-accel-dependent hold factor (2026-07-27; see HOLD_AY_BP /
       # hold_factor() at module scope). In a curve, "on-target" is achieved
