@@ -159,11 +159,17 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
 - **RX checks** on brake, gas, speed and either cruise-status message, plus
   the stepper status.
 - `disable_forwarding = true`; cruise-engaged state is taken from the DCC/NCC
-  status messages via `pcm_cruise_check`.
+  status messages.
+- **LKA two-stage disengagement** (2026-08-14): DCC engaging latches
+  `controls_allowed`; DCC dropping does NOT clear it (lateral continues while
+  the driver owns gas/brake). A human cancel press on F-CAN while DCC is
+  already off fully disengages. `brake_pressed` is deliberately not reported —
+  brake means "drop to LKA", not "kill steering". See
+  `.superpowers/sdd/2026-08-14-bmw-lka-mode/lka-mode-brief.md`.
 
 ## Hooks
 
-From `plugin.json` — **six** hooks:
+From `plugin.json` — **seven** hooks:
 
 | Hook | Function (module) | Purpose |
 |---|---|---|
@@ -173,6 +179,7 @@ From `plugin.json` — **six** hooks:
 | `ui.vehicle_settings` | `on_vehicle_settings` (`register`) | append the Temperature-Overlay toggle + Resume-Button note to the Driving panel's vehicle section (only when `CP.brand == 'bmw'`) |
 | `ui.render_overlay` | `on_render_overlay` (`ui_overlay`) | draw coolant/oil temperature on the driving HUD |
 | `device.health_check` | `on_health_check` (`register`) | report whether the BMW interface registered into opendbc |
+| `selfdrived.events_filter` | `on_events_filter` (`lka_mode`) | LKA two-stage disengagement: strip brake/first-cancel disengage events so lateral survives DCC dropping; a cancel press that starts in LKA fully disengages |
 
 The `ui.vehicle_settings` hook is **dispatched by** the `ui_mod` plugin from
 inside its Driving panel: when a car is detected, ui_mod draws a vehicle

@@ -25,21 +25,45 @@
 #define CAN_ACTUATOR_TQ_FAC 0.125
 
 static float bmw_speed = 0.0f;
+static bool bmw_cruise_engaged = false;
+static bool bmw_cancel_prev = false;
 
 
 static void bmw_rx_hook(const CANPacket_t *msg) {
   int addr = msg->addr;
   int bus = msg->bus;
 
-  if (addr == BMW_DynamicCruiseControlStatus) { // VO544 
+  // LKA mode (two-stage disengagement): DCC engaging latches controls_allowed;
+  // DCC dropping does NOT clear it — lateral stays live while the driver owns
+  // gas/brake. Panda-side disengage paths: stage-2 cancel below, torque limits,
+  // and openpilot commanding steer mode 0.
+  if (addr == BMW_DynamicCruiseControlStatus) { // VO544
     bool cruise_engaged = (((msg->data[5] >> 3) & 0x1U) == 1U);
-    pcm_cruise_check(cruise_engaged);
-  } else if (addr == BMW_CruiseControlStatus) { // VO540 
+    if (cruise_engaged && !bmw_cruise_engaged) {
+      controls_allowed = true;
+    }
+    bmw_cruise_engaged = cruise_engaged;
+  } else if (addr == BMW_CruiseControlStatus) { // VO540
     bool cruise_engaged = (((msg->data[1] >> 5) & 0x1U) == 1U);
-    pcm_cruise_check(cruise_engaged);
+    if (cruise_engaged && !bmw_cruise_engaged) {
+      controls_allowed = true;
+    }
+    bmw_cruise_engaged = cruise_engaged;
   }
 
-  // BMW cruise stalk cancel handling moved to openpilot CarState
+  // Stage-2 mirror: a human cancel press while DCC is already off fully
+  // disengages, independent of openpilot. F-CAN only: human stalk presses are
+  // rx'd on bus 1, our own TX'd stalk emulation is never self-received, and
+  // the PT-CAN gateway echo of our TX (bus 0) must not count as human.
+  // Note: DCC status is 5 Hz, so a double-tap faster than 200 ms reads as one
+  // stage-1 press. NCC (PT-CAN stalk) cars rely on the openpilot-side stage-2.
+  if ((addr == BMW_CruiseControlStalk) && (bus == BMW_F_CAN)) {
+    bool cancel_pressed = (msg->data[2] & 0x10U) != 0U;
+    if (cancel_pressed && !bmw_cancel_prev && !bmw_cruise_engaged) {
+      controls_allowed = false;
+    }
+    bmw_cancel_prev = cancel_pressed;
+  }
 
   // BMW TransmissionDataDisplay not needed for safety
   // BMW's own cruise control system handles gear position requirements
@@ -73,10 +97,12 @@ static void bmw_rx_hook(const CANPacket_t *msg) {
 
   // BMW E90 uses torque-controlled steering only - no angle monitoring needed
 
-  // BMW brake detection (disengagement handled by Panda for safety)
-  if (addr == BMW_EngineAndBrake) {
-    brake_pressed = (msg->data[7] & 0x20U) != 0U;
-  }
+  // LKA mode: brake_pressed is deliberately NOT reported. The common safety
+  // code hard-disengages on brake rising edge (no alt-experience flag exists
+  // for brake), which would kill lateral on every brake tap — brake means
+  // "drop to LKA" (openpilot-side), factory-LKA semantics. Trade-off accepted
+  // 2026-08-14; driver override is covered by the torque limits + stepper
+  // override detection. (BMW_EngineAndBrake data[7] & 0x20 if ever needed.)
 
   if (addr == BMW_AccPedal) {
     gas_pressed = (msg->data[6] & 0x30U) != 0U;
@@ -161,6 +187,8 @@ static safety_config bmw_init(uint16_t param) {
   };
 
   bmw_speed = 0.0f;
+  bmw_cruise_engaged = false;
+  bmw_cancel_prev = false;
 
   safety_config ret = BUILD_SAFETY_CFG(bmw_rx_checks, BMW_TX_MSGS);
   ret.disable_forwarding = true;   

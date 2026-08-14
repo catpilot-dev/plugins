@@ -94,9 +94,37 @@ def _oil_color(temp):
   return COLOR_COLD
 
 
+def lka_active(ui_state):
+  """LKA mode: openpilot engaged (lateral steering) while DCC is off — the
+  driver owns gas/brake. See lka_mode.py for the mode machine."""
+  try:
+    return bool(ui_state.engaged and not ui_state.sm['carState'].cruiseState.enabled)
+  except Exception:
+    return False
+
+
+def _draw_lka_badge(content_rect):
+  """Green 'LKA' pill above the temperature block, right-aligned."""
+  text = "LKA"
+  size = measure(_font, text, FONT_SIZE)
+  pad = 12
+  x_right = int(content_rect.x + content_rect.width) - RIGHT_MARGIN
+  # sits above the two temperature lines plus their padding and a gap
+  temps_h = LINE_HEIGHT * 2 + pad * 2
+  y_top = int(content_rect.y + content_rect.height) - BOTTOM_MARGIN - temps_h - LINE_HEIGHT - pad * 2
+  bg_rect = rl.Rectangle(x_right - size.x - pad, y_top - pad, size.x + pad * 2, size.y + pad * 2)
+  rl.draw_rectangle_rounded(bg_rect, 0.3, 10, rl.Color(34, 197, 94, 90))
+  rl.draw_text_ex(_font, text, rl.Vector2(x_right - size.x, y_top), FONT_SIZE, 0, rl.Color(255, 255, 255, 230))
+
+
 def on_render_overlay(default, content_rect):
   """Hook callback for ui.render_overlay. Called each frame inside scissor mode."""
   _ensure_init()
+  if _font is None:
+    return None
+
+  if lka_active(_ui_state):
+    _draw_lka_badge(content_rect)
 
   if not _is_enabled():
     return None

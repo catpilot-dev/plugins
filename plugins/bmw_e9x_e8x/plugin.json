@@ -62,6 +62,11 @@
       "module": "register",
       "function": "on_health_check",
       "priority": 50
+    },
+    "selfdrived.events_filter": {
+      "module": "lka_mode",
+      "function": "on_events_filter",
+      "priority": 50
     }
   }
 }
