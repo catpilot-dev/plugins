@@ -468,6 +468,63 @@ This document is the canonical reference for the lateral controller registered b
 > sluggish re-centering or a wobblier rest band on-car, that overrides the
 > replay numbers.
 
+> **2026-08-14 — persistent-lean escape on the rest band (route 3f8 on-car
+> verdict).** The hysteresis above went to the car and delivered its calm:
+> activations **16.1 → 11.2/min**, `cancel_tol` occupancy **8.0% → 2.8%**,
+> `at_rest` **61%** of straight time. But the user felt **"a bit left-hug and
+> slow correction"**, and the data agreed: the slow (5 s EMA) error exceeded
+> **0.002 rad on 8.2%** of straight time (**3.5%** speed-matched, vs **0.3%**
+> on the baseline), **leftward-biased** and concentrated on **crowned
+> stretches**. Diagnosis: a *constant* road-crown pull that lands inside the
+> new entry gap `(0.001, 0.0015)` is never corrected on its own merits — it
+> is corrected only when noise happens to walk it past `HOLD_BAND_ENTER`, so
+> the lean latency is **unbounded**.
+>
+> **The fix (variant F): a second leave-rest condition on the SLOW error.**
+> Entry stays at `HOLD_BAND_ENTER` (0.0015) and the settle branch is
+> untouched; rest is additionally escaped when
+> `|EMA(τ = HOLD_EMA_TAU) of delta_err| > HOLD_EMA_ESCAPE`.
+>
+> - `HOLD_EMA_TAU = 2.0` s — updated **every livePose tick** (α = 0.05/2.0 =
+>   0.025), not at the decision cadence, so the lean estimate is independent
+>   of how often the controller decides.
+> - `HOLD_EMA_ESCAPE = 0.0012` rad, **strict `>`** — an EMA converging to a
+>   constant 0.0012 bias approaches from below and never exceeds it, so that
+>   value stays in the "hold" class by construction.
+>
+> **Why a 2 s average is safe**: symmetric flicker barely moves it (that is
+> the whole point — the calm survives), while a one-sided lean accumulates.
+> Replayed entry cost, entries/min: **A 13.4 · B 17.5 · F 14.8 · legacy
+> 21.1** — the shipped variant F costs **+1.4/min** over doing nothing and
+> still runs ~**30% under legacy**.
+>
+> **Latency profile** (constant bias → time to escape): 0.002 → **~1.8 s**;
+> 0.0014 → **~4 s**; ≤ 0.0012 → **never, by design** — that zone *is* the
+> measured noise floor (σ = 0.00081 rad), and chasing it would re-open the
+> flicker the hysteresis just closed.
+>
+> **EMA re-prime on settle**: `state['derr_ema']` is reset to the current
+> `delta_err` on every `False → True` (settle) transition — only there, never
+> on each resting tick (otherwise it could never accumulate while resting).
+> Without it, a converged lean reading would survive the correction it caused
+> and instantly re-exit the rest state the settle just entered. Pinned by
+> `test_ema_reprimed_on_settle`.
+>
+> **Kill-switch unchanged**: the escape term is gated on the same
+> `_hold_hyst_on`, so `HoldHysteresis='0'` still yields **exact legacy
+> behaviour** — it now disables the hysteresis *and* the escape
+> (`test_killswitch_disables_escape`). No new param, no plugin.json change —
+> this rides the existing feature and its kill-switch.
+>
+> **Telemetry** gains `derr_ema` (§ 9): the live slow-error EMA driving the
+> escape, so a drive's lean profile is readable straight from the bus.
+>
+> **Open-loop caveat**: replay prices only the **cost** side (entries/min).
+> The benefit — a bounded, shrinking lean — is *structural* (a constant bias
+> can no longer sit uncorrected for an unbounded time), but how it *feels*,
+> and whether the left-hug actually goes away, needs the next drive.
+> Straight-line calm remains the veto.
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -742,7 +799,7 @@ State held in `state['action']`, published in `bmw_lat_control` telemetry. Usefu
 
 Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`. Added: `hold_curve`. Telemetry gains `hold_f`.
 Removed 2026-07-28 (SAFETY ARCHITECTURE, top of doc): `cancel_accel`, `cancel_jerk` — the lateral controller no longer abandons a turn; `a_y` is bounded by speedlimitd.
-`hold_zero`/`hold_curve` vs. `ramp` are now decided by `state['at_rest']` (2026-08-13, entry/settle hysteresis — see the dated note above): leaving rest needs `|delta_err| > HOLD_BAND_ENTER` (0.0015 rad, or `HOLD_BAND` with the `HoldHysteresis` kill-switch off), returning needs `|delta_err| ≤ HOLD_BAND` (0.001, unchanged).
+`hold_zero`/`hold_curve` vs. `ramp` are now decided by `state['at_rest']` (2026-08-13, entry/settle hysteresis — see the dated note above): leaving rest needs `|delta_err| > HOLD_BAND_ENTER` (0.0015 rad, or `HOLD_BAND` with the `HoldHysteresis` kill-switch off), returning needs `|delta_err| ≤ HOLD_BAND` (0.001, unchanged). Since 2026-08-14 rest is also left when the slow error persists — `|EMA(2 s) of delta_err| > HOLD_EMA_ESCAPE` (0.0012 rad, strict `>`, same kill-switch) — see the persistent-lean-escape note above.
 
 ---
 
@@ -772,6 +829,7 @@ Published each livePose tick:
 | `relax_ticks` | consecutive ticks of overshoot-side error while deep in a curve (dwell counter) |
 | `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
 | `hb_enter` | (2026-08-13) live leave-rest threshold in effect this tick (rad) — `0.0015` with `HoldHysteresis` on, `0.001` kill-switched; also each drive's self-label (absent = pre-hysteresis build) |
+| `derr_ema` | (2026-08-14) slow (2 s, `HOLD_EMA_TAU`) EMA of `delta_err` (rad) — the lean signal behind the persistent-lean escape; `\|derr_ema\| > 0.0012` leaves rest |
 | `push_moved` | (2026-08-12) signed degrees moved from `push_ref` since the current push began (0 when not ramping) |
 | `budget_spent` | (2026-08-12) `True` once `push_moved` has reached `BUDGET_DEG` in the commanded direction (always `False` with `AngleBudget` off) |
 | `budget_on` | (2026-08-13) live toggle state — init-time param read, overridden mid-drive by the `angle_budget` bus topic; labels each tick's A/B leg |

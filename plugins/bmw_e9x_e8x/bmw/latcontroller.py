@@ -125,6 +125,10 @@ def on_lat_controller_init(result, lac, CP):
   and lateral-drift correction live upstream in the lane_keeping position
   loop. Since 2026-08-13 entry and settle are split (hysteresis):
     leave rest:   |δ_err| > HOLD_BAND_ENTER  (0.0015)
+             or:  |EMA(2 s) δ_err| > HOLD_EMA_ESCAPE (0.0012) — the
+                  persistent-lean escape added 2026-08-14, which bounds
+                  how long a constant (road-crown) pull can sit inside
+                  the entry gap uncorrected.
     return:       |δ_err| ≤ HOLD_BAND        (0.001)
 
   Plant-inversion target torque, angle domain (linear tire regime). P acts
@@ -390,6 +394,22 @@ def on_lat_controller_init(result, lac, CP):
   # ('0' disables -> both thresholds = HOLD_BAND -> exact legacy behaviour).
   HOLD_BAND_ENTER = 0.0015
 
+  # Persistent-lean escape (2026-08-14, route 3f8 on-car verdict). The entry
+  # gap (0.001, 0.0015) rejects symmetric noise but also hid a constant
+  # road-crown pull: slow |err| > 0.002 grew to 8.2% of straight time
+  # (0.3% baseline speed-matched) and the user felt a left-hug with slow
+  # correction. A second leave-rest condition on the SLOW error bounds the
+  # lean latency: escape when |EMA(2 s) of delta_err| > HOLD_EMA_ESCAPE.
+  # Flicker cannot move a 2-s average (replayed cost: +1.4 entries/min,
+  # still ~30% under legacy); a sustained bias of 0.002 escapes in ~1.8 s,
+  # 0.0014 in ~4 s, <= 0.0012 never (that zone IS the noise floor).
+  # EMA is re-primed to the instantaneous error at every rest ENTRY so a
+  # stale lean reading cannot instantly re-exit right after a correction
+  # settles. Gated on the same HoldHysteresis kill-switch ('0' disables
+  # escape AND hysteresis -> exact legacy behaviour).
+  HOLD_EMA_TAU = 2.0        # s
+  HOLD_EMA_ESCAPE = 0.0012  # rad; strict > so a bias exactly at threshold never escapes
+
   # SAFETY ARCHITECTURE (2026-07-28): NO ISO accel/jerk cancel guard. It used
   # to live here (a κ-indexed BMW_LATERAL_JERK table + a commanded-a_y
   # accel_guard_threshold, both gated on an `overshooting` predicate, draining
@@ -429,6 +449,7 @@ def on_lat_controller_init(result, lac, CP):
     'push_moved': 0.0,       # debug: signed deg moved since then
     'budget_spent': False,   # debug: 2 deg moved in the commanded direction
     'at_rest': True,   # hysteresis state: True = holding, False = correcting
+    'derr_ema': 0.0,   # slow (HOLD_EMA_TAU) EMA of delta_err, livePose rate
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -571,6 +592,9 @@ def on_lat_controller_init(result, lac, CP):
       delta_err = delta_err_raw
       state['delta_err'] = delta_err
 
+      # Slow-error EMA for the persistent-lean escape (see HOLD_EMA_TAU).
+      state['derr_ema'] += (DT_LIVEPOSE / HOLD_EMA_TAU) * (delta_err - state['derr_ema'])
+
       # Lookahead is still needed for the hold cap below.
       lookahead_m = v * model_action_t
 
@@ -709,11 +733,16 @@ def on_lat_controller_init(result, lac, CP):
         # per-decision comparison (leave on >, return on <=).
         _enter = HOLD_BAND_ENTER if _hold_hyst_on else HOLD_BAND
         if state['at_rest']:
-          if abs(delta_err) > _enter:
+          if abs(delta_err) > _enter or \
+             (_hold_hyst_on and abs(state['derr_ema']) > HOLD_EMA_ESCAPE):
             state['at_rest'] = False
         else:
           if abs(delta_err) <= HOLD_BAND:
             state['at_rest'] = True
+            # Re-prime: lean measurement restarts after each correction —
+            # a converged (stale) EMA must not instantly re-exit the rest
+            # state the settle just entered.
+            state['derr_ema'] = delta_err
         if state['at_rest']:
           # On-target. Low commanded a_y (hold_f=0 — straights and gentle-
           # slow curves): drain to 0, stiction holds. Higher commanded a_y
@@ -886,6 +915,7 @@ def on_lat_controller_init(result, lac, CP):
           'hold_cap': float(state['hold_cap']),
           'hold_band': float(HOLD_BAND),                      # stiction hold trigger (rad)
           'hb_enter': float(HOLD_BAND_ENTER if _hold_hyst_on else HOLD_BAND),  # leave-rest threshold (rad); drive self-label: 0.0015=hysteresis, 0.001=kill-switched, absent=old build
+          'derr_ema': float(state['derr_ema']),               # slow (2 s) error EMA driving the persistent-lean escape (rad)
           'at_rest': bool(state['at_rest']),                  # hysteresis decision state (observable even when action is cancel_tol/idle, where action is not a proxy for it)
           'relax_ticks': int(state['relax_ticks']),
           'push_moved': float(state['push_moved']),

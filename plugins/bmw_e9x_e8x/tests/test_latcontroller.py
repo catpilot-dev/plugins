@@ -976,6 +976,118 @@ def test_hb_enter_telemetry_reflects_killswitch(monkeypatch):
 
 
 # ============================================================
+# Persistent-lean escape (2026-08-14, route 3f8 on-car verdict). The entry
+# gap (0.001, 0.0015) rejects symmetric noise but also hid a constant
+# road-crown pull (left-hug, slow correction). A second leave-rest condition
+# on the SLOW error bounds the lean latency: escape when the 2 s EMA of
+# delta_err exceeds HOLD_EMA_ESCAPE = 0.0012 (strict >).
+#
+# One _call_update == one livePose tick, so the EMA alpha per call is
+# DT_LIVEPOSE / HOLD_EMA_TAU = 0.05 / 2.0 = 0.025. A constant bias E reaches
+# 0.0012 after n ticks where E*(1 - 0.975^n) > 0.0012 -- E=0.0014 needs ~78
+# ticks (~3.9 s), E=0.0012 never (converges from below). The pre-existing
+# hysteresis tests above drive <= 4 ticks, far from any of this.
+# ============================================================
+
+_EMA_ESCAPE = 0.0012   # == HOLD_EMA_ESCAPE in latcontroller.py
+
+
+class TestPersistentLeanEscape:
+  def test_sustained_lean_escapes_rest(self, monkeypatch):
+    """delta_err = 0.0014 sits inside the entry gap: the plain hysteresis
+    would rest forever. The 2 s EMA climbs past 0.0012 (~78 ticks) and forces
+    the correction."""
+    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
+    for _ in range(150):
+      _drive_to(lac, sm, state, 0.0014)
+    assert state['at_rest'] is False
+    assert state['action'] == 'ramp'
+    assert abs(state['derr_ema']) > _EMA_ESCAPE
+
+  def test_lean_at_threshold_never_escapes(self, monkeypatch):
+    """delta_err = 0.0012 exactly: the EMA converges to 0.0012 from below and
+    the comparison is strict >, so the escape never fires. This is also what
+    keeps test_between_settle_and_enter_from_rest_stays_holding valid.
+
+    Convergence alone does NOT pin the strictness: after 200 ticks the EMA is
+    only ~0.0011924, where `>` and `>=` are indistinguishable (mutation
+    survived review). So the second phase forces the EMA to the threshold
+    EXACTLY and keeps it there: with derr_ema == delta_err == 0.0012 the EMA
+    update is bit-identity (x + a*(x - x) == x), so every subsequent tick
+    evaluates the comparison precisely AT 0.0012 -- `>` holds rest, `>=`
+    escapes."""
+    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
+    for _ in range(200):
+      _drive_to(lac, sm, state, _EMA_ESCAPE)
+    assert state['at_rest'] is True
+    assert state['action'] in ('hold_zero', 'hold_curve')
+    assert abs(state['derr_ema']) <= _EMA_ESCAPE
+
+    # Exact-threshold pin for the strict `>`.
+    state['derr_ema'] = _EMA_ESCAPE
+    for _ in range(5):
+      _drive_to(lac, sm, state, _EMA_ESCAPE)
+      assert state['derr_ema'] == _EMA_ESCAPE   # bit-identity, no drift
+      assert state['at_rest'] is True
+    assert state['action'] in ('hold_zero', 'hold_curve')
+
+  def test_symmetric_flicker_does_not_escape(self, monkeypatch):
+    """The calm-preservation pin: +/-0.0013 alternating every tick (both legs
+    inside the entry gap) averages to ~0 over 2 s, so the escape stays quiet
+    and the controller keeps resting."""
+    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
+    for i in range(200):
+      _drive_to(lac, sm, state, 0.0013 if i % 2 == 0 else -0.0013)
+      assert state['at_rest'] is True
+    assert abs(state['derr_ema']) < _EMA_ESCAPE
+
+  def test_ema_reprimed_on_settle(self, monkeypatch):
+    """A converged (stale) lean reading must not survive the settle: on the
+    False->True transition the EMA is re-primed to the current error, so the
+    next tick cannot instantly re-exit the rest state."""
+    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
+    _drive_to(lac, sm, state, 0.0018)
+    assert state['at_rest'] is False
+    # Same shape as test_settle_returns_to_rest: the 0.0012 tick is consumed
+    # by cancel_tol (which preempts the cadence decision), so the settle
+    # branch is only reached on the following tick.
+    _drive_to(lac, sm, state, 0.0012)
+    assert state['at_rest'] is False
+
+    state['derr_ema'] = 0.005              # stale, far past the escape point
+    _drive_to(lac, sm, state, 0.0008)      # settles (<= HOLD_BAND)
+    assert state['at_rest'] is True
+    assert state['derr_ema'] == pytest.approx(state['delta_err'])
+    assert state['derr_ema'] == pytest.approx(0.0008)
+
+    _drive_to(lac, sm, state, 0.0008)      # no instant re-exit
+    assert state['at_rest'] is True
+    assert state['action'] in ('hold_zero', 'hold_curve')
+
+  def test_killswitch_disables_escape(self, monkeypatch):
+    """Mutation pin for the `_hold_hyst_on and ...` gate: with the
+    kill-switch off, an EMA well past the escape threshold must not move
+    at_rest -- HoldHysteresis='0' is exact legacy behaviour."""
+    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=False)
+    state['derr_ema'] = 0.005
+    for _ in range(3):
+      _drive_to(lac, sm, state, 0.0009)    # below HOLD_BAND: legacy holds
+      assert state['at_rest'] is True
+    # The escape condition WOULD have been true throughout (decays slowly).
+    assert abs(state['derr_ema']) > _EMA_ESCAPE
+    assert state['action'] in ('hold_zero', 'hold_curve')
+
+  def test_telemetry_has_derr_ema(self, monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
+    payloads = []
+    state['lat_pub'] = SimpleNamespace(send=payloads.append)
+    _drive_to(lac, sm, state, 0.0008)
+    assert payloads
+    assert isinstance(payloads[-1]['derr_ema'], float)
+    assert payloads[-1]['derr_ema'] == pytest.approx(state['derr_ema'])
+
+
+# ============================================================
 # FRICTION retirement (2026-08-13): the two epsilon-gates are DELETED.
 # These tests pin the deletions — restoring either conjunct fails here.
 # ============================================================
