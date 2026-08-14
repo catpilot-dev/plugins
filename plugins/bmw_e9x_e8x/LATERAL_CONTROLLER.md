@@ -511,12 +511,13 @@ This document is the canonical reference for the lateral controller registered b
 > measured noise floor (σ = 0.00081 rad), and chasing it would re-open the
 > flicker the hysteresis just closed.
 >
-> **EMA re-prime on settle**: `state['derr_ema']` is reset to the current
+> **EMA re-prime on settle** — ~~`state['derr_ema']` is reset to the current
 > `delta_err` on every `False → True` (settle) transition — only there, never
 > on each resting tick (otherwise it could never accumulate while resting).
 > Without it, a converged lean reading would survive the correction it caused
-> and instantly re-exit the rest state the settle just entered. Pinned by
-> `test_ema_reprimed_on_settle`.
+> and instantly re-exit the rest state the settle just entered.~~
+> **REMOVED 2026-08-15** — this is exactly what starved the escape to zero
+> on-car fires; see the route 3f9 note below.
 >
 > **Kill-switch unchanged**: the escape term is gated on the same
 > `_hold_hyst_on`, so `HoldHysteresis='0'` still yields **exact legacy
@@ -532,6 +533,58 @@ This document is the canonical reference for the lateral controller registered b
 > can no longer sit uncorrected for an unbounded time), but how it *feels*,
 > and whether the left-hug actually goes away, needs the next drive.
 > Straight-line calm remains the veto.
+
+> **2026-08-15 — the escape shipped INERT; the settle re-prime is removed
+> (route 3f9 on-car verdict).** The mechanism above went to the car and did
+> **nothing**: **zero** escape fires in **15 straight-minutes**. All **190**
+> rest-exits in that window were threshold-driven (`|delta_err| >
+> HOLD_BAND_ENTER`), with `|derr_ema|` at exit sitting at a p50 of just
+> **0.0005** — nowhere near the 0.0012 escape point. The latency profile in
+> the note above (0.002 → ~1.8 s, 0.0014 → ~4 s) described a machine that
+> never ran.
+>
+> **Root cause — two effects compounding, neither of them the threshold:**
+>
+> 1. **Noise pre-empts the escape.** Instantaneous `delta_err` carries
+>    σ ≈ 0.0008, so from any resting lean the *instantaneous* signal crosses
+>    `HOLD_BAND_ENTER` within ~**1–2 decisions**. The escape needs seconds of
+>    accumulation; it always loses that race. The entry threshold is not a
+>    wall a lean sits behind — noise walks the car over it almost at once.
+> 2. **The re-prime starves what little is left.** The correction runs,
+>    settles, and the settle branch resets `derr_ema` to the settle-point
+>    error (≤ `HOLD_BAND` = 0.001, by definition of settling). A 2-s EMA
+>    re-primed that low can never climb to 0.0012 during the short rest
+>    interval before noise triggers the next threshold exit. The escape was
+>    structurally unreachable, not merely rare.
+>
+> **The fix: delete the re-prime.** The settle branch now sets `at_rest =
+> True` and leaves `derr_ema` alone. Replayed on route 3f9 without the
+> re-prime: the escape fires **1.54/min**, and entries go **13.3 →
+> 14.7/min** (+1.4/min — the same cost the variant-F replay predicted) with
+> **no churn loop**.
+>
+> **Why re-firing right after a settle is correct, not thrash.** The
+> re-prime was defending against an EMA that "instantly re-exits the rest
+> state the settle just entered". That behaviour is the escape *working*: if
+> the slow error is still high after a correction settled, the road is still
+> pulling — a crowned stretch needs **continuous** correction, not one
+> correction and a nap. And the re-fires are **self-limiting**, because the
+> correction itself drags the EMA down; once the lean is genuinely gone the
+> EMA falls under 0.0012 and rest holds. The emergent behaviour is a
+> **gradient**: crowned roads trend toward the legacy near-continuous
+> correction (which is what those stretches always needed), while clean roads
+> keep the full hysteresis calm because their EMA never gets near the escape
+> point. Pinned by `test_ema_survives_settle_and_escape_fires`, which drives
+> a correction to settle with a standing `derr_ema = 0.005` and asserts both
+> that the EMA survives the settle and that the next tick exits rest.
+>
+> **Process lesson — replay the design you actually ship.** Variant F was
+> replayed and priced *before* the re-prime was added; the re-prime was then
+> added on a plausible-sounding safety argument and shipped **unreplayed**.
+> The as-built machine was never run against a route, so a change that
+> zeroed the feature's entire benefit passed review looking like a
+> refinement. When a "small safety guard" is added after the numbers were
+> taken, the numbers no longer describe the build — re-run them.
 
 > **2026-08-14 — the 2-degree push budget is RETIRED (route 3f4 A/B
 > verdict).** The mechanism described in the 2026-08-12 entry above failed

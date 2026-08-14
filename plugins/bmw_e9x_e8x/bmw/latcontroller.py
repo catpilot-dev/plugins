@@ -371,10 +371,12 @@ def on_lat_controller_init(result, lac, CP):
   # Flicker cannot move a 2-s average (replayed cost: +1.4 entries/min,
   # still ~30% under legacy); a sustained bias of 0.002 escapes in ~1.8 s,
   # 0.0014 in ~4 s, <= 0.0012 never (that zone IS the noise floor).
-  # EMA is re-primed to the instantaneous error at every rest ENTRY so a
-  # stale lean reading cannot instantly re-exit right after a correction
-  # settles. Gated on the same HoldHysteresis kill-switch ('0' disables
-  # escape AND hysteresis -> exact legacy behaviour).
+  # The EMA is deliberately NOT re-primed on settle (route 3f9, 2026-08-15):
+  # re-priming starved the escape to zero fires, and a still-high EMA that
+  # re-exits right after a settle is the intended behaviour on a crowned road,
+  # where the correction itself drags the EMA back down. Gated on the same
+  # HoldHysteresis kill-switch ('0' disables escape AND hysteresis -> exact
+  # legacy behaviour).
   HOLD_EMA_TAU = 2.0        # s
   HOLD_EMA_ESCAPE = 0.0012  # rad; strict > so a bias exactly at threshold never escapes
 
@@ -648,10 +650,16 @@ def on_lat_controller_init(result, lac, CP):
         else:
           if abs(delta_err) <= HOLD_BAND:
             state['at_rest'] = True
-            # Re-prime: lean measurement restarts after each correction —
-            # a converged (stale) EMA must not instantly re-exit the rest
-            # state the settle just entered.
-            state['derr_ema'] = delta_err
+            # NO re-prime on settle (route 3f9, 2026-08-15): re-priming to the
+            # settle-point error starved the escape — instantaneous noise wins
+            # the race to HOLD_BAND_ENTER within ~1-2 decisions of any lean,
+            # and a freshly re-primed 2-s EMA can never reach HOLD_EMA_ESCAPE
+            # during rest (measured: 0 escape fires in 15 straight-min, all
+            # 190 rest-exits threshold-driven). A still-high EMA re-exiting
+            # right after settle is the escape working: a crowned road needs
+            # continuous correction, and the correction itself drags the EMA
+            # down, so re-fires are self-limiting (replayed on 3f9:
+            # 1.54 fires/min, +1.4 entries/min, no churn loop).
         if state['at_rest']:
           # On-target. Low commanded a_y (hold_f=0 — straights and gentle-
           # slow curves): drain to 0, stiction holds. Higher commanded a_y

@@ -582,10 +582,11 @@ class TestPersistentLeanEscape:
       assert state['at_rest'] is True
     assert abs(state['derr_ema']) < _EMA_ESCAPE
 
-  def test_ema_reprimed_on_settle(self, monkeypatch):
-    """A converged (stale) lean reading must not survive the settle: on the
-    False->True transition the EMA is re-primed to the current error, so the
-    next tick cannot instantly re-exit the rest state."""
+  def test_ema_survives_settle_and_escape_fires(self, monkeypatch):
+    """Mutation pin for the settle re-prime's REMOVAL (route 3f9, 2026-08-15).
+    The re-prime reset derr_ema to the settle-point error, which starved the
+    escape to zero on-car fires. A still-high lean average must survive the
+    settle and immediately re-exit rest -- that is the escape working."""
     lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
     _drive_to(lac, sm, state, 0.0018)
     assert state['at_rest'] is False
@@ -595,15 +596,16 @@ class TestPersistentLeanEscape:
     _drive_to(lac, sm, state, 0.0012)
     assert state['at_rest'] is False
 
-    state['derr_ema'] = 0.005              # stale, far past the escape point
+    state['derr_ema'] = 0.005              # standing lean, far past the escape point
     _drive_to(lac, sm, state, 0.0008)      # settles (<= HOLD_BAND)
     assert state['at_rest'] is True
-    assert state['derr_ema'] == pytest.approx(state['delta_err'])
-    assert state['derr_ema'] == pytest.approx(0.0008)
+    # NOT re-primed to the small current error: only normal EMA decay applies.
+    assert state['derr_ema'] != pytest.approx(state['delta_err'])
+    assert abs(state['derr_ema']) > 0.003
 
-    _drive_to(lac, sm, state, 0.0008)      # no instant re-exit
-    assert state['at_rest'] is True
-    assert state['action'] in ('hold_zero', 'hold_curve')
+    _drive_to(lac, sm, state, 0.0008)      # escape fires right back out of rest
+    assert state['at_rest'] is False
+    assert abs(state['derr_ema']) > _EMA_ESCAPE
 
   def test_killswitch_disables_escape(self, monkeypatch):
     """Mutation pin for the `_hold_hyst_on and ...` gate: with the
