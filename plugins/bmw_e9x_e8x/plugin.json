@@ -24,7 +24,7 @@
     },
     "StallBreakaway": {
       "default": false,
-      "description": "Shed steering torque when a stalled rack releases and crosses the commanded wheel angle. Write 1 to enable."
+      "description": "Shed steering torque when a stalled rack breaks away and sweeps more than 2 degrees at speed. Write 1 to enable. Read at drive start."
     }
   },
   "cereal": {

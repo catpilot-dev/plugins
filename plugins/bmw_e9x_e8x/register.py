@@ -132,6 +132,16 @@ def _write_param(key, value):
     f.write(value)
 
 
+def _set_stall_breakaway(state):
+  """Persist the StallBreakaway kill-switch (param file only).
+
+  Restart-scoped by design: controlsd is onroad-only, so latcontroller reads
+  this at every drive start and there is no bus topic or heartbeat to keep in
+  sync — flipping it while parked is the whole A/B procedure.
+  """
+  _write_param('StallBreakaway', '1' if state else '0')
+
+
 def on_vehicle_settings(items, CP):
   """Hook callback: populate Vehicle panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
@@ -144,6 +154,17 @@ def on_vehicle_settings(items, CP):
     "Show coolant and oil temperature at the bottom-right corner of the onroad HUD.",
     _read_param('TemperatureOverlay') != '0',
     callback=lambda state: _write_param('TemperatureOverlay', '1' if state else '0'),
+  ))
+
+  # Default-OFF polarity (`== '1'`), deliberately the opposite of the
+  # TemperatureOverlay row above — this arms a safety net, so an absent param
+  # file must read as off.
+  items.append(toggle_item(
+    "Stall Breakaway",
+    "Shed steering torque when a stalled steering rack breaks away and sweeps "
+    "more than 2 degrees at speed. Applies at the next drive.",
+    _read_param('StallBreakaway') == '1',
+    callback=_set_stall_breakaway,
   ))
 
   items.append(toggle_item(
