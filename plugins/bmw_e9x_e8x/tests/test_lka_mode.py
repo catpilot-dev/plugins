@@ -26,6 +26,8 @@ class EventName(IntEnum):
   buttonCancel = 2
   doorOpen = 3
   steerSaturated = 4
+  wrongGear = 5
+  pcmDisable = 6
 
 
 class ButtonType(IntEnum):
@@ -33,6 +35,15 @@ class ButtonType(IntEnum):
   cancel = 0
   resumeCruise = 1
   accelCruise = 2
+
+
+class GearShifter(IntEnum):
+  """Subset of car.CarState.GearShifter."""
+  unknown = 0
+  park = 1
+  drive = 2
+  neutral = 3
+  reverse = 4
 
 
 @pytest.fixture(autouse=True)
@@ -44,17 +55,21 @@ def mock_deps(monkeypatch):
   cereal_mock.log.OnroadEvent.EventName = EventName
   car_mock = MagicMock()
   car_mock.CarState.ButtonEvent.Type = ButtonType
+  car_mock.CarState.GearShifter = GearShifter
   cereal_mock.car = car_mock
   monkeypatch.setitem(sys.modules, 'cereal.car', car_mock)
 
 
 class FakeEvents:
-  """Mirror of the openpilot Events attribute the filter mutates."""
+  """Mirror of the openpilot Events API the filter uses (events list + add)."""
   def __init__(self, names):
     self.events = list(names)
 
+  def add(self, name):
+    self.events.append(name)
 
-def make_cs(dcc_on=False, cancel_press=None):
+
+def make_cs(dcc_on=False, cancel_press=None, gear=GearShifter.drive):
   """cancel_press: True = rising edge event, False = release edge, None = no event."""
   btns = []
   if cancel_press is not None:
@@ -62,6 +77,7 @@ def make_cs(dcc_on=False, cancel_press=None):
   return SimpleNamespace(
     cruiseState=SimpleNamespace(enabled=dcc_on),
     buttonEvents=btns,
+    gearShifter=gear,
   )
 
 
@@ -135,6 +151,84 @@ class TestLkaMode:
     events = FakeEvents([EventName.buttonCancel])
     filt.filter(events, make_cs(dcc_on=True, cancel_press=True), make_cs(), op_enabled=True)
     assert events.events == []
+
+
+class TestGearDisengage:
+  """Route 3fb seg 2: Neutral in LKA triggered wrongGear soft-disable (loud
+  'Gear not D' countdown). User ruling 2026-08-16: only Drive permits
+  engagement — any other definite gear disengages directly, FULL or LKA.
+  `unknown` (signal glitch) falls back to stock soft-disable."""
+
+  @pytest.mark.parametrize("gear", [GearShifter.neutral, GearShifter.reverse,
+                                    GearShifter.park])
+  @pytest.mark.parametrize("dcc_on", [False, True])
+  def test_non_drive_gear_disengages_quietly(self, filt, gear, dcc_on):
+    events = FakeEvents([EventName.wrongGear])
+    filt.filter(events, make_cs(dcc_on=dcc_on, gear=gear),
+                make_cs(), op_enabled=True)
+    assert EventName.pcmDisable in events.events
+    assert EventName.wrongGear not in events.events
+
+  def test_drive_gear_no_disengage(self, filt):
+    events = FakeEvents([])
+    filt.filter(events, make_cs(dcc_on=False, gear=GearShifter.drive),
+                make_cs(), op_enabled=True)
+    assert EventName.pcmDisable not in events.events
+
+  def test_unknown_gear_falls_back_to_stock(self, filt):
+    """A transient CAN glitch must not instantly disengage — stock wrongGear
+    soft-disable handles it with its countdown."""
+    events = FakeEvents([EventName.wrongGear])
+    filt.filter(events, make_cs(dcc_on=False, gear=GearShifter.unknown),
+                make_cs(), op_enabled=True)
+    assert EventName.pcmDisable not in events.events
+    assert EventName.wrongGear in events.events
+
+  def test_neutral_while_disengaged_untouched(self, filt):
+    events = FakeEvents([EventName.wrongGear])
+    filt.filter(events, make_cs(dcc_on=False, gear=GearShifter.neutral),
+                make_cs(), op_enabled=False)
+    assert events.events == [EventName.wrongGear]
+
+
+class TestLkaUiStatus:
+  """LKA border shows the override grey: ui.state_tick sets UIStatus.OVERRIDE."""
+
+  @pytest.fixture(autouse=True)
+  def mock_ui_deps(self, monkeypatch):
+    for mod in ('pyray', 'fonts', 'openpilot.system.ui.lib.application'):
+      monkeypatch.setitem(sys.modules, mod, MagicMock())
+    self.ui_status = SimpleNamespace(ENGAGED='engaged', OVERRIDE='override',
+                                     DISENGAGED='disengaged')
+    self.ui_state = SimpleNamespace(
+      engaged=True,
+      status=self.ui_status.ENGAGED,
+      sm={'carState': SimpleNamespace(cruiseState=SimpleNamespace(enabled=False))},
+    )
+    mod = MagicMock()
+    mod.ui_state = self.ui_state
+    mod.UIStatus = self.ui_status
+    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.ui.ui_state', mod)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+      'bmw_lka_test_ui_overlay2', os.path.join(_PLUGIN_DIR, 'ui_overlay.py'))
+    self.overlay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(self.overlay)
+
+  def test_lka_sets_override_status(self):
+    self.overlay.on_ui_state_tick(None, self.ui_state.sm)
+    assert self.ui_state.status == self.ui_status.OVERRIDE
+
+  def test_full_mode_keeps_engaged_status(self):
+    self.ui_state.sm['carState'].cruiseState.enabled = True
+    self.overlay.on_ui_state_tick(None, self.ui_state.sm)
+    assert self.ui_state.status == self.ui_status.ENGAGED
+
+  def test_disengaged_untouched(self):
+    self.ui_state.engaged = False
+    self.ui_state.status = self.ui_status.DISENGAGED
+    self.overlay.on_ui_state_tick(None, self.ui_state.sm)
+    assert self.ui_state.status == self.ui_status.DISENGAGED
 
 
 class TestLkaBadgePredicate:

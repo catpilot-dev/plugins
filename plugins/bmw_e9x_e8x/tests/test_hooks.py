@@ -332,16 +332,22 @@ class TestVehicleSettingsRows:
     assert (tmp_path / 'data' / 'TemperatureOverlay').read_text() == '0'
     assert register._read_param('TemperatureOverlay') == '0'
 
-  def test_state_tick_hook_is_gone(self):
-    """Retirement pin (2026-08-14): `ui.state_tick` existed only to heartbeat
-    the retired steering-push hot toggle. With that feature gone there is
-    nothing to publish, so both the hook entry and its handler are deleted —
-    a re-added manifest entry pointing at a missing function would break
-    plugin load."""
+  def test_state_tick_hook_targets_existing_function(self):
+    """Originally a retirement pin (2026-08-14) asserting `ui.state_tick` was
+    gone with the steering-push hot toggle. The hook returned 2026-08-16 for
+    the LKA override-grey border, now in ui_overlay — the hazard the pin
+    guarded (a manifest entry pointing at a missing function breaks plugin
+    load) is asserted directly instead: the entry must target a function that
+    exists, and the retired register-module handler must stay gone."""
     import json as _json
     import register
     with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            'plugin.json')) as f:
       manifest = _json.load(f)
-    assert 'ui.state_tick' not in manifest['hooks']
+    entry = manifest['hooks']['ui.state_tick']
+    assert entry['module'] == 'ui_overlay'
+    assert entry['function'] == 'on_ui_state_tick'
+    ov_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               'ui_overlay.py')).read()
+    assert 'def on_ui_state_tick(' in ov_src
     assert not hasattr(register, 'on_ui_state_tick')

@@ -32,6 +32,7 @@ class LkaModeFilter:
     from cereal import car, log
     EventName = log.OnroadEvent.EventName
     ButtonType = car.CarState.ButtonEvent.Type
+    GearShifter = car.CarState.GearShifter
 
     dcc_on = CS.cruiseState.enabled
     for be in CS.buttonEvents:
@@ -44,6 +45,18 @@ class LkaModeFilter:
     strip = {EventName.pedalPressed}
     if not (self.cancel_press_in_lka and not dcc_on):
       strip.add(EventName.buttonCancel)
+
+    # Only Drive permits engagement (route 3fb seg 2, user ruling 2026-08-16):
+    # any other definite gear — FULL or LKA — disengages directly instead of
+    # wrongGear's soft-disable "Gear not D" countdown. pcmDisable =
+    # USER_DISABLE with the normal disengage chime; it never occurs otherwise
+    # on this car (pcmCruise=False). `unknown` (transient CAN glitch) is left
+    # to the stock soft-disable so a one-frame dropout can't instantly
+    # disengage. Entry-side gating is stock wrongGear NO_ENTRY, untouched.
+    if CS.gearShifter not in (GearShifter.drive, GearShifter.unknown):
+      strip.add(EventName.wrongGear)
+      events.add(EventName.pcmDisable)
+
     events.events[:] = [e for e in events.events if e not in strip]
 
 

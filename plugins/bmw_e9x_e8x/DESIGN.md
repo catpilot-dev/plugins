@@ -182,7 +182,7 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
 
 ## Hooks
 
-From `plugin.json` — **seven** hooks:
+From `plugin.json` — **eight** hooks:
 
 | Hook | Function (module) | Purpose |
 |---|---|---|
@@ -192,7 +192,8 @@ From `plugin.json` — **seven** hooks:
 | `ui.vehicle_settings` | `on_vehicle_settings` (`register`) | append the Temperature-Overlay toggle + Resume-Button note to the Driving panel's vehicle section (only when `CP.brand == 'bmw'`) |
 | `ui.render_overlay` | `on_render_overlay` (`ui_overlay`) | draw coolant/oil temperature on the driving HUD |
 | `device.health_check` | `on_health_check` (`register`) | report whether the BMW interface registered into opendbc |
-| `selfdrived.events_filter` | `on_events_filter` (`lka_mode`) | LKA two-stage disengagement: strip brake/first-cancel disengage events so lateral survives DCC dropping; a cancel press that starts in LKA fully disengages |
+| `selfdrived.events_filter` | `on_events_filter` (`lka_mode`) | LKA two-stage disengagement: strip brake/first-cancel disengage events so lateral survives DCC dropping; a cancel press that starts in LKA fully disengages; any definite gear other than Drive disengages directly (stock soft-disable only for `unknown` glitches) |
+| `ui.state_tick` | `on_ui_state_tick` (`ui_overlay`) | LKA border shows the override grey (UIStatus.OVERRIDE, same as gasPressed while engaged) |
 
 The `ui.vehicle_settings` hook is **dispatched by** the `ui_mod` plugin from
 inside its Driving panel: when a car is detected, ui_mod draws a vehicle

@@ -94,6 +94,19 @@ def _oil_color(temp):
   return COLOR_COLD
 
 
+def on_ui_state_tick(default, sm):
+  """Hook callback: ui.state_tick (runs after _update_status each frame).
+  LKA border shows the override grey (same as gasPressed while engaged) —
+  UIStatus.OVERRIDE maps to the 0x89928D border in augmented_road_view."""
+  try:
+    from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
+    if lka_active(ui_state):
+      ui_state.status = UIStatus.OVERRIDE
+  except Exception:
+    pass
+  return default
+
+
 def lka_active(ui_state):
   """LKA mode: openpilot engaged (lateral steering) while DCC is off — the
   driver owns gas/brake. See lka_mode.py for the mode machine."""

@@ -67,6 +67,11 @@
       "module": "lka_mode",
       "function": "on_events_filter",
       "priority": 50
+    },
+    "ui.state_tick": {
+      "module": "ui_overlay",
+      "function": "on_ui_state_tick",
+      "priority": 50
     }
   }
 }
