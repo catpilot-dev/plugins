@@ -124,6 +124,10 @@ SB_EPISODE_TICKS = 200        # 2 s max episode after breakaway
 SB_TRIP_DISP_DEG = 2.0        # wheel travel past the breakaway point
 SB_TRIP_RATE_DPS = 30.0       # sweep speed over the 0.2 s window
 SB_TRIP_KAPPA_MAX = 0.010     # |kappa_des| above this: SAT self-arrests, stay out
+SB_TRIP_MIN_TORQUE = 0.12   # frac (~1.4 Nm): a release without windup worth shedding
+                            # must not trip — 8 of 9 on-car benign trips (3fa/3fb)
+                            # were corner-exit unwinds at 0.007-0.088; the 3f2 real
+                            # event carried 0.293. (2026-08-16)
 SB_SHED_FRAMES = 10           # drain torque -> 0 over 100 ms on trip
 SB_BLOCK_TICKS = 50           # 0.5 s same-side push suppression after trip
 
@@ -472,6 +476,7 @@ def on_lat_controller_init(result, lac, CP):
     'sb_state': 0,          # 0=idle, 1=armed(stall), 2=breakaway episode
     'sb_brk_angle': 0.0,    # steerAngleDeg at breakaway (displacement reference)
     'sb_dir': 0.0,          # +1/-1: breakaway MOTION direction (self-referenced)
+    'sb_arm_kappa': 0.0,    # |kappa_des| LATCHED at ARM (internal, not telemetry)
     'sb_episode_ticks': 0,  # countdown in state 2
     'sb_block': 0,          # same-side push suppression countdown after a trip
     'sb_trips': 0,          # cumulative (telemetry)
@@ -554,6 +559,11 @@ def on_lat_controller_init(result, lac, CP):
         if state['action'] == 'ramp' and len(ring) == ring.maxlen \
            and (max(ring) - min(ring)) < 2 * ANGLE_QUANTUM_DEG:
           state['sb_state'] = 1
+          # LATCH the arming curvature (2026-08-16). Never updated in state 1
+          # or 2 — that is the point: arming mid-corner latches the IN-corner
+          # kappa, so a corner-exit decay cannot sneak the episode under the
+          # deep-curve gate later. Re-latched on every fresh arm.
+          state['sb_arm_kappa'] = abs(state['desired'])
       elif state['sb_state'] == 1:
         if state['action'] != 'ramp':
           state['sb_state'] = 0
@@ -585,8 +595,19 @@ def on_lat_controller_init(result, lac, CP):
                 if len(ring) > SB_MOVE_TICKS else 0.0
         if state['sb_episode_ticks'] <= 0 or state['action'] in ('hold_zero', 'hold_curve'):
           state['sb_state'] = 0
+        # The kappa gate is applied BOTH instantaneous and latched-at-arm
+        # (2026-08-16, drives 3fa/3fb). The instantaneous gate alone is
+        # defeated by the hairpin-exit case: on 3fb t=1569 kappa_des decayed
+        # 0.019 -> 0.0096 DURING the episode, slipping under
+        # SB_TRIP_KAPPA_MAX while the wheel was still at -43 deg, so a plain
+        # corner-exit unwind read as a release. The arm-time latch pins the
+        # episode to the curvature it actually started in.
+        # SB_TRIP_MIN_TORQUE: no standing windup, nothing to shed — 8 of the
+        # 9 benign on-car trips were corner-exit unwinds at 0.007-0.088 frac.
         elif state['action'] != 'relax_dwell' \
+             and abs(state['torque']) >= SB_TRIP_MIN_TORQUE \
              and abs(state['desired']) <= SB_TRIP_KAPPA_MAX \
+             and state['sb_arm_kappa'] <= SB_TRIP_KAPPA_MAX \
              and (ring[-1] - state['sb_brk_angle']) * state['sb_dir'] >= SB_TRIP_DISP_DEG \
              and _rate >= SB_TRIP_RATE_DPS:
           # TRIP: the released rack has swept SB_TRIP_DISP_DEG past where it

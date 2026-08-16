@@ -984,6 +984,91 @@ class TestStallBreakawayV2:
     assert state['sb_state'] == 2                      # episode live, just no trip
     assert state['sb_trips'] == 0
 
+  def test_tiny_torque_no_trip(self, monkeypatch):
+    """THE MIN-TORQUE PIN (2026-08-16, drives 3fa/3fb). Identical fast
+    release choreography, but the standing push at the crossing is 0.05 frac
+    — there is no windup worth shedding, so the trip is pointless. 8 of the 9
+    benign on-car trips were exactly this: corner-exit unwinds carrying
+    0.007-0.088 frac, versus 0.293 on the 3f2 real event."""
+    lac, sm, mod, state = _sb_make(monkeypatch)
+    _sb_arm(lac)
+    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
+    assert state['sb_state'] == 2
+
+    state['torque'] = -0.05                            # below SB_TRIP_MIN_TORQUE
+    assert abs(state['torque']) < mod.SB_TRIP_MIN_TORQUE
+    for k in range(2, self.TRIP_K + 1):
+      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
+
+    # Everything else about the crossing was trip-ready (this is the exact
+    # tick test_breakaway_and_trip trips on).
+    assert state['sb_state'] == 2                      # episode live, just no trip
+    assert state['sb_trips'] == 0
+    assert state['sb_block'] == 0
+
+  def test_arm_in_deep_curve_no_trip_after_decay(self, monkeypatch):
+    """THE ARM-LATCH PIN (2026-08-16). The hairpin-exit case from 3fb
+    t=1569: the machine arms mid-corner at |kappa_des| = 0.019, then the
+    corner-exit decay carries kappa_des under SB_TRIP_KAPPA_MAX (0.0096)
+    while the wheel is still at -43 deg and unwinding. The INSTANTANEOUS
+    gate is wide open by the crossing tick; only the curvature latched at
+    ARM keeps this benign unwind from reading as a release."""
+    deep, shallow = 0.02, 0.005
+    lac, sm, mod, state = _sb_make(monkeypatch)
+    assert deep > mod.SB_TRIP_KAPPA_MAX
+    assert shallow < mod.SB_TRIP_KAPPA_MAX
+
+    _sb_arm(lac, kappa_des=deep)
+    assert state['sb_state'] == 1
+    assert state['sb_arm_kappa'] == pytest.approx(deep)
+
+    # Corner exit: kappa_des decays under the gate, and the release plays out
+    # in full — fast, in-direction, with real torque standing.
+    _sb_tick(lac, _SB_A0 + self.FAST_STEP, kappa_des=shallow)
+    assert state['sb_state'] == 2
+    state['torque'] = -0.3
+    assert abs(state['torque']) >= mod.SB_TRIP_MIN_TORQUE
+    for k in range(2, self.TRIP_K + 1):
+      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP, kappa_des=shallow)
+
+    # The instantaneous gate passes; the latch is what holds.
+    assert abs(state['desired']) <= mod.SB_TRIP_KAPPA_MAX
+    assert state['sb_arm_kappa'] > mod.SB_TRIP_KAPPA_MAX
+    assert state['sb_trips'] == 0
+
+  def test_arm_kappa_relatches_on_rearm(self, monkeypatch):
+    """The latch must not STICK across episodes. After a deep-curve arm
+    expires, a fresh arm in a mild curve latches the new value and the same
+    crossing DOES trip — otherwise one hairpin would disable the mechanism
+    for the rest of the drive."""
+    deep = 0.02
+    lac, sm, mod, state = _sb_make(monkeypatch)
+    _sb_arm(lac, kappa_des=deep)
+    assert state['sb_arm_kappa'] == pytest.approx(deep)
+
+    # The deep arm ends the way arms ordinarily do: the action leaves ramp.
+    # Two ticks, because the machine runs BEFORE the livePose branch that
+    # writes state['desired'] — so the curvature it reads is always one tick
+    # old, and the second tick is what lets `mild` reach it. (Same one-tick
+    # staleness the instantaneous gate has always had; it errs toward NOT
+    # tripping, so it needs no correction — only respecting.)
+    mild = 0.001
+    _sb_tick(lac, _SB_A0, action='hold_curve', kappa_des=deep)
+    assert state['sb_state'] == 0
+    _sb_tick(lac, _SB_A0, action='hold_curve', kappa_des=mild)
+
+    # Fresh arm in a mild curve -> the latch takes the NEW curvature.
+    _sb_arm(lac, ticks=45, kappa_des=mild)
+    assert state['sb_state'] == 1
+    assert state['sb_arm_kappa'] == pytest.approx(mild)
+
+    _sb_tick(lac, _SB_A0 + self.FAST_STEP, kappa_des=mild)
+    assert state['sb_state'] == 2
+    state['torque'] = -0.3
+    for k in range(2, self.TRIP_K + 1):
+      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP, kappa_des=mild)
+    assert state['sb_trips'] == 1
+
   def test_wrong_direction_no_trip(self, monkeypatch):
     """THE DIRECTION PIN. The rack breaks away one way, then travels the
     OTHER way. Displacement is signed by sb_dir — the direction the wheel
@@ -1014,6 +1099,7 @@ class TestStallBreakawayV2:
     _sb_arm(lac)
     _sb_tick(lac, _SB_A0 + self.FAST_STEP)
     assert state['sb_state'] == 2
+    state['torque'] = -0.3               # windup worth shedding (SB_TRIP_MIN_TORQUE)
     for k in range(2, self.TRIP_K):
       _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
 
