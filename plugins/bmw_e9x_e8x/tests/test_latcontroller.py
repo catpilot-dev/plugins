@@ -1535,7 +1535,6 @@ class TestOverrideObservers:
     # Poke B: cumulative counts, the last-fire id, the push memory, and three
     # sustain runs one tick short of firing.
     state_b.update({
-      'ov_ring_t': 12345,
       'ov_eod': 7, 'ov_hold': 3, 'ov_crawl': 11, 'ov_wsd': 5,
       'ov_eod_n': 9, 'ov_hold_n': 49, 'ov_crawl_n': 49, 'ov_wsd_n': 14,
       'ov_brake_fires': 2, 'ov_last': 4,
@@ -1578,6 +1577,71 @@ class TestOverrideObservers:
     # the two controllers really did end up with different counts.
     assert state_a['ov_eod'] >= 1
     assert state_a['ov_eod'] != state_b['ov_eod']
+
+  def test_observer_block_writes_only_ov(self, monkeypatch):
+    """CONTAINMENT PIN — the half the lockstep test structurally cannot see.
+
+    test_no_behavior_change proves no ov_* VALUE reaches actuation, but it
+    compares two controllers running the same code: an UNCONDITIONAL write to
+    a non-ov_ key inside the observer block (say `state['torque'] *= 1-1e-9`)
+    happens identically in both twins and sails straight through it. So this
+    test reads the source instead: it parses the block delimited by the
+    `# --- override observers (phase 1) ---` / `# --- end override
+    observers ---` markers and asserts, structurally, that
+
+      1. every `state[...]` store inside targets an 'ov_'-prefixed literal key,
+      2. no method is called on the shared ring (append/clear/pop would mutate
+         the sb machine's state — the block's reuse of it is READ-ONLY), and
+      3. every detector's `_ov_bump()` names an 'ov_' counter — the helper
+         itself stores to `state[key]` for a key passed in at runtime, which
+         is the one store AST cannot resolve, so it is pinned at the call
+         sites instead.
+    """
+    import ast
+    import textwrap
+    import bmw.latcontroller as mod
+
+    begin, end = ('# --- override observers (phase 1) ---',
+                  '# --- end override observers ---')
+    with open(mod.__file__, encoding='utf-8') as f:
+      lines = f.read().splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.strip() == begin]
+    ends = [i for i, ln in enumerate(lines) if ln.strip() == end]
+    assert len(starts) == 1 and len(ends) == 1 and starts[0] < ends[0], \
+      'the observer-block markers must exist exactly once, in order'
+    tree = ast.parse(textwrap.dedent('\n'.join(lines[starts[0]:ends[0]])))
+
+    stored, bumped = [], []
+    for node in ast.walk(tree):
+      if isinstance(node, (ast.Assign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+          for sub in ast.walk(target):
+            if isinstance(sub, ast.Attribute):
+              raise AssertionError(f'attribute store in observer block: {ast.dump(sub)}')
+            if isinstance(sub, ast.Subscript):
+              assert isinstance(sub.value, ast.Name) and sub.value.id == 'state', \
+                f'subscript store outside state[]: {ast.dump(sub)}'
+              assert isinstance(sub.slice, ast.Constant), 'dynamic state key'
+              stored.append(sub.slice.value)
+      if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute):
+          holder = node.func.value
+          assert not (isinstance(holder, ast.Name) and holder.id == 'ring'), \
+            f'ring.{node.func.attr}() mutates the shared sb_ring'
+          assert not (isinstance(holder, ast.Subscript)
+                      and isinstance(holder.value, ast.Name)
+                      and holder.value.id == 'state'), \
+            f'state[...].{node.func.attr}() mutates shared state'
+        elif isinstance(node.func, ast.Name) and node.func.id == '_ov_bump':
+          assert isinstance(node.args[0], ast.Constant)
+          bumped.append(node.args[0].value)
+
+    assert stored, 'found no state writes — the markers are probably misplaced'
+    for key in stored:
+      assert isinstance(key, str) and key.startswith('ov_'), \
+        f"observer block writes state[{key!r}] — phase 1 may only write ov_* keys"
+    assert sorted(bumped) == ['ov_crawl', 'ov_eod', 'ov_hold', 'ov_wsd']
 
   # ---- (2) EOD -----------------------------------------------------------
 
@@ -1758,14 +1822,12 @@ class TestOverrideObservers:
     assert state['ov_hold'] == 1
     assert state['ov_hold_n'] == 70
     assert state['ov_push_dir'] != 0.0
-    assert state['ov_ring_t'] == self.HOLD_FIRE_TICK + 20
 
     _ov_tick(lac, 2.0, torque=0.28, active=False)
     assert state['ov_hold_n'] == 0
     assert state['ov_eod_n'] == state['ov_crawl_n'] == state['ov_wsd_n'] == 0
     assert state['ov_push_dir'] == 0.0
     assert state['ov_push_t'] == 0
-    assert state['ov_ring_t'] == 0
     assert state['ov_hold'] == 1               # retained
     assert state['ov_last'] == 2               # retained
 

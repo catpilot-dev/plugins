@@ -826,7 +826,35 @@ This document is the canonical reference for the lateral controller registered b
 > event from one on a trailing throttle, and that is the context phase 2 needs.
 > Compare an at-speed drive against the budgets above; a clean highway hour
 > that accumulates EOD or HOLD fires is a refutation of the constants, not a
-> tuning opportunity.
+> tuning opportunity. **Four caveats, all of them interpretation rather than
+> defect:**
+>
+> 1. **`ov_eod` is only meaningful alongside `sb_on`.** The `sb_block`
+>    stand-down is *dead code on a v2-off drive*: `sb_block` is only ever armed
+>    inside `if _stall_v2_on`, so with `StallBreakaway` off nothing claims the
+>    rebound class and **plant windup releases will be COUNTED as EOD fires**.
+>    The `EOD 0 / 3.2 h` budget above was measured with v2 effectively claiming
+>    them. On this car v2 *is* armed, so the budget applies as stated — but an
+>    `sb_on: false` drive is not comparable, and an EOD count from one is not
+>    evidence about drivers. Phase 2 revisits whether EOD needs a v2-independent
+>    rebound test.
+> 2. **The counts are not summable.** The detectors are independent hypotheses,
+>    not a partition, and one real event can increment two counters. The exact
+>    relation is **`HOLD ∧ (|torque| ≥ 0.30) ⊆ CRAWL`**: a frozen ring bounds
+>    the measured rate at `2 quanta / 0.2 s = 0.44 °/s`, far inside
+>    `OV_CRAWL_RATE_DPS`, and both share the same 6° bound — so a frozen wheel
+>    at supra-`OV_CRAWL_TQ` torque satisfies CRAWL as well. It is **not**
+>    containment in general: frozen at `0.25 ≤ |torque| < 0.30` fires **HOLD
+>    alone**, which is exactly the band HOLD exists for. Report the four counts
+>    separately; "total overrides" is not a number this telemetry produces.
+> 3. **`ov_last` is last-*evaluated*, not last-*started*.** The detectors run in
+>    block order EOD → HOLD → CRAWL → WSD and each fire overwrites the field, so
+>    on a tick where several fire together **CRAWL masks HOLD and WSD masks
+>    everything**. Use it as a coarse "what kind of event ended this drive"
+>    hint, never as an event sequence.
+> 4. **`ov_brake_fires` counts fires, not ticks.** Two detectors firing on the
+>    same braked tick add **two**, so it can exceed the number of distinct
+>    braked events. It is a context weight for phase 2, not an event count.
 >
 > **Phase 2 is NOT in this change**: yield tiers, the brake short-circuit, and
 > integration with the LKA events are all designed in the memory and
@@ -1143,12 +1171,14 @@ Published each livePose tick:
 | `sb_trips` | (2026-08-15) cumulative trips this drive. Budget on ordinary driving: **≈ 0** (replay residue 0.071/min). A drive with many is a refutation |
 | `sb_block` | (2026-08-15) same-side push-suppression ticks left after a trip (counts down from `SB_BLOCK_TICKS` = 50 = 0.5 s) |
 | `sb_on` | (2026-08-15) `StallBreakaway` param as read at drive start — each drive's A/B self-label (absent = pre-v2 build) |
-| `ov_eod` | (2026-08-17) driver-override observer, cumulative fires this drive: **panic yank** — fast motion against our torque. Clean-at-speed budget **0 / 3.2 h** |
+| `ov_eod` | (2026-08-17) driver-override observer, cumulative fires this drive: **panic yank** — fast motion against our torque. Clean-at-speed budget **0 / 3.2 h**, *and only on an `sb_on: true` drive* — with v2 off nothing claims plant rebounds and they land here (see the dated note) |
 | `ov_hold` | (2026-08-17) cumulative: **rigid hold** — frozen wheel at supra-knee torque. Clean-at-speed budget **0 / 3.2 h** |
 | `ov_crawl` | (2026-08-17) cumulative: **firm resist** — supra-knee torque, sub-sweep rate. Clean-at-speed budget **2 / 3.2 h** |
 | `ov_wsd` | (2026-08-17) cumulative: **deliberate correction** — deepening onto the wrong side of intent. Clean-at-speed budget **4 / 3.2 h** |
-| `ov_brake_fires` | (2026-08-17) fires (any detector) that landed while `brakePressed` — the stage-2 context counter |
-| `ov_last` | (2026-08-17) last detector to fire this drive: `1`=eod `2`=hold `3`=crawl `4`=wsd, `0`=none |
+
+The four `ov_*` counts are **not summable** — independent hypotheses, not a partition (`HOLD ∧ |torque| ≥ 0.30 ⊆ CRAWL`; frozen at `0.25 ≤ |torque| < 0.30` fires HOLD alone). See the 2026-08-17 dated note for all four reading caveats.
+| `ov_brake_fires` | (2026-08-17) fires (any detector) that landed while `brakePressed` — the stage-2 context counter. Counts **fires, not ticks**: several detectors firing together each add one |
+| `ov_last` | (2026-08-17) last detector to fire this drive: `1`=eod `2`=hold `3`=crawl `4`=wsd, `0`=none. Last-**evaluated** in block order, so on a shared tick CRAWL masks HOLD and WSD masks all |
 
 Removed 2026-08-14 with the push-budget retirement (see the dated note in the header): `push_moved`, `budget_spent`, `budget_on`. Payloads from drives before that date still carry them; a build after it carries none of the three.
 

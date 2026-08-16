@@ -516,7 +516,6 @@ def on_lat_controller_init(result, lac, CP):
     'sb_trips': 0,          # cumulative (telemetry)
     # Driver-override observers, phase 1 (see the OV_* constants at module
     # scope). PURE OBSERVERS: nothing in the actuator path reads any ov_* key.
-    'ov_ring_t': 0,          # CAN ticks since engage (observer warm-up diagnostic)
     'ov_eod_n': 0, 'ov_hold_n': 0, 'ov_crawl_n': 0, 'ov_wsd_n': 0,   # sustain counters
     'ov_eod': 0, 'ov_hold': 0, 'ov_crawl': 0, 'ov_wsd': 0,           # cumulative fire counts (telemetry)
     'ov_brake_fires': 0,     # fires (any detector) while CS.brakePressed — the stage-2 context counter
@@ -704,7 +703,17 @@ def on_lat_controller_init(result, lac, CP):
     else:
       state['sb_state'] = 0
 
-    # ---- Driver-override observers, phase 1 (100 Hz) ---------------------
+    # --- override observers (phase 1) ---
+    # ^ THAT MARKER IS LOAD-BEARING. It and its matching end marker delimit
+    # the region that TestOverrideObservers.test_observer_block_writes_only_ov
+    # parses out of this file with ast and checks for containment: every
+    # state[...] store inside must target an 'ov_' key, and sb_ring must never
+    # be called (no append/clear/pop). Do not rename, duplicate or drop either
+    # marker without updating that test — it is the pin that the twin-lockstep
+    # test cannot provide (an unconditional write to a non-ov_ key is
+    # invisible to a lockstep comparison, since both twins do it).
+    #
+    # Driver-override observers, phase 1 (100 Hz).
     # Mission: make the controller UNDERSTAND driver intention rather than
     # fight it. The E90 has no driver-torque sensor, so the rack's own
     # measured physics is the microphone — four signatures that a driver, not
@@ -727,7 +736,6 @@ def on_lat_controller_init(result, lac, CP):
     # and state['desired'] are the values that were actually standing while
     # the ring recorded the motion being judged.
     if active:
-      state['ov_ring_t'] += 1
       ring = state['sb_ring']    # READ-ONLY reuse of the sb machine's ring
       _ov_brake = bool(getattr(CS, 'brakePressed', False))
       if len(ring) > OV_RATE_TICKS:
@@ -805,13 +813,13 @@ def on_lat_controller_init(result, lac, CP):
       # Disengaged: the sustain runs and the push memory are drive-state and
       # reset with the ring; the cumulative counts are the drive's record and
       # must survive (they are what the telemetry reports).
-      state['ov_ring_t'] = 0
       state['ov_eod_n'] = 0
       state['ov_hold_n'] = 0
       state['ov_crawl_n'] = 0
       state['ov_wsd_n'] = 0
       state['ov_push_dir'] = 0.0
       state['ov_push_t'] = 0
+    # --- end override observers ---
 
     _sm.update(0)
     lp = _sm['livePose']
