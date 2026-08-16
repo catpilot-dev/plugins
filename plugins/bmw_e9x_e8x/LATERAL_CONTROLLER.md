@@ -748,6 +748,90 @@ This document is the canonical reference for the lateral controller registered b
 > breakaway point in a mild curve. A drive that accumulates trips at
 > ordinary-steering rates is a refutation, not a tuning opportunity — the same
 > standard that retired the push budget.
+
+> **2026-08-17 — driver-override observers, phase 1: four detectors, telemetry
+> only.** The mission is to make openpilot **understand driver intention
+> rather than fight it**. Everything above this line is about tracking the
+> commanded curvature well; this is about noticing when the *driver* has a
+> different opinion. Design record: `project_driver_override_design` memory
+> and `.superpowers/sdd/2026-08-12-angle-based-breakaway/`.
+>
+> **The hard constraint: this car has no driver-torque sensor.** There is no
+> `steeringTorque` to threshold — `steeringPressed` on this platform is a
+> VoiceControl button OR `gasPressed`, and is *not* a hands-on signal. So the
+> **rack's own measured physics is the microphone**: what the wheel does under
+> a known applied torque is the only evidence a driver is on it. Each detector
+> below is a statement about motion that the plant alone cannot produce.
+>
+> Sign conventions used throughout: **angle + = LEFT, torque − = LEFT**, so the
+> command direction in angle space is `−sign(torque)`, and the curvature intent
+> in the angle domain is `−sign(κ_des)`. Rate is the signed 0.2 s difference
+> over the shared `sb_ring` (deltas only — the ~−1.58° alignment offset in
+> `steeringAngleDeg` cancels).
+>
+> | detector | signature | conjuncts | sustain |
+> |---|---|---|---|
+> | **EOD** | panic yank | motion **against** our push at ≥ `OV_EOD_RATE_DPS` 40 °/s with \|torque\| > `OV_EOD_MIN_TQ` 0.05; **not** toward-center from beyond `OV_SAT_SAFE_DEG` 10° (SAT does that unaided); **and `sb_block == 0`** | `OV_EOD_TICKS` 10 (100 ms) |
+> | **HOLD** | rigid hold | wheel **frozen** (the sb machine's own test: full ring, span < 2 quanta) at \|torque\| ≥ `OV_HOLD_TQ` **0.25 frac ≈ 3 Nm** — static friction cannot hold past the knee (user ruling) — and \|angle\| < 6° | `OV_HOLD_TICKS` 50 (0.5 s) |
+> | **CRAWL** | firm resist | \|torque\| ≥ `OV_CRAWL_TQ` 0.30 with \|rate\| < `OV_CRAWL_RATE_DPS` 8 °/s and \|angle\| < `OV_CRAWL_ANG_DEG` 6° — a free rack at 0.30 *sweeps* | `OV_CRAWL_TICKS` 50 (0.5 s) |
+> | **WSD** | deliberate correction | wheel deepening onto the **wrong side of the commanded intent** (`intent = −sign(κ_des)` when \|κ_des\| > `OV_WSD_INTENT_KAPPA` 0.001; on a straight, any side past a wider floor and still moving out) at ≥ `OV_WSD_RATE_DPS` 4 °/s against a **remembered** push | `OV_WSD_TICKS` 15 (150 ms) |
+>
+> **`OV_CRAWL_ANG_DEG` was tightened 10 → 6** on this date: SAT plus friction
+> can balance 0.30 frac on their own at 8–10°, so a crawl there proves nothing.
+> `HOLD` reuses the same 6° near-center bound, and it binds harder there since
+> `OV_HOLD_TQ` < `OV_CRAWL_TQ`.
+>
+> **The push memory (`OV_PUSH_MEM_S` = 0.3 s)** exists because `cancel_tol`
+> yields ~0.3 s after the driver wins — measured on 3f2 seg 22 — which masks
+> the against-torque test exactly when the override is most visible. A **new
+> push in either direction re-primes it**: carrying a stale direction across a
+> command reversal cost **12 false WSD fires / 3.2 h** at curve entries.
+>
+> **The `sb_block` stand-down on EOD** is composition with stall/breakaway v2,
+> not belt-and-braces. While a trip is settling, the fast motion is the *plant*
+> shedding windup (a rebound), which v2 owns; validated on 3fa seg 10, and the
+> single at-speed EOD fire in the clean set coincides exactly with a v2 trip.
+>
+> **Validation** (six routes, ~6 h, including the new low-speed LKA regime).
+> Clean-at-speed fire rates per 3.2 h: **EOD 0, HOLD 0, CRAWL 2, WSD 4.** Both
+> ground-truth positives are caught: **3f2 seg 22** (driver resisting) fires
+> CRAWL + WSD; **3f2 seg 10** (takeover) fires EOD + WSD. **Low-speed
+> maneuvering (3–6 m/s, LKA regime) fires EOD/WSD on genuine driver steering —
+> expected and wanted**: those are real overrides, and phase 2 needs them in
+> the dataset.
+>
+> **Phase-1 semantics — read this before touching the block.** The detectors
+> are **pure observers: they count and publish, and act on nothing.** There is
+> **no param** (they are always-on; there is nothing to gate because there is
+> nothing to do) and **no behavior change of any kind**: the block writes
+> `ov_*` state keys and nothing else, and **no `ov_*` key is read anywhere in
+> the actuator path**. Actuation is byte-identical with and without it — pinned
+> by `TestOverrideObservers.test_no_behavior_change`, which steps two
+> controllers through the same choreography with one's `ov_*` state pre-poked
+> and requires exact equality of every non-`ov_` state key, the returned
+> output, and every non-`ov_` telemetry field on every tick.
+>
+> Placement: after the sb machine (EOD reads `sb_block`, which that machine
+> both arms and decrements) and before the livePose branch, so `state['torque']`
+> and `state['desired']` are the values that were actually standing while the
+> ring recorded the motion being judged. The block **reuses `sb_ring`
+> read-only** — do not add a second ring. On disengage the sustain runs and the
+> push memory reset with the ring; the **cumulative counts survive** (they are
+> the drive's record).
+>
+> **Reading the telemetry** (§9): `ov_eod` / `ov_hold` / `ov_crawl` / `ov_wsd`
+> are cumulative fires this drive, `ov_last` is the most recent detector
+> (`1`=eod `2`=hold `3`=crawl `4`=wsd, `0`=none), and `ov_brake_fires` counts
+> fires that landed while `brakePressed` — a fire on the brake is a different
+> event from one on a trailing throttle, and that is the context phase 2 needs.
+> Compare an at-speed drive against the budgets above; a clean highway hour
+> that accumulates EOD or HOLD fires is a refutation of the constants, not a
+> tuning opportunity.
+>
+> **Phase 2 is NOT in this change**: yield tiers, the brake short-circuit, and
+> integration with the LKA events are all designed in the memory and
+> deliberately unbuilt until the phase-1 counters have been read from real
+> drives.
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -1059,6 +1143,12 @@ Published each livePose tick:
 | `sb_trips` | (2026-08-15) cumulative trips this drive. Budget on ordinary driving: **≈ 0** (replay residue 0.071/min). A drive with many is a refutation |
 | `sb_block` | (2026-08-15) same-side push-suppression ticks left after a trip (counts down from `SB_BLOCK_TICKS` = 50 = 0.5 s) |
 | `sb_on` | (2026-08-15) `StallBreakaway` param as read at drive start — each drive's A/B self-label (absent = pre-v2 build) |
+| `ov_eod` | (2026-08-17) driver-override observer, cumulative fires this drive: **panic yank** — fast motion against our torque. Clean-at-speed budget **0 / 3.2 h** |
+| `ov_hold` | (2026-08-17) cumulative: **rigid hold** — frozen wheel at supra-knee torque. Clean-at-speed budget **0 / 3.2 h** |
+| `ov_crawl` | (2026-08-17) cumulative: **firm resist** — supra-knee torque, sub-sweep rate. Clean-at-speed budget **2 / 3.2 h** |
+| `ov_wsd` | (2026-08-17) cumulative: **deliberate correction** — deepening onto the wrong side of intent. Clean-at-speed budget **4 / 3.2 h** |
+| `ov_brake_fires` | (2026-08-17) fires (any detector) that landed while `brakePressed` — the stage-2 context counter |
+| `ov_last` | (2026-08-17) last detector to fire this drive: `1`=eod `2`=hold `3`=crawl `4`=wsd, `0`=none |
 
 Removed 2026-08-14 with the push-budget retirement (see the dated note in the header): `push_moved`, `budget_spent`, `budget_on`. Payloads from drives before that date still carry them; a build after it carries none of the three.
 
@@ -1196,6 +1286,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | Cadence decision | inside update | hold_zero / hold_curve / ramp / target_nm formula |
 | Ramp application | inside update | Per-CAN-tick torque ramp |
 | Stall/breakaway v2 | module scope (`SB_*`) + top of `update()` | Displacement trip machine (2026-08-15): ring / arm / breakaway / trip plus the shed-rate enforcement, all run before the livePose branch; the same-side block sits at the end of the ramp branch. No absolute-geometry helper — every comparison is a difference of angle samples |
+| Driver-override observers | module scope (`OV_*`) + `_ov_bump()` + after the sb machine in `update()` | Phase 1 (2026-08-17): four detectors (EOD / HOLD / CRAWL / WSD) that count driver-override signatures and **act on nothing**. Reuses `sb_ring` read-only; writes `ov_*` state keys only — no `ov_*` key is read in the actuator path |
 | Telemetry publish | inside update | `bmw_lat_control` topic via plugin_bus |
 
 ---

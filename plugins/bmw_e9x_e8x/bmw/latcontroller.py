@@ -131,6 +131,40 @@ SB_TRIP_MIN_TORQUE = 0.12   # frac (~1.4 Nm): a release without windup worth she
 SB_SHED_FRAMES = 10           # drain torque -> 0 over 100 ms on trip
 SB_BLOCK_TICKS = 50           # 0.5 s same-side push suppression after trip
 
+# Driver-override observers, phase 1 (2026-08-17): four detectors that COUNT
+# driver-override signatures and publish telemetry — they act on nothing.
+# E90 has no driver-torque sensor; the rack's measured physics is the only
+# microphone (design: project_driver_override_design memory; validated on
+# 6 routes + 2 ground-truth positives). Detectors own one behavior each:
+#   EOD   panic yank:   fast motion AGAINST our torque
+#   HOLD  rigid hold:   frozen wheel at supra-knee torque (friction can't)
+#   CRAWL firm resist:  supra-knee torque, sub-sweep rate (free rack sweeps)
+#   WSD   deliberate correction: deepening onto the wrong side of intent
+# Clean-at-speed fire rates over 3.2 h: EOD 0, HOLD 0, CRAWL 2, WSD 4. Both
+# ground-truth positives are caught (3f2 seg 22 driver-resist: crawl + wsd;
+# 3f2 seg 10 takeover: eod + wsd). Low-speed LKA maneuvering (3-6 m/s) fires
+# EOD/WSD on genuine driver steering — expected and wanted in the dataset.
+OV_EOD_RATE_DPS = 40.0     # against-command rate; sustained OV_EOD_TICKS
+OV_EOD_TICKS = 10          # 100 ms
+OV_EOD_MIN_TQ = 0.05
+OV_SAT_SAFE_DEG = 10.0     # toward-center motion from beyond this = SAT-explainable, not driver
+OV_HOLD_TQ = 0.25          # frac (3 Nm, user ruling): static friction cannot hold past the knee
+OV_HOLD_TICKS = 50         # 0.5 s
+OV_CRAWL_TQ = 0.30
+OV_CRAWL_RATE_DPS = 8.0
+OV_CRAWL_ANG_DEG = 6.0     # tightened from 10 (2026-08-17): SAT+friction can balance 0.30 at 8-10 deg
+OV_CRAWL_TICKS = 50
+OV_WSD_RATE_DPS = 4.0
+OV_WSD_FLOOR_DEG = 1.5     # curve intent; straights use +0.5 more
+OV_WSD_TICKS = 15
+OV_WSD_INTENT_KAPPA = 0.001
+OV_PUSH_MEM_S = 0.3        # cancel_tol yields ~0.3 s after the driver wins and
+                           # masks the against-torque test (seg 22, measured);
+                           # memory INVALIDATES on torque sign flip (stale
+                           # direction across command reversals = 12 false
+                           # fires/3.2 h at curve entries, measured)
+OV_RATE_TICKS = 20         # 0.2 s signed-rate window over the shared sb_ring
+
 
 def on_lat_controller_init(result, lac, CP):
   """Plant-inversion at 500 ms horizon in front-wheel-angle space.
@@ -480,7 +514,34 @@ def on_lat_controller_init(result, lac, CP):
     'sb_episode_ticks': 0,  # countdown in state 2
     'sb_block': 0,          # same-side push suppression countdown after a trip
     'sb_trips': 0,          # cumulative (telemetry)
+    # Driver-override observers, phase 1 (see the OV_* constants at module
+    # scope). PURE OBSERVERS: nothing in the actuator path reads any ov_* key.
+    'ov_ring_t': 0,          # CAN ticks since engage (observer warm-up diagnostic)
+    'ov_eod_n': 0, 'ov_hold_n': 0, 'ov_crawl_n': 0, 'ov_wsd_n': 0,   # sustain counters
+    'ov_eod': 0, 'ov_hold': 0, 'ov_crawl': 0, 'ov_wsd': 0,           # cumulative fire counts (telemetry)
+    'ov_brake_fires': 0,     # fires (any detector) while CS.brakePressed — the stage-2 context counter
+    'ov_last': 0,            # 1=eod 2=hold 3=crawl 4=wsd, last fire this drive
+    'ov_push_dir': 0.0, 'ov_push_t': 0,     # push memory (direction, CAN ticks since the push ended)
   }
+
+  def _ov_bump(key, hit, ticks, ident, brake):
+    """Shared sustain-and-fire counter for the driver-override observers.
+
+    `hit` must hold for `ticks` consecutive CAN ticks; the fire lands on the
+    tick the run reaches exactly that length, so one sustained episode counts
+    once no matter how long it persists. Any miss resets the run. Writes only
+    ov_* keys — this helper is the ONLY place a cumulative count changes.
+    """
+    n_key = key + '_n'
+    if not hit:
+      state[n_key] = 0
+      return
+    state[n_key] += 1
+    if state[n_key] == ticks:
+      state[key] += 1
+      state['ov_last'] = ident
+      if brake:
+        state['ov_brake_fires'] += 1
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
@@ -642,6 +703,115 @@ def on_lat_controller_init(result, lac, CP):
           state['sb_state'] = 0
     else:
       state['sb_state'] = 0
+
+    # ---- Driver-override observers, phase 1 (100 Hz) ---------------------
+    # Mission: make the controller UNDERSTAND driver intention rather than
+    # fight it. The E90 has no driver-torque sensor, so the rack's own
+    # measured physics is the microphone — four signatures that a driver, not
+    # the plant, is moving (or refusing to move) the wheel. See the OV_*
+    # constants at module scope for the per-detector rationale.
+    #
+    # PHASE 1 IS TELEMETRY ONLY. This block writes ov_* state keys and
+    # nothing else, and no ov_* key is read anywhere in the actuator path
+    # (torque / target_frac / ramp_* / action). Actuation is byte-identical
+    # with and without this block — pinned by
+    # TestOverrideObservers.test_no_behavior_change.
+    #
+    # Sign conventions (restated here because every detector is a sign test):
+    # angle + = LEFT and torque - = LEFT, so the command direction IN ANGLE
+    # SPACE is cmd = -sign(torque), and the curvature intent in the angle
+    # domain is intent = -sign(kappa_des).
+    #
+    # Placed AFTER the sb machine (EOD reads sb_block, which that machine both
+    # arms and decrements) and BEFORE the livePose branch, so state['torque']
+    # and state['desired'] are the values that were actually standing while
+    # the ring recorded the motion being judged.
+    if active:
+      state['ov_ring_t'] += 1
+      ring = state['sb_ring']    # READ-ONLY reuse of the sb machine's ring
+      _ov_brake = bool(getattr(CS, 'brakePressed', False))
+      if len(ring) > OV_RATE_TICKS:
+        # Signed rate over the same 0.2 s window the sb machine measures its
+        # sweep rate over. Deltas only — the steeringAngleDeg alignment
+        # offset cancels (see the _angle comment above).
+        rate = (ring[-1] - ring[-1 - OV_RATE_TICKS]) / (OV_RATE_TICKS * DT_CAN_TICK)
+        tq = state['torque']
+        a = ring[-1]
+
+        # Push memory. After the driver wins, cancel_tol drops the command to
+        # ~0 for ~0.3 s (measured, 3f2 seg 22), which would mask the
+        # against-torque test exactly when the override is most visible — so
+        # the last push direction persists that long. A NEW push in EITHER
+        # direction re-primes it: carrying a stale direction across a command
+        # reversal cost 12 false WSD fires / 3.2 h at curve entries (measured).
+        if abs(tq) > OV_EOD_MIN_TQ:
+          state['ov_push_dir'] = -1.0 if tq > 0 else 1.0
+          state['ov_push_t'] = 0
+        else:
+          state['ov_push_t'] += 1
+        mem = state['ov_push_dir'] if state['ov_push_t'] <= int(OV_PUSH_MEM_S / DT_CAN_TICK) else 0.0
+        cmd = (-1.0 if tq > 0 else 1.0) if abs(tq) > OV_EOD_MIN_TQ else 0.0
+
+        # EOD — panic yank: the wheel is moving fast AGAINST our push.
+        # Stands down while a v2 trip episode is settling: sb_block means the
+        # plant just released a windup, and that rebound is v2's to explain,
+        # not a driver's (validated on 3fa seg 10 — the one at-speed EOD fire
+        # in the clean set coincides exactly with a v2 trip).
+        # SAT exclusion: fast motion TOWARD center from beyond
+        # OV_SAT_SAFE_DEG is what self-aligning torque does unaided.
+        _eod_hit = (cmd != 0.0
+                    and rate * cmd < -OV_EOD_RATE_DPS
+                    and not (a * rate < 0.0 and abs(a) > OV_SAT_SAFE_DEG)
+                    and state['sb_block'] == 0)
+        _ov_bump('ov_eod', _eod_hit, OV_EOD_TICKS, 1, _ov_brake)
+
+        # HOLD — rigid hold: the wheel is frozen (same frozen test the sb
+        # machine arms on) while we push past the friction knee. OV_HOLD_TQ =
+        # 3 Nm: static friction alone cannot hold that. Near-center only —
+        # past OV_CRAWL_ANG_DEG, SAT plus friction can hold it, which is the
+        # same measurement that tightened the CRAWL angle gate and binds
+        # harder here since OV_HOLD_TQ < OV_CRAWL_TQ.
+        _frozen = (len(ring) == ring.maxlen
+                   and (max(ring) - min(ring)) < 2 * ANGLE_QUANTUM_DEG)
+        _hold_hit = (_frozen and abs(tq) >= OV_HOLD_TQ and abs(a) < OV_CRAWL_ANG_DEG)
+        _ov_bump('ov_hold', _hold_hit, OV_HOLD_TICKS, 2, _ov_brake)
+
+        # CRAWL — firm resist: supra-knee torque, sub-sweep rate. A free rack
+        # at OV_CRAWL_TQ sweeps; one that only crawls has something holding
+        # it. Near-center for the same SAT reason as HOLD.
+        _crawl_hit = (abs(tq) >= OV_CRAWL_TQ
+                      and abs(rate) < OV_CRAWL_RATE_DPS
+                      and abs(a) < OV_CRAWL_ANG_DEG)
+        _ov_bump('ov_crawl', _crawl_hit, OV_CRAWL_TICKS, 3, _ov_brake)
+
+        # WSD — deliberate correction: the wheel is deepening onto the WRONG
+        # side of the commanded intent, against a push we made recently.
+        # With an intent (|kappa_des| past OV_WSD_INTENT_KAPPA) "wrong side"
+        # is literal and still growing; on a straight there is no commanded
+        # side, so any side counts but the floor is wider and the wheel must
+        # be moving further out (a * rate > 0).
+        intent = 0.0
+        if abs(state['desired']) > OV_WSD_INTENT_KAPPA:
+          intent = -1.0 if state['desired'] > 0 else 1.0
+        if intent != 0.0:
+          _wrong_side = (a * intent < -OV_WSD_FLOOR_DEG and rate * intent < 0.0)
+        else:
+          _wrong_side = (abs(a) > OV_WSD_FLOOR_DEG + 0.5 and a * rate > 0.0)
+        _wsd_hit = (mem != 0.0
+                    and rate * mem < -OV_WSD_RATE_DPS
+                    and _wrong_side)
+        _ov_bump('ov_wsd', _wsd_hit, OV_WSD_TICKS, 4, _ov_brake)
+    else:
+      # Disengaged: the sustain runs and the push memory are drive-state and
+      # reset with the ring; the cumulative counts are the drive's record and
+      # must survive (they are what the telemetry reports).
+      state['ov_ring_t'] = 0
+      state['ov_eod_n'] = 0
+      state['ov_hold_n'] = 0
+      state['ov_crawl_n'] = 0
+      state['ov_wsd_n'] = 0
+      state['ov_push_dir'] = 0.0
+      state['ov_push_t'] = 0
 
     _sm.update(0)
     lp = _sm['livePose']
@@ -1034,6 +1204,14 @@ def on_lat_controller_init(result, lac, CP):
           'sb_trips': int(state['sb_trips']),                 # cumulative trips this drive
           'sb_block': int(state['sb_block']),                 # same-side push suppression ticks left
           'sb_on': bool(_stall_v2_on),                        # StallBreakaway param, drive self-label
+          # Driver-override observers, phase 1 — counts only, nothing acts on
+          # them. Cumulative per drive; ov_last is the most recent detector.
+          'ov_eod': int(state['ov_eod']),                     # panic yank: fast motion against our torque
+          'ov_hold': int(state['ov_hold']),                   # rigid hold: frozen wheel at supra-knee torque
+          'ov_crawl': int(state['ov_crawl']),                 # firm resist: supra-knee torque, sub-sweep rate
+          'ov_wsd': int(state['ov_wsd']),                     # deliberate correction: deepening wrong-side
+          'ov_brake_fires': int(state['ov_brake_fires']),     # fires (any detector) while brakePressed
+          'ov_last': int(state['ov_last']),                   # 1=eod 2=hold 3=crawl 4=wsd, 0=none this drive
         }
         state['lat_pub'].send(payload)
       except Exception:

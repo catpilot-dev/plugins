@@ -1413,3 +1413,387 @@ class TestLowSpeedLkaReference:
       _call_update(lac, 0.006, v_ego=v)
       torques.append(state['torque'])
     assert torques[0] == pytest.approx(torques[1], rel=1e-9)
+
+
+# ============================================================
+# Driver-override observers, phase 1 (2026-08-17). Four detectors that COUNT
+# driver-override signatures and act on NOTHING. The E90 has no driver-torque
+# sensor, so each one is a statement about rack physics that a driver — and
+# only a driver — can produce:
+#   EOD   the wheel moves fast AGAINST our push
+#   HOLD  the wheel is frozen while we push past the friction knee
+#   CRAWL supra-knee torque, sub-sweep rate (a free rack sweeps)
+#   WSD   the wheel deepens onto the wrong side of the commanded intent
+#
+# THE PRIMARY CONTRACT IS test_no_behavior_change: the actuator path must be
+# byte-identical with the observers present. Everything else here pins a
+# single detector conjunct so that removing it turns a test red.
+#
+# Sign conventions, once: angle + = LEFT, torque - = LEFT, so the command
+# direction in angle space is -sign(torque), and the curvature intent in the
+# angle domain is -sign(kappa_des).
+#
+# Harness: one _ov_tick is one CAN tick and one livePose tick, so tick counts
+# map straight onto the OV_*_TICKS constants. The observers need the shared
+# sb_ring longer than OV_RATE_TICKS (21 ticks) before they evaluate anything,
+# and the frozen test needs it FULL (41 ticks) — every choreography below
+# warms up first.
+# ============================================================
+
+_OV_Q = 0.04395          # == ANGLE_QUANTUM_DEG
+_OV_V = 20.0
+
+
+def _ov_make(monkeypatch, kappa_meas=0.0, v=_OV_V):
+  """Controller at the production defaults (stall/breakaway OFF): the
+  observers are always-on, there is no param to enable."""
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _set_measured(sm, v, kappa_meas)
+  return lac, sm, mod, state
+
+
+def _ov_tick(lac, angle, *, torque=None, kappa_des=0.0, action='ramp',
+             active=True, brake=None, sb_block=None, v=_OV_V, cs=None):
+  """One CAN + livePose tick with the actuator state pinned.
+
+  torque is re-pinned every tick (the ramp at the bottom of update() would
+  otherwise walk it) and tick_count is held at 0 so no cadence decision runs.
+  The observers read state['torque'] / state['action'] / state['sb_block']
+  BEFORE the livePose branch, so pinning them here is what makes the
+  choreography deterministic — the same trick _sb_tick uses.
+
+  sb_block is re-pinned rather than set once because the sb machine
+  decrements it at the top of every tick.
+  """
+  state = _closure_state(lac.update)
+  if torque is not None:
+    state['torque'] = torque
+  if sb_block is not None:
+    state['sb_block'] = sb_block
+  state['action'] = action
+  state['tick_count'] = 0
+  if cs is None:
+    cs = SimpleNamespace(vEgo=v, steeringAngleDeg=angle)
+    if brake is not None:
+      cs.brakePressed = brake
+  return lac.update(active, cs, None, None, False, kappa_des, False, 0.2)
+
+
+# EOD choreography (used by three tests). Warm the ring frozen at a0 while
+# pushing LEFT (torque < 0, so the command direction in angle space is +1),
+# then sweep the wheel RIGHT at 10 quanta/tick = 43.95 deg/s — against the
+# command, past OV_EOD_RATE_DPS.
+#
+# The 0.2 s rate window is fixed, so while it still contains frozen samples
+# the measured rate is the window average: at moved tick j (j <= 20) it reads
+# -2.1975*j deg/s, first clearing -40 at j = 19 (-41.75; j = 18 reads -39.56).
+# OV_EOD_TICKS = 10 sustained hits then land the fire exactly on j = 28,
+# which pins both the rate boundary and the sustain length to single ticks.
+_OV_EOD_STEP = 10 * _OV_Q
+_OV_EOD_FIRE_J = 28
+# kappa_des is held on the LEFT (intent -1 in angle space) purely to keep WSD
+# out of these tests: rightward motion is then never "wrong side".
+_OV_EOD_KAPPA = 0.004
+
+
+def _ov_eod_run(lac, a0, ticks, **kw):
+  """Warm up frozen at a0, then sweep right. Yields (j, a) per moved tick."""
+  for _ in range(25):
+    _ov_tick(lac, a0, torque=-0.1, kappa_des=_OV_EOD_KAPPA, **kw)
+  for j in range(1, ticks + 1):
+    a = a0 - j * _OV_EOD_STEP
+    _ov_tick(lac, a, torque=-0.1, kappa_des=_OV_EOD_KAPPA, **kw)
+    yield j, a
+
+
+class TestOverrideObservers:
+
+  # ---- (1) THE CONTRACT --------------------------------------------------
+
+  def test_no_behavior_change(self, monkeypatch):
+    """PHASE-1 PRIMARY GATE: the observers are inert.
+
+    Two controllers are stepped through the same rich choreography with the
+    real control law running (nothing pinned — genuine cadence decisions,
+    ramps, holds, a disengagement, braking). The only difference is that one
+    has every ov_* key pre-poked to a different value, including three
+    sustain counters parked one tick below their fire thresholds — so its
+    detectors fire on different ticks than the other's.
+
+    After every single tick, every non-ov_ state key, the returned actuator
+    output, and every non-ov_ telemetry field must be EXACTLY equal (not
+    approx). If any ov_* key ever leaked into the actuator path, the poked
+    controller would diverge here.
+    """
+    lac_a, sm_a, mod, state_a = _ov_make(monkeypatch)
+    lac_b, sm_b, _, state_b = _ov_make(monkeypatch)
+
+    pay_a, pay_b = [], []
+    state_a['lat_pub'] = SimpleNamespace(send=pay_a.append)
+    state_b['lat_pub'] = SimpleNamespace(send=pay_b.append)
+
+    # Poke B: cumulative counts, the last-fire id, the push memory, and three
+    # sustain runs one tick short of firing.
+    state_b.update({
+      'ov_ring_t': 12345,
+      'ov_eod': 7, 'ov_hold': 3, 'ov_crawl': 11, 'ov_wsd': 5,
+      'ov_eod_n': 9, 'ov_hold_n': 49, 'ov_crawl_n': 49, 'ov_wsd_n': 14,
+      'ov_brake_fires': 2, 'ov_last': 4,
+      'ov_push_dir': -1.0, 'ov_push_t': 99,
+    })
+    assert state_b['ov_eod_n'] == mod.OV_EOD_TICKS - 1
+    assert state_b['ov_hold_n'] == mod.OV_HOLD_TICKS - 1
+    assert state_b['ov_wsd_n'] == mod.OV_WSD_TICKS - 1
+
+    # Choreography: frozen straight-ish push, a fast leftward yank (fires
+    # EOD), a braked sweep back from a large angle, a disengagement, then a
+    # long frozen stretch on a curve.
+    steps = []
+    steps += [(True, 0.004, 0.0, False)] * 30
+    steps += [(True, 0.004, j * _OV_EOD_STEP, False) for j in range(1, 41)]
+    steps += [(True, -0.003, 40 * _OV_EOD_STEP - j * _OV_EOD_STEP, True)
+              for j in range(1, 21)]
+    steps += [(False, 0.0, 5.0, False)] * 5
+    steps += [(True, 0.0, 3.0, False)] * 60
+
+    for i, (active, kappa, angle, brake) in enumerate(steps):
+      outs = []
+      for lac in (lac_a, lac_b):
+        cs = SimpleNamespace(vEgo=_OV_V, steeringAngleDeg=angle,
+                             brakePressed=brake)
+        outs.append(lac.update(active, cs, None, None, False, kappa, False, 0.2))
+      assert outs[0][0] == outs[1][0], f'output diverged at tick {i}'
+      assert outs[0][1] == outs[1][1]
+      for k in sorted(state_a):
+        if k.startswith('ov_') or k == 'lat_pub':
+          continue
+        assert state_a[k] == state_b[k], f'state[{k!r}] diverged at tick {i}'
+      assert len(pay_a) == len(pay_b)
+      if pay_a:
+        a_pay = {k: v for k, v in pay_a[-1].items() if not k.startswith('ov_')}
+        b_pay = {k: v for k, v in pay_b[-1].items() if not k.startswith('ov_')}
+        assert a_pay == b_pay, f'telemetry diverged at tick {i}'
+
+    # Non-vacuity: the choreography really did exercise the observers, and
+    # the two controllers really did end up with different counts.
+    assert state_a['ov_eod'] >= 1
+    assert state_a['ov_eod'] != state_b['ov_eod']
+
+  # ---- (2) EOD -----------------------------------------------------------
+
+  def test_eod_fires_on_fast_against_command(self, monkeypatch):
+    """Panic yank: 43.95 deg/s of wheel motion AGAINST a left push, near
+    center, sustained OV_EOD_TICKS. See the choreography note above for why
+    the fire lands exactly on moved tick 28."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    for j, a in _ov_eod_run(lac, 2.0, _OV_EOD_FIRE_J):
+      assert abs(a) < mod.OV_SAT_SAFE_DEG or a * -_OV_EOD_STEP > 0
+      if j < _OV_EOD_FIRE_J:
+        assert state['ov_eod'] == 0, f'fired early at j={j}'
+    assert state['ov_eod'] == 1
+    assert state['ov_last'] == 1
+    assert state['ov_brake_fires'] == 0        # no brakePressed on this CS
+
+    # Sustained motion counts the episode ONCE, not once per tick.
+    for _ in range(30):
+      _ov_tick(lac, -100.0, torque=-0.1, kappa_des=_OV_EOD_KAPPA)
+    assert state['ov_eod'] == 1
+
+  def test_eod_stands_down_during_sb_block(self, monkeypatch):
+    """SB_BLOCK PIN. While a stall/breakaway trip is still settling, fast
+    motion is the plant shedding windup (v2 owns it), not a driver — the
+    one at-speed EOD in the clean 3.2 h set coincided exactly with a trip."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    for _ in _ov_eod_run(lac, 2.0, _OV_EOD_FIRE_J + 10, sb_block=40):
+      pass
+    assert state['ov_eod'] == 0
+
+  def test_eod_sat_exclusion(self, monkeypatch):
+    """SAT PIN. The identical sweep, but running TOWARD center from beyond
+    OV_SAT_SAFE_DEG: self-aligning torque produces that unaided, so it is
+    not evidence of a driver."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    last = None
+    for _, last in _ov_eod_run(lac, 30.0, 40):
+      pass
+    assert last > mod.OV_SAT_SAFE_DEG          # stayed excluded the whole way
+    assert state['ov_eod'] == 0
+
+  # ---- (3) HOLD ----------------------------------------------------------
+
+  # The ring must be FULL (41 ticks) before the frozen test can pass, then
+  # OV_HOLD_TICKS = 50 sustained hits: the fire lands on tick 90.
+  HOLD_FIRE_TICK = 90
+
+  def _hold_run(self, lac, torque, ticks, **kw):
+    for _ in range(ticks):
+      _ov_tick(lac, 2.0, torque=torque, **kw)
+
+  def test_hold_fires_frozen_supra_knee(self, monkeypatch):
+    """Rigid hold: the wheel does not move at all while we push 3 Nm. Static
+    friction cannot do that past the knee — something is holding it."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    self._hold_run(lac, 0.28, self.HOLD_FIRE_TICK - 1)
+    assert state['ov_hold'] == 0
+    self._hold_run(lac, 0.28, 1)
+    assert state['ov_hold'] == 1
+    assert state['ov_last'] == 2
+    assert state['ov_crawl'] == 0              # 0.28 is below OV_CRAWL_TQ
+
+  def test_hold_ceiling_pin(self, monkeypatch):
+    """KNEE PIN. The same frozen wheel at 0.20 frac is just ordinary
+    stiction — below OV_HOLD_TQ nothing is claimed."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    self._hold_run(lac, 0.20, self.HOLD_FIRE_TICK + 20)
+    assert state['ov_hold'] == 0
+
+  # ---- (4) CRAWL ---------------------------------------------------------
+
+  # Supra-knee torque with the wheel barely creeping: 0.2 quanta/tick =
+  # 0.879 deg/s, well under OV_CRAWL_RATE_DPS but far too much drift to read
+  # as frozen (the 41-sample ring spans ~8 quanta), so this is CRAWL alone.
+  # Hits start once the ring passes OV_RATE_TICKS (tick 21) and
+  # OV_CRAWL_TICKS = 50 sustained hits land the fire on tick 70.
+  CRAWL_FIRE_TICK = 70
+  CRAWL_DRIFT = 0.2 * _OV_Q
+  # kappa_des on the RIGHT (intent +1) so leftward drift is never wrong-side.
+  CRAWL_KAPPA = -0.004
+
+  def _crawl_run(self, lac, a0, ticks, **kw):
+    for k in range(1, ticks + 1):
+      _ov_tick(lac, a0 + k * self.CRAWL_DRIFT, torque=0.35,
+               kappa_des=self.CRAWL_KAPPA, **kw)
+
+  def test_crawl_fires_on_firm_resist(self, monkeypatch):
+    """Firm resist: a free rack sweeps at 0.35 frac; one that only crawls
+    has something on the other end of it."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    self._crawl_run(lac, 1.0, self.CRAWL_FIRE_TICK - 1)
+    assert state['ov_crawl'] == 0
+    self._crawl_run(lac, 1.0 + (self.CRAWL_FIRE_TICK - 1) * self.CRAWL_DRIFT, 1)
+    assert state['ov_crawl'] == 1
+    assert state['ov_last'] == 3
+    assert state['ov_hold'] == 0               # drifting, so never "frozen"
+
+  def test_crawl_angle_gate(self, monkeypatch):
+    """TIGHTENED-GATE PIN (10 -> 6 deg, 2026-08-17). At 8 deg, SAT plus
+    friction can balance 0.30 frac on their own, so the same crawl there
+    proves nothing. The drift is slow enough that the angle never leaves the
+    8-9 deg band — a 10 deg gate would fire on this."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    self._crawl_run(lac, 8.0, self.CRAWL_FIRE_TICK + 20)
+    assert state['ov_crawl'] == 0
+    final = 8.0 + (self.CRAWL_FIRE_TICK + 20) * self.CRAWL_DRIFT
+    assert mod.OV_CRAWL_ANG_DEG < 8.0 <= final < 10.0
+
+  # ---- (5) WSD -----------------------------------------------------------
+
+  # A left push, then the command falls away (cancel_tol yields for ~0.3 s
+  # after the driver wins — that is what the push memory exists to bridge),
+  # then the wheel deepens RIGHT of a LEFT intent at 5 quanta/tick
+  # (21.975 deg/s). The window-average rate clears OV_WSD_RATE_DPS at moved
+  # tick 4, so OV_WSD_TICKS = 15 sustained hits fire on tick 18 — inside the
+  # OV_PUSH_MEM_S (30 tick) window, which is the point.
+  WSD_STEP = 5 * _OV_Q
+  WSD_FIRE_J = 18
+  WSD_KAPPA = -0.002        # left intent in angle space (intent = +1)
+
+  def _wsd_sweep(self, lac, a0, ticks):
+    for j in range(1, ticks + 1):
+      _ov_tick(lac, a0 - j * self.WSD_STEP, torque=0.0,
+               kappa_des=self.WSD_KAPPA)
+
+  def test_wsd_wrong_side_deepening(self, monkeypatch):
+    """Deliberate correction: the wheel is being carried further onto the
+    wrong side of the commanded curve, against a push we made moments ago."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    for _ in range(25):
+      _ov_tick(lac, -2.0, torque=-0.1, kappa_des=self.WSD_KAPPA)
+    self._wsd_sweep(lac, -2.0, self.WSD_FIRE_J - 1)
+    assert state['ov_wsd'] == 0
+    self._wsd_sweep(lac, -2.0 - (self.WSD_FIRE_J - 1) * self.WSD_STEP, 1)
+    assert state['ov_wsd'] == 1
+    assert state['ov_last'] == 4
+    assert state['ov_eod'] == 0                # 21.975 deg/s is far under EOD
+
+  def test_wsd_requires_a_recent_push(self, monkeypatch):
+    """MEMORY PIN. Identical wheel motion with no push behind it is just a
+    wheel moving — we never commanded anything for it to be against."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    for _ in range(25):
+      _ov_tick(lac, -2.0, torque=0.0, kappa_des=self.WSD_KAPPA)
+    self._wsd_sweep(lac, -2.0, self.WSD_FIRE_J + 10)
+    assert state['ov_wsd'] == 0
+
+  def test_wsd_memory_invalidates_on_flip(self, monkeypatch):
+    """SIGN-FLIP PIN. A push LEFT then a push RIGHT re-primes the memory to
+    the new direction, so the same rightward wheel motion is now WITH the
+    command, not against it. Carrying the stale direction across command
+    reversals cost 12 false fires / 3.2 h at curve entries."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    for _ in range(25):
+      _ov_tick(lac, -2.0, torque=-0.1, kappa_des=self.WSD_KAPPA)
+    for _ in range(5):
+      _ov_tick(lac, -2.0, torque=+0.1, kappa_des=self.WSD_KAPPA)
+    self._wsd_sweep(lac, -2.0, self.WSD_FIRE_J + 10)
+    assert state['ov_wsd'] == 0
+    assert state['ov_push_dir'] == -1.0        # re-primed to the right push
+
+  # ---- (6) Context, lifecycle, telemetry ---------------------------------
+
+  def test_brake_context_counter(self, monkeypatch):
+    """Stage-2 context: a fire while the driver is on the brake is a
+    different event from one on a trailing throttle. Phase 1 only counts."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    self._hold_run(lac, 0.28, self.HOLD_FIRE_TICK, brake=True)
+    assert state['ov_hold'] == 1
+    assert state['ov_brake_fires'] == 1
+
+  def test_counters_survive_disengage_sustains_reset(self, monkeypatch):
+    """A disengagement resets the drive-state (sustain runs, push memory,
+    tick count) because the ring resets with it — but the cumulative counts
+    are the drive's record and must survive."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    self._hold_run(lac, 0.28, self.HOLD_FIRE_TICK + 20)
+    assert state['ov_hold'] == 1
+    assert state['ov_hold_n'] == 70
+    assert state['ov_push_dir'] != 0.0
+    assert state['ov_ring_t'] == self.HOLD_FIRE_TICK + 20
+
+    _ov_tick(lac, 2.0, torque=0.28, active=False)
+    assert state['ov_hold_n'] == 0
+    assert state['ov_eod_n'] == state['ov_crawl_n'] == state['ov_wsd_n'] == 0
+    assert state['ov_push_dir'] == 0.0
+    assert state['ov_push_t'] == 0
+    assert state['ov_ring_t'] == 0
+    assert state['ov_hold'] == 1               # retained
+    assert state['ov_last'] == 2               # retained
+
+  def test_missing_brake_attr_safe(self, monkeypatch):
+    """CS is a stub on some paths — a missing brakePressed must degrade to
+    False, exactly like the steeringAngleDeg guard above it."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    cs = SimpleNamespace(vEgo=_OV_V, steeringAngleDeg=2.0)
+    assert not hasattr(cs, 'brakePressed')
+    for _ in range(self.HOLD_FIRE_TICK):
+      _ov_tick(lac, 2.0, torque=0.28, cs=cs)
+    assert state['ov_hold'] == 1
+    assert state['ov_brake_fires'] == 0
+
+  def test_telemetry_keys(self, monkeypatch):
+    """Six counters on the bus; nothing else is added and no gate/param
+    field is advertised (phase 1 has neither)."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    payloads = []
+    state['lat_pub'] = SimpleNamespace(send=payloads.append)
+    self._hold_run(lac, 0.28, self.HOLD_FIRE_TICK, brake=True)
+    assert payloads
+    p = payloads[-1]
+    for key in ('ov_eod', 'ov_hold', 'ov_crawl', 'ov_wsd', 'ov_brake_fires',
+                'ov_last'):
+      assert isinstance(p[key], int), key
+    assert p['ov_hold'] == 1
+    assert p['ov_brake_fires'] == 1
+    assert p['ov_last'] == 2
+    assert 'ov_on' not in p
+    assert 'ov_push_dir' not in p
