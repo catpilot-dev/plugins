@@ -53,10 +53,26 @@ class TestService:
 
 
 class TestProcess:
-  def test_mapd_process_declared(self):
-    procs = {p['name']: p for p in _manifest()['processes']}
-    assert 'mapd' in procs
-    assert procs['mapd']['module'] == 'mapd_runner'
+  def test_no_process_declared_binary_is_dormant(self):
+    """mapd is interface-only (2026-08-19): no process, so the binary never runs.
+
+    speedlimitd's control path is osm_query.OsmTileReader; mapdOut was Phase-1
+    observation telemetry only. Dormant until a release ships gomsgq v0.1.11
+    (mapd fe45d10) — re-activation restores a {'name': 'mapd', 'module':
+    'mapd_runner'} entry here.
+    """
+    assert _manifest()['processes'] == []
+
+  def test_interface_survives_the_dormant_binary(self):
+    """The cereal slots and mapdOut service MUST stay declared while dormant.
+
+    This is why mapd is enforced rather than .disabled: .disabled makes
+    custom_capnp.py revert the slots to CustomReservedN and services.py drop
+    mapdOut, tearing down the interface we are deliberately keeping warm.
+    """
+    m = _manifest()
+    assert set(m['cereal']['slots']) == {'17', '18', '19'}
+    assert m['services']['mapdOut'][0] is True
 
 
 class TestHooks:

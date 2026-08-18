@@ -302,11 +302,22 @@ if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
     rm -f "$PLUGINS_DEST/lane_keeping/.disabled"
   fi
 fi
-# mapd is the sole OSM road-context provider (speedlimitd consumes mapdOut).
-# Enforced so a stale .disabled cannot silently leave the car with no map data.
-# Was pinned off until v2.3.0: v2.0.6-v2.2.0 hardcoded a slotless ("shadow")
-# carState subscription whose torn reads panic gomsgq. v2.3.0 made shadow a
-# per-queue setting — see mapd_defaults.json.
+# mapd is INTERFACE-ONLY as of 2026-08-19: plugin.json declares no process, so
+# the Go binary never launches. speedlimitd's control path is and always was the
+# offline tile reader (osm_query.OsmTileReader); mapdOut fed Phase-1 observation
+# telemetry only (mapd_source.telemetry_from_mapd), which degrades to
+# (None, False) when the service is absent — see speedlimitd.py:1285.
+# Still ENFORCED (not .disabled) on purpose: .disabled makes custom_capnp.py
+# revert slots 17-19 to the CustomReservedN stub and services.py drop mapdOut,
+# which would tear down the very interface we are keeping warm for the day
+# pfeiferj cuts a release containing gomsgq v0.1.11 (mapd commit fe45d10 —
+# shadow readers no longer panic on torn reads). Re-activation is one edit:
+# restore the "processes" entry in plugins/mapd/plugin.json.
+# History: v2.0.6-v2.2.0 hardcoded a slotless ("shadow") carState subscription
+# whose torn reads panic gomsgq; v2.3.0 made shadow per-queue but shipped the
+# OTHER queues slotted, and mapd's panic-restarts leak reader slots until the
+# table wipes — that killed loggerd on route 410 (see mapd_defaults.json, which
+# now sets every queue shadow).
 if [[ -d "$PLUGINS_DEST/mapd" ]]; then
   if $DRY_RUN; then
     echo "  ENFORCE mapd (touch .enforced, rm .disabled)"
