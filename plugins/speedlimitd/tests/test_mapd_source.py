@@ -1,5 +1,6 @@
 """Adapter tests — mapdOut becomes the road-context dict speedlimitd consumes."""
 import os
+import re
 import sys
 from dataclasses import dataclass
 
@@ -86,3 +87,130 @@ class TestTelemetry:
     live = mapd_source.telemetry_from_mapd(FakeMapdOut(wayRef='S20'), True, 'S20')
     dead = mapd_source.telemetry_from_mapd(None, False, 'S20')
     assert set(live) == set(dead)
+
+
+# plugins/mapd/cereal holds the real generated schema. slot19.capnp is a
+# struct-body FRAGMENT (no wrapper) that install.sh's custom_capnp.py injects
+# into openpilot's cereal/custom.capnp in place of CustomReserved19; to load it
+# standalone here it is reassembled the same way
+# plugins/mapd/tests/test_slot_schemas.py does: the fragment wrapped in its own
+# `struct MapdOut { ... }` declaration, plus the shared enum defs it needs from
+# standalone.capnp.
+#
+# Only the ENUM blocks are pulled from standalone.capnp, not the whole file:
+# standalone.capnp's structs (MapdPosition etc.) carry explicit, hand-assigned
+# @0x IDs, and plugins/mapd/tests/test_slot_schemas.py already loads a merged
+# file containing the full standalone.capnp text in this same pytest process.
+# capnp's schema loader aborts the whole interpreter (uncaught kj::Exception,
+# "Duplicate ID @0x...") if those explicit IDs are registered a second time by
+# a second capnp.load() call — reproduced directly while building this fixture.
+# Enums have no explicit ID here, so their (file-id, name)-derived ID differs
+# safely between the two independently-loaded files.
+_MAPD_CEREAL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 '..', 'mapd', 'cereal')
+
+# capnp requires a file ID. Arbitrary but fixed; never persisted anywhere.
+_FILE_ID = '@0xd4a1f0b3e2c9a716;'
+
+# Enums referenced by MapdOut's fields (waySelectionType, roadContext,
+# highwayClass) — the only standalone.capnp types this fixture needs.
+_REQUIRED_ENUMS = ('WaySelectionType', 'RoadContext', 'HighwayClass')
+
+
+def _extract_enum_blocks(standalone_text, names):
+  """Pull the named top-level `enum X { ... }` blocks out of standalone.capnp.
+
+  Reads the real, current file rather than hand-copying enum bodies, so this
+  stays in sync with upstream drift the same way test_slot_schemas.py's own
+  EXPECTED_HIGHWAY_CLASS check does. Enums in this file have no nested braces,
+  so a non-greedy match to the first `^}` closes each block correctly.
+  """
+  found = {}
+  for m in re.finditer(r'^enum (\w+) \{.*?^\}\n', standalone_text, re.DOTALL | re.MULTILINE):
+    found[m.group(1)] = m.group(0)
+  missing = [n for n in names if n not in found]
+  assert not missing, f'enum(s) not found in standalone.capnp: {missing}'
+  return '\n'.join(found[n] for n in names)
+
+
+@pytest.fixture(scope='module')
+def real_mapdout_schema(tmp_path_factory):
+  """Reassemble the needed standalone.capnp enums + the MapdOut slot fragment
+  into one loadable file.
+
+  The capnp gate lives here, not at module scope (see
+  plugins/speedlimitd/tests/test_generate_hw_tiles.py / plugins/mapd/tests/
+  test_slot_schemas.py for the established pattern): a module-scope
+  pytest.importorskip('capnp') would skip collection of this whole file,
+  whereas gating inside the fixture only skips the tests that request it —
+  the other 8 tests above keep running with no capnp present.
+  """
+  capnp = pytest.importorskip('capnp')
+  with open(os.path.join(_MAPD_CEREAL_DIR, 'standalone.capnp')) as f:
+    standalone_text = f.read()
+  with open(os.path.join(_MAPD_CEREAL_DIR, 'slot19.capnp')) as f:
+    body = f.read()
+  parts = [
+    _FILE_ID,
+    _extract_enum_blocks(standalone_text, _REQUIRED_ENUMS),
+    f'struct MapdOut {{\n{body}}}\n',
+  ]
+  merged = tmp_path_factory.mktemp('capnp') / 'merged.capnp'
+  merged.write_text('\n'.join(parts))
+  return capnp.load(str(merged))
+
+
+class TestRealCapnpEnum:
+  """Pins the adapter against an actual generated MapdOut, not FakeMapdOut.
+
+  On a real message, mapd_out.highwayClass is a capnp._DynamicEnum, not a str
+  -- isinstance(hc, str) is False. mapd_source's _CLASS_TO_OSM.get(value, '')
+  still returns the right answer because _DynamicEnum hashes/compares equal to
+  the matching enumerant name string, but FakeMapdOut above only ever hands
+  the adapter plain strings, so nothing else in the suite would notice if that
+  equivalence broke. It matters because the car runs pycapnp 2.1.0 (pinned for
+  an unrelated memory leak) while this dev machine runs 2.2.4, and the
+  _DynamicEnum hash/eq behaviour has only ever been observed on 2.2.4: if it
+  differs on-device, every road silently classifies as '' with no error.
+  """
+
+  def test_compound_enum_value_is_not_a_str(self, real_mapdout_schema):
+    msg = real_mapdout_schema.MapdOut.new_message()
+    msg.highwayClass = 'motorwayLink'
+    assert not isinstance(msg.highwayClass, str)
+
+  def test_compound_name_from_real_enum(self, real_mapdout_schema):
+    msg = real_mapdout_schema.MapdOut.new_message()
+    msg.highwayClass = 'motorwayLink'
+    assert mapd_source.highway_class_name(msg.highwayClass) == 'motorway_link'
+
+  def test_simple_name_from_real_enum(self, real_mapdout_schema):
+    msg = real_mapdout_schema.MapdOut.new_message()
+    msg.highwayClass = 'motorway'
+    assert mapd_source.highway_class_name(msg.highwayClass) == 'motorway'
+
+  def test_default_unset_enum_is_empty(self, real_mapdout_schema):
+    msg = real_mapdout_schema.MapdOut.new_message()   # highwayClass left unset
+    assert mapd_source.highway_class_name(msg.highwayClass) == ''
+
+  def test_telemetry_end_to_end_from_real_message(self, real_mapdout_schema):
+    msg = real_mapdout_schema.MapdOut.new_message()
+    msg.wayRef = 'S20'
+    msg.speedLimit = 27.8
+    msg.lanes = 4
+    msg.highwayClass = 'motorway'
+    msg.wayId = 42
+    msg.tileLoaded = True
+    msg.distanceFromWayCenter = 1.5
+    msg.waySelectionType = 'current'
+    with real_mapdout_schema.MapdOut.from_bytes(msg.to_bytes()) as out:
+      t = mapd_source.telemetry_from_mapd(out, valid=True, our_way_ref='S20')
+    assert t['mapdWayRef'] == 'S20'
+    assert t['mapdWayId'] == 42
+    assert t['mapdSpeedLimit'] == pytest.approx(100.1, abs=0.1)   # 27.8 m/s → km/h
+    assert t['mapdHwClass'] == 'motorway'
+    assert t['mapdLanes'] == 4
+    assert t['mapdSelType'] == 'current'
+    assert t['mapdTileLoaded'] is True
+    assert t['mapdDistance'] == pytest.approx(1.5)
+    assert t['mapdRefAgree'] is True
