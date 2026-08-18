@@ -277,3 +277,82 @@ class TestSettingsParamWrite:
     runner, cfg = self._runner_with_config(monkeypatch, tmp_path)
     cfg.PARAMS_DIR = str(blocker / 'params')
     assert runner.write_settings_param() is False
+
+
+class TestHealthHookDormancy:
+  """hook.on_health_check must not cry wolf while mapd is dormant by design.
+
+  mapd is kept installed with its cereal interface warm but declares no
+  process, so the binary never launches. A permanent expected warning is worse
+  than none: it desensitises the reader, and a real failure after re-activation
+  would not stand out. The manifest is therefore the source of truth for what
+  "healthy" means, so restoring the process entry re-arms the warning with no
+  edit to hook.py.
+  """
+
+  @staticmethod
+  def _hook(monkeypatch, *, alive, processes):
+    import importlib
+    if PLUGIN_DIR not in sys.path:
+      sys.path.insert(0, PLUGIN_DIR)
+    import hook
+    importlib.reload(hook)
+    monkeypatch.setattr(hook, '_pid_alive', lambda name: alive)
+    monkeypatch.setattr(hook, '_declares_process', lambda: bool(processes))
+    return hook
+
+  def test_dormant_and_stopped_is_ok_not_a_warning(self, monkeypatch):
+    hook = self._hook(monkeypatch, alive=False, processes=False)
+    r = hook.on_health_check({})['mapd']
+    assert r['status'] == 'ok'
+    assert r['dormant'] is True
+    assert 'warnings' not in r
+
+  def test_dormant_still_reports_process_alive_honestly(self, monkeypatch):
+    # The field keeps its literal meaning so an rlog reader can distinguish
+    # "switched off" from "crashed" without consulting the manifest.
+    hook = self._hook(monkeypatch, alive=False, processes=False)
+    assert hook.on_health_check({})['mapd']['process_alive'] is False
+
+  def test_active_and_stopped_still_warns(self, monkeypatch):
+    hook = self._hook(monkeypatch, alive=False, processes=True)
+    r = hook.on_health_check({})['mapd']
+    assert r['status'] == 'warning'
+    assert r['dormant'] is False
+    assert r['warnings'] == ['mapd process not running']
+
+  def test_active_and_running_is_ok(self, monkeypatch):
+    hook = self._hook(monkeypatch, alive=True, processes=True)
+    r = hook.on_health_check({})['mapd']
+    assert r['status'] == 'ok'
+    assert 'warnings' not in r
+
+  def test_accumulator_is_preserved(self, monkeypatch):
+    hook = self._hook(monkeypatch, alive=False, processes=False)
+    assert hook.on_health_check({'other': 1})['other'] == 1
+
+
+class TestHealthHookManifestReading:
+  """_declares_process reads the REAL manifest — this is what makes the hook
+  self-maintaining across activation/deactivation."""
+
+  @staticmethod
+  def _fresh_hook():
+    import importlib
+    if PLUGIN_DIR not in sys.path:
+      sys.path.insert(0, PLUGIN_DIR)
+    import hook
+    importlib.reload(hook)
+    return hook
+
+  def test_tracks_the_shipped_manifest(self):
+    hook = self._fresh_hook()
+    declared = any(p.get('name') == 'mapd' for p in _manifest().get('processes', []))
+    assert hook._declares_process() is declared
+
+  def test_unreadable_manifest_assumes_active(self, monkeypatch):
+    # Fail LOUD, not silent: if we cannot tell, the state where a missing
+    # binary is a real problem is the one worth defaulting to.
+    hook = self._fresh_hook()
+    monkeypatch.setattr(hook, '_PLUGIN_DIR', '/nonexistent-plugin-dir')
+    assert hook._declares_process() is True

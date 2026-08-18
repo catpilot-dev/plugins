@@ -101,6 +101,12 @@ the panic is now gated to non-shadow readers and shadow readers get
 4. Success criterion: one long-lived mapd PID across a whole drive (versus the
    1–2 min flap baseline above).
 
+Nothing to do for the health hook: `hook.py` reads this manifest, so it reports
+`status: ok, dormant: true` while no process is declared and re-arms the
+"mapd process not running" warning the moment step 1 restores the entry. That
+indirection exists so a permanently-expected warning never desensitises the
+reader to a real post-re-activation failure.
+
 ## Settings
 
 `mapd_defaults.json` (in this plugin dir) is the single declarative source of
