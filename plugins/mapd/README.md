@@ -46,13 +46,24 @@ our `cereal/slot19.capnp` silently drops any field we have not declared —
 road, with no error anywhere. Bumping the pin requires diffing mapd's
 `cereal/custom/custom.capnp` against our slot files first.
 
-**Shadow subscribers.** v2.0.6 through v2.2.0 hardcoded a slotless ("shadow")
-`carState` subscription: it reads the msgq ring buffer without claiming a
-reader slot, so the writer can overwrite the region mid-read and gomsgq panics
-on the torn size field (pfeiferj/mapd#88). v2.3.0 made shadow a per-queue
-setting. We keep upstream's default of shadow-on for carState — it consumes no
-reader slot — and rely on plugind respawning mapd, with speedlimitd degrading
-to vision-only meanwhile.
+**Shadow subscribers — ALL queues, not just carState (2026-08-18).** v2.0.6
+through v2.2.0 hardcoded a slotless ("shadow") `carState` subscription: it
+reads the msgq ring buffer without claiming a reader slot, so the writer can
+overwrite the region mid-read and gomsgq panics on the torn size field
+(pfeiferj/mapd#88). v2.3.0 made shadow a per-queue setting, and upstream's
+defaults leave the OTHER queues (modelV2, gpsLocation, selfdriveState)
+SLOTTED. That combination crashed loggerd on route 410 seg 4: mapd still
+flaps on the carState torn-read panic, a Go panic exits without
+deregistering its slotted readers, each respawn leaks a slot, and when a
+queue's registration exceeds NUM_READERS=15 gomsgq ZEROES THE WHOLE READER
+TABLE (`gomsgq/subscriber.go:31-34`) — every reader of that socket gets its
+state wiped mid-read, and loggerd (which subscribes to everything) dies on
+the C++ msgq assert with a truncated rlog and a red "logger error" alert.
+So every `subscriber` entry in `mapd_defaults.json` is `shadow: true`:
+mapd consumes ZERO reader slots anywhere, its panics stay contained to
+itself, and plugind respawns it with speedlimitd degrading to vision-only
+meanwhile. Do not set any of them slotted without re-auditing the slot
+budget of that queue AND fixing the slot leak upstream.
 
 ## Settings
 
