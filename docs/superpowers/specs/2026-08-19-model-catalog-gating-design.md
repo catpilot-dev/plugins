@@ -53,13 +53,18 @@ is overwritten by every deploy, which is the intended update path.
 ```
 
 `verified_on` holds openpilot versions as reported by `common/version.h`. A model
-that survives a rebase gains one string rather than a duplicated entry.
+that survives a rebase gains one string rather than a duplicated entry. `files`
+is informational — the required ONNX filenames are already derived from
+`MODEL_CONFIGS`; it is carried for parity with `model_registry.json` entries and
+is not read by the gate.
 
 **`baseline_for` is mandatory:** for each version present in the catalog, exactly
 one driving entry and one DM entry must claim `baseline_for` — the model that
 ships with that catpilot version. Without it a user who switches away from stock
 has no catalogued route back, and the recovery path below has nothing to point
-at.
+at. The invariant is enforced by a `validate_catalog()` check in `catalog.py`,
+covered by a test that fails on a version with zero or multiple baselines, so a
+malformed catalog is caught before it ships rather than on a device.
 
 ### `catalog.py`
 
@@ -144,7 +149,9 @@ commands survive unchanged as **maintainer** tooling. They no longer feed the UI
 
 - **`test_catalog.py`** (new) — version parse from a fake `version.h`, fallback
   chain, `verified_on` filtering, `baseline_entry` resolution, corrupt/missing
-  file fails closed, unlock-marker detection.
+  file fails closed, unlock-marker detection, and `validate_catalog()` rejecting
+  a version with zero or multiple baselines. One test runs `validate_catalog()`
+  against the real shipped `compatible_models.json`.
 - **`test_model_download.py`** — `check_updates` returns only verified,
   uninstalled entries; returns empty for a version absent from the catalog;
   `download_model` refuses an uncatalogued id and proceeds when unlocked.
