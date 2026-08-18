@@ -3522,6 +3522,16 @@ class TestMapdPhase1Telemetry:
     once with a full mapd message reporting a DIFFERENT road at a DIFFERENT
     speed — and asserts every control-bearing attribute is unchanged. The tile
     reader sees no tiles in either run, so it contributes identically.
+
+    Two complementary assertions:
+    - `control_attrs` is a fixed, named list — it FAILS FAST and localises
+      exactly which attribute leaked.
+    - the full published payload (minus the ten `mapd*` keys) must also be
+      identical between the two runs. That is the actual "actuation stays
+      byte-identical" claim — `speedLimit` (planner_hook's input) and
+      `laneCount` live here, not in `control_attrs`, and unlike a hand-picked
+      attribute list this can't go stale as speedlimitd grows new published
+      fields.
     """
     control_attrs = ('last_way_ref', 'last_road_name', 'last_osm_hwtype',
                      'last_osm_speed_kph', 'last_road_context',
@@ -3529,6 +3539,8 @@ class TestMapdPhase1Telemetry:
                      'inference_mode', '_gs_limit_kph')
 
     baseline = self._armed(sld)
+    baseline_sent = {}
+    baseline._sl_pub.send = lambda payload: baseline_sent.update(payload)
     baseline.update()
     before = {a: getattr(baseline, a) for a in control_attrs}
 
@@ -3549,6 +3561,9 @@ class TestMapdPhase1Telemetry:
     injected.sm = MagicMock()
     injected.sm.__getitem__ = lambda _s, k: fake if k == 'mapdOut' else real_sm[k]
     injected.sm.valid = {'mapdOut': True}
+    # alive must be explicit too (2nd review round): the freshness conjunct
+    # added at the speedlimitd.py call site reads sm.alive, not just sm.valid.
+    injected.sm.alive = {'mapdOut': True}
     # Route to real_sm.updated (not a bare {}) so every OTHER key (modelV2,
     # gpsLocationExternal, livePose) behaves exactly as it does in the
     # baseline run above — the containment comparison is only meaningful if
@@ -3562,7 +3577,14 @@ class TestMapdPhase1Telemetry:
 
     after = {a: getattr(injected, a) for a in control_attrs}
     assert after == before, 'mapd data leaked into a control variable'
-    # ...and the injected data really did arrive, so the assertion above is
+
+    # Structural containment over the WHOLE published payload, not just the
+    # named control_attrs above.
+    baseline_rest = {k: v for k, v in baseline_sent.items() if not k.startswith('mapd')}
+    injected_rest = {k: v for k, v in sent.items() if not k.startswith('mapd')}
+    assert injected_rest == baseline_rest, 'mapd data leaked into the published payload'
+
+    # ...and the injected data really did arrive, so the assertions above are
     # testing containment rather than an absent message.
     assert sent['mapdWayRef'] == 'G1503'
     assert sent['mapdAlive'] is True

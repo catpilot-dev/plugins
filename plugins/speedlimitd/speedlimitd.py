@@ -751,6 +751,7 @@ class SpeedLimitMiddleware:
     # to pluginBusLog for the cutover comparison and must never be read by any
     # control path — the tile reader above still drives everything.
     self._mapd_telemetry = mapd_source.telemetry_from_mapd(None, False, '')
+    self._mapd_sample_error_logged = False  # log the sampling except: once, not every 5 s
 
     self.country_bboxes = load_country_bboxes()
     self.country_detected = False
@@ -1232,10 +1233,26 @@ class SpeedLimitMiddleware:
       # compares mapd and the tile reader at the same instant. Nothing below
       # reads these values.
       try:
+        # sm.valid[s] latches True on first receipt and is never cleared, and
+        # sm.data[s] retains the last message — so valid alone can't tell a
+        # live mapd from one that died or wedged mid-drive; every subsequent
+        # sample would silently report the frozen way as "alive", corrupting
+        # mapdRefAgree (the cutover metric) and the rlog uptime count. sm.alive
+        # is the recomputed freshness signal (0.5 s window at 20 Hz) — require
+        # both.
+        mapd_ok = bool(self.sm.valid.get('mapdOut', False) and
+                       self.sm.alive.get('mapdOut', False))
         self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(
-          self.sm['mapdOut'], bool(self.sm.valid.get('mapdOut', False)),
-          self.last_way_ref)
+          self.sm['mapdOut'], mapd_ok, self.last_way_ref)
       except Exception:
+        if not self._mapd_sample_error_logged:
+          self._mapd_sample_error_logged = True
+          try:
+            from openpilot.common.swaglog import cloudlog
+            cloudlog.warning("speedlimitd: mapd telemetry sampling failed — "
+                              "check mapdOut schema injection")
+          except Exception:
+            pass
         self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(None, False, '')
 
     # --- Reactive measured-a_y cap + measured-curvature apex point (2026-07-28) ---
@@ -1651,6 +1668,13 @@ class SpeedLimitMiddleware:
 
     # --- Publish ---
     self._sl_pub.send({
+      # --- Phase 1 mapd observation (see mapd_source.telemetry_from_mapd) ---
+      # Read-only comparison against the tile-derived fields below.
+      # mapdRefAgree is the cutover decision metric. Spread FIRST (not last):
+      # this is the one structural channel by which adapter output could
+      # reach planner_hook, so any accidental key collision below must win
+      # over these keys, not silently override them.
+      **self._mapd_telemetry,
       'speedLimit': self._displayed_speed_limit,
       'source': source,
       'confirmed': self.confirmed,
@@ -1684,10 +1708,6 @@ class SpeedLimitMiddleware:
       # 'low_value' counts measure how live the ramp-sign mis-attribution is.
       'osmTrusted': osm_trusted,
       'osmRejectReason': osm_reject_reason,
-      # --- Phase 1 mapd observation (see mapd_source.telemetry_from_mapd) ---
-      # Read-only comparison against the tile-derived fields above.
-      # mapdRefAgree is the cutover decision metric.
-      **self._mapd_telemetry,
     })
 
 
