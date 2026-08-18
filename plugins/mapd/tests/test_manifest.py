@@ -124,6 +124,14 @@ class TestRunnerSettings:
       assert key not in src, f'{key} should now come from mapd_defaults.json'
 
 
+class _ExecReplacedProcess(Exception):
+  """Sentinel raised by the fake execv to model its real contract: on success,
+  os.execv replaces the process image and never returns to the caller. Not
+  SystemExit — test_gives_up_after_all_delays already asserts on SystemExit
+  and reusing it here would blur the two distinct outcomes.
+  """
+
+
 class TestRunnerRetry:
   """plugind respawns dead processes every POLL_INTERVAL (5 s).
 
@@ -154,21 +162,30 @@ class TestRunnerRetry:
     importlib.reload(mapd_runner)
     return mapd_runner, calls
 
+  @staticmethod
+  def _fake_execv(execed):
+    def execv(p, a):
+      execed.append(p)
+      raise _ExecReplacedProcess  # os.execv never returns on success
+    return execv
+
   def test_execs_immediately_when_binary_ready(self, monkeypatch):
     runner, calls = self._load_runner(monkeypatch, [True])
     execed = []
-    monkeypatch.setattr(runner.os, 'execv', lambda p, a: execed.append(p))
+    monkeypatch.setattr(runner.os, 'execv', self._fake_execv(execed))
     monkeypatch.setattr(runner.time, 'sleep', lambda s: pytest.fail('should not sleep'))
-    runner.main()
+    with pytest.raises(_ExecReplacedProcess):
+      runner.main()
     assert execed == ['/tmp/fake-mapd']
     assert len(calls) == 1
 
   def test_retries_with_backoff_then_succeeds(self, monkeypatch):
     runner, calls = self._load_runner(monkeypatch, [False, False, True])
     execed, slept = [], []
-    monkeypatch.setattr(runner.os, 'execv', lambda p, a: execed.append(p))
+    monkeypatch.setattr(runner.os, 'execv', self._fake_execv(execed))
     monkeypatch.setattr(runner.time, 'sleep', lambda s: slept.append(s))
-    runner.main()
+    with pytest.raises(_ExecReplacedProcess):
+      runner.main()
     assert execed == ['/tmp/fake-mapd']
     assert slept == list(runner.RETRY_DELAYS[:2])   # backoff grows between tries
 

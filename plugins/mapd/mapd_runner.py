@@ -26,7 +26,6 @@ def main():
   for attempt, delay in enumerate(RETRY_DELAYS, start=1):
     if ensure_binary():
       os.execv(str(MAPD_PATH), [str(MAPD_PATH)])
-      return  # os.execv never returns in production; this only matters for tests
     print(f"mapd binary unavailable (attempt {attempt}/{len(RETRY_DELAYS)}), "
           f"retrying in {delay}s", file=sys.stderr)
     time.sleep(delay)
