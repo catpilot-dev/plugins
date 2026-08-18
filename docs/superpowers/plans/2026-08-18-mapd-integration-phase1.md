@@ -808,7 +808,7 @@ git commit -m "feat(mapd): declarative defaults — data-source-only, shadow car
 
 **Scope note — do not add more than this.** Phase 2 will need a `result_from_mapd` adapter that rebuilds the `osm_query`-shaped dict, plus a `tiles_missing` helper and a `roadContext` classifier. **None of those belong in Phase 1**, because nothing in Phase 1 calls them: Phase 1 observes and publishes, it does not feed `_ingest_osm_result`. Writing them now would ship untested-in-anger code and pre-commit to a shape the Phase 1 drive might invalidate. The design spec records their intended signatures; implement them in Phase 2 against real telemetry.
 
-**Background the implementer needs:** pycapnp returns an enum field as its **camelCase enumerant name string**, so `highway_class_name` must accept strings; it should also accept ints so plain dataclass stubs work in tests. This module is pure — no imports from `speedlimitd`, no I/O, no clock — which is what makes it testable without the openpilot mocks the rest of the suite needs.
+**Background the implementer needs:** pycapnp returns an enum field as its **camelCase enumerant name string**, so `highway_class_name` takes that form and no other — do not add an integer branch, nothing produces one. This module is pure — no imports from `speedlimitd`, no I/O, no clock — which is what makes it testable without the openpilot mocks the rest of the suite needs.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -861,14 +861,10 @@ class TestHighwayClassName:
     # '' is what speedlimitd already treats as "no OSM classification".
     assert mapd_source.highway_class_name('unknown') == ''
 
-  def test_accepts_ordinals(self):
-    assert mapd_source.highway_class_name(0) == ''
-    assert mapd_source.highway_class_name(1) == 'motorway'
-    assert mapd_source.highway_class_name(13) == 'living_street'
-
   def test_unrecognised_value_is_empty_not_an_error(self):
+    # A future mapd release adding an enum member must degrade to "no
+    # classification", not crash the daemon.
     assert mapd_source.highway_class_name('someFutureClass') == ''
-    assert mapd_source.highway_class_name(99) == ''
 
 
 class TestTelemetry:
@@ -966,26 +962,18 @@ _CLASS_TO_OSM = {
   'livingStreet': 'living_street',
 }
 
-# Ordinal -> enumerant name, matching HighwayClass in
-# plugins/mapd/cereal/standalone.capnp. Only needed so integer stubs work in
-# tests; pycapnp itself hands back the name.
-_ORDINAL_TO_CLASS = (
-  'unknown', 'motorway', 'motorwayLink', 'trunk', 'trunkLink',
-  'primary', 'primaryLink', 'secondary', 'secondaryLink',
-  'tertiary', 'tertiaryLink', 'unclassified', 'residential', 'livingStreet',
-)
-
 MS_TO_KPH = 3.6
 
 
 def highway_class_name(value) -> str:
-  """capnp HighwayClass value (enumerant name or ordinal) -> OSM highway=* string.
+  """capnp HighwayClass enumerant name -> OSM highway=* string.
+
+  pycapnp reads an enum field back as its camelCase enumerant name, so that is
+  the only input form this needs to handle.
 
   Unrecognised values return '' rather than raising: a mapd release that adds an
   enum member must not crash the daemon, it must degrade to "no classification".
   """
-  if isinstance(value, int) and not isinstance(value, bool):
-    value = _ORDINAL_TO_CLASS[value] if 0 <= value < len(_ORDINAL_TO_CLASS) else 'unknown'
   return _CLASS_TO_OSM.get(value, '')
 
 
@@ -1032,13 +1020,13 @@ def telemetry_from_mapd(mapd_out, valid: bool, our_way_ref: str) -> dict:
 
 Run: `PYTHONPATH= python3 -m pytest plugins/speedlimitd/tests/test_mapd_source.py -q`
 
-Expected: PASS, 9 passed.
+Expected: PASS, 8 passed.
 
 - [ ] **Step 5: Run the full suite**
 
 Run: `PYTHONPATH= python3 -m pytest plugins -q`
 
-Expected: `3 failed, 777 passed, 21 skipped`.
+Expected: `3 failed, 776 passed, 21 skipped`.
 
 - [ ] **Step 6: Commit**
 
@@ -1250,7 +1238,7 @@ Expected: PASS, 6 passed.
 
 Run: `PYTHONPATH= python3 -m pytest plugins -q`
 
-Expected: `3 failed, 783 passed, 21 skipped`. If any pre-existing speedlimitd test now fails, the mapd sampling has leaked into control state — fix the leak, do not adjust the test.
+Expected: `3 failed, 782 passed, 21 skipped`. If any pre-existing speedlimitd test now fails, the mapd sampling has leaked into control state — fix the leak, do not adjust the test.
 
 - [ ] **Step 9: Document the observation path**
 
