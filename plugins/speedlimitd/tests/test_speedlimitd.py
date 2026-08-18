@@ -20,6 +20,14 @@ _REPO_ROOT = os.path.dirname(_PLUGINS_DIR)
 if _REPO_ROOT not in sys.path:
   sys.path.insert(0, _REPO_ROOT)
 
+# speedlimitd.py imports its siblings (osm_query, mapd_source) by bare name,
+# matching the device's flat runtime layout. Put that directory on sys.path
+# explicitly — relying on test_osm_query.py having been collected first makes
+# this suite depend on collection order.
+_SLD_DIR = os.path.join(_PLUGINS_DIR, 'speedlimitd')
+if _SLD_DIR not in sys.path:
+  sys.path.insert(0, _SLD_DIR)
+
 
 @pytest.fixture(autouse=True)
 def mock_openpilot(monkeypatch):
@@ -3451,3 +3459,110 @@ class TestOsmGateTelemetry:
     assert pub['osmTrusted'] is True
     assert pub['osmRejectReason'] == ''
     assert pub['inferenceMode'] == 'osm'
+
+
+class TestMapdPhase1Telemetry:
+  """Phase 1 publishes mapd observations and changes NOTHING else.
+
+  The point of the phase is to compare mapd's road context against the tile
+  reader's on a real drive while the tile reader still drives every control
+  path. If any mapd value reached actuation, the comparison would be measuring
+  itself.
+  """
+
+  def test_mapd_out_is_subscribed(self, sld):
+    import inspect
+    src = inspect.getsource(sld.SpeedLimitMiddleware.__init__)
+    assert "'mapdOut'" in src or '"mapdOut"' in src
+
+  def test_telemetry_keys_published(self, sld, monkeypatch):
+    mw = sld.SpeedLimitMiddleware()
+    sent = {}
+    mw._sl_pub.send = lambda payload: sent.update(payload)
+    mw.update()
+    for key in ('mapdAlive', 'mapdWayRef', 'mapdWayId', 'mapdSpeedLimit',
+                'mapdHwClass', 'mapdLanes', 'mapdSelType', 'mapdTileLoaded',
+                'mapdDistance', 'mapdRefAgree'):
+      assert key in sent, f'{key} missing from published telemetry'
+
+  def test_publishes_even_when_mapd_absent(self, sld):
+    # A drive with a dead mapd must still yield an analysable rlog.
+    mw = sld.SpeedLimitMiddleware()
+    sent = {}
+    mw._sl_pub.send = lambda payload: sent.update(payload)
+    mw.update()
+    assert sent['mapdAlive'] is False
+    assert sent['mapdWayRef'] == ''
+
+  @staticmethod
+  def _armed(sld):
+    """An instance whose 5 s OSM/mapd sampling block will actually run.
+
+    A fresh instance has _gps_valid False, so the sampling block is skipped
+    entirely — a containment test built on one would pass trivially without ever
+    injecting anything.
+    """
+    mw = sld.SpeedLimitMiddleware()
+    mw._gps_valid = True
+    mw._gps_lat, mw._gps_lon = 31.3137, 121.5395
+    mw._osm_last_query_t = 0.0
+    return mw
+
+  def test_sampling_block_actually_runs(self, sld):
+    # Guards the containment test below: proves _armed() reaches the sampling
+    # path, so a passing containment result means something.
+    mw = self._armed(sld)
+    mw.update()
+    assert mw._osm_last_query_t > 0.0
+
+  def test_mapd_values_do_not_reach_control_state(self, sld):
+    """Containment: injecting mapd data must not move any control variable.
+
+    Runs update() from identical armed state twice — once with no mapd data,
+    once with a full mapd message reporting a DIFFERENT road at a DIFFERENT
+    speed — and asserts every control-bearing attribute is unchanged. The tile
+    reader sees no tiles in either run, so it contributes identically.
+    """
+    control_attrs = ('last_way_ref', 'last_road_name', 'last_osm_hwtype',
+                     'last_osm_speed_kph', 'last_road_context',
+                     'last_highway_type', 'last_road_id', 'curvature_cap',
+                     'inference_mode', '_gs_limit_kph')
+
+    baseline = self._armed(sld)
+    baseline.update()
+    before = {a: getattr(baseline, a) for a in control_attrs}
+
+    fake = MagicMock()
+    fake.wayRef = 'G1503'
+    fake.wayName = 'injected'
+    fake.roadName = 'injected'
+    fake.speedLimit = 33.3
+    fake.lanes = 5
+    fake.highwayClass = 'motorway'
+    fake.wayId = 999
+    fake.tileLoaded = True
+    fake.distanceFromWayCenter = 0.4
+    fake.waySelectionType = 'current'
+
+    injected = self._armed(sld)
+    real_sm = injected.sm
+    injected.sm = MagicMock()
+    injected.sm.__getitem__ = lambda _s, k: fake if k == 'mapdOut' else real_sm[k]
+    injected.sm.valid = {'mapdOut': True}
+    # Route to real_sm.updated (not a bare {}) so every OTHER key (modelV2,
+    # gpsLocationExternal, livePose) behaves exactly as it does in the
+    # baseline run above — the containment comparison is only meaningful if
+    # mapdOut is the sole difference between the two update() calls. A literal
+    # {} here made speedlimitd.py's unrelated `self.sm.updated['modelV2']`
+    # direct-index read KeyError, which is a mocking-parity bug, not a leak.
+    injected.sm.updated = real_sm.updated
+    sent = {}
+    injected._sl_pub.send = lambda payload: sent.update(payload)
+    injected.update()
+
+    after = {a: getattr(injected, a) for a in control_attrs}
+    assert after == before, 'mapd data leaked into a control variable'
+    # ...and the injected data really did arrive, so the assertion above is
+    # testing containment rather than an absent message.
+    assert sent['mapdWayRef'] == 'G1503'
+    assert sent['mapdAlive'] is True

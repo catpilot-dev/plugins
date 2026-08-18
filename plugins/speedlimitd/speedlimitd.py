@@ -732,7 +732,7 @@ class SpeedLimitMiddleware:
     # measured lateral accel — forward speed (velocityDevice.x) and yaw rate
     # (angularVelocityDevice.z) both come from the localizer, no car sensor or
     # steering ratio involved. a_y_meas = v · yaw_rate.
-    self.sm = messaging.SubMaster(['modelV2', 'gpsLocationExternal', 'livePose'])
+    self.sm = messaging.SubMaster(['modelV2', 'gpsLocationExternal', 'livePose', 'mapdOut'])
     from openpilot.selfdrive.plugins.plugin_bus import PluginPub
     self._sl_pub = PluginPub('speedLimitState')
 
@@ -744,6 +744,13 @@ class SpeedLimitMiddleware:
     self._osm = OsmTileReader()
     self._osm_query_interval = 5.0  # seconds between tile queries (0.2 Hz)
     self._osm_last_query_t = 0.0
+
+    import mapd_source
+    self._mapd_source = mapd_source
+    # Phase 1: mapd road context is OBSERVED ONLY. These values are published
+    # to pluginBusLog for the cutover comparison and must never be read by any
+    # control path — the tile reader above still drives everything.
+    self._mapd_telemetry = mapd_source.telemetry_from_mapd(None, False, '')
 
     self.country_bboxes = load_country_bboxes()
     self.country_detected = False
@@ -1220,6 +1227,17 @@ class SpeedLimitMiddleware:
         except Exception:
           pass
 
+      # --- Phase 1 mapd observation (telemetry only) ---
+      # Sampled on the SAME 5 s cadence as the tile query above so each rlog row
+      # compares mapd and the tile reader at the same instant. Nothing below
+      # reads these values.
+      try:
+        self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(
+          self.sm['mapdOut'], bool(self.sm.valid.get('mapdOut', False)),
+          self.last_way_ref)
+      except Exception:
+        self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(None, False, '')
+
     # --- Reactive measured-a_y cap + measured-curvature apex point (2026-07-28) ---
     # Read ahead of the modelV2 block below so this tick's measured curvature
     # is available to curvature_speed_cap() as a same-tick virtual apex point
@@ -1666,6 +1684,10 @@ class SpeedLimitMiddleware:
       # 'low_value' counts measure how live the ramp-sign mis-attribution is.
       'osmTrusted': osm_trusted,
       'osmRejectReason': osm_reject_reason,
+      # --- Phase 1 mapd observation (see mapd_source.telemetry_from_mapd) ---
+      # Read-only comparison against the tile-derived fields above.
+      # mapdRefAgree is the cutover decision metric.
+      **self._mapd_telemetry,
     })
 
 

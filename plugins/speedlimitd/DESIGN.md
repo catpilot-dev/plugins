@@ -331,6 +331,18 @@ toggle state:
 `inferenceMode` gains a third value, `'osm'` (OSM base active), alongside the
 existing `'gs_osm'` and `'lane_count'`.
 
+### mapd observation (Phase 1, 2026-08-18)
+
+speedlimitd subscribes to `mapdOut` and publishes ten `mapd*` fields into
+`speedLimitState` for comparison against the tile-derived values beside them.
+This is telemetry only: `mapd_source.telemetry_from_mapd` output is published
+and discarded, and the offline tile reader still drives every control path.
+
+`mapdRefAgree` — mapd's bearing-aware way match versus our nearest-polyline
+match — is the metric that decides the Phase 2 cutover and whether the G/S
+margin-release rule can be retired. See
+`docs/superpowers/specs/2026-08-18-mapd-integration-design.md`.
+
 ## Curve caps
 
 ### Proactive: `curvature_speed_cap` (distance-aware braking)
