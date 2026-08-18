@@ -270,6 +270,62 @@ overlay_opendbc() {
 overlay_ui
 overlay_opendbc
 install_plugins
+
+# Mark enforced plugins (always-on, greyed-out in Plugins panel)
+#
+# ORDERING (critical): this runs AFTER install_plugins (which populates
+# $PLUGINS_DEST and preserves any pre-existing .disabled markers) but BEFORE
+# overlay_cereal. custom_capnp.py and services.py both SKIP plugins carrying
+# .disabled — custom_capnp.py even reverts their slot back to the
+# CustomReservedN stub. Clearing .disabled after the injection would leave an
+# enforced plugin running against a cereal tree that has no schema or service
+# for it (mapd up, mapdOut absent, speedlimitd crash-looping) until a second
+# install run happened to fix it.
+if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
+  if $DRY_RUN; then
+    echo "  ENFORCE c3_compat (touch .enforced)"
+  else
+    touch "$PLUGINS_DEST/c3_compat/.enforced"
+  fi
+fi
+# lane_keeping is coupled to the Phase-2 BMW lateral controller: the tracker
+# needs its smoothed reference unconditionally, so removing the plugin from
+# the hook (.disabled) is the documented-unsafe rollback. Enforced always-on;
+# the ONLY user control is the Driving-panel "Lane Keeping" toggle, which
+# gates the position anchor while the conditioning keeps running. Clear any
+# stale .disabled — the registry loader honors it even when enforced.
+if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
+  if $DRY_RUN; then
+    echo "  ENFORCE lane_keeping (touch .enforced, rm .disabled)"
+  else
+    touch "$PLUGINS_DEST/lane_keeping/.enforced"
+    rm -f "$PLUGINS_DEST/lane_keeping/.disabled"
+  fi
+fi
+# mapd is the sole OSM road-context provider (speedlimitd consumes mapdOut).
+# Enforced so a stale .disabled cannot silently leave the car with no map data.
+# Was pinned off until v2.3.0: v2.0.6-v2.2.0 hardcoded a slotless ("shadow")
+# carState subscription whose torn reads panic gomsgq. v2.3.0 made shadow a
+# per-queue setting — see mapd_defaults.json.
+if [[ -d "$PLUGINS_DEST/mapd" ]]; then
+  if $DRY_RUN; then
+    echo "  ENFORCE mapd (touch .enforced, rm .disabled)"
+  else
+    touch "$PLUGINS_DEST/mapd/.enforced"
+    rm -f "$PLUGINS_DEST/mapd/.disabled"
+  fi
+  # mapd reads its custom defaults from a fixed path in the openpilot repo
+  # root. Untracked there, so `git reset --hard` leaves it alone; re-placed
+  # here on every install in case `git clean` removed it.
+  if [[ -f "$PLUGINS_DEST/mapd/mapd_defaults.json" ]]; then
+    if $DRY_RUN; then
+      echo "  COPY $PLUGINS_DEST/mapd/mapd_defaults.json → $OPENPILOT_ROOT/mapd_defaults.json"
+    else
+      cp "$PLUGINS_DEST/mapd/mapd_defaults.json" "$OPENPILOT_ROOT/mapd_defaults.json"
+    fi
+  fi
+fi
+
 overlay_cereal
 
 # Copy shared modules to plugins-runtime root so all plugins can import them
@@ -336,36 +392,6 @@ if ! $DRY_RUN; then
   done
   # Signal plugind to restart plugin processes and UI when offroad
   touch "$PLUGINS_DEST/.needs_restart"
-fi
-
-# Mark enforced plugins (always-on, greyed-out in Plugins panel)
-if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
-  touch "$PLUGINS_DEST/c3_compat/.enforced"
-fi
-# lane_keeping is coupled to the Phase-2 BMW lateral controller: the tracker
-# needs its smoothed reference unconditionally, so removing the plugin from
-# the hook (.disabled) is the documented-unsafe rollback. Enforced always-on;
-# the ONLY user control is the Driving-panel "Lane Keeping" toggle, which
-# gates the position anchor while the conditioning keeps running. Clear any
-# stale .disabled — the registry loader honors it even when enforced.
-if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
-  touch "$PLUGINS_DEST/lane_keeping/.enforced"
-  rm -f "$PLUGINS_DEST/lane_keeping/.disabled"
-fi
-# mapd is the sole OSM road-context provider (speedlimitd consumes mapdOut).
-# Enforced so a stale .disabled cannot silently leave the car with no map data.
-# Was pinned off until v2.3.0: v2.0.6-v2.2.0 hardcoded a slotless ("shadow")
-# carState subscription whose torn reads panic gomsgq. v2.3.0 made shadow a
-# per-queue setting — see mapd_defaults.json.
-if [[ -d "$PLUGINS_DEST/mapd" ]]; then
-  touch "$PLUGINS_DEST/mapd/.enforced"
-  rm -f "$PLUGINS_DEST/mapd/.disabled"
-  # mapd reads its custom defaults from a fixed path in the openpilot repo
-  # root. Untracked there, so `git reset --hard` leaves it alone; re-placed
-  # here on every install in case `git clean` removed it.
-  if [[ -f "$PLUGINS_DEST/mapd/mapd_defaults.json" ]]; then
-    cp "$PLUGINS_DEST/mapd/mapd_defaults.json" "$OPENPILOT_ROOT/mapd_defaults.json"
-  fi
 fi
 
 if $DRY_RUN; then

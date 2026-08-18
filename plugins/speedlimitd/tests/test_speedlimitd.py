@@ -33,7 +33,11 @@ if _SLD_DIR not in sys.path:
 def mock_openpilot(monkeypatch):
   """Mock openpilot + cereal imports."""
   mock_services = MagicMock()
-  mock_services.SERVICE_LIST = {'modelV2': MagicMock(), 'gpsLocationExternal': MagicMock()}
+  # mapdOut is present here because install.sh injects it into cereal/services.py
+  # on a healthy device. TestMapdPhase1Telemetry removes it to cover the
+  # injection-missing device state.
+  mock_services.SERVICE_LIST = {'modelV2': MagicMock(), 'gpsLocationExternal': MagicMock(),
+                                'livePose': MagicMock(), 'mapdOut': MagicMock()}
   mock_plugin_bus = MagicMock()
   # PluginSub().drain() must return None to avoid infinite loop in __init__
   mock_plugin_bus.PluginSub.return_value.drain.return_value = None
@@ -3482,7 +3486,7 @@ class TestMapdPhase1Telemetry:
     mw.update()
     for key in ('mapdAlive', 'mapdWayRef', 'mapdWayId', 'mapdSpeedLimit',
                 'mapdHwClass', 'mapdLanes', 'mapdSelType', 'mapdTileLoaded',
-                'mapdDistance', 'mapdRefAgree'):
+                'mapdDistance', 'mapdRefAgree', 'mapdRoadContext'):
       assert key in sent, f'{key} missing from published telemetry'
 
   def test_publishes_even_when_mapd_absent(self, sld):
@@ -3493,6 +3497,41 @@ class TestMapdPhase1Telemetry:
     mw.update()
     assert sent['mapdAlive'] is False
     assert sent['mapdWayRef'] == ''
+
+  @staticmethod
+  def _drop_mapd_service():
+    """Simulate a device whose cereal has no injected mapdOut service.
+
+    Reachable three ways: a catpilot `git reset --hard` wiping the injection,
+    an install that touched the enforcement markers after overlay_cereal, and a
+    user's .disabled on mapd at the next install. SubMaster raises on an unknown
+    service, so an unguarded subscribe crash-loops speedlimitd and the car
+    drives with NO speed-limit data — a far worse failure than losing Phase 1
+    telemetry. The mock sys.modules entry is restored by mock_openpilot's
+    monkeypatch.
+    """
+    services = sys.modules['cereal.services']
+    services.SERVICE_LIST = {k: v for k, v in services.SERVICE_LIST.items()
+                             if k != 'mapdOut'}
+
+  def test_builds_without_mapd_service_in_service_list(self, sld):
+    self._drop_mapd_service()
+    mw = sld.SpeedLimitMiddleware()
+    assert mw._mapd_service_available is False
+    subs = sld.messaging.SubMaster.call_args[0][0]
+    assert 'mapdOut' not in subs
+    assert 'modelV2' in subs and 'livePose' in subs
+
+  def test_update_runs_and_still_publishes_absent_shape_without_service(self, sld):
+    self._drop_mapd_service()
+    mw = self._armed(sld)          # armed: the 5 s sampling block really runs
+    sent = {}
+    mw._sl_pub.send = lambda payload: sent.update(payload)
+    mw.update()
+    assert mw._osm_last_query_t > 0.0   # the sampling block was entered
+    assert sent['mapdAlive'] is False
+    assert sent['mapdWayRef'] == ''
+    assert sent['mapdRoadContext'] == ''
 
   @staticmethod
   def _armed(sld):
@@ -3526,7 +3565,7 @@ class TestMapdPhase1Telemetry:
     Two complementary assertions:
     - `control_attrs` is a fixed, named list — it FAILS FAST and localises
       exactly which attribute leaked.
-    - the full published payload (minus the ten `mapd*` keys) must also be
+    - the full published payload (minus the eleven `mapd*` keys) must also be
       identical between the two runs. That is the actual "actuation stays
       byte-identical" claim — `speedLimit` (planner_hook's input) and
       `laneCount` live here, not in `control_attrs`, and unlike a hand-picked

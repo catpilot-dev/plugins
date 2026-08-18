@@ -732,7 +732,19 @@ class SpeedLimitMiddleware:
     # measured lateral accel — forward speed (velocityDevice.x) and yaw rate
     # (angularVelocityDevice.z) both come from the localizer, no car sensor or
     # steering ratio involved. a_y_meas = v · yaw_rate.
-    self.sm = messaging.SubMaster(['modelV2', 'gpsLocationExternal', 'livePose', 'mapdOut'])
+    # mapdOut is INJECTED into cereal by install.sh (plugins/services.py), not
+    # stock — so it can legitimately be absent: a catpilot `git reset --hard`
+    # wipes the injection, and a user's .disabled on mapd removes it at the next
+    # install. SubMaster raises on an unknown service, which would crash-loop
+    # this daemon and leave the car with NO speed-limit data at all. Phase 1
+    # telemetry is not worth that, so subscribe conditionally and degrade to the
+    # dead-mapd telemetry shape.
+    from cereal.services import SERVICE_LIST
+    _subs = ['modelV2', 'gpsLocationExternal', 'livePose']
+    self._mapd_service_available = 'mapdOut' in SERVICE_LIST
+    if self._mapd_service_available:
+      _subs.append('mapdOut')
+    self.sm = messaging.SubMaster(_subs)
     from openpilot.selfdrive.plugins.plugin_bus import PluginPub
     self._sl_pub = PluginPub('speedLimitState')
 
@@ -1232,28 +1244,32 @@ class SpeedLimitMiddleware:
       # Sampled on the SAME 5 s cadence as the tile query above so each rlog row
       # compares mapd and the tile reader at the same instant. Nothing below
       # reads these values.
-      try:
-        # sm.valid[s] latches True on first receipt and is never cleared, and
-        # sm.data[s] retains the last message — so valid alone can't tell a
-        # live mapd from one that died or wedged mid-drive; every subsequent
-        # sample would silently report the frozen way as "alive", corrupting
-        # mapdRefAgree (the cutover metric) and the rlog uptime count. sm.alive
-        # is the recomputed freshness signal (0.5 s window at 20 Hz) — require
-        # both.
-        mapd_ok = bool(self.sm.valid.get('mapdOut', False) and
-                       self.sm.alive.get('mapdOut', False))
-        self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(
-          self.sm['mapdOut'], mapd_ok, self.last_way_ref)
-      except Exception:
-        if not self._mapd_sample_error_logged:
-          self._mapd_sample_error_logged = True
-          try:
-            from openpilot.common.swaglog import cloudlog
-            cloudlog.warning("speedlimitd: mapd telemetry sampling failed — "
-                              "check mapdOut schema injection")
-          except Exception:
-            pass
-        self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(None, False, '')
+      # Skipped entirely when mapdOut was never subscribed (see __init__) —
+      # the absent-shape default telemetry from __init__ still publishes, so
+      # the rlog stays analysable.
+      if self._mapd_service_available:
+        try:
+          # sm.valid[s] latches True on first receipt and is never cleared, and
+          # sm.data[s] retains the last message — so valid alone can't tell a
+          # live mapd from one that died or wedged mid-drive; every subsequent
+          # sample would silently report the frozen way as "alive", corrupting
+          # mapdRefAgree (the cutover metric) and the rlog uptime count. sm.alive
+          # is the recomputed freshness signal (0.5 s window at 20 Hz) — require
+          # both.
+          mapd_ok = bool(self.sm.valid.get('mapdOut', False) and
+                         self.sm.alive.get('mapdOut', False))
+          self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(
+            self.sm['mapdOut'], mapd_ok, self.last_way_ref)
+        except Exception:
+          if not self._mapd_sample_error_logged:
+            self._mapd_sample_error_logged = True
+            try:
+              from openpilot.common.swaglog import cloudlog
+              cloudlog.warning("speedlimitd: mapd telemetry sampling failed — "
+                                "check mapdOut schema injection")
+            except Exception:
+              pass
+          self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(None, False, '')
 
     # --- Reactive measured-a_y cap + measured-curvature apex point (2026-07-28) ---
     # Read ahead of the modelV2 block below so this tick's measured curvature

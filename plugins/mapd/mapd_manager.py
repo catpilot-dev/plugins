@@ -29,9 +29,53 @@ GITHUB_API_URL = "https://api.github.com/repos/pfeiferj/mapd/releases/latest"
 # cereal/slot19.capnp before changing this.
 MAX_ALLOWED_VERSION = "v2.3.0"
 
+def _version_tuple(v):
+  """'v2.10.0' -> (2, 10, 0), for ORDERING comparisons.
+
+  String compare is wrong here: "v2.10.0" > "v2.3.0" is False lexicographically,
+  so the first double-digit minor release would sail straight past the pin.
+  Non-numeric components sort as 0 rather than raising — an unparseable tag
+  must not take the daemon down, and it degrades to "not newer than the pin".
+  """
+  parts = str(v).lstrip('vV').split('.')
+  out = []
+  for p in parts:
+    try:
+      out.append(int(p))
+    except ValueError:
+      out.append(0)
+  return tuple(out)
+
 def ensure_binary():
-  """Ensure mapd binary exists at MAPD_PATH, downloading if needed"""
+  """Ensure mapd binary exists at MAPD_PATH and is the pinned version.
+
+  Existence alone is NOT enough: a device carrying an older binary (v2.0.5 on
+  the fleet today) would keep running it against the new slot19 schema, so
+  highwayClass reads back empty and mapd_defaults.json goes unread, with no
+  error anywhere. Upgrade in place when the installed version differs from the
+  pin.
+  """
   if MAPD_PATH.exists():
+    current = get_current_version()
+    if _version_tuple(current) == _version_tuple(MAX_ALLOWED_VERSION):
+      return True
+
+    print(f"mapd {current} installed, pinned version is {MAX_ALLOWED_VERSION} — upgrading...")
+    backup_current_binary()
+    temp = download_binary(MAX_ALLOWED_VERSION)
+    if temp:
+      if replace_binary(temp):
+        update_version_param(MAX_ALLOWED_VERSION)
+      else:
+        # rename failed — the old binary is untouched and still runnable
+        temp.unlink(missing_ok=True)
+      return True
+
+    # GitHub unreachable (the common case: no data connection at boot). An old
+    # mapd is better than no mapd, and mapd_runner's retry loop must not brick
+    # startup — keep going with what is on disk.
+    print(f"WARNING: could not upgrade mapd to {MAX_ALLOWED_VERSION}, "
+          f"continuing with {current}", file=sys.stderr)
     return True
 
   MAPD_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -198,9 +242,12 @@ def perform_update():
     print("ERROR: Could not fetch latest version")
     return False
 
-  # Pin to MAX_ALLOWED_VERSION — v2.0.6+ has shadow subscription crash
-  if latest_version > MAX_ALLOWED_VERSION:
-    print(f"Skipping {latest_version} (pinned to {MAX_ALLOWED_VERSION} — shadow mode crash)")
+  # Pin to MAX_ALLOWED_VERSION — the rationale is now SCHEMA COUPLING, not the
+  # old v2.0.6 shadow-subscription crash (fixed in v2.3.0): a newer binary
+  # publishing into our slot19 silently drops any field it added. See the
+  # comment block on MAX_ALLOWED_VERSION.
+  if _version_tuple(latest_version) > _version_tuple(MAX_ALLOWED_VERSION):
+    print(f"Skipping {latest_version} (pinned to {MAX_ALLOWED_VERSION} — slot19 schema coupling)")
     latest_version = MAX_ALLOWED_VERSION
 
   if current_version == latest_version:

@@ -68,6 +68,12 @@ def telemetry_from_mapd(mapd_out, valid: bool, our_way_ref: str) -> dict:
   mapdRefAgree is the headline number: it compares mapd's bearing-aware match
   against the tile reader's nearest-polyline match, and is the evidence for both
   the Phase 2 cutover and retiring the G/S margin-release rule.
+
+  mapdRoadContext is mapd's OWN urban/rural verdict (its RoadContext enum), kept
+  distinct from mapdHwClass: the design spec calls for observing it in Phase 1
+  because the S100+ reclassification concern — elevated/ring ways mapd tags
+  'freeway' that are trunk-class in practice — cannot be checked from the rlog
+  without it.
   """
   if not valid or mapd_out is None:
     return {
@@ -81,6 +87,7 @@ def telemetry_from_mapd(mapd_out, valid: bool, our_way_ref: str) -> dict:
       'mapdTileLoaded': False,
       'mapdDistance': 0.0,
       'mapdRefAgree': False,
+      'mapdRoadContext': '',
     }
 
   ref = mapd_out.wayRef or ''
@@ -95,4 +102,5 @@ def telemetry_from_mapd(mapd_out, valid: bool, our_way_ref: str) -> dict:
     'mapdTileLoaded': bool(mapd_out.tileLoaded),
     'mapdDistance': round(float(mapd_out.distanceFromWayCenter or 0.0), 2),
     'mapdRefAgree': ref == (our_way_ref or ''),
+    'mapdRoadContext': str(mapd_out.roadContext),
   }

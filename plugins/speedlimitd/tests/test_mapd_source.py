@@ -56,7 +56,7 @@ class TestTelemetry:
     out = FakeMapdOut(wayRef='S20', roadName='外环高速', speedLimit=27.8,
                       lanes=4, highwayClass='motorway', wayId=42,
                       tileLoaded=True, distanceFromWayCenter=1.5,
-                      waySelectionType='current')
+                      waySelectionType='current', roadContext='freeway')
     t = mapd_source.telemetry_from_mapd(out, valid=True, our_way_ref='S20')
     assert t['mapdAlive'] is True
     assert t['mapdWayRef'] == 'S20'
@@ -68,6 +68,16 @@ class TestTelemetry:
     assert t['mapdTileLoaded'] is True
     assert t['mapdDistance'] == pytest.approx(1.5)
     assert t['mapdRefAgree'] is True
+    # mapd's OWN urban/rural verdict — the S100+ reclassification concern in the
+    # design spec cannot be checked from the rlog without it.
+    assert t['mapdRoadContext'] == 'freeway'
+
+  def test_road_context_is_stringified_not_the_enum_object(self):
+    # The publisher writes into a capnp Text field; a _DynamicEnum would not
+    # serialise. str() is the same treatment mapdSelType already gets.
+    t = mapd_source.telemetry_from_mapd(FakeMapdOut(roadContext='city'), True, '')
+    assert t['mapdRoadContext'] == 'city'
+    assert isinstance(t['mapdRoadContext'], str)
 
   def test_ref_disagreement_is_the_headline_number(self):
     out = FakeMapdOut(wayRef='S20', roadName='x')
@@ -80,6 +90,7 @@ class TestTelemetry:
     assert t['mapdWayRef'] == ''
     assert t['mapdSpeedLimit'] == 0.0
     assert t['mapdRefAgree'] is False
+    assert t['mapdRoadContext'] == ''
 
   def test_always_returns_the_same_keys(self):
     # The rlog schema must not depend on mapd being up, or a drive with a dead
@@ -203,6 +214,7 @@ class TestRealCapnpEnum:
     msg.tileLoaded = True
     msg.distanceFromWayCenter = 1.5
     msg.waySelectionType = 'current'
+    msg.roadContext = 'freeway'
     with real_mapdout_schema.MapdOut.from_bytes(msg.to_bytes()) as out:
       t = mapd_source.telemetry_from_mapd(out, valid=True, our_way_ref='S20')
     assert t['mapdWayRef'] == 'S20'
@@ -214,3 +226,17 @@ class TestRealCapnpEnum:
     assert t['mapdTileLoaded'] is True
     assert t['mapdDistance'] == pytest.approx(1.5)
     assert t['mapdRefAgree'] is True
+    assert t['mapdRoadContext'] == 'freeway'
+
+  def test_class_map_covers_every_enumerant_exactly(self, real_mapdout_schema):
+    """_CLASS_TO_OSM keys == the real HighwayClass enumerants, no drift.
+
+    Without this, renaming an enumerant in standalone.capnp and in
+    test_slot_schemas.py's EXPECTED_HIGHWAY_CLASS together passes the whole
+    suite while the adapter silently returns '' for that class — every road of
+    that type loses its OSM classification with no error anywhere (mutation
+    verified). The schema is the source of truth in BOTH directions: a missing
+    key means a silent '' and an extra key is dead code hiding a rename.
+    """
+    enumerants = set(real_mapdout_schema.HighwayClass.schema.enumerants.keys())
+    assert set(mapd_source._CLASS_TO_OSM.keys()) == enumerants

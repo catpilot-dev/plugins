@@ -333,10 +333,21 @@ existing `'gs_osm'` and `'lane_count'`.
 
 ### mapd observation (Phase 1, 2026-08-18)
 
-speedlimitd subscribes to `mapdOut` and publishes ten `mapd*` fields into
+speedlimitd subscribes to `mapdOut` and publishes eleven `mapd*` fields into
 `speedLimitState` for comparison against the tile-derived values beside them.
 This is telemetry only: `mapd_source.telemetry_from_mapd` output is published
 and discarded, and the offline tile reader still drives every control path.
+
+The subscription is conditional on `mapdOut` being present in the injected
+`SERVICE_LIST`: the schema/service injection is not stock, so a catpilot
+`git reset --hard` or a `.disabled` on mapd can remove it, and an unguarded
+`SubMaster` would crash-loop speedlimitd — leaving the car with no speed-limit
+data at all. When absent, the same eleven keys still publish in their
+dead-mapd shape (`mapdAlive: False`).
+
+`mapdRoadContext` is mapd's own urban/rural verdict, observed alongside
+`mapdHwClass` so the S100+ reclassification concern can be checked from the
+rlog.
 
 `mapdRefAgree` — mapd's bearing-aware way match versus our nearest-polyline
 match — is the metric that decides the Phase 2 cutover and whether the G/S
