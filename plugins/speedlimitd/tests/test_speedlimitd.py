@@ -2227,7 +2227,7 @@ class TestGsDistanceGuardedRelease:
 
     Path 1 — MARGIN rule: while holding and the best match is non-G/S, release
     when the matched way is GS_RELEASE_MARGIN_M CLOSER than the held G/S way (or
-    the held way is absent → margin +inf) for GS_RELEASE_MARGIN_QUERIES
+    the held way is absent → margin +inf) for a GS_RELEASE_MARGIN_S continuous run of
     consecutive queries. An absolute gate on the held-way distance fails — at
     seg-19 ramp entry the held S1 is only ~13.5 m off — so the MARGIN separates a
     genuine exit (car on the ramp, held way receding) from a stacked mis-match
@@ -2332,11 +2332,38 @@ class TestGsDistanceGuardedRelease:
     # Query 1: margin ~12.9 > 8 → count=1, still held.
     pub = self._diverge(mw, clock, held_dist=13.5, matched_dist=0.6)
     assert pub['inferenceMode'] == 'gs_osm'
-    assert mw._gs_margin_count == 1
+    assert mw._gs_margin_since is not None
     # Query 2: margin still > 8 → count=2 → release.
     pub = self._diverge(mw, clock, held_dist=17.0, matched_dist=0.6)
     assert pub['inferenceMode'] == 'lane_count'
     assert pub['inferredSpeed'] == 60            # lane_count(3)
+
+  def test_margin_release_is_time_based_at_1hz(self, sld, monkeypatch):
+    """At the production 1 Hz cadence the margin rule needs a CONTINUOUS
+    GS_RELEASE_MARGIN_S (5 s) run — queries 1-5 (elapsed 0-4 s) must NOT
+    release; query 6 (elapsed 5.0 s) must. Pins the 2026-08-18 conversion
+    from a 2-consecutive-query count (which at 1 Hz would have released
+    after 1 s) to a time window."""
+    mw = self._mw(sld)
+    mw.lane_count_stable = 3
+    clock = {'t': 7000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    self._hold_s1(mw)
+    for i in range(5):                           # queries 1-5: elapsed 0..4 s
+      mw._ingest_osm_result(self._result(roadName='ramp',
+                                         highwayType='motorway_link',
+                                         distance=0.6,
+                                         refDistances={'S1': 13.5}))
+      mw.update()
+      assert self._published(mw)['inferenceMode'] == 'gs_osm', f'query {i+1}'
+      clock['t'] += 1.0
+    # Query 6: elapsed exactly 5.0 s → release.
+    mw._ingest_osm_result(self._result(roadName='ramp',
+                                       highwayType='motorway_link',
+                                       distance=0.6,
+                                       refDistances={'S1': 13.5}))
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
 
   def test_margin_stacked_no_early_release(self, sld, monkeypatch):
     """Stacked: matched surface street 5.7 m, held 中环路-style S1 at 5.9 m
@@ -2351,7 +2378,7 @@ class TestGsDistanceGuardedRelease:
       pub = self._diverge(mw, clock, held_dist=5.9, matched_dist=5.7,
                           hwtype='residential')
       assert pub['inferenceMode'] == 'gs_osm'
-    assert mw._gs_margin_count == 0              # never accumulated
+    assert mw._gs_margin_since is None              # never accumulated
     # An S1 re-match resets the absence timer.
     self._hold_s1(mw)
     assert mw._gs_absent_since is None
@@ -2365,7 +2392,7 @@ class TestGsDistanceGuardedRelease:
     self._hold_s1(mw)
     pub = self._diverge(mw, clock, held_dist=8.0, matched_dist=2.0)   # margin 6
     assert pub['inferenceMode'] == 'gs_osm'
-    assert mw._gs_margin_count == 0
+    assert mw._gs_margin_since is None
 
   def test_margin_resets_on_a_below_threshold_query(self, sld, monkeypatch):
     # margin 9 (one query) then margin 4 → count resets, no release.
@@ -2375,9 +2402,9 @@ class TestGsDistanceGuardedRelease:
     monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
     self._hold_s1(mw)
     self._diverge(mw, clock, held_dist=11.0, matched_dist=2.0)        # margin 9
-    assert mw._gs_margin_count == 1
+    assert mw._gs_margin_since is not None
     pub = self._diverge(mw, clock, held_dist=6.0, matched_dist=2.0)   # margin 4
-    assert mw._gs_margin_count == 0              # reset
+    assert mw._gs_margin_since is None              # reset
     assert pub['inferenceMode'] == 'gs_osm'
 
   def test_margin_boundary_strictly_greater(self, sld, monkeypatch):
@@ -2388,9 +2415,9 @@ class TestGsDistanceGuardedRelease:
     monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
     self._hold_s1(mw)
     self._diverge(mw, clock, held_dist=10.0, matched_dist=2.0)        # margin 8.0
-    assert mw._gs_margin_count == 0
+    assert mw._gs_margin_since is None
     self._diverge(mw, clock, held_dist=10.01, matched_dist=2.0)       # margin 8.01
-    assert mw._gs_margin_count == 1
+    assert mw._gs_margin_since is not None
 
   def test_margin_held_ref_absent_releases(self, sld, monkeypatch):
     """Held S1 absent from the candidate set → margin +inf → releases after 2
@@ -2401,7 +2428,7 @@ class TestGsDistanceGuardedRelease:
     monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
     self._hold_s1(mw)
     pub = self._diverge(mw, clock, held_dist=None, matched_dist=5.0)  # S1 absent
-    assert pub['inferenceMode'] == 'gs_osm' and mw._gs_margin_count == 1
+    assert pub['inferenceMode'] == 'gs_osm' and mw._gs_margin_since is not None
     pub = self._diverge(mw, clock, held_dist=None, matched_dist=5.0)
     assert pub['inferenceMode'] == 'lane_count'
     assert pub['inferredSpeed'] == 60
@@ -2420,7 +2447,7 @@ class TestGsDistanceGuardedRelease:
     clock['t'] += 5.0
     mw.update()
     assert self._published(mw)['inferenceMode'] == 'gs_osm'   # < 10 s → still held
-    assert mw._gs_margin_count == 0                            # margin path idle
+    assert mw._gs_margin_since is None                            # margin path idle
     clock['t'] += 11.0
     mw._ingest_osm_result(self._result(roadName='ramp', highwayType='primary'))
     mw.update()
@@ -2531,11 +2558,14 @@ class TestGsDistanceGuardedRelease:
                                        refDistances={'S1': 3.0}))
     mw.update()
     clock['t'] += 0.2
-    for _ in range(2):                           # two divergent queries (margin ~13)
+    # Divergent queries at the 1 Hz cadence until GS_RELEASE_MARGIN_S (5 s) of
+    # continuous evidence has accumulated (was 2 queries 0.2 s apart under the
+    # count-based rule — spacing the time-based rule rightly rejects).
+    for _ in range(6):                           # elapsed 0..5 s of margin ~13
       mw._ingest_osm_result(self._result(roadName='ramp', highwayType='motorway_link',
                                          distance=0.6, refDistances={'S1': 13.5}))
       mw.update()
-      clock['t'] += 0.2
+      clock['t'] += 1.0
     assert self._published(mw)['inferenceMode'] == 'lane_count'
     assert mw._gs_force_release is True          # released via the margin path
     assert mw._gs_lane_drop_since is None        # path 2 never armed (raw ≥3)
@@ -2580,7 +2610,7 @@ class TestGsDistanceGuardedRelease:
       assert mw._gs_force_release is True
       self._hold_s1(mw)                          # genuine re-match re-promotes
       displayed.append(mw._displayed_speed_limit)
-      assert mw._gs_margin_count == 0            # reset on the re-match
+      assert mw._gs_margin_since is None            # reset on the re-match
     # No teleport: consecutive displayed limits are equal or exactly one rung apart.
     for a, b in zip(displayed, displayed[1:]):
       assert abs(STD.index(a) - STD.index(b)) <= 1, f'displayed teleported {a}->{b}'
@@ -2601,7 +2631,7 @@ class TestGsDistanceGuardedRelease:
     clock['t'] += 5.0
     mw.update()
     assert mw._gs_held_ref == 'S20'              # held identity switched cleanly
-    assert mw._gs_margin_count == 0
+    assert mw._gs_margin_since is None
     # Divergence tracks S20 (20 m, margin 19.4 > 8), ignoring S1 sitting at 1 m.
     for _ in range(2):
       mw._ingest_osm_result(self._result(roadName='ramp', highwayType='motorway_link',

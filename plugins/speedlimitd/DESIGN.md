@@ -22,7 +22,7 @@ fallback whenever OSM isn't fresh, plausible, or enabled.
 
 ```
 gpsLocationExternal ─► country auto-detect (bbox) ─► per-country speed table
-                    └► OSM tile query (0.2 Hz) ─► wayRef / name / G|S class
+                    └► OSM tile query (1 Hz) ─► wayRef / name / G|S class
 
 modelV2 ─► infer_lane_count ─► lane_count_stable ─► lane_count_limit ─┐
         ├► vision_speed_cap (≤2-lane narrow cap) ────────────────────┤
@@ -129,7 +129,7 @@ transient). Release happens on **any** of:
 |---|---|---|
 | Absolute ceiling | `GS_STICKY_S = 30 s` | time since last G/S match |
 | Continuous absence | `GS_RELEASE_CONT_S = 10 s` | non-G/S matches unbroken this long (an alternating flicker keeps resetting it → stickiness preserved) |
-| Margin rule (path 1) | `GS_RELEASE_MARGIN_M = 8 m`, `GS_RELEASE_MARGIN_QUERIES = 2` | matched way is decisively closer than the held G/S way (or held ref absent → +inf) for 2 consecutive OSM queries. Uses `refDistances` from `osm_query`; an absolute distance gate on the held way was proven insufficient (held S1 only 13.5 m off at ramp entry) |
+| Margin rule (path 1) | `GS_RELEASE_MARGIN_M = 8 m`, `GS_RELEASE_MARGIN_S = 5 s` | matched way is decisively closer than the held G/S way (or held ref absent → +inf) continuously for 5 s (time-based since 2026-08-18; equals the old 2-consecutive-query window at the former 5 s cadence). Uses `refDistances` from `osm_query`; an absolute distance gate on the held way was proven insufficient (held S1 only 13.5 m off at ramp entry) |
 | Lane-drop (path 2) | `GS_LANE_DROP_S = 1.5 s` | held ref absent **and** raw lane count ≤2 continuous — two independent exit signals, no OSM-distance dependence |
 | Narrow section | — | `lane_count_stable ≤ 2` releases immediately (a ramp must obey the narrow limit, never a stale 100/120) |
 
@@ -185,7 +185,8 @@ Outside China, OSM replaces the base only when **all** of:
 - `last_osm_speed_kph >= 30.0` — the same 30 km/h floor as `MIN_SPEED_LIMIT`,
   rejecting implausible tags,
 - `now - last_osm_speed_t <= 2.0 * self._osm_query_interval` — **two query
-  intervals**; queries run at 5 s cadence, so this is a 10 s freshness
+  intervals**; the freshness window is an absolute `OSM_SPEED_FRESH_S = 10 s`
+  (decoupled from the query cadence 2026-08-18 when queries moved 5 s → 1 s)
   window. One missed/`None` query keeps the limit; a sustained loss (two
   consecutive misses) falls back to vision.
 
@@ -309,7 +310,7 @@ safety cap — an OSM-posted 100 km/h limit still yields to a 60 km/h curve cap.
 `osm_query.OsmTileReader.tile_missing` is set True when a query finds
 **neither** the `offline_hw` nor `offline` tile file on disk for the current
 position (distinct from "tile exists but is still loading in the background",
-which is *not* missing). On every OSM query cycle (0.2 Hz, gated on GPS
+which is *not* missing). On every OSM query cycle (1 Hz, gated on GPS
 validity — independent of the toggle), the daemon reads that flag and writes
 it to the `OsmTilesMissing` param (`'1'`/`'0'`) **only on the first query or
 when the value changes** (not every cycle, to avoid needless param-file

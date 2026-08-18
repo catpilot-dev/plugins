@@ -635,11 +635,18 @@ GS_RELEASE_MARGIN_M = 8.0   # release when the matched non-G/S way is this much
                             # mis-match matches a way essentially co-located with
                             # the held one (margin 0.2-5 m, 3d0 forensics). Held
                             # way ABSENT from candidates ⇒ margin +inf.
-GS_RELEASE_MARGIN_QUERIES = 2  # consecutive OSM queries (~5 s cadence) the
-                            # margin must hold before releasing — one divergent
-                            # query could be a single mis-query; two in a row is
-                            # the car committed to the other road. Still bounded
-                            # well under the 10 s absence timer and 30 s ceiling.
+GS_RELEASE_MARGIN_S = 5.0   # seconds the margin must hold CONTINUOUSLY before
+                            # releasing — one divergent query could be a single
+                            # mis-query; a sustained run is the car committed to
+                            # the other road. Time-based since 2026-08-18 (was
+                            # GS_RELEASE_MARGIN_QUERIES=2 consecutive queries):
+                            # at the old 5 s cadence 2 consecutive queries span
+                            # exactly 5.0 s, so this value preserves the
+                            # field-validated 3de seg-19 behaviour bit-for-bit
+                            # while making the window independent of the query
+                            # cadence (now 1 Hz — a count would have shrunk the
+                            # evidence window 5x). Still bounded well under the
+                            # 10 s absence timer and 30 s ceiling.
 GS_LANE_DROP_S = 1.5        # release path 2 (route 3de user addition): while the
                             # held G/S ref has stopped matching (ref-empty absence
                             # run active), a RAW lane count (infer_lane_count) that
@@ -663,6 +670,16 @@ LANE_COUNT_LIMIT_4 = 80     # ≥4 confident lanes → 80 km/h
 # map-matched onto 高速/高架 mainlines; no safety cap catches a wrong-and-low
 # tag on a straight road. No real G/S expressway is posted below this.
 GS_OSM_MIN_KPH = 60
+OSM_SPEED_FRESH_S = 10.0    # gate freshness: reject a held OSM maxspeed older
+                            # than this. ABSOLUTE seconds since 2026-08-18 (was
+                            # 2.0 * _osm_query_interval): when the query cadence
+                            # moved 5 s → 1 s, the derived form would have
+                            # silently shrunk the shipped 10 s gap tolerance to
+                            # 2 s — one background tile parse (~1.7 s measured on
+                            # a dense Shanghai tile) or GPS glitch would flick
+                            # the gate to 'stale' and the indicator to VISION.
+                            # The tolerance is about the WORLD (tile loads, GPS
+                            # dropouts), not about the query rhythm.
 
 # Noise-tolerant narrow-band (≤2 lane) confirmation (route 3d3 seg 16 / 3d1 seg 29).
 # A single directional debounce timer resets on ANY raw-count change, so on a
@@ -754,7 +771,12 @@ class SpeedLimitMiddleware:
       __import__('sys').path.insert(0, _pkg_dir)
     from osm_query import OsmTileReader
     self._osm = OsmTileReader()
-    self._osm_query_interval = 5.0  # seconds between tile queries (0.2 Hz)
+    self._osm_query_interval = 1.0  # seconds between tile queries (1 Hz;
+                                    # 5.0 until 2026-08-18 — at 100 km/h that
+                                    # sampled the road every ~150 m, now ~30 m.
+                                    # Warm query measured 24.6 ms on the C3's
+                                    # densest Shanghai tile (12,349 ways), so
+                                    # 1 Hz costs ~2.5% of one core.
     self._osm_last_query_t = 0.0
 
     import mapd_source
@@ -792,7 +814,9 @@ class SpeedLimitMiddleware:
                                         # with no trackable identity)
     self._gs_force_release: bool = False  # margin-rule (path 1) divergence latch;
                                           # sticky until a genuine G/S re-match
-    self._gs_margin_count: int = 0        # consecutive divergent-margin OSM queries
+    self._gs_margin_since: float | None = None  # monotonic t of the FIRST query
+                                        # of the current continuous divergent-
+                                        # margin run (None ⇒ no run active)
     self._gs_lane_drop_since: float | None = None  # start of the continuous RAW
                                                     # ≤2 lane run (path 2); None ⇒
                                                     # last raw read was ≥3
@@ -993,7 +1017,7 @@ class SpeedLimitMiddleware:
       return False, 'disabled'
     if self.last_osm_speed_kph < 30.0:
       return False, 'no_data'
-    if now - self.last_osm_speed_t > 2.0 * self._osm_query_interval:
+    if now - self.last_osm_speed_t > OSM_SPEED_FRESH_S:
       return False, 'stale'
     if self.country_detected and self.country != 'cn':
       return True, ''                       # non-CN: unchanged, as shipped
@@ -1149,7 +1173,7 @@ class SpeedLimitMiddleware:
     match is non-G/S, the car has decisively moved onto another road when the
     matched way is GS_RELEASE_MARGIN_M closer than the held G/S way — or the
     held way has dropped out of the candidate set entirely (margin +inf) — for
-    GS_RELEASE_MARGIN_QUERIES consecutive such queries. An absolute distance
+    a continuous GS_RELEASE_MARGIN_S run of such queries. An absolute distance
     gate on the held way does not work: at seg-19 ramp entry the held S1
     polyline is only ~13.5 m off (a 25 m gate would fire later than the 10 s
     timer). The MARGIN is the generic discriminator — a genuine exit sits the
@@ -1159,7 +1183,7 @@ class SpeedLimitMiddleware:
 
     Sets the sticky _gs_force_release latch (cleared only by a genuine G/S
     re-match, below). Distance unavailable (no refDistances / no result / no
-    matched distance) ⇒ leave the count and latch untouched: the 10 s absence
+    matched distance) ⇒ leave the run start and latch untouched: the 10 s absence
     timer is the fallback.
     """
     current_is_gs = (is_gs_expressway_ref(self.last_way_ref)
@@ -1171,7 +1195,7 @@ class SpeedLimitMiddleware:
       # ref) and the timer/lane-drop paths govern instead.
       self._gs_held_ref = self.last_way_ref if is_gs_expressway_ref(self.last_way_ref) else ''
       self._gs_force_release = False
-      self._gs_margin_count = 0
+      self._gs_margin_since = None
       return
     if not self._gs_held_ref:
       return  # no trackable held identity — margin path disabled
@@ -1182,11 +1206,13 @@ class SpeedLimitMiddleware:
     held_dist = ref_dists.get(self._gs_held_ref)
     margin = math.inf if held_dist is None else held_dist - matched_dist
     if margin > GS_RELEASE_MARGIN_M:
-      self._gs_margin_count += 1
-      if self._gs_margin_count >= GS_RELEASE_MARGIN_QUERIES:
+      now = time.monotonic()
+      if self._gs_margin_since is None:
+        self._gs_margin_since = now             # run starts at THIS query
+      elif now - self._gs_margin_since >= GS_RELEASE_MARGIN_S:
         self._gs_force_release = True
     else:
-      self._gs_margin_count = 0
+      self._gs_margin_since = None
 
   def update(self):
     global SPEED_TABLE_URBAN, SPEED_TABLE_NONURBAN, DEFAULT_FALLBACK_SPEED, LANE_WIDTH_CLASS_TABLE
@@ -1218,7 +1244,7 @@ class SpeedLimitMiddleware:
         if not self._osm_default_resolved:
           self._osm_default_resolved = self._resolve_osm_default(self.country)
 
-    # --- Query OSM tiles at 0.2 Hz ---
+    # --- Query OSM tiles at 1 Hz ---
     if self._gps_valid and now - self._osm_last_query_t >= self._osm_query_interval:
       self._osm_last_query_t = now
       try:
@@ -1241,7 +1267,7 @@ class SpeedLimitMiddleware:
           pass
 
       # --- Phase 1 mapd observation (telemetry only) ---
-      # Sampled on the SAME 5 s cadence as the tile query above so each rlog row
+      # Sampled on the SAME cadence as the tile query above so each rlog row
       # compares mapd and the tile reader at the same instant. Nothing below
       # reads these values.
       # Skipped entirely when mapdOut was never subscribed (see __init__) —
@@ -1532,7 +1558,7 @@ class SpeedLimitMiddleware:
     # Release the sticky expressway hold on ANY of:
     #   - absolute ceiling (GS_STICKY_S) since the last G/S match;
     #   - the margin rule (path 1): the matched way is decisively closer than the
-    #     held G/S way for GS_RELEASE_MARGIN_QUERIES queries (_gs_force_release);
+    #     held G/S way for a GS_RELEASE_MARGIN_S continuous run (_gs_force_release);
     #   - the ref-empty + narrow-drop conjunction (path 2, gs_lane_drop above);
     #   - non-G/S matches CONTINUOUS for GS_RELEASE_CONT_S — a genuine exit
     #     accumulates it in one run; an alternating stacked flicker keeps
