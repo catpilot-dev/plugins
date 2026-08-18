@@ -5,12 +5,16 @@ install.sh's custom_capnp.py injects them into openpilot's cereal/custom.capnp
 in place of the CustomReservedN stubs. To parse them standalone this module
 reassembles a valid schema file — standalone.capnp plus each fragment wrapped
 in its struct declaration — and loads that.
+
+The capnp gate lives inside the `schema` fixture below, not at module scope
+(see plugins/speedlimitd/tests/test_generate_hw_tiles.py for the established
+pattern): a module-scope `pytest.importorskip('capnp')` skips collection of
+the whole file as a single opaque unit, whereas gating inside the fixture
+lets pytest attribute the skip to each individual test that requests it.
 """
 import os
 
 import pytest
-
-capnp = pytest.importorskip('capnp')
 
 CEREAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cereal')
 
@@ -44,6 +48,7 @@ EXPECTED_HIGHWAY_CLASS = {
 @pytest.fixture(scope='module')
 def schema(tmp_path_factory):
   """Reassemble standalone.capnp + wrapped slot fragments into one loadable file."""
+  capnp = pytest.importorskip('capnp')
   parts = [FILE_ID]
   with open(os.path.join(CEREAL_DIR, 'standalone.capnp')) as f:
     parts.append(f.read())
