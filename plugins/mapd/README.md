@@ -1,6 +1,10 @@
 # Mapd — OpenStreetMap Data
 
-**Status: disabled — not currently running.**
+**Status: enabled — mapd is the sole provider of OSM road context.**
+
+speedlimitd consumes the `mapdOut` message; it no longer reads map tiles
+itself. Tiles are downloaded by COD's web UI into `/data/media/0/osm/offline/`,
+which is exactly where mapd reads them.
 
 ## What it's for
 
@@ -32,20 +36,30 @@ binaries are kept in `/data/media/0/osm/mapd_backups/`.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| MapdVersion | string | v2.0.5 | Version tracked/pinned by `mapd_manager.py` |
+| MapdVersion | string | v2.3.0 | Version tracked/pinned by `mapd_manager.py` |
 
-The v2.0.5 pin is deliberate: v2.0.6 subscribes to `carState` in a "shadow"
-mode that reads the shared-memory ring buffer without claiming a reader slot,
-so the writer can overwrite unread data and crash the process. It is
-hardcoded upstream and can't be configured away — see `MAX_ALLOWED_VERSION`
-in `mapd_manager.py` before changing this.
+The v2.3.0 pin is deliberate, for two independent reasons.
+
+**Schema coupling.** Cap'n Proto is additive, so a newer binary publishing into
+our `cereal/slot19.capnp` silently drops any field we have not declared —
+`highwayClass` would read as `unknown` and speedlimitd would mis-classify every
+road, with no error anywhere. Bumping the pin requires diffing mapd's
+`cereal/custom/custom.capnp` against our slot files first.
+
+**Shadow subscribers.** v2.0.6 through v2.2.0 hardcoded a slotless ("shadow")
+`carState` subscription: it reads the msgq ring buffer without claiming a
+reader slot, so the writer can overwrite the region mid-read and gomsgq panics
+on the torn size field (pfeiferj/mapd#88). v2.3.0 made shadow a per-queue
+setting. We keep upstream's default of shadow-on for carState — it consumes no
+reader slot — and rely on plugind respawning mapd, with speedlimitd degrading
+to vision-only meanwhile.
 
 ## Key files
 
 ```
 mapd/
-  plugin.json      # Plugin manifest — currently empty hooks/processes (disabled)
+  plugin.json      # Plugin manifest — slots 17-19, mapdOut service, mapd process, health hook
   mapd_manager.py  # Binary download, update, version management (manual use)
-  mapd_runner.py   # Process entry point (ensure + execv) — not currently invoked
-  hook.py          # device.health_check reporting — not currently invoked
+  mapd_runner.py   # Process entry point (ensure + execv) — spawned by plugind
+  hook.py          # device.health_check reporting — invoked via the manifest hook
 ```

@@ -21,9 +21,13 @@ PLUGIN_DATA_DIR = plugin_data_dir("mapd")
 
 GITHUB_API_URL = "https://api.github.com/repos/pfeiferj/mapd/releases/latest"
 
-# v2.0.6 uses gomsgq shadow subscription for carState which crashes on AGNOS.
-# Pin to v2.0.5 (last compatible release with regular subscriptions).
-MAX_ALLOWED_VERSION = "v2.0.5"
+# Pinned to the release whose MapdOut shape matches cereal/slot19.capnp.
+# BUMPING THIS REQUIRES A SCHEMA REVIEW: capnp is additive, so a newer binary
+# publishing into an older slot19 silently DROPS its new fields — highwayClass
+# would read as 'unknown' and speedlimitd would mis-classify every road with no
+# error anywhere. Check mapd's cereal/custom/custom.capnp MapdOut against
+# cereal/slot19.capnp before changing this.
+MAX_ALLOWED_VERSION = "v2.3.0"
 
 def ensure_binary():
   """Ensure mapd binary exists at MAPD_PATH, downloading if needed"""

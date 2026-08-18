@@ -8,15 +8,48 @@
   "min_openpilot": "0.10.0",
   "max_openpilot": "0.11.99",
   "device_filter": ["tici", "tizi", "mici"],
-  "cereal": {},
-  "services": {},
+  "cereal": {
+    "slots": {
+      "17": {
+        "struct_name": "MapdExtendedOut",
+        "event_field": "mapdExtendedOut",
+        "schema_file": "cereal/slot17.capnp"
+      },
+      "18": {
+        "struct_name": "MapdIn",
+        "event_field": "mapdIn",
+        "schema_file": "cereal/slot18.capnp"
+      },
+      "19": {
+        "struct_name": "MapdOut",
+        "event_field": "mapdOut",
+        "schema_file": "cereal/slot19.capnp"
+      }
+    },
+    "standalone_schema": "cereal/standalone.capnp"
+  },
+  "services": {
+    "mapdOut": [true, 20.0, 20]
+  },
   "panel": false,
-  "hooks": {},
-  "processes": [],
+  "hooks": {
+    "device.health_check": {
+      "module": "hook",
+      "function": "on_health_check",
+      "priority": 50
+    }
+  },
+  "processes": [
+    {
+      "name": "mapd",
+      "module": "mapd_runner",
+      "condition": "always_run"
+    }
+  ],
   "params": {
     "MapdVersion": {
       "type": "string",
-      "default": "v2.0.5",
+      "default": "v2.3.0",
       "label": "Mapd Version"
     }
   }

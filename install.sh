@@ -352,11 +352,15 @@ if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
   touch "$PLUGINS_DEST/lane_keeping/.enforced"
   rm -f "$PLUGINS_DEST/lane_keeping/.disabled"
 fi
-# mapd v2.0.6 uses slotless carState subscription (gomsgq) which causes
-# msgq ring buffer corruption on C3's USB panda. Not enforced until fixed.
-# if [[ -d "$PLUGINS_DEST/mapd" ]]; then
-#   touch "$PLUGINS_DEST/mapd/.enforced"
-# fi
+# mapd is the sole OSM road-context provider (speedlimitd consumes mapdOut).
+# Enforced so a stale .disabled cannot silently leave the car with no map data.
+# Was pinned off until v2.3.0: v2.0.6-v2.2.0 hardcoded a slotless ("shadow")
+# carState subscription whose torn reads panic gomsgq. v2.3.0 made shadow a
+# per-queue setting — see mapd_defaults.json.
+if [[ -d "$PLUGINS_DEST/mapd" ]]; then
+  touch "$PLUGINS_DEST/mapd/.enforced"
+  rm -f "$PLUGINS_DEST/mapd/.disabled"
+fi
 
 if $DRY_RUN; then
   log "Dry run complete. Re-run without --dry-run to apply."
