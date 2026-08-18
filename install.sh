@@ -360,6 +360,12 @@ fi
 if [[ -d "$PLUGINS_DEST/mapd" ]]; then
   touch "$PLUGINS_DEST/mapd/.enforced"
   rm -f "$PLUGINS_DEST/mapd/.disabled"
+  # mapd reads its custom defaults from a fixed path in the openpilot repo
+  # root. Untracked there, so `git reset --hard` leaves it alone; re-placed
+  # here on every install in case `git clean` removed it.
+  if [[ -f "$PLUGINS_DEST/mapd/mapd_defaults.json" ]]; then
+    cp "$PLUGINS_DEST/mapd/mapd_defaults.json" "$OPENPILOT_ROOT/mapd_defaults.json"
+  fi
 fi
 
 if $DRY_RUN; then
