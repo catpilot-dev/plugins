@@ -314,14 +314,18 @@ if [[ -d "$PLUGINS_DEST/mapd" ]]; then
     touch "$PLUGINS_DEST/mapd/.enforced"
     rm -f "$PLUGINS_DEST/mapd/.disabled"
   fi
-  # mapd reads its custom defaults from a fixed path in the openpilot repo
-  # root. Untracked there, so `git reset --hard` leaves it alone; re-placed
-  # here on every install in case `git clean` removed it.
-  if [[ -f "$PLUGINS_DEST/mapd/mapd_defaults.json" ]]; then
+  # Settings go to mapd via the MapdSettings PARAM (written by mapd_runner on
+  # every start), NOT via /data/openpilot/mapd_defaults.json. The custom-file
+  # path is fatal on mapd v2.3.0: settings.go Default() parses the file with
+  # gabs (numbers → float64) but version-checks against uint64, so ANY custom
+  # defaults file — version present or absent — panics mapd at startup
+  # (interface-conversion crash, verified on-device 2026-08-18). Remove any
+  # stray copy so mapd can boot.
+  if [[ -f "$OPENPILOT_ROOT/mapd_defaults.json" ]]; then
     if $DRY_RUN; then
-      echo "  COPY $PLUGINS_DEST/mapd/mapd_defaults.json → $OPENPILOT_ROOT/mapd_defaults.json"
+      echo "  REMOVE $OPENPILOT_ROOT/mapd_defaults.json (panics mapd v2.3.0)"
     else
-      cp "$PLUGINS_DEST/mapd/mapd_defaults.json" "$OPENPILOT_ROOT/mapd_defaults.json"
+      rm -f "$OPENPILOT_ROOT/mapd_defaults.json"
     fi
   fi
 fi

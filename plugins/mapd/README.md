@@ -54,12 +54,28 @@ setting. We keep upstream's default of shadow-on for carState — it consumes no
 reader slot — and rely on plugind respawning mapd, with speedlimitd degrading
 to vision-only meanwhile.
 
+## Settings
+
+`mapd_defaults.json` (in this plugin dir) is the single declarative source of
+what mapd is allowed to do — nothing: every control feature off, shadow
+carState on. `mapd_runner.py` writes it to the **MapdSettings param** on every
+start, which survives openpilot wiping `/data/params/d/` on boot.
+
+Do NOT place a `/data/openpilot/mapd_defaults.json` — on mapd v2.3.0 the
+custom-defaults file path panics at startup regardless of content
+(`settings.go` `Default()` parses with gabs, so JSON numbers arrive as
+float64, but the version check and migration cast expect uint64; version
+absent hits a nil-interface assert in `Migrate()` instead). The param path
+(`Load()`) compares float64 to float64 and is safe. `install.sh` removes any
+stray copy of that file. Worth an upstream bug report.
+
 ## Key files
 
 ```
 mapd/
-  plugin.json      # Plugin manifest — slots 17-19, mapdOut service, mapd process, health hook
-  mapd_manager.py  # Binary download, update, version management (manual use)
-  mapd_runner.py   # Process entry point (ensure + execv) — spawned by plugind
-  hook.py          # device.health_check reporting — invoked via the manifest hook
+  plugin.json        # Plugin manifest — slots 17-19, mapdOut service, mapd process, health hook
+  mapd_defaults.json # Declarative settings — data-source-only, shadow carState
+  mapd_manager.py    # Binary download, update, version management (auto-upgrade to the pin)
+  mapd_runner.py     # Process entry point (settings param + ensure + execv) — spawned by plugind
+  hook.py            # device.health_check reporting — invoked via the manifest hook
 ```

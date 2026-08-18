@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
 Mapd process entry point for plugin system.
-Ensures the mapd binary exists and execs it.
+Writes our declarative settings to the MapdSettings param, ensures the mapd
+binary exists, and execs it.
 
-Settings are NOT written here. mapd loads its built-in defaults, then
-/data/openpilot/mapd_defaults.json (placed by install.sh), then the
-MapdSettings param. Keeping our configuration in the defaults file means it
-survives openpilot wiping /data/params/d/ on boot without this process
-rewriting it on every start — and leaves exactly one place that decides
-whether mapd controls anything. It does not: see mapd_defaults.json.
+Settings delivery (2026-08-18): mapd_defaults.json (sibling file, the single
+declarative source of what mapd is allowed to do — nothing) is written to the
+MapdSettings PARAM here on every start, NOT copied to
+/data/openpilot/mapd_defaults.json. The custom-defaults file path is UNUSABLE
+on mapd v2.3.0: settings.go's Default() reads the file with gabs (JSON numbers
+become float64), compares the version against a uint64 (always "mismatched"),
+then either panics on `settingsVersion.(uint64)` (version present) or panics on
+a nil-interface assertion in Migrate() (version absent). The param path in
+Load() compares float64 to float64 and is the one mapd itself round-trips, so
+it is safe. Writing on every start also survives openpilot wiping
+/data/params/d/ on boot. install.sh actively REMOVES any stray
+/data/openpilot/mapd_defaults.json for the same reason.
 """
+import json
 import os
 import sys
 import time
@@ -20,9 +28,35 @@ import time
 # exit and let plugind schedule the next round.
 RETRY_DELAYS = (5, 15, 60, 180)
 
+DEFAULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mapd_defaults.json")
+
+
+def write_settings_param():
+  """Copy mapd_defaults.json into the MapdSettings param.
+
+  Best-effort: a failure must not block the mapd launch — mapd then runs on
+  its internal defaults, which is degraded (its control features default on)
+  but still harmless in Phase 1, where nothing consumes mapd's control
+  outputs. Failures are logged so a drive with wrong settings is explicable.
+  """
+  try:
+    from config import PARAMS_DIR
+    with open(DEFAULTS_PATH) as f:
+      settings = json.load(f)          # validate before writing
+    os.makedirs(PARAMS_DIR, exist_ok=True)
+    tmp = os.path.join(PARAMS_DIR, ".MapdSettings.tmp")
+    with open(tmp, "w") as f:
+      f.write(json.dumps(settings))
+    os.replace(tmp, os.path.join(PARAMS_DIR, "MapdSettings"))
+    return True
+  except Exception as e:
+    print(f"WARNING: could not write MapdSettings param: {e}", file=sys.stderr)
+    return False
+
 
 def main():
   from mapd_manager import ensure_binary, MAPD_PATH
+  write_settings_param()
   for attempt, delay in enumerate(RETRY_DELAYS, start=1):
     if ensure_binary():
       os.execv(str(MAPD_PATH), [str(MAPD_PATH)])

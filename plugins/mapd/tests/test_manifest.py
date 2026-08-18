@@ -156,10 +156,12 @@ class TestRunnerRetry:
     fake_manager.ensure_binary = ensure_binary
     fake_manager.MAPD_PATH = '/tmp/fake-mapd'
     monkeypatch.setitem(sys.modules, 'mapd_manager', fake_manager)
+    monkeypatch.delitem(sys.modules, 'config', raising=False)  # force ImportError path
     if PLUGIN_DIR not in sys.path:
       sys.path.insert(0, PLUGIN_DIR)
     import mapd_runner
     importlib.reload(mapd_runner)
+    monkeypatch.setattr(mapd_runner, 'write_settings_param', lambda: True)
     return mapd_runner, calls
 
   @staticmethod
@@ -207,3 +209,55 @@ class TestRunnerRetry:
     # Total in-process backoff stays well under a plugind poll storm but long
     # enough that a booting device with slow DHCP is not thrashing the API.
     assert 60 <= sum(delays) <= 600
+
+
+class TestSettingsParamWrite:
+  """mapd_runner.write_settings_param — mapd_defaults.json → MapdSettings param.
+
+  The custom-defaults FILE path (/data/openpilot/mapd_defaults.json) is fatal
+  on mapd v2.3.0: settings.go Default() parses it with gabs (numbers become
+  float64) but version-checks against uint64, so any such file panics mapd at
+  startup regardless of content. The param path (Load()) compares float64 to
+  float64 and is what mapd itself round-trips — so the runner ships our
+  declarative defaults through the param, rewritten on every start (which also
+  survives openpilot wiping /data/params/d/ on boot).
+  """
+
+  @staticmethod
+  def _runner_with_config(monkeypatch, tmp_path):
+    import importlib
+    import types
+    fake_config = types.ModuleType('config')
+    fake_config.PARAMS_DIR = str(tmp_path / 'params')
+    monkeypatch.setitem(sys.modules, 'config', fake_config)
+    if PLUGIN_DIR not in sys.path:
+      sys.path.insert(0, PLUGIN_DIR)
+    import mapd_runner
+    importlib.reload(mapd_runner)
+    return mapd_runner, fake_config
+
+  def test_writes_defaults_verbatim(self, monkeypatch, tmp_path):
+    runner, cfg = self._runner_with_config(monkeypatch, tmp_path)
+    assert runner.write_settings_param() is True
+    written = json.loads(open(os.path.join(cfg.PARAMS_DIR, 'MapdSettings')).read())
+    with open(os.path.join(PLUGIN_DIR, 'mapd_defaults.json')) as f:
+      assert written == json.load(f)
+
+  def test_keeps_settings_version_numeric(self, monkeypatch, tmp_path):
+    # Load() casts the version via float64 — a string here would fail its
+    # comparison and reroute through migrations.
+    runner, cfg = self._runner_with_config(monkeypatch, tmp_path)
+    runner.write_settings_param()
+    written = json.loads(open(os.path.join(cfg.PARAMS_DIR, 'MapdSettings')).read())
+    assert written['settings_version'] == 2
+    assert isinstance(written['settings_version'], int)
+
+  def test_failure_is_nonfatal(self, monkeypatch, tmp_path):
+    # An unwritable PARAMS_DIR (parent is a file) -> returns False, never
+    # raises: a settings failure must not block the mapd launch. Deterministic
+    # regardless of whether a real `config` module is importable in this run.
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    runner, cfg = self._runner_with_config(monkeypatch, tmp_path)
+    cfg.PARAMS_DIR = str(blocker / 'params')
+    assert runner.write_settings_param() is False
