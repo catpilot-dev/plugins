@@ -256,7 +256,6 @@ bmw_e9x_e8x/
     ocelot_controls.dbc # stepper-servo definitions
   safety/bmw.h          # Panda safety model (C, safety id 35)
   tests/                # unit + replay/analysis scripts
-  tools/dcc_study/      # DCC response-study tooling
 ```
 
 ## Known issues / notes
