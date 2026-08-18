@@ -23,3 +23,6 @@
   mapCurveSpeed @21 :Float32;
   waySelectionType @22 :WaySelectionType;
   speedLimitAccepted @23 :Bool;
+  highwayClass @24 :HighwayClass;
+  wayId @25 :Int64;
+  conditionalSpeedLimit @26 :Text;

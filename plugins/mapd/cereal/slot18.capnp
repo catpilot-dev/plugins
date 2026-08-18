@@ -3,3 +3,4 @@
   float @1 :Float32;
   str @2 :Text;
   bool @3 :Bool;
+  jsonPath @4 :Text;

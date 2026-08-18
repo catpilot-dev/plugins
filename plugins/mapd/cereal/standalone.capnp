@@ -20,6 +20,11 @@ struct MapdPathPoint @0xd6f78acca1bc3939 {
   targetVelocity @3 :Float32;
 }
 
+struct MapdPosition @0xde9705979aca8339 {
+  latitude @0 :Float64;
+  longitude @1 :Float64;
+}
+
 enum MapdInputType {
   download @0;
   setTargetLateralAccel @1;
@@ -60,6 +65,14 @@ enum MapdInputType {
   setAdjustSetSpeedToAcceptSpeedLimit @36;
   setAcceptSpeedLimitTimeout @37;
   setPressGasToOverrideSpeedLimit @38;
+  setConditionalSpeedLimitControl @39;
+  setShadowCarState @40;
+  setShadowModelV2 @41;
+  setShadowGpsLocation @42;
+  setJsonPathFloat @43;
+  setJsonPathText @44;
+  setJsonPathBool @45;
+  setShadowGpsLocationExternal @46;
 }
 
 enum WaySelectionType {
@@ -79,4 +92,26 @@ enum RoadContext {
   freeway @0;
   city @1;
   unknown @2;
+}
+
+# WARNING: must be kept in perfect sync (names and values) with the
+# HighwayClass enum in mapd's cereal/offline/offline.capnp — state.go casts
+# directly between the two generated enum types.
+# unknown either means the way's highway tag was not one of the listed values
+# or the loaded map tiles predate this field.
+enum HighwayClass {
+  unknown @0;
+  motorway @1;
+  motorwayLink @2;
+  trunk @3;
+  trunkLink @4;
+  primary @5;
+  primaryLink @6;
+  secondary @7;
+  secondaryLink @8;
+  tertiary @9;
+  tertiaryLink @10;
+  unclassified @11;
+  residential @12;
+  livingStreet @13;
 }

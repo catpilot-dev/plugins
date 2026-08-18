@@ -2,3 +2,4 @@
   downloadProgress @0 :MapdDownloadProgress;
   settings @1 :Text;
   path @2 :List(MapdPathPoint);
+  position @3 :MapdPosition;
