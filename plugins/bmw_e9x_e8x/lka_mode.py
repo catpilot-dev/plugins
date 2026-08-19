@@ -7,8 +7,10 @@ owns gas/brake while the StepperServo keeps steering:
 
   FULL (lat+long, DCC on) --cancel/brake/DCC drop--> LKA (lat only) --cancel--> OFF
 
-The longitudinal path needs no gating: carcontroller only emits stalk-emulation
-commands while cruiseState.enabled, so it is physically inert in LKA.
+The longitudinal path is physically inert in LKA — carcontroller only emits
+stalk-emulation commands while cruiseState.enabled — but openpilot must also
+stop *claiming* longitudinal authority, or checks that key off carControl
+believe it is driving. See the gasPressedOverride note below.
 
 Stage-2 detection keys on the cancel press's RISING edge: buttonCancel fires on
 both press and release edges, and the stage-1 release lands after DCC has
@@ -45,6 +47,19 @@ class LkaModeFilter:
     strip = {EventName.pedalPressed}
     if not (self.cancel_press_in_lka and not dcc_on):
       strip.add(EventName.buttonCancel)
+
+    if not dcc_on:
+      # LKA holds no longitudinal authority — carcontroller gates every stalk
+      # send on cruiseState.enabled — so openpilot must not claim any either.
+      # ET.OVERRIDE_LONGITUDINAL is what clears CC.longActive; nothing else
+      # does here, since stripping pedalPressed removed the only event that
+      # dropped it on this car. Route 411 seg 5 (09:59:33): a 0.85 g driver
+      # brake in LKA ran ExcessiveActuationCheck's longitudinal branch against
+      # the driver's own deceleration, latching an "Excessive Actuation"
+      # soft-disable that then blocked re-engagement for the rest of the drive.
+      # State.overriding keeps latActive (it is in ACTIVE_STATES) and still
+      # yields to USER_DISABLE, so stage-2 cancel is unaffected.
+      events.add(EventName.gasPressedOverride)
 
     # Only Drive permits engagement (route 3fb seg 2, user ruling 2026-08-16):
     # any other definite gear — FULL or LKA — disengages directly instead of

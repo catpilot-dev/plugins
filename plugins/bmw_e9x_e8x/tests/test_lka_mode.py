@@ -28,6 +28,7 @@ class EventName(IntEnum):
   steerSaturated = 4
   wrongGear = 5
   pcmDisable = 6
+  gasPressedOverride = 7
 
 
 class ButtonType(IntEnum):
@@ -124,12 +125,12 @@ class TestLkaMode:
     # release arrives after DCC dropped
     events = FakeEvents([EventName.buttonCancel])
     filt.filter(events, make_cs(dcc_on=False, cancel_press=False), make_cs(), op_enabled=True)
-    assert events.events == []
+    assert events.events == [EventName.gasPressedOverride]
 
   def test_brake_stripped_in_lka(self, filt):
     events = FakeEvents([EventName.pedalPressed])
     filt.filter(events, make_cs(dcc_on=False), make_cs(), op_enabled=True)
-    assert events.events == []
+    assert events.events == [EventName.gasPressedOverride]
 
   def test_stage2_cancel_disengages(self, filt):
     """A new cancel press starting in LKA keeps buttonCancel → USER_DISABLE."""
@@ -141,7 +142,7 @@ class TestLkaMode:
     # second, fresh press while in LKA
     events = FakeEvents([EventName.buttonCancel])
     filt.filter(events, make_cs(dcc_on=False, cancel_press=True), make_cs(), op_enabled=True)
-    assert events.events == [EventName.buttonCancel]
+    assert events.events == [EventName.buttonCancel, EventName.gasPressedOverride]
 
   def test_reengage_resets_to_stage1(self, filt):
     """LKA → FULL via resume, then cancel is stage-1 again (stripped)."""
@@ -151,6 +152,45 @@ class TestLkaMode:
     events = FakeEvents([EventName.buttonCancel])
     filt.filter(events, make_cs(dcc_on=True, cancel_press=True), make_cs(), op_enabled=True)
     assert events.events == []
+
+
+class TestLongitudinalOverride:
+  """Route 411 seg 5 (2026-08-19, 09:59:33): a 0.85 g driver brake in LKA
+  tripped the latching excessiveActuation soft-disable ("TAKE CONTROL
+  IMMEDIATELY"). CC.longActive had stayed True through the braking because
+  stripping pedalPressed removed the only event that dropped it on this car,
+  so ExcessiveActuationCheck attributed the driver's own deceleration to
+  openpilot. ET.OVERRIDE_LONGITUDINAL clears longActive — which is simply the
+  truth in LKA, where carcontroller gates every stalk send on DCC."""
+
+  def test_lka_emits_longitudinal_override(self, filt):
+    events = FakeEvents([])
+    filt.filter(events, make_cs(dcc_on=False), make_cs(), op_enabled=True)
+    assert EventName.gasPressedOverride in events.events
+
+  def test_full_mode_keeps_longitudinal_authority(self, filt):
+    """DCC on = openpilot really is driving long; the check must stay armed."""
+    events = FakeEvents([])
+    filt.filter(events, make_cs(dcc_on=True), make_cs(), op_enabled=True)
+    assert EventName.gasPressedOverride not in events.events
+
+  def test_disengaged_emits_nothing(self, filt):
+    events = FakeEvents([])
+    filt.filter(events, make_cs(dcc_on=False), make_cs(), op_enabled=False)
+    assert events.events == []
+
+  def test_override_survives_the_strip_pass(self, filt):
+    events = FakeEvents([EventName.pedalPressed])
+    filt.filter(events, make_cs(dcc_on=False), make_cs(), op_enabled=True)
+    assert events.events == [EventName.gasPressedOverride]
+
+  def test_stage2_cancel_still_disengages_with_override_present(self, filt):
+    """State.overriding must not shadow USER_DISABLE — stage 2 still works."""
+    filt.filter(FakeEvents([]), make_cs(dcc_on=False), make_cs(), op_enabled=True)
+    events = FakeEvents([EventName.buttonCancel])
+    filt.filter(events, make_cs(dcc_on=False, cancel_press=True), make_cs(), op_enabled=True)
+    assert EventName.buttonCancel in events.events
+    assert EventName.gasPressedOverride in events.events
 
 
 class TestGearDisengage:
