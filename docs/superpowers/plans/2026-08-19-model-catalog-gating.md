@@ -1069,7 +1069,10 @@ Change `show()` to import stock, flag an untested active model, and remember the
 
 Initialise `self._untested_active = {}` in `__init__` too, so `_on_model_select` is safe before the first `show()`.
 
-At the top of `_on_model_select`, offer the one-tap recovery before the normal list:
+At the top of `_on_model_select`, offer the one-tap recovery before the normal
+list. Insert the new block immediately after the existing early return, so the
+rest of the method (from `active_id = _read_active(model_type)[0]` onward) stays
+exactly as it is:
 
 ```python
     def _on_model_select(self, model_type):
@@ -1077,29 +1080,27 @@ At the top of `_on_model_select`, offer the one-tap recovery before the normal l
       if not models:
         return
 
+      # Untested active model (the normal consequence of a catpilot update):
+      # offer the release default once, then fall through to the normal list.
       baseline = catalog.baseline_entry(model_type)
       if model_type in self._untested_active and baseline:
-        installed = {m['id'] for m in models}
-        if baseline['id'] in installed:
+        if baseline['id'] in {m['id'] for m in models}:
           def on_recover(r, mt=model_type, bid=baseline['id']):
             if r == DialogResult.CONFIRM:
               self._activate(mt, bid)
             else:
+              # Declining clears the flag so the offer does not repeat, then
+              # opens the list the user originally asked for.
               self._untested_active.pop(mt, None)
               self._on_model_select(mt)
 
           gui_app.push_widget(ConfirmDialog(
             f"The active model is not tested with openpilot {catalog.openpilot_version()}. "
-            f"Switch to {baseline.get('name', bid_default(baseline))}?",
+            f"Switch to {baseline.get('name', baseline['id'])}?",
             'Switch', cancel_text='Keep', callback=on_recover))
           return
-      ...
-```
 
-Replace `bid_default(baseline)` with `baseline['id']` — written out:
-
-```python
-            f"Switch to {baseline.get('name', baseline['id'])}?",
+      active_id = _read_active(model_type)[0]
 ```
 
 - [ ] **Step 4: Extract the activate-and-reboot flow so recovery can reuse it**
