@@ -165,8 +165,11 @@ Run with `PYTHONPATH= uv run python -m pytest plugins -q`. The bare
 ## Caveats
 
 - GitHub cron is UTC and best-effort; peak-hour delays of 10–30 minutes are
-  normal and individual runs are occasionally skipped. This is a daily digest,
-  not a latency-sensitive alert.
+  normal and individual runs are occasionally skipped. **Accepted by the
+  maintainer as a non-issue** — this is a daily digest feeding a test-drive
+  queue, not a latency-sensitive alert. Do not add catch-up, retry, or
+  higher-frequency polling to compensate; a skipped run is picked up by the next
+  one, because the dedup key is the commit SHA rather than a time window.
 - GitHub disables scheduled workflows after 60 days of repository inactivity.
 - This is the repository's first workflow; there is no existing CI to follow.
 
