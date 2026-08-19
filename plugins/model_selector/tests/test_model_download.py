@@ -81,3 +81,89 @@ def test_add_from_pr_unmerged_returns_error():
     rc = md.add_model_from_pr(36849)
   assert rc == 1
   add_reg.assert_not_called()
+
+
+import json
+
+
+@pytest.fixture
+def dl_env(tmp_path, monkeypatch):
+  """Point catalog + install dirs at tmp_path for the download/check paths."""
+  import plugins.model_selector.catalog as cat
+  version_h = tmp_path / 'version.h'
+  version_h.write_text('#define COMMA_VERSION "0.11.1"\n')
+  monkeypatch.setattr(cat, 'VERSION_H', version_h)
+  monkeypatch.setattr(cat, 'CATALOG_FILE', tmp_path / 'catalog.json')
+  monkeypatch.setattr(cat, 'UNLOCK_MARKER', tmp_path / '.unlocked')
+  (tmp_path / 'catalog.json').write_text(json.dumps({
+    'driving': [{'id': 'good_model', 'name': 'Good', 'date': '2025-10-20',
+                 'commit': 'c' * 40,
+                 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
+                 'verified_on': ['0.11.1']},
+                {'id': 'stock_0.11.1', 'name': 'Release default', 'date': '2026-05-18',
+                 'source': 'shipped', 'verified_on': ['0.11.1'], 'baseline_for': ['0.11.1']}],
+    'dm': [],
+  }))
+  (tmp_path / 'models' / 'driving').mkdir(parents=True)
+  (tmp_path / 'models' / 'dm').mkdir(parents=True)
+  monkeypatch.setattr(md, 'BASE_DATA_DIR', tmp_path)
+  return tmp_path, cat
+
+
+class TestCheckUpdates:
+  def test_offers_verified_uninstalled(self, dl_env, capsys):
+    md.check_updates()
+    out = json.loads(capsys.readouterr().out)
+    assert [m['id'] for m in out['driving']] == ['good_model', 'stock_0.11.1']
+    assert out['total'] == 2
+    assert out['version'] == '0.11.1'
+    assert out['verified_total'] == 2
+
+  def test_skips_installed(self, dl_env, capsys):
+    tmp_path, _ = dl_env
+    (tmp_path / 'models' / 'driving' / 'good_model').mkdir()
+    md.check_updates()
+    out = json.loads(capsys.readouterr().out)
+    assert [m['id'] for m in out['driving']] == ['stock_0.11.1']
+
+  def test_entries_carry_type(self, dl_env, capsys):
+    md.check_updates()
+    out = json.loads(capsys.readouterr().out)
+    assert all(m['type'] == 'driving' for m in out['driving'])
+
+  def test_unknown_version_offers_nothing(self, dl_env, capsys):
+    tmp_path, cat = dl_env
+    cat.VERSION_H.write_text('#define COMMA_VERSION "9.9.9"\n')
+    md.check_updates()
+    out = json.loads(capsys.readouterr().out)
+    assert out['total'] == 0
+    assert out['verified_total'] == 0
+
+
+class TestDownloadGate:
+  def test_refuses_uncatalogued(self, dl_env, capsys):
+    assert md.download_model(md.ModelType.DRIVING, 'mystery_model') == 1
+    assert 'not a tested model' in capsys.readouterr().out
+
+  def test_refuses_shipped_entry(self, dl_env, capsys):
+    assert md.download_model(md.ModelType.DRIVING, 'stock_0.11.1') == 1
+    assert 'imported from disk' in capsys.readouterr().out
+
+  def test_allow_untested_bypasses_the_gate(self, dl_env, capsys):
+    # Gate passes, then the registry lookup fails — proving the gate was not
+    # what stopped it.
+    assert md.download_model(md.ModelType.DRIVING, 'mystery_model', allow_untested=True) == 1
+    assert 'not a tested model' not in capsys.readouterr().out
+
+  def test_unlock_marker_bypasses_the_gate(self, dl_env, capsys):
+    _, cat = dl_env
+    cat.UNLOCK_MARKER.write_text('')
+    assert md.download_model(md.ModelType.DRIVING, 'mystery_model') == 1
+    assert 'not a tested model' not in capsys.readouterr().out
+
+  def test_verified_model_downloads_from_catalog_metadata(self, dl_env, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(md, 'download_file', lambda url, dest, desc=None: calls.append(url))
+    assert md.download_model(md.ModelType.DRIVING, 'good_model') == 0
+    assert len(calls) == 2
+    assert all(('c' * 40) in url for url in calls)

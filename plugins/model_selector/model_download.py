@@ -167,13 +167,13 @@ def check_model_compatibility(model_info: dict, model_type: ModelType) -> tuple[
     return True, ""
 
 
-def download_model(model_type: ModelType, model_id: str, output_dir: Path = None):
+def download_model(model_type: ModelType, model_id: str, output_dir: Path = None,
+                   allow_untested: bool = False):
     """Download a model from openpilot master at specific commit"""
 
-    # Load registry
+    # Load registry (maintainer catalogue; the curated catalog takes priority)
     driving_models, dm_models = load_registry()
 
-    # Select registry based on type
     if model_type == ModelType.DRIVING:
         registry = driving_models
         type_name = "Driving Model"
@@ -183,14 +183,28 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
         type_name = "Driver Monitoring Model"
         default_dir_name = "models/dm"
 
-    if model_id not in registry:
+    entry = next((e for e in catalog.verified_entries(model_type) if e['id'] == model_id), None)
+
+    if entry is None and not (allow_untested or catalog.unlocked()):
+        version = catalog.openpilot_version() or 'unknown'
+        tested = [e['id'] for e in catalog.verified_entries(model_type)]
+        print(f"❌ '{model_id}' is not a tested model for openpilot {version}")
+        print(f"   Tested: {', '.join(tested) if tested else 'none'}")
+        print("   Maintainers: re-run with --unlocked to install an untested model.")
+        return 1
+
+    if entry is not None and entry.get('source') == 'shipped':
+        print(f"❌ '{model_id}' ships with the release — it is imported from disk, not downloaded")
+        return 1
+
+    model_info = entry if entry is not None else registry.get(model_id)
+
+    if model_info is None:
         print(f"❌ {type_name} '{model_id}' not found in registry")
         print(f"\nAvailable {type_name.lower()}s:")
         for mid, info in registry.items():
             print(f"  {mid}: {info['name']} ({info['commit']})")
         return 1
-
-    model_info = registry[model_id]
 
     # Check compatibility
     is_compatible, warning = check_model_compatibility(model_info, model_type)
@@ -209,12 +223,11 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
 
     # Determine output directory
     if output_dir is None:
-        if Path('/data').exists():
-            output_dir = Path('/data') / default_dir_name / model_id
-        else:
-            output_dir = Path.home() / 'driving_data' / default_dir_name / model_id
+        output_dir = BASE_DATA_DIR / default_dir_name / model_id
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    description = model_info.get('description') or model_info.get('notes', '')
 
     print("=" * 70)
     print(f"Downloading: {model_info['name']} ({type_name})")
@@ -222,7 +235,7 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
     print(f"Commit: {model_info['commit']}")
     print(f"Date: {model_info['date']}")
     print(f"PR: {model_info.get('pr', 'N/A')}")
-    print(f"Description: {model_info['description']}")
+    print(f"Description: {description}")
     print(f"Output: {output_dir}")
     print()
 
@@ -255,7 +268,7 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
         'commit': model_info['commit'],
         'date': model_info['date'],
         'pr': model_info.get('pr', ''),
-        'description': model_info['description'],
+        'description': description,
         'source': 'comma.ai',
         'type': model_type.value,
         'downloaded_date': datetime.now().isoformat(),
@@ -305,9 +318,6 @@ def list_available(model_type: ModelType = None):
         print("For lateral/longitudinal control (driving_vision.onnx + driving_policy.onnx)")
         print()
         for model_id, info in driving_models.items():
-            # Skip old models incompatible with current openpilot version
-            if info.get('date', '9999-99-99') < MIN_MODEL_DATE['driving']:
-                continue
             # Check compatibility
             is_compatible, _ = check_model_compatibility(info, ModelType.DRIVING)
             compat_icon = "✅" if is_compatible else "⚠️"
@@ -327,9 +337,6 @@ def list_available(model_type: ModelType = None):
         print("For driver attention detection (dmonitoring_model.onnx)")
         print()
         for model_id, info in dm_models.items():
-            # Skip old DM models incompatible with current openpilot version
-            if info.get('date', '9999-99-99') < MIN_MODEL_DATE['dm']:
-                continue
             print(f"📦 {model_id}")
             print(f"   Name: {info['name']}")
             print(f"   Commit: {info['commit']}")
@@ -341,81 +348,30 @@ def list_available(model_type: ModelType = None):
 
 
 def check_updates():
-    """Check for new models not yet installed
+    """List tested models not yet installed.
 
-    Returns JSON with new models available for download
-    Filters:
-    - Only models compatible with current openpilot version (MIN_MODEL_DATE)
-    - Excludes reverted models
-    - Excludes already downloaded models
+    The catalog is the only source — GitHub is not consulted. Output is JSON for
+    the UI to parse.
     """
-    # Load registry
-    driving_models, dm_models = load_registry()
+    result = {'version': catalog.openpilot_version()}
+    total = 0
+    verified_total = 0
 
-    # Determine base directory
-    base_data_dir = Path('/data') if Path('/data').exists() else Path.home() / 'driving_data'
+    for type_name in ('driving', 'dm'):
+        models_dir = BASE_DATA_DIR / 'models' / type_name
+        installed = set()
+        if models_dir.exists():
+            installed = {d.name for d in models_dir.iterdir()
+                         if d.is_dir() and not d.name.startswith('_')}
 
-    driving_models_dir = base_data_dir / 'models' / 'driving'
-    dm_models_dir = base_data_dir / 'models' / 'dm'
+        verified = catalog.verified_entries(type_name)
+        verified_total += len(verified)
+        entries = [dict(e, type=type_name) for e in verified if e['id'] not in installed]
+        result[type_name] = entries
+        total += len(entries)
 
-    # Get installed models
-    installed_driving = set()
-    if driving_models_dir.exists():
-        installed_driving = {d.name for d in driving_models_dir.iterdir()
-                           if d.is_dir() and not d.name.startswith('_')}
-
-    installed_dm = set()
-    if dm_models_dir.exists():
-        installed_dm = {d.name for d in dm_models_dir.iterdir()
-                       if d.is_dir() and not d.name.startswith('_')}
-
-    # Find new models with filtering
-    new_driving = []
-    for model_id, info in driving_models.items():
-        # Skip if already installed
-        if model_id in installed_driving:
-            continue
-
-        # FILTER 1: Exclude models older than minimum date for current openpilot version
-        if info.get('date', '9999-99-99') < MIN_MODEL_DATE['driving']:
-            continue
-
-        # FILTER 2: Skip reverted models
-        if 'revert' in model_id.lower() or 'revert' in info.get('name', '').lower():
-            continue
-
-        new_driving.append({
-            'id': model_id,
-            'type': 'driving',
-            **info
-        })
-
-    new_dm = []
-    for model_id, info in dm_models.items():
-        # Skip if already installed
-        if model_id in installed_dm:
-            continue
-
-        # FILTER 1: Exclude old DM models incompatible with current openpilot version
-        if info.get('date', '9999-99-99') < MIN_MODEL_DATE['dm']:
-            continue
-
-        # FILTER 2: Skip reverted models
-        if 'revert' in model_id.lower() or 'revert' in info.get('name', '').lower():
-            continue
-
-        new_dm.append({
-            'id': model_id,
-            'type': 'dm',
-            **info
-        })
-
-    # Output as JSON for UI parsing
-    result = {
-        'driving': new_driving,
-        'dm': new_dm,
-        'total': len(new_driving) + len(new_dm)
-    }
+    result['total'] = total
+    result['verified_total'] = verified_total
 
     print(json.dumps(result))
     return 0
@@ -738,6 +694,8 @@ def main():
                        help='Model ID to download/add, or PR number for add-from-pr')
     parser.add_argument('--output', '-o', type=Path,
                        help='Output directory (default: /data/models/ or /data/dm-models/)')
+    parser.add_argument('--unlocked', action='store_true',
+                        help='Maintainer: allow installing a model the catalog has not verified')
 
     # Arguments for add-model command
     parser.add_argument('--name', help='Model display name (for add-model)')
@@ -771,7 +729,7 @@ def main():
 
         model_type = ModelType.DRIVING if args.type == 'driving' else ModelType.DM
 
-        return download_model(model_type, args.model_id, args.output)
+        return download_model(model_type, args.model_id, args.output, allow_untested=args.unlocked)
 
     elif args.action == 'add-model':
         if not all([args.model_id, args.type, args.name, args.commit, args.date, args.description]):
