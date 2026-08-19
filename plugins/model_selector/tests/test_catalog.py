@@ -207,6 +207,16 @@ class TestValidateCatalog:
     c['driving'] = [_stock(verified_on=['0.11.2'], baseline_for=['0.11.1'])]
     assert any('baseline_for' in p for p in catalog_env.validate_catalog(c))
 
+  def test_upstream_reverted_field_is_allowed(self, catalog_env):
+    """A model comma withdrew can still be catalogued — the field is provenance."""
+    c = {'driving': [_entry(upstream_reverted='d' * 40), _stock()],
+         'dm': [_stock(id='stock_dm_0.11.1', name='Release default DM')]}
+    assert catalog_env.validate_catalog(c) == []
+
+  def test_upstream_reverted_does_not_affect_verification(self, catalog_env):
+    _write(catalog_env, {'driving': [_entry(upstream_reverted='d' * 40)], 'dm': []})
+    assert catalog_env.is_verified('driving', 'cool_people_3c957c6')
+
 
 class TestShippedCatalog:
   """The catalog that actually ships must be valid and cover this version."""
