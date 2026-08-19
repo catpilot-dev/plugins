@@ -14,6 +14,11 @@ from pathlib import Path
 from config import PLUGINS_RUNTIME_DIR
 from model_swapper import ModelSwapper, ModelType
 
+try:
+  from plugins.model_selector import catalog
+except ImportError:
+  import catalog
+
 PLUGINS_DIR = PLUGINS_RUNTIME_DIR
 PYTHON_BIN = '/usr/local/venv/bin/python'
 
@@ -66,14 +71,16 @@ def _read_active(model_type):
 
 def _list_models(model_type):
   models = _SWAPPERS[model_type].list_models()
-  return [{'id': m['id'], 'name': m.get('name', m['id']), 'date': m.get('date', '')}
+  return [{'id': m['id'], 'name': m.get('name', m['id']), 'date': m.get('date', ''),
+           'verified': m.get('verified', False)}
           for m in models if m.get('has_onnx')]
 
 
 def _display_label(model):
-  if model['date']:
-    return f"{model['name']} ({model['date']})"
-  return model['name']
+  label = f"{model['name']} ({model['date']})" if model['date'] else model['name']
+  if not model.get('verified', True):
+    label += '  — untested'
+  return label
 
 
 def _swap_model(model_type, model_id):
@@ -110,14 +117,14 @@ def on_software_settings_extend(default, layout):
   class ModelActionDialog(Widget):
     """3-button dialog: [Delete] (red) | [Cancel] | [Activate] (blue)."""
 
-    def __init__(self, model_name, is_active=False, callback=None):
+    def __init__(self, model_name, is_active=False, can_activate=True, callback=None):
       super().__init__()
       self._callback = callback
       self._label = Label(model_name, 70, FontWeight.BOLD, text_color=rl.Color(201, 201, 201, 255))
       self._delete_btn = Button('Delete', lambda: self._done(ACTION_DELETE), button_style=ButtonStyle.DANGER)
       self._cancel_btn = Button('Cancel', lambda: self._done(ACTION_CANCEL))
       self._activate_btn = Button('Activate', lambda: self._done(ACTION_ACTIVATE), button_style=ButtonStyle.PRIMARY)
-      self._activate_btn.set_enabled(not is_active)
+      self._activate_btn.set_enabled(not is_active and can_activate)
 
     def _done(self, result):
       gui_app.pop_widget()
@@ -151,6 +158,7 @@ def on_software_settings_extend(default, layout):
       self._model_btns = {}
       self._model_cache = {}
       self._check_proc = None
+      self._untested_active = {}
 
       self.items = []
       for model_type, label in MODEL_TYPE_LABELS.items():
@@ -161,7 +169,7 @@ def on_software_settings_extend(default, layout):
 
       self._last_check_time = None
 
-      self._new_models_btn = button_item('New Models', 'CHECK', callback=self._on_check_new_models)
+      self._new_models_btn = button_item('Tested Models', 'CHECK', callback=self._on_check_new_models)
       self._new_models_btn.action_item.set_value('up to date, last checked never')
       _orig_hint = self._new_models_btn.action_item.get_width_hint
       self._new_models_btn.action_item.get_width_hint = lambda _o=_orig_hint: math.ceil(_o())
@@ -183,11 +191,15 @@ def on_software_settings_extend(default, layout):
       return f'{d} day{"s" if d != 1 else ""} ago'
 
     def show(self):
+      self._untested_active = {}
       for model_type in MODEL_TYPE_LABELS:
+        _SWAPPERS[model_type].import_stock()
         self._model_cache[model_type] = _list_models(model_type)
-        _, active_name = _read_active(model_type)
+        active_id, active_name = _read_active(model_type)
+        if active_id and not catalog.is_verified(model_type, active_id):
+          self._untested_active[model_type] = active_id
+          active_name = f'{active_name} — untested'
         self._model_btns[model_type].action_item.set_value(active_name)
-      # Refresh "last checked" relative time
       self._set_status(f'up to date, last checked {self._time_ago()}')
 
     def update(self):
@@ -201,6 +213,26 @@ def on_software_settings_extend(default, layout):
       models = self._model_cache.get(model_type, [])
       if not models:
         return
+
+      # Untested active model (the normal consequence of a catpilot update):
+      # offer the release default once, then fall through to the normal list.
+      baseline = catalog.baseline_entry(model_type)
+      if model_type in self._untested_active and baseline:
+        if baseline['id'] in {m['id'] for m in models}:
+          def on_recover(r, mt=model_type, bid=baseline['id']):
+            if r == DialogResult.CONFIRM:
+              self._activate(mt, bid)
+            else:
+              # Declining clears the flag so the offer does not repeat, then
+              # opens the list the user originally asked for.
+              self._untested_active.pop(mt, None)
+              self._on_model_select(mt)
+
+          gui_app.push_widget(ConfirmDialog(
+            f"The active model is not tested with openpilot {catalog.openpilot_version()}. "
+            f"Switch to {baseline.get('name', baseline['id'])}?",
+            'Switch', cancel_text='Keep', callback=on_recover))
+          return
 
       active_id = _read_active(model_type)[0]
       options = [_display_label(m) for m in models]
@@ -229,38 +261,53 @@ def on_software_settings_extend(default, layout):
                 _delete_model(mt, mid)
                 self._model_cache[mt] = _list_models(mt)
               elif r == ACTION_ACTIVATE:
-                try:
-                  _swap_model(mt, mid)
-                except Exception:
-                  gui_app.push_widget(ConfirmDialog('Model swap failed.', 'OK', cancel_text='',
-                                                    callback=lambda _: None))
+                if not m.get('verified', False):
+                  gui_app.push_widget(ConfirmDialog(
+                    f'This model has not been tested with openpilot {catalog.openpilot_version()}.',
+                    'OK', cancel_text='', callback=lambda _: None))
                   return
+                self._activate(mt, mid)
 
-                _, new_name = _read_active(mt)
-                if mt in self._model_btns:
-                  self._model_btns[mt].action_item.set_value(new_name)
-
-                def on_reboot(r2, mt2=mt, prev2=prev):
-                  if r2 == DialogResult.CONFIRM:
-                    ui_state.params.put_bool_nonblocking("DoReboot", True)
-                  else:
-                    try:
-                      _swap_model(mt2, prev2)
-                      _, reverted_name = _read_active(mt2)
-                      if mt2 in self._model_btns:
-                        self._model_btns[mt2].action_item.set_value(reverted_name)
-                    except Exception:
-                      pass
-
-                gui_app.push_widget(ConfirmDialog('Model swapped. Reboot to activate.', 'Reboot',
-                                                  cancel_text='Cancel', callback=on_reboot))
-
-            action_dlg = ModelActionDialog(_display_label(m), is_active=is_active, callback=on_action)
+            action_dlg = ModelActionDialog(_display_label(m), is_active=is_active,
+                                           can_activate=m.get('verified', False),
+                                           callback=on_action)
             gui_app.push_widget(action_dlg)
             return
 
       dlg._callback = on_select
       gui_app.push_widget(dlg)
+
+    def _activate(self, model_type, model_id):
+      """Swap to model_id and prompt for the reboot that makes it take effect."""
+      prev = _read_active(model_type)[0]
+      try:
+        _swap_model(model_type, model_id)
+      except Exception:
+        gui_app.push_widget(ConfirmDialog('Model swap failed.', 'OK', cancel_text='',
+                                          callback=lambda _: None))
+        return
+
+      _, new_name = _read_active(model_type)
+      if model_type in self._model_btns:
+        self._model_btns[model_type].action_item.set_value(new_name)
+
+      def on_reboot(r2, mt2=model_type, prev2=prev):
+        if r2 == DialogResult.CONFIRM:
+          ui_state.params.put_bool_nonblocking("DoReboot", True)
+          return
+        # Canceling reverts, so a canceled activation is a no-op. Reverting to an
+        # untested previous model is refused by the gate; the new model then
+        # simply stays, which is the safer of the two outcomes.
+        try:
+          _swap_model(mt2, prev2)
+          _, reverted_name = _read_active(mt2)
+          if mt2 in self._model_btns:
+            self._model_btns[mt2].action_item.set_value(reverted_name)
+        except Exception:
+          pass
+
+      gui_app.push_widget(ConfirmDialog('Model swapped. Reboot to activate.', 'Reboot',
+                                        cancel_text='Cancel', callback=on_reboot))
 
     def _on_check_new_models(self):
       script = _find_script('model_download.py')
@@ -274,7 +321,7 @@ def on_software_settings_extend(default, layout):
       self._new_models_btn.action_item.set_enabled(False)
 
       self._check_proc = subprocess.Popen(
-        ['bash', '-c', f'{PYTHON_BIN} {script} update-registry >/dev/null 2>&1; {PYTHON_BIN} {script} check-updates'],
+        [PYTHON_BIN, str(script), 'check-updates'],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
       )
 
@@ -296,7 +343,10 @@ def on_software_settings_extend(default, layout):
       total = updates.get('total', 0)
       self._last_check_time = time.monotonic()
       if total == 0:
-        self._set_status('up to date, last checked now')
+        if updates.get('verified_total', 0) == 0:
+          self._set_status(f"no tested models for {updates.get('version', 'this version')}")
+        else:
+          self._set_status('up to date, last checked now')
         return
 
       TYPE_PREFIX = {'driving': 'Driving', 'dm': 'DM'}
@@ -320,7 +370,7 @@ def on_software_settings_extend(default, layout):
             self._start_download(m['type'], m['id'])
             return
 
-      dlg = MultiOptionDialog('New Models', options, current='', callback=on_result)
+      dlg = MultiOptionDialog('Tested Models', options, current='', callback=on_result)
       gui_app.push_widget(dlg)
 
     def _start_download(self, model_type, model_id):
@@ -366,6 +416,12 @@ def on_health_check(acc, **kwargs):
   # (only copies files not already in cache), so repeated calls are safe.
   # This ensures pkl files are saved to /data/models/ as soon as tinygrad
   # compiles them, so switching back to a model skips recompilation.
+  for model_type in ('driving', 'dm'):
+    try:
+      _SWAPPERS[model_type].import_stock()
+    except Exception:
+      pass
+
   for model_type_key, swapper in _SWAPPERS.items():
     try:
       active_id = swapper.get_active_model()
