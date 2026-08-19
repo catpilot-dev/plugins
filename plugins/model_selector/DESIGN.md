@@ -29,7 +29,11 @@ Models are openpilot's own model files, pulled at a specific **GitHub commit**:
   (it scans recent commits for `Revert` messages and drops the reverted commit
   hashes). A single model can also be added directly from a merged PR
   (`add-from-pr <n>`) — note it records the PR **head** commit, because the LFS
-  objects live there, not on the merge commit.
+  objects live there, not on the merge commit. `update-registry`, `add-from-pr`,
+  and `list` are **maintainer-only CLI** now: they build the pool of candidates a
+  maintainer can review, but nothing about the UI reads the registry directly —
+  the UI, and every gate, read `compatible_models.json` through `catalog.py`
+  instead (see Compatibility gating below).
 - **Download** fetches each ONNX from
   `raw.githubusercontent.com/commaai/openpilot/<commit>/selfdrive/modeld/models/<file>`.
   These files are Git LFS pointers; `download_file` detects the pointer, parses
@@ -84,8 +88,9 @@ The swap **returns `requires_reboot: True`** and does not restart anything.
 Nothing changes until openpilot reloads modeld — i.e. **a reboot**. In the UI,
 activating a model raises a "Model swapped. Reboot to activate." dialog whose
 **Reboot** sets the `DoReboot` param; **Cancel** swaps the previous model back
-in immediately (so a canceled activation is a no-op). Models older than
-`MIN_MODEL_DATE` are filtered out of every list, so they can't be selected.
+in immediately (so a canceled activation is a no-op). `swap_model` itself
+refuses any model the catalog has not verified for the running openpilot
+version (unless unlocked) — see Compatibility gating below.
 
 ## ONNX + PKL caching
 
@@ -112,7 +117,7 @@ Software layout's plugin extension points:
 
 - `layout._plugin_items` — three `button_item` rows: **Driving Model** and
   **Driver Monitoring** (each `SELECT`, showing the active model's name+date),
-  and **New Models** (`CHECK`, showing check status / "last checked …").
+  and **Tested Models** (`CHECK`, showing check status / "last checked …").
 - `layout._plugin_updaters` — `manager.update`, polled to detect completion of
   the background check/download subprocess.
 - `layout._plugin_show_cbs` — `manager.show`, refreshes the installed-model
@@ -128,28 +133,39 @@ Interaction flow:
   (3 buttons: **Delete** / **Cancel** / **Activate**). Activate runs the swap +
   reboot dialog above; Delete removes the model dir (blocked for the active
   model).
-- **CHECK** → spawns `model_download.py update-registry` then `check-updates`
-  as a subprocess (via `/usr/local/venv/bin/python`), parses the JSON list of
-  new, compatible, uninstalled models, and offers them in a dialog; selecting
-  one spawns `model_download.py download <id> --type <type>`.
+- **CHECK** → spawns `model_download.py check-updates` as a subprocess (via
+  `/usr/local/venv/bin/python`). This is a local diff against
+  `compatible_models.json` — no GitHub call, no network needed — that parses
+  the JSON list of verified, uninstalled models and offers them in a dialog;
+  selecting one spawns `model_download.py download <id> --type <type>`.
 
 Scripts are located under `PLUGINS_RUNTIME_DIR/model_selector/` at runtime
 (`/data/plugins-runtime/model_selector/`).
 
-## Compatibility filtering
+## Compatibility gating
 
-Three independent gates keep incompatible models out:
+A model may be downloaded or activated only if `compatible_models.json` — the
+curated catalog shipped at the plugin root — records that it passed a test drive
+on the openpilot version this device runs. `catalog.py` owns that policy; the
+date heuristics it replaced (`MIN_MODEL_DATE`, the revert-name filter) are gone.
 
-1. **`MIN_MODEL_DATE`** (`model_swapper.py`): `driving` ≥ `2025-10-01`,
-   `dm` ≥ `2025-11-01`. Applied when *listing* installed models and available
-   downloads — older ones are hidden (DM models before 2025-11-01 lack
-   `output_slices` metadata; the driving floor is the v0.10.3 shipping model).
-2. **`desire_pulse` transition** (`check_model_compatibility`, driving only):
-   driving models dated before **2025-08-27** expect `desire` instead of
-   `desire_pulse` and are flagged/blocked at download.
-3. **Registry ingestion filters** (`update_registry_from_github`): only commits
-   from **2025-09-05** (Firehose) onward are ingested; revert commits and the
-   models they revert are excluded.
+- **Catalog** — `compatible_models.json`, at the plugin root so every deploy
+  overwrites it. `data/` is preserved across reinstalls and would freeze a
+  catalog placed there. Entries carry `verified_on: ["0.11.1", …]`; one entry per
+  type per version also carries `baseline_for`, marking the known-good fallback.
+- **Version** — read from `/data/openpilot/common/version.h`, falling back to
+  `manifest.OPENPILOT_VERSION`.
+- **Shipped models** — the ONNX a release ships is verified by definition. Its
+  entry carries `source: "shipped"` and no `commit`; `ModelSwapper.import_stock`
+  copies the files out of `ACTIVE_DIR` into storage, but only while the active
+  tracker is absent, which proves no swap has happened yet.
+- **Fail closed** — a missing or corrupt catalog yields zero verified models.
+- **Unlock** — `<PLUGINS_RUNTIME_DIR>/model_selector/data/.unlocked` (or
+  `download --unlocked`) lets a maintainer install and activate untested models.
+  It has no UI surface and survives reinstalls, since `data/` is preserved.
+
+Enforced at three call sites so no path is ungated: `check_updates` (what is
+offered), `download_model` (what is fetched), `swap_model` (what is activated).
 
 ## Hooks
 
@@ -161,33 +177,44 @@ Three independent gates keep incompatible models out:
 ## Config / paths
 
 No plugin params in a `data/` dir — enable/disable is the framework-level
-Settings → Plugins toggle. The moving parts are file locations and the
-date constants:
+Settings → Plugins toggle. The moving parts are file locations:
 
 | Name | Value | Where | Meaning |
 |---|---|---|---|
-| `REGISTRY_FILE` | `/data/models/model_registry.json` | `model_download.py` | Available-models catalog |
+| `REGISTRY_FILE` | `/data/models/model_registry.json` | `model_download.py` | Maintainer's available-models catalogue (candidate pool, not the gate) |
 | `BASE_DATA_DIR` | `/data` (else `~/driving_data`) | `model_swapper.py` | Root of model storage |
 | `ACTIVE_DIR` | `/data/openpilot/selfdrive/modeld/models` | `model_swapper.py` | Where openpilot loads the live model |
 | `active_<type>_model` | JSON `{id, name, tinygrad}` | `/data/models/` | Which model is active per type |
-| `MIN_MODEL_DATE['driving']` | `2025-10-01` | `model_swapper.py` | List/download floor for driving |
-| `MIN_MODEL_DATE['dm']` | `2025-11-01` | `model_swapper.py` | List/download floor for DM |
+| `CATALOG_FILE` | `<plugin root>/compatible_models.json` | `catalog.py` | The curated compatibility gate |
+| `VERSION_H` | `/data/openpilot/common/version.h` | `catalog.py` | Running openpilot version (source of truth) |
+| `UNLOCK_MARKER` | `<PLUGINS_RUNTIME_DIR>/model_selector/data/.unlocked` | `catalog.py` | Maintainer unlock for untested models |
 | `_LFS_BATCH_URLS` | GitHub, then GitLab | `model_download.py` | LFS resolve order |
 | `PYTHON_BIN` | `/usr/local/venv/bin/python` | `ui.py` | Interpreter for the download subprocess |
 
 ## Key files
 
+- `catalog.py` — the compatibility gate: `load_catalog`, `verified_entries`,
+  `is_verified`, `baseline_entry`, `unlocked`, `validate_catalog`. Pure policy,
+  no ONNX/storage knowledge; `model_download.py` and `model_swapper.py` both
+  call into it rather than re-deriving compatibility themselves.
+- `compatible_models.json` — the curated catalog data `catalog.py` reads, at
+  the plugin root (not `data/`) so every deploy overwrites it.
 - `model_download.py` — registry maintenance and downloading. CLI:
   `list`, `download`, `check-updates`, `add-model`, `add-from-pr`,
   `update-registry`. LFS pointer resolution lives here.
 - `model_swapper.py` — the `ModelSwapper` class: `list_models`, `swap_model`,
-  `cache_compiled_pkl`, `get_active_model`, `verify_model`, `delete_model`, plus
-  a `--type {driving,dm}` CLI.
+  `cache_compiled_pkl`, `get_active_model`, `verify_model`, `delete_model`,
+  `import_stock`, plus a `--type {driving,dm}` CLI.
 - `ui.py` — the Software-panel hook, the dialogs, and the `device.health_check`
   hook.
 - `tests/test_model_swapper.py` — covers `ModelType`, `MODEL_CONFIGS`,
   `list_models` (empty / with-info / hidden-dir skip / date sort),
   `resolve_model_id`, and `swap_model` validation (missing model, missing ONNX).
+- `tests/test_catalog.py` — covers version parsing/fallback, fail-closed
+  behavior on a missing or corrupt catalog, `verified_entries`/`is_verified`
+  version matching, `baseline_entry`, the unlock marker, and
+  `validate_catalog`'s checks (duplicate ids, missing baseline, required
+  fields per entry type).
 
 ## Notes / rough edges
 

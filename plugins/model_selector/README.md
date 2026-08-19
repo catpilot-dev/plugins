@@ -14,9 +14,8 @@ active:
   drives.
 - **Driver-monitoring model** — swapping it changes how driver monitoring behaves.
 
-It can also reach out to the [openpilot](https://github.com/commaai/openpilot)
-GitHub repo, find newer models that comma has published, and download them for
-you.
+It can also download models that comma has published and that have been test
+driven on your openpilot version, ready to switch to whenever you want.
 
 ## How to use it
 
@@ -28,9 +27,10 @@ Everything lives in **Settings → Software**. The plugin adds three rows:
   every driving model installed on the device and switch, or delete one you no
   longer want.
 - **Driver Monitoring** — same, for the DM model.
-- **New Models** — tap **CHECK**. It asks GitHub what comma has published
-  since, lists anything newer than what you have, and lets you download it.
-  The row shows status (`checking…`, `N available`, `downloading`,
+- **Tested Models** — tap **CHECK**. It lists the models that have been test
+  driven on your openpilot version and aren't installed yet, and lets you
+  download one. The list ships with the plugin, so it updates when catpilot
+  does. The row shows status (`checking…`, `N available`, `downloading`,
   `download complete`, `up to date`).
 
 When you activate a model, the plugin stages it and asks you to **Reboot** —
@@ -48,9 +48,13 @@ it puts the previous model back, so nothing changes until you actually reboot.
   you've used before is instant.
 - **You can't delete the model that's currently active.** Switch to another
   one first.
-- **Old models are hidden.** Models too old to work with this openpilot
-  version are filtered out of the lists automatically, so you can't
-  accidentally install one that won't run.
+- **Only tested models can be selected.** Every model offered here has been
+  test driven on your openpilot version, along with the model your release
+  ships. Anything else on the device is shown as *untested* and can't be
+  activated.
+- **After a catpilot update, a model you were using may become untested.**
+  It keeps running — nothing changes under you — but the panel flags it and
+  offers to switch you back to the model your release ships.
 
 ## Turning it on and off
 
