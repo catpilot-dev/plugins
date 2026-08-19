@@ -206,20 +206,25 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
             print(f"  {mid}: {info['name']} ({info['commit']})")
         return 1
 
-    # Check compatibility
-    is_compatible, warning = check_model_compatibility(model_info, model_type)
-    if not is_compatible:
-        print(warning)
-        if sys.stdin.isatty():
-            print("=" * 70)
-            response = input("Download anyway? (yes/no): ")
-            if response.lower() not in ['yes', 'y']:
-                print("Download cancelled")
+    # Check compatibility — but only for the registry (maintainer) path.
+    # Curation strictly supersedes the date heuristic: an entry that came
+    # from the catalog was maintainer-test-driven and put there deliberately,
+    # so the date rule (pre-desire_pulse) must not veto it. The registry path
+    # has no such verification, so it keeps the heuristic.
+    if entry is None:
+        is_compatible, warning = check_model_compatibility(model_info, model_type)
+        if not is_compatible:
+            print(warning)
+            if sys.stdin.isatty():
+                print("=" * 70)
+                response = input("Download anyway? (yes/no): ")
+                if response.lower() not in ['yes', 'y']:
+                    print("Download cancelled")
+                    return 1
+                print()
+            else:
+                print("Skipping incompatible model (non-interactive)")
                 return 1
-            print()
-        else:
-            print("Skipping incompatible model (non-interactive)")
-            return 1
 
     # Determine output directory
     if output_dir is None:
@@ -366,7 +371,14 @@ def check_updates():
 
         verified = catalog.verified_entries(type_name)
         verified_total += len(verified)
-        entries = [dict(e, type=type_name) for e in verified if e['id'] not in installed]
+        # Shipped entries have no commit/files — download_model always refuses
+        # them (they're imported from disk by ModelSwapper.import_stock, not
+        # downloaded), so they must never appear in the offer list. They still
+        # count toward verified_total: that answers "does this openpilot
+        # version have any tested models at all", which shipped entries do
+        # satisfy.
+        entries = [dict(e, type=type_name) for e in verified
+                   if e['id'] not in installed and e.get('source') != 'shipped']
         result[type_name] = entries
         total += len(entries)
 

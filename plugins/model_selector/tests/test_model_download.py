@@ -114,17 +114,33 @@ class TestCheckUpdates:
   def test_offers_verified_uninstalled(self, dl_env, capsys):
     md.check_updates()
     out = json.loads(capsys.readouterr().out)
-    assert [m['id'] for m in out['driving']] == ['good_model', 'stock_0.11.1']
-    assert out['total'] == 2
+    # 'stock_0.11.1' is a shipped entry: download_model always refuses it (no
+    # commit/files, it's imported from disk by import_stock, not downloaded),
+    # so it must never be offered even though it is verified and uninstalled.
+    assert [m['id'] for m in out['driving']] == ['good_model']
+    assert out['total'] == 1
     assert out['version'] == '0.11.1'
+    # verified_total still counts the shipped entry: it answers "does this
+    # openpilot version have any tested models at all".
     assert out['verified_total'] == 2
+
+  def test_shipped_entry_never_offered_even_when_never_installed(self, dl_env, capsys):
+    # A device that has swapped models away from stock never has the shipped
+    # entry's directory under models/driving/ (import_stock only runs while
+    # no swap has ever happened) — it must not show up as "available" forever.
+    md.check_updates()
+    out = json.loads(capsys.readouterr().out)
+    assert 'stock_0.11.1' not in {m['id'] for m in out['driving']}
 
   def test_skips_installed(self, dl_env, capsys):
     tmp_path, _ = dl_env
     (tmp_path / 'models' / 'driving' / 'good_model').mkdir()
     md.check_updates()
     out = json.loads(capsys.readouterr().out)
-    assert [m['id'] for m in out['driving']] == ['stock_0.11.1']
+    # good_model is now installed and stock_0.11.1 is shipped (never offered):
+    # nothing left to offer, but verified_total still counts both.
+    assert out['driving'] == []
+    assert out['verified_total'] == 2
 
   def test_entries_carry_type(self, dl_env, capsys):
     md.check_updates()
@@ -167,3 +183,54 @@ class TestDownloadGate:
     assert md.download_model(md.ModelType.DRIVING, 'good_model') == 0
     assert len(calls) == 2
     assert all(('c' * 40) in url for url in calls)
+
+
+class TestCompatibilityHeuristicSuperseded:
+  """Curation strictly supersedes the pre-desire_pulse date heuristic: a
+  catalogued entry is maintainer-test-driven and must not be vetoed by the
+  date rule. The registry (non-catalogued, maintainer-add-a-model) path keeps
+  running the heuristic since nothing has verified those entries."""
+
+  def test_catalogued_entry_predating_the_cutoff_still_downloads(self, dl_env, monkeypatch, capsys):
+    tmp_path, cat = dl_env
+    data = json.loads(cat.CATALOG_FILE.read_text())
+    data['driving'].append({
+      'id': 'old_but_catalogued', 'name': 'Old But Catalogued', 'date': '2025-01-01',
+      'commit': 'd' * 40, 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
+      'verified_on': ['0.11.1'],
+    })
+    cat.CATALOG_FILE.write_text(json.dumps(data))
+
+    calls = []
+    monkeypatch.setattr(md, 'download_file', lambda url, dest, desc=None: calls.append(url))
+    assert md.download_model(md.ModelType.DRIVING, 'old_but_catalogued') == 0
+    assert len(calls) == 2
+    assert all(('d' * 40) in url for url in calls)
+
+  def test_registry_path_still_blocks_pre_desire_pulse_noninteractive(self, dl_env, monkeypatch, capsys):
+    import types
+    _, cat = dl_env
+    # Bypass the catalog gate (this id is not in the catalog at all) so the
+    # registry lookup is reached — the existing maintainer escape hatch.
+    cat.UNLOCK_MARKER.write_text('')
+    monkeypatch.setattr(md, 'load_registry', lambda: (
+      {'old_registry_model': {
+        'name': 'Old Registry Model', 'commit': 'e' * 40, 'date': '2025-01-01',
+        'files': ['driving_vision.onnx', 'driving_policy.onnx'],
+      }}, {}))
+    monkeypatch.setattr(md.sys, 'stdin', types.SimpleNamespace(isatty=lambda: False))
+    assert md.download_model(md.ModelType.DRIVING, 'old_registry_model') == 1
+    assert 'Skipping incompatible model' in capsys.readouterr().out
+
+  def test_registry_path_compatible_model_still_downloads(self, dl_env, monkeypatch, capsys):
+    _, cat = dl_env
+    cat.UNLOCK_MARKER.write_text('')
+    monkeypatch.setattr(md, 'load_registry', lambda: (
+      {'new_registry_model': {
+        'name': 'New Registry Model', 'commit': 'f' * 40, 'date': '2025-10-20',
+        'files': ['driving_vision.onnx', 'driving_policy.onnx'],
+      }}, {}))
+    calls = []
+    monkeypatch.setattr(md, 'download_file', lambda url, dest, desc=None: calls.append(url))
+    assert md.download_model(md.ModelType.DRIVING, 'new_registry_model') == 0
+    assert len(calls) == 2

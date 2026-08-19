@@ -82,6 +82,30 @@ class TestLoadCatalog:
     _write(catalog_env, {'driving': [_entry(), {'name': 'no id'}], 'dm': []})
     assert len(catalog_env.load_catalog()['driving']) == 1
 
+  def test_non_utf8_file_fails_closed(self, catalog_env):
+    # A binary-garbled catalog (e.g. truncated write, wrong encoding) must
+    # not raise UnicodeDecodeError out of the gate.
+    catalog_env.CATALOG_FILE.write_bytes(b'\xff\xfe\x00\x01garbage')
+    assert catalog_env.load_catalog() == {}
+    assert catalog_env.verified_entries('driving') == []
+
+  def test_wrong_shaped_type_value_fails_closed(self, catalog_env):
+    # Structurally valid JSON of the wrong shape: passes isinstance(data,
+    # dict) but a per-type value that isn't a list must not raise TypeError
+    # when iterated.
+    _write(catalog_env, {'driving': 5, 'dm': []})
+    result = catalog_env.load_catalog()
+    assert result['driving'] == []
+    assert catalog_env.verified_entries('driving') == []
+
+  def test_one_bad_type_does_not_poison_the_other(self, catalog_env):
+    _write(catalog_env, {'driving': [_entry()], 'dm': 'nope'})
+    result = catalog_env.load_catalog()
+    assert result['dm'] == []
+    assert len(result['driving']) == 1
+    assert catalog_env.verified_entries('driving')[0]['id'] == 'cool_people_3c957c6'
+    assert catalog_env.verified_entries('dm') == []
+
 
 class TestVerifiedEntries:
   def test_matching_version_is_returned(self, catalog_env):

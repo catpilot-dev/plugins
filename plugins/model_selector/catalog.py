@@ -45,16 +45,26 @@ def openpilot_version() -> str:
 
 
 def load_catalog() -> dict:
-  """Parse the catalog. Returns {} on any problem — the gate fails closed."""
+  """Parse the catalog. Returns {} on any problem — the gate fails closed.
+
+  Any failure mode (missing file, malformed JSON, non-UTF-8 bytes, or valid
+  JSON of the wrong shape) must degrade to an empty catalog rather than raise
+  — this is called from the UI thread with no caller-side guard.
+  """
   try:
     with open(CATALOG_FILE) as f:
       data = json.load(f)
-  except (OSError, json.JSONDecodeError):
+  except Exception:
     return {}
   if not isinstance(data, dict):
     return {}
-  return {t: [e for e in data.get(t, []) if isinstance(e, dict) and e.get('id')]
-          for t in MODEL_TYPES}
+  result = {}
+  for t in MODEL_TYPES:
+    entries = data.get(t, [])
+    if not isinstance(entries, list):
+      entries = []
+    result[t] = [e for e in entries if isinstance(e, dict) and e.get('id')]
+  return result
 
 
 def verified_entries(model_type) -> list:
