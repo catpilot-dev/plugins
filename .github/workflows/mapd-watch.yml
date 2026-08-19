@@ -1,0 +1,42 @@
+name: mapd release watch
+
+# Daily check for a pfeiferj/mapd release newer than the pin in
+# mapd_manager.py. Schedule drift is accepted: dedup is keyed on the release
+# tag, not a time window, so a skipped run loses nothing — the next run reports
+# the same release.
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print what would be filed without creating issues'
+        type: boolean
+        default: false
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install requests pytest
+
+      - name: Test the watch script
+        run: python -m pytest .github/scripts/tests -q
+
+      - name: Check pfeiferj/mapd for new releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python .github/scripts/mapd_watch.py \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
