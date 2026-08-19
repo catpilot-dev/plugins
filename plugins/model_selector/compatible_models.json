@@ -42,6 +42,20 @@
         "0.11.1"
       ],
       "notes": "dmonitoring_model.onnx shipped in catpilot v0.11.1"
+    },
+    {
+      "id": "le_mans_gt3_model_04dcdf4",
+      "name": "Le Mans GT3 Model",
+      "date": "2026-02-27",
+      "commit": "04dcdf46bc7c3d84f8a20f6e81cfb5b38dab8689",
+      "pr": "#37425",
+      "files": [
+        "dmonitoring_model.onnx"
+      ],
+      "verified_on": [
+        "0.11.1"
+      ],
+      "notes": "test driven on catpilot v0.11.1; the DM model running on the reference C3 as of 2026-08-19"
     }
   ]
 }
