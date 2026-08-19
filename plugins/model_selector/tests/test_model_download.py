@@ -300,3 +300,73 @@ class TestScanUpstreamModels:
     """Catalog ids like pop_model_37727 come from this function — they must agree."""
     out = md.scan_upstream_models([_commit('0' * 40, 'POP model (#37727)')])
     assert out['candidates'][0]['id'] == 'pop_model_37727'
+
+  def test_skip_commits_drops_the_candidate_without_a_pr_fallback_call(self, monkeypatch):
+    """Finding 3 regression: a commit already in the registry would be
+    discarded by update_registry_from_github anyway, so it must never reach
+    the unauthenticated, 60/hr-shared-limit PR-fallback lookup. skip_commits
+    must short-circuit BEFORE that network call, not just filter results
+    after the fact."""
+    def _boom(*a, **k):
+      raise AssertionError('PR-fallback network call must not happen for a skipped commit')
+    monkeypatch.setattr(md.requests, 'get', _boom)
+
+    out = md.scan_upstream_models(
+      [_commit('e' * 40, 'unlabelled bump')],  # no '(#' -> would hit PR fallback
+      skip_commits={'e' * 40},
+    )
+    assert out['candidates'] == []
+
+  def test_skip_commits_default_none_preserves_existing_behavior(self, monkeypatch):
+    """Default (no skip_commits) must behave exactly as before: the
+    PR-fallback call still happens for a commit without a `(#NNNNN)`."""
+    calls = []
+
+    class _Resp:
+      def raise_for_status(self): pass
+      def json(self): return [{'number': 999, 'title': 'Still Called'}]
+
+    def _get(*a, **k):
+      calls.append(1)
+      return _Resp()
+
+    monkeypatch.setattr(md.requests, 'get', _get)
+    out = md.scan_upstream_models([_commit('e' * 40, 'some model bump')])
+    assert len(calls) == 1
+    assert out['candidates'][0]['name'] == 'Still Called'
+
+
+class TestUpdateRegistryFromGithub:
+  def test_skips_pr_fallback_for_a_commit_already_in_the_registry(self, tmp_path, monkeypatch):
+    """Finding 3 wiring: update_registry_from_github must compute
+    existing_commits BEFORE calling scan_upstream_models and pass it as
+    skip_commits, so a commit already in the registry never reaches the
+    PR-fallback network call — it would be discarded on the way out anyway."""
+    registry_file = tmp_path / 'model_registry.json'
+    registry_file.write_text(json.dumps({
+      'driving_models': {'old_model_1': {'commit': 'e' * 40, 'pr': '#1',
+                                          'files': [], 'name': 'Old', 'date': '2025-12-01'}},
+      'dm_models': {},
+    }))
+    monkeypatch.setattr(md, 'REGISTRY_FILE', registry_file)
+
+    commits_resp = MagicMock()
+    commits_resp.raise_for_status.return_value = None
+    # 'e' * 40 has no '(#NNNNN)' -> would hit the PR-fallback call unless
+    # skip_commits filters it out first.
+    commits_resp.json.return_value = [_commit('e' * 40, 'unlabelled bump')]
+
+    calls = []
+
+    def _get(url, **kwargs):
+      calls.append(url)
+      if 'commits' in url and 'pulls' not in url:
+        return commits_resp
+      raise AssertionError(f'unexpected/PR-fallback request: {url}')
+
+    monkeypatch.setattr(md.requests, 'get', _get)
+    rc = md.update_registry_from_github()
+
+    assert rc in (0, None)
+    # Only the initial commits-list request happened — no PR-fallback lookup.
+    assert len(calls) == 1

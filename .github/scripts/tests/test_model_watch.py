@@ -174,3 +174,48 @@ class TestPlanIssues:
     assert '"id": "nice_model_37727"' in body
     assert '"commit": "' + 'a' * 40 + '"' in body
     assert 'verified_on' not in body.split('```')[1]
+
+  def test_reverted_candidate_is_never_reported_twice_across_two_runs(self):
+    """Finding 1 regression: a model published AND reverted between two daily
+    runs must get exactly one issue, ever — not a candidate issue on day 1
+    followed by a spec-forbidden model-revert issue on day 2.
+
+    Day 1: never-reported reverted candidate -> one candidate issue, whose
+    body must carry the revert sha as a second marker line (this is the ONLY
+    issue this revert will ever get). Day 2: feed that body's markers back in
+    as `reported` against the identical scan -> nothing left to file.
+    """
+    scan = {'candidates': [_cand(upstream_reverted='d' * 40)], 'reverted': {'a' * 40: 'd' * 40}}
+
+    day1 = mw.plan_issues(scan, self._catalog(), set())
+    assert [p['kind'] for p in day1] == ['candidate']
+
+    day1_issue = {'number': 1, 'state': 'open', 'body': day1[0]['body']}
+    reported_after_day1 = mw.reported_shas([day1_issue])
+    assert reported_after_day1 == {'a' * 40, 'd' * 40}
+
+    day2 = mw.plan_issues(scan, self._catalog(), reported_after_day1)
+    assert day2 == []
+
+
+class TestMainCatalogFailClosed:
+  """Finding 2: catalog.load_catalog() fails OPEN by design ({} on any read
+  or parse error) because that's correct for the car's UI thread. In CI that
+  same {} makes every catalogued model look brand new to _catalog_ids and
+  spam a fresh candidate issue — main() must treat an empty catalog as a
+  hard error instead of planning against it."""
+
+  def test_empty_catalog_returns_1_and_creates_nothing(self, monkeypatch, capsys):
+    monkeypatch.setattr(mw, 'fetch_commits', lambda: [])
+    monkeypatch.setattr(mw.catalog, 'load_catalog', lambda: {})
+
+    def _must_not_be_called(*a, **k):
+      raise AssertionError('main() must return before touching issues/creating anything')
+
+    monkeypatch.setattr(mw, 'fetch_issues', _must_not_be_called)
+    monkeypatch.setattr(mw, 'create_issue', _must_not_be_called)
+
+    rc = mw.main(['--repo', 'owner/repo'])
+
+    assert rc == 1
+    assert 'catalog' in capsys.readouterr().err.lower()

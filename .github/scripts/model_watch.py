@@ -32,7 +32,12 @@ MODEL_PATH = 'selfdrive/modeld/models'
 MAINTAINER = '@OxygenLiu'
 
 
-def fetch_commits(per_page: int = 30) -> list:
+def fetch_commits(per_page: int = 100) -> list:
+    # 100 is GitHub's max per_page — same single request as per_page=30, no
+    # extra cost — and it widens the window this job looks back through.
+    # That matters for reverts specifically: plan_issues only reconciles
+    # commits inside this window, so a revert of a model old enough to have
+    # scrolled out of it is never reported at all, not even late.
     resp = requests.get(
         f"https://api.github.com/repos/{WATCH_REPO}/commits",
         params={'path': MODEL_PATH, 'per_page': per_page},
@@ -99,14 +104,24 @@ def _candidate_body(cand: dict) -> str:
         'files': cand['files'],
     }
     revert_note = ''
+    revert_marker = ''
     if cand['upstream_reverted']:
         revert_note = (
             f"\n> **Reverted upstream** by `{cand['upstream_reverted'][:12]}`. "
             "That is not a verdict on whether it drives — comma reverts for many "
             "reasons, none of them a road test on this car. Still worth a drive.\n"
         )
+        # A second marker line for the revert sha itself: this candidate issue
+        # is the ONLY issue this revert will ever get (a model reported and
+        # reverted between two runs is one issue, not a candidate issue plus a
+        # revert issue — see module docstring). reported_shas() collects every
+        # marker line in a body, so recording the revert sha here means the
+        # next run's dedup set already contains it and plan_issues' second
+        # branch (news-worthy revert of an already-known model) never fires
+        # for news that was already delivered in this very body.
+        revert_marker = f"{MARKER} {cand['upstream_reverted']}\n"
     return f"""{MARKER} {cand['commit']}
-
+{revert_marker}
 {MAINTAINER} — new upstream model candidate.
 {revert_note}
 | | |
@@ -214,6 +229,18 @@ def main(argv=None) -> int:
 
     scan = scan_upstream_models(fetch_commits())
     cat = catalog.load_catalog()
+    if not cat:
+        # load_catalog() fails CLOSED (returns {}) on any read/parse problem —
+        # correct for the UI thread (offer nothing), wrong here. An empty
+        # catalog is not a real state for this repo: compatible_models.json
+        # always ships with at least the release-default entries. {} here
+        # means the file is missing or corrupt, and every catalogued model
+        # would look brand-new to _catalog_ids — silently spamming a fresh
+        # candidate issue for each one. Fail loudly instead of filing.
+        print("error: catalog.load_catalog() returned empty — file missing or "
+              "corrupt; refusing to file issues against a blank catalog",
+              file=sys.stderr)
+        return 1
     # A dry run needs the real reported set too, or it prints a dishonest plan.
     reported = reported_shas(fetch_issues(args.repo))
 

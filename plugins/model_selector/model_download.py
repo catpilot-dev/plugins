@@ -536,7 +536,7 @@ def _parse_reverts(commits_data: list) -> dict:
     return reverted
 
 
-def scan_upstream_models(commits_data: list) -> dict:
+def scan_upstream_models(commits_data: list, skip_commits: set = None) -> dict:
     """Parse GitHub commits touching the model dir into model candidates.
 
     Pure: no network except the PR-title fallback, no disk, no registry. Shared
@@ -548,7 +548,15 @@ def scan_upstream_models(commits_data: list) -> dict:
     regression, infrastructure, a competing model winning — and none of them is
     a road test on this fork. Only the revert commit itself is excluded, because
     it is not a model.
+
+    `skip_commits`, if given, is a set of shas to drop before the PR-fallback
+    network call — used by the device `update-registry` path to skip commits
+    already in the registry (they would be discarded anyway, so no point
+    burning an unauthenticated, 60/hr-shared-limit lookup on them). The CI
+    watch job must NOT pass this: it needs every candidate, including already
+    known ones, to reconcile against filed issues and the catalog.
     """
+    skip_commits = skip_commits or set()
     reverted = _parse_reverts(commits_data)
     candidates = []
 
@@ -562,6 +570,9 @@ def scan_upstream_models(commits_data: list) -> dict:
 
         # The revert commit itself is not a model
         if commit_message.split('\n')[0].lower().startswith('revert'):
+            continue
+
+        if commit_hash in skip_commits:
             continue
 
         if '(#' not in commit_message:
@@ -647,12 +658,18 @@ def update_registry_from_github():
     with open(REGISTRY_FILE) as f:
         registry = json.load(f)
 
-    scan = scan_upstream_models(commits_data)
-
     existing_commits = set()
     for models_dict in [registry['driving_models'], registry['dm_models']]:
         for model_info in models_dict.values():
             existing_commits.add(model_info['commit'])
+
+    # Commits already in the registry would be discarded below anyway (see
+    # the `cand['commit'] in existing_commits` skip in the loop over
+    # scan['candidates']) — skip them here too, before scan_upstream_models
+    # reaches its PR-fallback network call, so an unauthenticated,
+    # 60/hr-shared-limit lookup is never spent on a commit whose result will
+    # be thrown away.
+    scan = scan_upstream_models(commits_data, skip_commits=existing_commits)
 
     # Mark — never delete — registry entries whose commit was reverted upstream.
     # A revert is not a verdict on whether the model drives; see DESIGN.md.
