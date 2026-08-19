@@ -124,12 +124,13 @@ class TestOpenpilotVersion:
 
   def test_missing_version_h_falls_back_to_empty(self, catalog_env, tmp_path, monkeypatch):
     monkeypatch.setattr(catalog_env, 'VERSION_H', tmp_path / 'nope.h')
-    # manifest import fails off-device, so the chain ends at ''
-    assert catalog_env.openpilot_version() in ('', '0.11.1')
+    # The openpilot package is not importable from the plugins repo, so the
+    # manifest fallback fails and the chain ends at ''.
+    assert catalog_env.openpilot_version() == ''
 
   def test_malformed_version_h_does_not_raise(self, catalog_env):
     catalog_env.VERSION_H.write_text('garbage with no quotes\n')
-    assert catalog_env.openpilot_version() in ('', '0.11.1')
+    assert catalog_env.openpilot_version() == ''
 
 
 class TestLoadCatalog:
@@ -498,34 +499,57 @@ git commit -m "feat(model_selector): seed catalog with the v0.11.1 release defau
 Append to `plugins/model_selector/tests/test_model_swapper.py`:
 
 ```python
+CATALOG_FIXTURE = {
+  'driving': [{'id': 'good_model', 'name': 'Good', 'date': '2025-10-20',
+               'commit': 'c' * 40, 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
+               'verified_on': ['0.11.1']},
+              {'id': 'stock_0.11.1', 'name': 'Release default', 'date': '2026-05-18',
+               'source': 'shipped', 'verified_on': ['0.11.1'], 'baseline_for': ['0.11.1']}],
+  'dm': [],
+}
+
+
+def _build_swapper(swapper_mod, tmp_path, monkeypatch):
+  """A DRIVING swapper rooted in tmp_path.
+
+  Built with __new__ like the other tests in this file: ModelSwapper.__init__
+  mkdirs under the real BASE_DATA_DIR, which a test must not touch.
+  """
+  models_dir = tmp_path / 'models' / 'driving'
+  models_dir.mkdir(parents=True)
+  active = tmp_path / 'active'
+  active.mkdir()
+
+  sw = swapper_mod.ModelSwapper.__new__(swapper_mod.ModelSwapper)
+  sw.model_type = swapper_mod.ModelType.DRIVING
+  sw.config = swapper_mod.ModelSwapper.MODEL_CONFIGS[swapper_mod.ModelType.DRIVING]
+  sw.models_dir = models_dir
+  sw.active_model_file = models_dir.parent / 'active_driving_model'
+  sw.onnx_files = sw.config['onnx_files']
+  sw.pkl_patterns = sw.config['pkl_patterns']
+  sw.required_pkl_stems = sw.config['required_pkl_stems']
+  sw.display_name = sw.config['display_name']
+  monkeypatch.setattr(swapper_mod.ModelSwapper, 'ACTIVE_DIR', active)
+  return sw
+
+
+def _point_catalog_at(tmp_path, monkeypatch, data):
+  """Redirect the catalog module at a temp catalog, version.h and marker."""
+  import plugins.model_selector.catalog as cat
+  version_h = tmp_path / 'version.h'
+  version_h.write_text('#define COMMA_VERSION "0.11.1"\n')
+  monkeypatch.setattr(cat, 'VERSION_H', version_h)
+  monkeypatch.setattr(cat, 'CATALOG_FILE', tmp_path / 'catalog.json')
+  monkeypatch.setattr(cat, 'UNLOCK_MARKER', tmp_path / '.unlocked')
+  (tmp_path / 'catalog.json').write_text(json.dumps(data))
+  return cat
+
+
 class TestCatalogGate:
   @pytest.fixture
   def gated(self, swapper_mod, tmp_path, monkeypatch):
-    """A DRIVING swapper whose storage is tmp_path and whose catalog is ours."""
-    import plugins.model_selector.catalog as cat
-
-    version_h = tmp_path / 'version.h'
-    version_h.write_text('#define COMMA_VERSION "0.11.1"\n')
-    monkeypatch.setattr(cat, 'VERSION_H', version_h)
-    monkeypatch.setattr(cat, 'CATALOG_FILE', tmp_path / 'catalog.json')
-    monkeypatch.setattr(cat, 'UNLOCK_MARKER', tmp_path / '.unlocked')
-    (tmp_path / 'catalog.json').write_text(json.dumps({
-      'driving': [{'id': 'good_model', 'name': 'Good', 'date': '2025-10-20',
-                   'commit': 'c' * 40, 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
-                   'verified_on': ['0.11.1']},
-                  {'id': 'stock_0.11.1', 'name': 'Release default', 'date': '2026-05-18',
-                   'source': 'shipped', 'verified_on': ['0.11.1'], 'baseline_for': ['0.11.1']}],
-      'dm': [],
-    }))
-
-    models_dir = tmp_path / 'models' / 'driving'
-    models_dir.mkdir(parents=True)
-    sw = swapper_mod.ModelSwapper(swapper_mod.ModelType.DRIVING)
-    sw.models_dir = models_dir
-    sw.active_model_file = models_dir.parent / 'active_driving_model'
-    monkeypatch.setattr(type(sw), 'ACTIVE_DIR', tmp_path / 'active')
-    (tmp_path / 'active').mkdir()
-    return sw, cat, tmp_path
+    cat = _point_catalog_at(tmp_path, monkeypatch, CATALOG_FIXTURE)
+    return _build_swapper(swapper_mod, tmp_path, monkeypatch), cat, tmp_path
 
   def _install(self, sw, model_id, date='2025-10-20'):
     d = sw.models_dir / model_id
@@ -571,27 +595,10 @@ class TestCatalogGate:
 class TestImportStock:
   @pytest.fixture
   def stocked(self, swapper_mod, tmp_path, monkeypatch):
-    import plugins.model_selector.catalog as cat
-    version_h = tmp_path / 'version.h'
-    version_h.write_text('#define COMMA_VERSION "0.11.1"\n')
-    monkeypatch.setattr(cat, 'VERSION_H', version_h)
-    monkeypatch.setattr(cat, 'CATALOG_FILE', tmp_path / 'catalog.json')
-    monkeypatch.setattr(cat, 'UNLOCK_MARKER', tmp_path / '.unlocked')
-    (tmp_path / 'catalog.json').write_text(json.dumps({
-      'driving': [{'id': 'stock_0.11.1', 'name': 'Release default', 'date': '2026-05-18',
-                   'source': 'shipped', 'verified_on': ['0.11.1'], 'baseline_for': ['0.11.1']}],
-      'dm': [],
-    }))
-    models_dir = tmp_path / 'models' / 'driving'
-    models_dir.mkdir(parents=True)
-    sw = swapper_mod.ModelSwapper(swapper_mod.ModelType.DRIVING)
-    sw.models_dir = models_dir
-    sw.active_model_file = models_dir.parent / 'active_driving_model'
-    active = tmp_path / 'active'
-    active.mkdir()
-    monkeypatch.setattr(type(sw), 'ACTIVE_DIR', active)
+    _point_catalog_at(tmp_path, monkeypatch, CATALOG_FIXTURE)
+    sw = _build_swapper(swapper_mod, tmp_path, monkeypatch)
     for f in sw.onnx_files:
-      (active / f).write_bytes(b'shipped-onnx')
+      (sw.ACTIVE_DIR / f).write_bytes(b'shipped-onnx')
     return sw
 
   def test_imports_when_no_tracker(self, stocked):
@@ -634,6 +641,24 @@ try:
 except ImportError:
     import catalog
 ```
+
+3a-bis. `model_download.py` imports `MIN_MODEL_DATE` from this module (lines
+18-22). Deleting the constant without touching that import leaves
+`model_download` unimportable — and because its test module skips itself on
+`ImportError`, the suite would go green while the module is broken. In the same
+commit, replace that import block in `model_download.py` with:
+
+```python
+try:
+    from plugins.model_selector import catalog
+except ImportError:
+    import catalog
+
+# Root of model storage. Module-level so tests can redirect it.
+BASE_DATA_DIR = Path('/data') if Path('/data').exists() else Path.home() / 'driving_data'
+```
+
+Task 4 expects this already done and will skip its own step 3a.
 
 3b. In `list_models`, delete the date-filter block:
 
@@ -840,17 +865,9 @@ Expected: FAIL — `AttributeError: module 'plugins.model_selector.model_downloa
 
 - [ ] **Step 3: Modify `model_download.py`**
 
-3a. Replace the `MIN_MODEL_DATE` import (lines 18-22) with the catalog import and a module-level data dir the tests can point at:
-
-```python
-try:
-    from plugins.model_selector import catalog
-except ImportError:
-    import catalog
-
-# Root of model storage. Module-level so tests can redirect it.
-BASE_DATA_DIR = Path('/data') if Path('/data').exists() else Path.home() / 'driving_data'
-```
+3a. **Already done by Task 3** — verify `model_download.py` imports `catalog`
+and defines module-level `BASE_DATA_DIR`, and only add them if missing. Do not
+duplicate them.
 
 3b. In `download_model`, change the signature and replace the registry lookup (the `if model_id not in registry:` block through `model_info = registry[model_id]`) with the catalog-first gate:
 
