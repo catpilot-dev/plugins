@@ -1401,9 +1401,12 @@ class TestLowSpeedLkaReference:
     _call_update(lac, 0.02, v_ego=5.0)
     assert state['measured'] == pytest.approx(0.02, rel=1e-6)
 
-  def test_torque_gains_keep_30kph_floor(self, monkeypatch):
-    """Identical kappa state at 5 and 8.5 m/s commands identical torque:
-    gains/caps reference max(v, 8.5) even though the measurement does not."""
+  def test_torque_gains_track_true_speed_above_the_floor(self, monkeypatch):
+    """SUPERSEDES test_torque_gains_keep_30kph_floor (route 413 seg 2): the
+    gains referenced max(v, 8.5), so 5 m/s commanded exactly what 8.5 m/s did.
+    They now reference max(v, 2.778), so below 30 km/h torque follows actual
+    speed. Same near-straight kappa the old test used — the point is that this
+    case is no longer exempt."""
     torques = []
     for v in (5.0, 8.5):
       lac, fake_sm, mod, state = _make_controller(monkeypatch)
@@ -1411,64 +1414,63 @@ class TestLowSpeedLkaReference:
       # kappa_des small enough that the P target stays below the per-decision
       # step cap — otherwise both runs saturate at step_max and can't differ
       _call_update(lac, 0.006, v_ego=v)
-      torques.append(state['torque'])
-    assert torques[0] == pytest.approx(torques[1], rel=1e-9)
-
-
-class TestIntersectionGainFloor:
-  """Route 411 seg 2 (2026-08-19): a 90 deg intersection at 14-19 km/h ramped
-  to 9.9 Nm and could not be overridden by hand. The 8.5 m/s gain floor stands
-  in for constant rack friction with a FAKE v^2, so below 30 km/h it
-  over-delivers by 72.25/v_true^2 — 2.9x at 18 km/h — and the P law saturates,
-  carrying no information about how wrong the wheel actually is.
-
-  Fix: fade the floor 8.5 -> 2.778 m/s (30 -> 10 km/h) across the intersection
-  curvature band. Below the band nothing changes at any speed; above 8.5 m/s
-  true speed wins regardless, so every route tuned at speed is untouched.
-  DCC cannot engage below 30 km/h, so a sub-30 change is LKA-scoped by
-  construction — no DCC state needed in the controller."""
-
-  def test_below_the_band_keeps_the_30kph_floor(self, monkeypatch):
-    """Straights and mild curves are unchanged at EVERY speed — the property
-    that makes this safe to ship without re-validating the at-speed routes."""
-    _, _, mod, _ = _make_controller(monkeypatch)
-    for v_true in (1.0, 5.0, 8.0):
-      assert mod.gain_reference_speed(v_true, 0.005) == pytest.approx(8.5)
-
-  def test_intersection_band_uses_true_speed(self, monkeypatch):
-    """18 km/h through a tight turn: the gain references actual speed."""
-    _, _, mod, _ = _make_controller(monkeypatch)
-    assert mod.gain_reference_speed(5.0, 0.11) == pytest.approx(5.0)
-
-  def test_floor_still_binds_at_walking_pace(self, monkeypatch):
-    """5 km/h tight turn: true v^2 alone would command 0.6-1.6 Nm — all below
-    the ~2.75 Nm breakaway knee, i.e. no steering at all. The 10 km/h floor is
-    the friction headroom the v^2 term cannot supply."""
-    _, _, mod, _ = _make_controller(monkeypatch)
-    assert mod.gain_reference_speed(1.389, 0.11) == pytest.approx(2.778)
-
-  def test_inert_above_30kph_at_any_curvature(self, monkeypatch):
-    _, _, mod, _ = _make_controller(monkeypatch)
-    for k in (0.0, 0.005, 0.03, 0.11):
-      assert mod.gain_reference_speed(10.0, k) == pytest.approx(10.0)
-
-  def test_floor_fades_monotonically_across_the_band(self, monkeypatch):
-    _, _, mod, _ = _make_controller(monkeypatch)
-    floors = [mod.gain_reference_speed(1.0, k) for k in (0.010, 0.013, 0.016, 0.020)]
-    assert floors[0] == pytest.approx(8.5)
-    assert floors[-1] == pytest.approx(2.778)
-    assert all(a > b for a, b in zip(floors, floors[1:])), floors
-
-  def test_intersection_torque_now_tracks_true_speed(self, monkeypatch):
-    """The behavioral counterpart of test_torque_gains_keep_30kph_floor: in
-    the intersection band 5 m/s must NO LONGER command what 8.5 m/s commands."""
-    torques = []
-    for v in (5.0, 8.5):
-      lac, fake_sm, mod, state = _make_controller(monkeypatch)
-      _set_measured(fake_sm, v, 0.024)
-      _call_update(lac, 0.025, v_ego=v)
       torques.append(abs(state['torque']))
     assert torques[0] < torques[1] * 0.6, torques
+
+
+class TestLowSpeedGainFloor:
+  """Route 411 seg 2 -> 413 seg 2. The torque law referenced max(v_true, 8.5):
+  below 30 km/h the gain stopped extrapolating v^2 toward zero. That floor is a
+  PROXY for constant rack friction, and a fake v^2 is the wrong shape for it —
+  it over-delivers by 8.5^2/v_true^2 (2.9x at 18 km/h, 37x at 5 km/h) and
+  saturates the P law, so commanded torque carries no information about how
+  wrong the wheel is.
+
+  Floor moved to 2.778 m/s (10 km/h). A curvature-banded version of this
+  shipped first (033df35) and was WRONG: route 413 seg 2 fought at 5 km/h with
+  |kappa_des| BELOW the band, where the old 8.5 floor still applied and the
+  target was ~10 Nm; the band edge also swung the gain 7x as kappa_des drifted
+  across it. Speed is the axis that matters — and since DCC cannot engage below
+  30 km/h, a sub-30 change is LKA-scoped by construction."""
+
+  def test_floor_is_flat_10kph(self, monkeypatch):
+    """No curvature dependence — that was the 033df35 mistake."""
+    _, _, mod, _ = _make_controller(monkeypatch)
+    for k in (0.0, 0.0003, 0.005, 0.03, 0.11):
+      assert mod.gain_reference_speed(1.0) == pytest.approx(2.778)
+
+  def test_true_speed_governs_above_the_floor(self, monkeypatch):
+    _, _, mod, _ = _make_controller(monkeypatch)
+    assert mod.gain_reference_speed(5.0) == pytest.approx(5.0)
+    assert mod.gain_reference_speed(3.0) == pytest.approx(3.0)
+
+  def test_floor_binds_at_walking_pace(self, monkeypatch):
+    """5 km/h: a pure v^2 law commands 0.6-1.6 Nm, all below the ~2.75 Nm
+    breakaway knee — i.e. no steering at all. The floor is the friction
+    headroom v^2 cannot supply, so it is lowered, never removed."""
+    _, _, mod, _ = _make_controller(monkeypatch)
+    assert mod.gain_reference_speed(1.389) == pytest.approx(2.778)
+
+  def test_unchanged_at_and_above_30kph(self, monkeypatch):
+    """The property that leaves the at-speed field tuning alone: at or above
+    the OLD floor, old and new laws are the identity."""
+    _, _, mod, _ = _make_controller(monkeypatch)
+    for v in (8.5, 10.0, 25.0):
+      assert mod.gain_reference_speed(v) == pytest.approx(max(v, 8.5))
+
+  def test_near_straight_low_speed_is_no_longer_exempt(self, monkeypatch):
+    """The 413 seg 2 case: 5 km/h with kappa_des ~0 used to target ~10 Nm."""
+    torques = []
+    for v in (1.4, 8.5):
+      lac, fake_sm, mod, state = _make_controller(monkeypatch)
+      # near-straight, but a real delta_err: kappa_des ~0 with kappa_meas ~0
+      # lands under HOLD_BAND and commands nothing on BOTH sides, which would
+      # pass the assertion vacuously (0 < 0 is false, but 0 vs 0 tests nothing)
+      _set_measured(fake_sm, v, 0.004)
+      _call_update(lac, 0.005, v_ego=v)
+      torques.append(abs(state['torque']))
+    assert torques[0] > 0.0, "fixture commands no torque - test proves nothing"
+    assert torques[0] < torques[1] * 0.2, torques
 
 
 # ============================================================

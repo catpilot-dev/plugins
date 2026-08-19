@@ -159,43 +159,43 @@ OV_WSD_FLOOR_DEG = 1.5     # curve intent; straights use +0.5 more
 OV_WSD_TICKS = 15
 OV_WSD_INTENT_KAPPA = 0.001
 
-# --- Intersection gain floor (route 411 seg 2, 2026-08-19) ------------------
-# The torque law references max(v, V_GAIN_FLOOR_HI): below 30 km/h the gain
-# stops extrapolating v^2 toward zero. That floor is a PROXY for constant rack
-# friction, and a fake v^2 is the wrong shape for it — below 30 km/h it
-# over-delivers by V_GAIN_FLOOR_HI^2 / v_true^2 (2.9x at 18 km/h, 37x at
-# 5 km/h). On 411 seg 2 a 14-19 km/h intersection turn ramped to 9.9 Nm and
-# could not be overridden by hand: the P law was saturated across the whole
-# error range, so its torque carried no information about how wrong the wheel
-# was.
+# --- Low-speed gain floor (routes 411 seg 2 / 413 seg 2, 2026-08-19) --------
+# The torque law references max(v_true, floor) so the gain stops extrapolating
+# v^2 toward zero at low speed. That floor is a PROXY for constant rack
+# friction, and a fake v^2 is the wrong SHAPE for it: at the old 8.5 m/s it
+# over-delivers by 8.5^2/v_true^2 -- 2.9x at 18 km/h, 37x at 5 km/h -- and
+# saturates the P law, so the commanded torque stops carrying any information
+# about how wrong the wheel actually is. On 411 seg 2 a 14-19 km/h
+# intersection turn pinned 9.9 Nm and could not be overridden by hand.
 #
-# Fade the floor toward V_GAIN_FLOOR_LO (10 km/h) across the intersection
-# curvature band, where kappa_scale is saturating at 3.0 anyway. Two
-# properties make this safe to ship on top of the existing field tuning:
-#   - below the band the floor is unchanged at EVERY speed (straights and
-#     mild curves keep the 30 km/h reference), and
-#   - above V_GAIN_FLOOR_HI true speed wins regardless of curvature,
-#     so every route tuned at speed is bit-for-bit unaffected.
-# DCC cannot engage below 30 km/h, so a sub-30 change is LKA-scoped by
-# construction — the controller needs no DCC state to stay in that lane.
+# The floor is LOWERED, not removed. At 5 km/h a pure v^2 law commands
+# 0.6-1.6 Nm, entirely below the ~2.75 Nm breakaway knee -- i.e. no steering
+# at all. The residual over-delivery at walking pace IS the friction headroom
+# v^2 cannot supply.
 #
-# The floor is NOT removed: at 5 km/h a pure v^2 law commands 0.6-1.6 Nm,
-# entirely below the ~2.75 Nm breakaway knee — i.e. no steering at all. The
-# residual 4x at walking pace IS the friction headroom v^2 cannot supply.
-V_GAIN_FLOOR_HI = 8.5      # m/s (30 km/h) — the reference below the band
-V_GAIN_FLOOR_LO = 2.778    # m/s (10 km/h) — intersection reference (user ruling)
-V_GAIN_FLOOR_KAPPA = [0.01, 0.02]                        # |kappa_des| band (1/m)
-V_GAIN_FLOOR_BP = [V_GAIN_FLOOR_HI, V_GAIN_FLOOR_LO]     # floor at those breakpoints
+# Behaviour at or above the OLD 8.5 m/s floor is the identity, so every route
+# tuned at speed is bit-for-bit unaffected. DCC cannot engage below 30 km/h,
+# so a sub-30 change is LKA-scoped by construction -- the controller needs no
+# DCC state to stay in that lane.
+#
+# HISTORY: 033df35 first shipped this as a floor that faded across a kappa_des
+# band [0.01, 0.02], on the theory that only intersection-curvature turns
+# needed it. Route 413 seg 2 refuted that: the fight there was at 5 km/h with
+# |kappa_des| ~0.0003 -- BELOW the band, where the 8.5 floor still applied and
+# the target was ~10 Nm (only the STEP_MAX ramp held actual torque to 4.8 Nm
+# inside a 2 s window). The band edge was also a 7x gain step that kappa_des
+# crossed on its own at low speed. Speed is the axis that matters; curvature
+# is not. Do not reintroduce the band.
+V_GAIN_FLOOR = 2.778       # m/s (10 km/h), was 8.5 (30 km/h) -- user ruling
 
 
-def gain_reference_speed(v_true, kappa_des):
+def gain_reference_speed(v_true):
   """Speed the TORQUE PARAMETERS reference (gains and caps), not the plant.
 
-  Never below v_true — this only ever raises the reference, so above
-  V_GAIN_FLOOR_HI it is the identity at any curvature.
+  Never below v_true -- this only ever raises the reference, so above
+  V_GAIN_FLOOR it is the identity.
   """
-  floor = float(np.interp(abs(kappa_des), V_GAIN_FLOOR_KAPPA, V_GAIN_FLOOR_BP))
-  return max(float(v_true), floor)
+  return max(float(v_true), V_GAIN_FLOOR)
 OV_PUSH_MEM_S = 0.3        # cancel_tol yields ~0.3 s after the driver wins and
                            # masks the against-torque test (seg 22, measured);
                            # memory INVALIDATES on torque sign flip (stale
@@ -910,11 +910,10 @@ def on_lat_controller_init(result, lac, CP):
       #   v — the TORQUE-PARAMETER reference. All gains/caps (P target, t_cap,
       #     hold_cap, hold_factor gate, lookahead, step_max interp) reference
       #     a FLOORED speed rather than extrapolating v² toward zero. The
-      #     floor is 8.5 m/s ≈ 30 kph below the intersection curvature band
-      #     and fades to 2.778 m/s ≈ 10 kph inside it — see
-      #     gain_reference_speed() at module scope for why (411 seg 2).
+      #     floor is V_GAIN_FLOOR = 2.778 m/s ≈ 10 kph — see
+      #     gain_reference_speed() at module scope for why (411/413 seg 2).
       v_true = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 1.0)
-      v = gain_reference_speed(v_true, state['desired'])
+      v = gain_reference_speed(v_true)
       state['measured'] = float(lp.angularVelocityDevice.z) / v_true
 
       # Lateral-accel-dependent hold factor (2026-07-27; see HOLD_AY_BP /
