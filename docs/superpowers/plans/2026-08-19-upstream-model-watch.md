@@ -564,7 +564,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / 'plugins' / 'model_selector'))
 
 import catalog  # noqa: E402
-from model_download import scan_upstream_models  # noqa: E402
+# _github_headers is shared, not re-implemented: one place decides how these
+# calls authenticate, and CI must authenticate or it hits the 60/hr per-IP cap.
+from model_download import _github_headers, scan_upstream_models  # noqa: E402
 
 MARKER = 'upstream-commit:'
 WATCH_REPO = 'commaai/openpilot'
@@ -572,19 +574,11 @@ MODEL_PATH = 'selfdrive/modeld/models'
 MAINTAINER = '@OxygenLiu'
 
 
-def _headers() -> dict:
-    headers = {"Accept": "application/vnd.github.v3+json"}
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
 def fetch_commits(per_page: int = 30) -> list:
     resp = requests.get(
         f"https://api.github.com/repos/{WATCH_REPO}/commits",
         params={'path': MODEL_PATH, 'per_page': per_page},
-        headers=_headers(), timeout=30,
+        headers=_github_headers(), timeout=30,
     )
     resp.raise_for_status()
     return resp.json()
@@ -598,7 +592,7 @@ def fetch_issues(repo: str) -> list:
             f"https://api.github.com/repos/{repo}/issues",
             params={'state': 'all', 'labels': 'model-candidate,model-revert',
                     'per_page': 100, 'page': page},
-            headers=_headers(), timeout=30,
+            headers=_github_headers(), timeout=30,
         )
         resp.raise_for_status()
         batch = resp.json()
@@ -722,7 +716,7 @@ def plan_issues(scan: dict, cat: dict, reported: set) -> list:
 def create_issue(repo: str, planned: dict) -> int:
     resp = requests.post(
         f"https://api.github.com/repos/{repo}/issues",
-        headers=_headers(), timeout=30,
+        headers=_github_headers(), timeout=30,
         json={'title': planned['title'], 'body': planned['body'],
               'labels': planned['labels']},
     )
@@ -744,9 +738,8 @@ def main(argv=None) -> int:
 
     scan = scan_upstream_models(fetch_commits())
     cat = catalog.load_catalog()
-    reported = set() if args.dry_run else reported_shas(fetch_issues(args.repo))
-    if args.dry_run:
-        reported = reported_shas(fetch_issues(args.repo))
+    # A dry run needs the real reported set too, or it prints a dishonest plan.
+    reported = reported_shas(fetch_issues(args.repo))
 
     planned = plan_issues(scan, cat, reported)
     print(f"{len(scan['candidates'])} candidates upstream, "
@@ -765,14 +758,6 @@ def main(argv=None) -> int:
 if __name__ == '__main__':
     sys.exit(main())
 ```
-
-Note the `--dry-run` block above is written twice by mistake in the draft — write it once, as:
-
-```python
-    reported = reported_shas(fetch_issues(args.repo))
-```
-
-with no conditional; a dry run still needs the real reported set to print an honest plan.
 
 - [ ] **Step 4: Run the tests**
 
