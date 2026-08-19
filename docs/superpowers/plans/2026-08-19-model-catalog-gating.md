@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Repo: `/home/oxygen/catpilot-dev/plugins`, branch `dev`. Plugin dir: `plugins/model_selector/`.
-- Run tests as `PYTHONPATH= uv run pytest plugins/model_selector -q` from the repo root. The empty `PYTHONPATH` is mandatory — a foreign `PYTHONPATH` in this shell shadows the repo's namespace package and silently tests a different worktree.
+- Run tests as `PYTHONPATH= uv run python -m pytest plugins/model_selector -q` from the repo root. The empty `PYTHONPATH` is mandatory — a foreign `PYTHONPATH` in this shell shadows the repo's namespace package and silently tests a different worktree.
 - The catalog file lives at the **plugin root** (`plugins/model_selector/compatible_models.json`), never in `data/`. `install.sh` preserves `data/` wholesale across reinstalls, so a catalog there would freeze at first install.
 - The unlock marker lives at `<PLUGINS_RUNTIME_DIR>/model_selector/data/.unlocked` precisely because `data/` is preserved.
 - Every module in this plugin must import siblings with the repo's dual-import pattern (`try: from plugins.model_selector.X import Y / except ImportError: from X import Y`) — the scripts run both as an installed package and as bare CLI scripts under `/usr/local/venv/bin/python`.
@@ -251,7 +251,7 @@ class TestValidateCatalog:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `PYTHONPATH= uv run pytest plugins/model_selector/tests/test_catalog.py -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins/model_selector/tests/test_catalog.py -q`
 Expected: collection error — `ModuleNotFoundError: No module named 'plugins.model_selector.catalog'`
 
 - [ ] **Step 3: Write `catalog.py`**
@@ -385,7 +385,7 @@ def validate_catalog(catalog: dict | None = None) -> list:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `PYTHONPATH= uv run pytest plugins/model_selector/tests/test_catalog.py -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins/model_selector/tests/test_catalog.py -q`
 Expected: all pass.
 
 - [ ] **Step 5: Commit**
@@ -432,7 +432,7 @@ Note this uses the `cat` fixture, not `catalog_env` — it deliberately reads th
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `PYTHONPATH= uv run pytest plugins/model_selector/tests/test_catalog.py::TestShippedCatalog -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins/model_selector/tests/test_catalog.py::TestShippedCatalog -q`
 Expected: FAIL — `load_catalog()` returns `{}` because the file does not exist, so `catalog['driving']` raises `KeyError`.
 
 - [ ] **Step 3: Write the catalog**
@@ -468,7 +468,7 @@ Create `plugins/model_selector/compatible_models.json`:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `PYTHONPATH= uv run pytest plugins/model_selector/tests/test_catalog.py -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins/model_selector/tests/test_catalog.py -q`
 Expected: all pass.
 
 - [ ] **Step 5: Commit**
@@ -628,7 +628,7 @@ class TestImportStock:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `PYTHONPATH= uv run pytest plugins/model_selector/tests/test_model_swapper.py -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins/model_selector/tests/test_model_swapper.py -q`
 Expected: FAIL — `AttributeError: 'ModelSwapper' object has no attribute 'import_stock'` and `KeyError: 'verified'`.
 
 - [ ] **Step 3: Modify `model_swapper.py`**
@@ -742,7 +742,7 @@ and delete the now-duplicate resolution line in STEP 2 (`model_id = self.resolve
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `PYTHONPATH= uv run pytest plugins/model_selector -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins/model_selector -q`
 Expected: all pass. If any pre-existing test asserted the date filter, update it to the catalog behavior rather than restoring `MIN_MODEL_DATE`.
 
 - [ ] **Step 5: Commit**
@@ -860,7 +860,7 @@ class TestDownloadGate:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `PYTHONPATH= uv run pytest plugins/model_selector/tests/test_model_download.py -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins/model_selector/tests/test_model_download.py -q`
 Expected: FAIL — `AttributeError: module 'plugins.model_selector.model_download' has no attribute 'BASE_DATA_DIR'`.
 
 - [ ] **Step 3: Modify `model_download.py`**
@@ -976,7 +976,7 @@ and change the download dispatch to:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `PYTHONPATH= uv run pytest plugins/model_selector -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins/model_selector -q`
 Expected: all pass.
 
 - [ ] **Step 5: Commit**
@@ -1218,7 +1218,7 @@ Place it before the existing PKL caching loop, and keep the existing return valu
 
 - [ ] **Step 7: Verify the module still imports and the suite passes**
 
-Run: `PYTHONPATH= uv run python -c "import ast,sys; ast.parse(open('plugins/model_selector/ui.py').read())" && PYTHONPATH= uv run pytest plugins/model_selector -q`
+Run: `PYTHONPATH= uv run python -c "import ast,sys; ast.parse(open('plugins/model_selector/ui.py').read())" && PYTHONPATH= uv run python -m pytest plugins/model_selector -q`
 Expected: no syntax error; all tests pass. (`ui.py` cannot be imported off-device — it needs raylib — so an AST parse is the available check.)
 
 - [ ] **Step 8: Commit**
@@ -1319,7 +1319,7 @@ git commit -m "docs(model_selector): document catalog gating"
 
 - [ ] **Step 1: Run the whole plugin suite**
 
-Run: `PYTHONPATH= uv run pytest plugins -q`
+Run: `PYTHONPATH= uv run python -m pytest plugins -q`
 Expected: no regressions against the pre-change baseline of 13 passed, 1 skipped in `plugins/model_selector` (the wider `plugins` suite includes other plugins; compare failures, not totals).
 
 - [ ] **Step 2: Confirm no unrelated files are staged or committed**
