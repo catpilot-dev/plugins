@@ -71,9 +71,9 @@ is never downloaded:
 
 `verified_on` holds openpilot versions as reported by `common/version.h`. A model
 that survives a rebase gains one string rather than a duplicated entry. `files`
-is informational — the required ONNX filenames are already derived from
-`MODEL_CONFIGS`; it is carried for parity with `model_registry.json` entries and
-is not read by the gate.
+is required on every downloadable entry and is consumed by the downloader, not by
+the gate; `source: "shipped"` entries omit it along with `commit`, since they are
+copied from disk rather than fetched.
 
 The shipped default is normally the baseline. **`baseline_for` is mandatory:** for each version present in the catalog, exactly
 one driving entry and one DM entry must claim `baseline_for` — the model that
@@ -88,7 +88,7 @@ malformed catalog is caught before it ships rather than on a device.
 ### Stock import
 
 A `source: "shipped"` entry has no download URL — its weights are the ONNX
-already sitting in `ACTIVE_DIR` on a fresh install. `catalog.import_stock()`
+already sitting in `ACTIVE_DIR` on a fresh install. `ModelSwapper.import_stock()`
 copies them into `/data/models/<type>/<stock_id>/` and writes a `model_info.json`,
 but **only when the active-model tracker is absent**. An absent tracker is proof
 that no swap has ever run, so `ACTIVE_DIR` still holds the release's own files;
@@ -112,7 +112,12 @@ New module in `plugins/model_selector/`, the single source of truth for policy:
 | `verified_entries(model_type)` | Catalog entries whose `verified_on` contains `openpilot_version()`. |
 | `is_verified(model_type, model_id)` | Membership test over the above. |
 | `baseline_entry(model_type)` | The entry claiming `baseline_for` for the running version, else `None`. |
-| `import_stock(model_type)` | Copies `ACTIVE_DIR` ONNX into the stock entry's storage dir when the active tracker is absent and the dir does not yet exist. Returns True when it imported. |
+
+`import_stock()` is the one piece of this feature that lives on `ModelSwapper`
+rather than in `catalog.py`: it needs `MODEL_CONFIGS` (ONNX filenames, storage
+dirs, tracker paths), and putting it in `catalog.py` would either duplicate that
+table or import `model_swapper`, which imports `catalog` — a cycle. `catalog.py`
+stays pure policy with no file-layout knowledge.
 | `unlocked()` | True when the marker file exists in the plugin's runtime `data/` dir. |
 
 `version.h` is preferred over `manifest.OPENPILOT_VERSION` because it is the
