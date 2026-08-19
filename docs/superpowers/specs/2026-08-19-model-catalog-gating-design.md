@@ -52,19 +52,54 @@ is overwritten by every deploy, which is the intended update path.
 }
 ```
 
+The model an upstream release ships is **verified by definition** — it is what
+catpilot itself runs, so it needs no test drive to enter the catalog. It is
+represented by a `source: "shipped"` entry, which carries no `commit` because it
+is never downloaded:
+
+```json
+{
+  "id": "stock_0.11.1",
+  "name": "Release default",
+  "date": "2026-08-11",
+  "source": "shipped",
+  "verified_on": ["0.11.1"],
+  "baseline_for": ["0.11.1"],
+  "notes": "ONNX shipped in catpilot 0.11.1"
+}
+```
+
 `verified_on` holds openpilot versions as reported by `common/version.h`. A model
 that survives a rebase gains one string rather than a duplicated entry. `files`
 is informational — the required ONNX filenames are already derived from
 `MODEL_CONFIGS`; it is carried for parity with `model_registry.json` entries and
 is not read by the gate.
 
-**`baseline_for` is mandatory:** for each version present in the catalog, exactly
+The shipped default is normally the baseline. **`baseline_for` is mandatory:** for each version present in the catalog, exactly
 one driving entry and one DM entry must claim `baseline_for` — the model that
 ships with that catpilot version. Without it a user who switches away from stock
 has no catalogued route back, and the recovery path below has nothing to point
-at. The invariant is enforced by a `validate_catalog()` check in `catalog.py`,
+at. Entries with `source: "shipped"` are exempt from the `commit` requirement;
+every other entry must carry one, since `commit` is what the downloader fetches
+by. The invariant is enforced by a `validate_catalog()` check in `catalog.py`,
 covered by a test that fails on a version with zero or multiple baselines, so a
 malformed catalog is caught before it ships rather than on a device.
+
+### Stock import
+
+A `source: "shipped"` entry has no download URL — its weights are the ONNX
+already sitting in `ACTIVE_DIR` on a fresh install. `catalog.import_stock()`
+copies them into `/data/models/<type>/<stock_id>/` and writes a `model_info.json`,
+but **only when the active-model tracker is absent**. An absent tracker is proof
+that no swap has ever run, so `ACTIVE_DIR` still holds the release's own files;
+once a swap has happened those files may be any model, and mislabeling them as
+stock would put an untested model behind a "release default" label. It is
+idempotent and runs from the existing `device.health_check` hook.
+
+Devices that swapped before this feature ships therefore get no stock entry.
+Their baseline is whatever verified model they are running; nothing breaks, they
+simply have no offline route back to the release default. Re-importing one would
+mean fetching LFS blobs by oid, which is out of scope.
 
 ### `catalog.py`
 
@@ -77,6 +112,7 @@ New module in `plugins/model_selector/`, the single source of truth for policy:
 | `verified_entries(model_type)` | Catalog entries whose `verified_on` contains `openpilot_version()`. |
 | `is_verified(model_type, model_id)` | Membership test over the above. |
 | `baseline_entry(model_type)` | The entry claiming `baseline_for` for the running version, else `None`. |
+| `import_stock(model_type)` | Copies `ACTIVE_DIR` ONNX into the stock entry's storage dir when the active tracker is absent and the dir does not yet exist. Returns True when it imported. |
 | `unlocked()` | True when the marker file exists in the plugin's runtime `data/` dir. |
 
 `version.h` is preferred over `manifest.OPENPILOT_VERSION` because it is the
@@ -130,6 +166,9 @@ commands survive unchanged as **maintainer** tooling. They no longer feed the UI
 
 ### Maintainer workflow
 
+0. For a new catpilot version, add its `stock_<version>` entry with
+   `source: "shipped"` and `baseline_for: ["<version>"]`. No test drive: the
+   release's own model is verified by definition.
 1. `model_download.py update-registry` (or `add-from-pr <n>`) — unchanged
    GitHub scrape, maintainer-only.
 2. `touch /data/plugins-runtime/model_selector/data/.unlocked`, then
@@ -149,7 +188,8 @@ commands survive unchanged as **maintainer** tooling. They no longer feed the UI
 
 - **`test_catalog.py`** (new) — version parse from a fake `version.h`, fallback
   chain, `verified_on` filtering, `baseline_entry` resolution, corrupt/missing
-  file fails closed, unlock-marker detection, and `validate_catalog()` rejecting
+  file fails closed, unlock-marker detection, `import_stock` copying only when
+  the tracker is absent and being idempotent, and `validate_catalog()` rejecting
   a version with zero or multiple baselines. One test runs `validate_catalog()`
   against the real shipped `compatible_models.json`.
 - **`test_model_download.py`** — `check_updates` returns only verified,
