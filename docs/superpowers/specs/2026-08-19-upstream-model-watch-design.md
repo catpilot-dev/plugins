@@ -93,6 +93,13 @@ Flow:
      issue, informational. It does **not** close the candidate issue and does not
      ask for the catalog entry to be removed — under the revert policy the
      candidate remains valid.
+
+   Exactly one issue per model per event. A model published and reverted between
+   two daily runs has never been reported, so it produces a single
+   `model-candidate` issue carrying the revert status in its body — not a
+   candidate issue plus a revert issue. A `model-revert` issue is only for news
+   about something a previous run already told the maintainer about, or that is
+   already in the catalog.
 6. `--dry-run` prints what it would file without touching issues.
 
 Dedup key is the `upstream-commit: <40-char sha>` line in the issue body.
