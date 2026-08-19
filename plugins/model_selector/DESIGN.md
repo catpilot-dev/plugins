@@ -25,9 +25,10 @@ Models are openpilot's own model files, pulled at a specific **GitHub commit**:
   `driving_models` / `dm_models`. It is refreshed from the GitHub commits API
   (`/repos/commaai/openpilot/commits?path=selfdrive/modeld/models`,
   `model_download.py update-registry`), which parses commit messages / linked
-  PRs to derive each model's name and type, and also **removes reverted models**
-  (it scans recent commits for `Revert` messages and drops the reverted commit
-  hashes). A single model can also be added directly from a merged PR
+  PRs to derive each model's name and type, and also **marks reverted models**
+  (it scans recent commits for `Revert` messages and tags the reverted commit's
+  registry entry with `upstream_reverted: "<sha>"`; it is never dropped — see
+  Upstream reverts below). A single model can also be added directly from a merged PR
   (`add-from-pr <n>`) — note it records the PR **head** commit, because the LFS
   objects live there, not on the merge commit. `update-registry`, `add-from-pr`,
   and `list` are **maintainer-only CLI** now: they build the pool of candidates a
@@ -166,6 +167,26 @@ date heuristics it replaced (`MIN_MODEL_DATE`, the revert-name filter) are gone.
 
 Enforced at three call sites so no path is ungated: `check_updates` (what is
 offered), `download_model` (what is fetched), `swap_model` (what is activated).
+
+### Upstream reverts
+
+A revert upstream is **not** a verdict on whether a model drives. comma reverts
+for many reasons — a metric regression, infrastructure, a competing model
+winning — and none of them is a road test on this fork. Reverted models stay
+eligible: `update-registry` marks them `upstream_reverted: "<sha>"` and keeps
+them, and a catalog entry may carry the same field as provenance. Only the
+revert commit itself is never treated as a model.
+
+### Upstream watch (CI)
+
+`.github/workflows/model-watch.yml` runs `.github/scripts/model_watch.py` daily.
+It reads the commits API for `selfdrive/modeld/models`, reconciles against
+`compatible_models.json` and against existing GitHub issues, and files a
+`model-candidate` issue per new model (and `model-revert` for a revert of
+something already reported or catalogued). Dedup state is the issues themselves,
+keyed by an `upstream-commit: <sha>` line in each body; closing an issue means
+handled, so it is never re-reported. The job reports only — it cannot make a
+model installable.
 
 ## Hooks
 
