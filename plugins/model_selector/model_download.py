@@ -86,7 +86,7 @@ def download_file(url: str, dest: Path, desc: str = None):
     print(f"  Downloading {desc or dest.name}...")
 
     # Download the file (may be LFS pointer or regular file)
-    response = requests.get(url, timeout=30)
+    response = requests.get(url, headers=_github_headers(), timeout=30)
     response.raise_for_status()
     content = response.content
 
@@ -452,7 +452,7 @@ def add_model_from_pr(pr_number: int, model_type: str = 'driving'):
 
     api_url = f"https://api.github.com/repos/commaai/openpilot/pulls/{pr_number}"
     try:
-        response = requests.get(api_url)
+        response = requests.get(api_url, headers=_github_headers())
         response.raise_for_status()
         pr = response.json()
     except Exception as e:
