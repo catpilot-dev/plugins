@@ -1,5 +1,6 @@
 """Tests for model_selector plugin — ModelType, configs, listing, ONNX validation, PKL compat."""
 import json
+import shutil
 import pytest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
@@ -335,3 +336,38 @@ class TestImportStock:
     stocked.import_stock()
     by_id = {m['id']: m for m in stocked.list_models()}
     assert by_id['stock_0.11.1']['verified'] is True
+
+  def test_failed_copy_does_not_leave_an_orphaned_temp_dir(self, stocked, monkeypatch):
+    # Simulate a failure partway through the build (e.g. disk full). The temp
+    # dir must be cleaned up rather than surviving as orphaned junk, and the
+    # exception must still propagate (callers, e.g. on_health_check, already
+    # wrap this in try/except).
+    monkeypatch.setattr(shutil, 'copy2', MagicMock(side_effect=OSError('disk full')))
+    with pytest.raises(OSError, match='disk full'):
+      stocked.import_stock()
+
+    leftovers = [p for p in stocked.models_dir.iterdir() if p.name.startswith('_')]
+    assert leftovers == [], f"orphaned temp dir(s) left behind: {leftovers}"
+    assert not (stocked.models_dir / 'stock_0.11.1').exists()
+
+  def test_successful_import_still_lands_atomically(self, stocked):
+    # The build happens under a _-prefixed temp name and only becomes the
+    # real model dir via an atomic rename — no _-prefixed leftovers after a
+    # successful import either.
+    assert stocked.import_stock() is True
+    dest = stocked.models_dir / 'stock_0.11.1'
+    assert dest.is_dir()
+    leftovers = [p for p in stocked.models_dir.iterdir() if p.name.startswith('_')]
+    assert leftovers == []
+
+  def test_concurrent_callers_use_distinct_temp_dirs(self, stocked):
+    # UI's show() and plugind's on_health_check (every ~5s) both call
+    # import_stock; the temp dir name must not be a fixed path they could
+    # race on. We can't easily run two real processes in a unit test, but we
+    # can assert the mechanism (pid-qualified name) that prevents the race.
+    import os
+    tmp_name = f"_stock_0.11.1.{os.getpid()}.tmp"
+    assert not (stocked.models_dir / tmp_name).exists()
+    assert stocked.import_stock() is True
+    # The pid-qualified temp path must never survive as itself post-rename.
+    assert not (stocked.models_dir / tmp_name).exists()

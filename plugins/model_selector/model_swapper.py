@@ -5,6 +5,7 @@ Handles two independent model types:
 - Driving Models: driving_vision.onnx + driving_policy.onnx
 - Driver Monitoring Models: dmonitoring_model.onnx
 """
+import os
 import shutil
 import json
 import subprocess
@@ -178,19 +179,28 @@ class ModelSwapper:
             return False
 
         # Build in a _-prefixed temp dir (list_models skips those), then rename,
-        # so an interrupted copy can never present as a complete model.
-        tmp = dest.with_name(f"_{entry['id']}.tmp")
+        # so an interrupted copy can never present as a complete model. The
+        # name includes our pid: this and on_health_check's periodic poll can
+        # both call import_stock concurrently, and a fixed name would let two
+        # processes race on the same path (FileExistsError/ENOTEMPTY).
+        tmp = dest.with_name(f"_{entry['id']}.{os.getpid()}.tmp")
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True)
-        for filename in self.onnx_files:
-            shutil.copy2(self.ACTIVE_DIR / filename, tmp / filename)
-        (tmp / 'model_info.json').write_text(json.dumps({
-            'name': entry.get('name', entry['id']),
-            'date': entry.get('date', ''),
-            'description': entry.get('notes', ''),
-            'source': 'shipped',
-            'type': self.model_type.value,
-        }, indent=2))
+        try:
+            for filename in self.onnx_files:
+                shutil.copy2(self.ACTIVE_DIR / filename, tmp / filename)
+            (tmp / 'model_info.json').write_text(json.dumps({
+                'name': entry.get('name', entry['id']),
+                'date': entry.get('date', ''),
+                'description': entry.get('notes', ''),
+                'source': 'shipped',
+                'type': self.model_type.value,
+            }, indent=2))
+        except Exception:
+            # A partial build (e.g. disk full mid-copy) must not leave an
+            # orphaned temp dir behind.
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
         tmp.rename(dest)
         return True
 

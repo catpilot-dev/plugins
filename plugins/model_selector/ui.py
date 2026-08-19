@@ -193,13 +193,26 @@ def on_software_settings_extend(default, layout):
     def show(self):
       self._untested_active = {}
       for model_type in MODEL_TYPE_LABELS:
-        _SWAPPERS[model_type].import_stock()
-        self._model_cache[model_type] = _list_models(model_type)
-        active_id, active_name = _read_active(model_type)
-        if active_id and not catalog.is_verified(model_type, active_id):
-          self._untested_active[model_type] = active_id
-          active_name = f'{active_name} — untested'
-        self._model_btns[model_type].action_item.set_value(active_name)
+        # One bad model type (e.g. a garbled catalog) must not take the whole
+        # panel down — degrade that row instead of raising out of show().
+        try:
+          _SWAPPERS[model_type].import_stock()
+          models = _list_models(model_type)
+          self._model_cache[model_type] = models
+          active_id, active_name = _read_active(model_type)
+          if active_id and not catalog.is_verified(model_type, active_id):
+            self._untested_active[model_type] = active_id
+            active_name = f'{active_name} — untested'
+            if not any(m.get('verified') for m in models):
+              # The recovery offer (SELECT -> "switch to baseline") only
+              # fires when the baseline is actually installed locally; if it
+              # isn't (and nothing else verified is either) that offer never
+              # appears and every row in the list is greyed out with no
+              # explanation. Say so here instead of leaving a dead end.
+              active_name = f'{active_name}, none tested for this openpilot version'
+          self._model_btns[model_type].action_item.set_value(active_name)
+        except Exception:
+          pass
       self._set_status(f'up to date, last checked {self._time_ago()}')
 
     def update(self):
@@ -344,7 +357,7 @@ def on_software_settings_extend(default, layout):
       self._last_check_time = time.monotonic()
       if total == 0:
         if updates.get('verified_total', 0) == 0:
-          self._set_status(f"no tested models for {updates.get('version', 'this version')}")
+          self._set_status(f"no tested models for {updates.get('version') or 'this version'}")
         else:
           self._set_status('up to date, last checked now')
         return
