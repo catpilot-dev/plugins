@@ -182,3 +182,17 @@ class TestValidateCatalog:
     c = self._valid()
     c['driving'] = [_stock(verified_on=['0.11.2'], baseline_for=['0.11.1'])]
     assert any('baseline_for' in p for p in catalog_env.validate_catalog(c))
+
+
+class TestShippedCatalog:
+  """The catalog that actually ships must be valid and cover this version."""
+
+  def test_shipped_catalog_is_valid(self, cat):
+    assert cat.validate_catalog(cat.load_catalog()) == []
+
+  def test_shipped_catalog_has_a_baseline_for_0_11_1(self, cat):
+    catalog = cat.load_catalog()
+    for model_type in ('driving', 'dm'):
+      baselines = [e for e in catalog[model_type] if '0.11.1' in e.get('baseline_for', [])]
+      assert len(baselines) == 1, f"{model_type} needs exactly one 0.11.1 baseline"
+      assert baselines[0]['source'] == 'shipped'

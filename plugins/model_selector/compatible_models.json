@@ -1,0 +1,24 @@
+{
+  "driving": [
+    {
+      "id": "stock_0.11.1",
+      "name": "Release default",
+      "date": "2026-05-18",
+      "source": "shipped",
+      "verified_on": ["0.11.1"],
+      "baseline_for": ["0.11.1"],
+      "notes": "driving_vision.onnx + driving_policy.onnx shipped in catpilot v0.11.1"
+    }
+  ],
+  "dm": [
+    {
+      "id": "stock_dm_0.11.1",
+      "name": "Release default DM",
+      "date": "2026-05-18",
+      "source": "shipped",
+      "verified_on": ["0.11.1"],
+      "baseline_for": ["0.11.1"],
+      "notes": "dmonitoring_model.onnx shipped in catpilot v0.11.1"
+    }
+  ]
+}
