@@ -25,6 +25,89 @@ def _issue(sha, state='open'):
   return {'number': 1, 'state': state, 'body': f'{mw.MARKER} {sha}\n\nrest'}
 
 
+class _FakeResponse:
+  def __init__(self, payload):
+    self._payload = payload
+
+  def raise_for_status(self):
+    pass
+
+  def json(self):
+    return self._payload
+
+
+class TestFetchIssues:
+  """Regression coverage for the labels-param AND-semantics bug.
+
+  GitHub's issues-list `labels` filter is AND: an issue must carry every
+  listed label to match. Our issues each carry exactly one of
+  model-candidate / model-revert, never both, so a single query for
+  'model-candidate,model-revert' matches nothing. fetch_issues must query
+  per label and merge, or every already-reported model gets re-filed daily.
+  """
+
+  def test_returns_issues_for_either_label_not_only_both(self, monkeypatch):
+    candidate_issue = {'number': 1, 'state': 'open', 'body': 'candidate body'}
+    revert_issue = {'number': 2, 'state': 'closed', 'body': 'revert body'}
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+      calls.append(dict(params))
+      if params['page'] > 1:
+        return _FakeResponse([])
+      if params['labels'] == 'model-candidate':
+        return _FakeResponse([candidate_issue])
+      if params['labels'] == 'model-revert':
+        return _FakeResponse([revert_issue])
+      # Simulates real GitHub AND semantics: a combined-label query matches
+      # nothing here, since no issue in this fixture carries both labels.
+      return _FakeResponse([])
+
+    monkeypatch.setattr(mw.requests, 'get', fake_get)
+    issues = mw.fetch_issues('owner/repo')
+
+    assert {i['number'] for i in issues} == {1, 2}
+    # Queried per label, not one combined AND query.
+    assert any(c['labels'] == 'model-candidate' for c in calls)
+    assert any(c['labels'] == 'model-revert' for c in calls)
+    assert not any(c['labels'] == 'model-candidate,model-revert' for c in calls)
+
+  def test_paginates_per_label_and_terminates_without_dropping_a_page(self, monkeypatch):
+    pages_seen = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+      pages_seen.append((params['labels'], params['page']))
+      if params['labels'] == 'model-candidate' and params['page'] == 1:
+        return _FakeResponse([{'number': 10, 'state': 'open', 'body': ''}])
+      if params['labels'] == 'model-revert' and params['page'] == 1:
+        return _FakeResponse([{'number': 20, 'state': 'open', 'body': ''}])
+      return _FakeResponse([])
+
+    monkeypatch.setattr(mw.requests, 'get', fake_get)
+    issues = mw.fetch_issues('owner/repo')
+
+    assert {i['number'] for i in issues} == {10, 20}
+    # Each label's pagination fetched page 1, then terminated on the empty
+    # page 2 — no infinite loop, and page 1 was not skipped.
+    assert pages_seen.count(('model-candidate', 1)) == 1
+    assert pages_seen.count(('model-candidate', 2)) == 1
+    assert pages_seen.count(('model-revert', 1)) == 1
+    assert pages_seen.count(('model-revert', 2)) == 1
+
+  def test_dedups_an_issue_that_somehow_carries_both_labels(self, monkeypatch):
+    both_labels_issue = {'number': 5, 'state': 'open', 'body': 'both'}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+      if params['page'] > 1:
+        return _FakeResponse([])
+      return _FakeResponse([both_labels_issue])
+
+    monkeypatch.setattr(mw.requests, 'get', fake_get)
+    issues = mw.fetch_issues('owner/repo')
+
+    assert [i['number'] for i in issues] == [5]
+
+
 class TestReportedShas:
   def test_extracts_marker_from_bodies(self):
     assert mw.reported_shas([_issue('a' * 40), _issue('b' * 40)]) == {'a' * 40, 'b' * 40}

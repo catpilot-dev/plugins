@@ -42,13 +42,22 @@ def fetch_commits(per_page: int = 30) -> list:
     return resp.json()
 
 
-def fetch_issues(repo: str) -> list:
-    """All watch issues, open and closed, across pages."""
+WATCH_LABELS = ('model-candidate', 'model-revert')
+
+
+def _fetch_issues_for_label(repo: str, label: str) -> list:
+    """All issues carrying `label`, open and closed, across pages.
+
+    GitHub's issues-list `labels` param is AND semantics (an issue must carry
+    every listed label to match) — passing both watch labels at once would
+    only ever match an issue carrying BOTH, which none of ours ever do. So we
+    query once per label and the caller merges by issue number.
+    """
     issues, page = [], 1
     while True:
         resp = requests.get(
             f"https://api.github.com/repos/{repo}/issues",
-            params={'state': 'all', 'labels': 'model-candidate,model-revert',
+            params={'state': 'all', 'labels': label,
                     'per_page': 100, 'page': page},
             headers=_github_headers(), timeout=30,
         )
@@ -58,6 +67,15 @@ def fetch_issues(repo: str) -> list:
             return issues
         issues.extend(batch)
         page += 1
+
+
+def fetch_issues(repo: str) -> list:
+    """All watch issues (either label), open and closed, deduped by number."""
+    by_number = {}
+    for label in WATCH_LABELS:
+        for issue in _fetch_issues_for_label(repo, label):
+            by_number[issue['number']] = issue
+    return list(by_number.values())
 
 
 def reported_shas(issues: list) -> set:
