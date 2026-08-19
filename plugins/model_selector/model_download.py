@@ -17,9 +17,12 @@ from enum import Enum
 
 
 try:
-    from plugins.model_selector.model_swapper import MIN_MODEL_DATE
+    from plugins.model_selector import catalog
 except ImportError:
-    from model_swapper import MIN_MODEL_DATE
+    import catalog
+
+# Root of model storage. Module-level so tests can redirect it.
+BASE_DATA_DIR = Path('/data') if Path('/data').exists() else Path.home() / 'driving_data'
 
 
 class ModelType(Enum):

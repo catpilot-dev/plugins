@@ -12,13 +12,10 @@ from pathlib import Path
 from enum import Enum
 
 
-# Minimum model dates for v0.10.3 compatibility
-# Driving: cool_people (2025-10-20) is the v0.10.3 shipping model
-# DM: models before 2025-11-01 lack output_slices metadata
-MIN_MODEL_DATE = {
-    'driving': '2025-10-01',
-    'dm': '2025-11-01',
-}
+try:
+    from plugins.model_selector import catalog
+except ImportError:
+    import catalog
 
 
 class ModelType(Enum):
@@ -140,18 +137,16 @@ class ModelSwapper:
                         # Check which PKL files exist (cached)
                         cached_pkl = len(self._glob_compiled_files(model_dir))
 
-                        # Filter out models incompatible with current openpilot version
-                        min_date = MIN_MODEL_DATE.get(self.model_type.value, '0000-00-00')
-                        if info.get('date', '0000-00-00') < min_date:
-                            continue
-
-                        models.append({
+                        entry = {
                             'id': model_dir.name,
                             'has_onnx': has_onnx,
                             'cached_pkl_count': cached_pkl,
                             'total_pkl_count': len(self.required_pkl_stems),
                             **info
-                        })
+                        }
+                        # after **info so a stale model_info.json cannot forge a verdict
+                        entry['verified'] = catalog.is_verified(self.model_type, model_dir.name)
+                        models.append(entry)
                     except Exception as e:
                         print(f"Warning: Could not load {info_file}: {e}")
                         continue
@@ -161,6 +156,43 @@ class ModelSwapper:
         models.sort(key=lambda m: m.get('date', '0000-00-00'), reverse=True)
 
         return models
+
+    def import_stock(self) -> bool:
+        """Import the release's own ONNX as the stock model. Returns True if imported.
+
+        Only runs while the active tracker is absent. An absent tracker proves no
+        swap has ever happened, so ACTIVE_DIR still holds the files the release
+        shipped; once a swap has run they could be any model, and labeling those
+        as the release default would put an untested model behind a trusted name.
+        """
+        entry = catalog.baseline_entry(self.model_type)
+        if not entry or entry.get('source') != 'shipped':
+            return False
+        if self.active_model_file.exists():
+            return False
+
+        dest = self.models_dir / entry['id']
+        if dest.exists():
+            return False
+        if not all((self.ACTIVE_DIR / f).exists() for f in self.onnx_files):
+            return False
+
+        # Build in a _-prefixed temp dir (list_models skips those), then rename,
+        # so an interrupted copy can never present as a complete model.
+        tmp = dest.with_name(f"_{entry['id']}.tmp")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        for filename in self.onnx_files:
+            shutil.copy2(self.ACTIVE_DIR / filename, tmp / filename)
+        (tmp / 'model_info.json').write_text(json.dumps({
+            'name': entry.get('name', entry['id']),
+            'date': entry.get('date', ''),
+            'description': entry.get('notes', ''),
+            'source': 'shipped',
+            'type': self.model_type.value,
+        }, indent=2))
+        tmp.rename(dest)
+        return True
 
     def resolve_model_id(self, name_or_id: str) -> str:
         """
@@ -196,6 +228,15 @@ class ModelSwapper:
         Returns:
             dict with swap status and whether compilation is needed
         """
+        # STEP 0: Refuse models the catalog has not verified for this version.
+        # Resolution happens first so a name (not just an id) can be gated.
+        model_id = self.resolve_model_id(model_id)
+        if not catalog.is_verified(self.model_type, model_id) and not catalog.unlocked():
+            raise ValueError(
+                f"Model '{model_id}' is not verified for openpilot "
+                f"{catalog.openpilot_version() or 'unknown'}"
+            )
+
         # STEP 1: Cache compiled PKL files from CURRENT model (if any)
         current_model_id = self.get_active_model()
         cached_count = 0
@@ -208,7 +249,6 @@ class ModelSwapper:
                 pass
 
         # STEP 2: Validate NEW model ONNX files exist in /data storage
-        model_id = self.resolve_model_id(model_id)
         source_dir = self.models_dir / model_id
 
         if not source_dir.exists():

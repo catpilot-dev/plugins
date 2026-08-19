@@ -166,7 +166,11 @@ class TestResolveModelId:
 
 
 class TestSwapModelValidation:
-  def test_missing_model_raises(self, ModelSwapper, ModelType, tmp_path):
+  def test_missing_model_raises(self, swapper_mod, ModelSwapper, ModelType, tmp_path, monkeypatch):
+    # These validations sit behind the catalog gate (STEP 0); unlock so the
+    # test reaches the storage-validation code under test rather than the gate.
+    monkeypatch.setattr(swapper_mod.catalog, 'unlocked', lambda: True)
+
     models_dir = tmp_path / 'models' / 'driving'
     models_dir.mkdir(parents=True)
 
@@ -182,7 +186,10 @@ class TestSwapModelValidation:
     with pytest.raises(ValueError, match="not found"):
       swapper.swap_model('nonexistent')
 
-  def test_missing_onnx_raises(self, ModelSwapper, ModelType, tmp_path):
+  def test_missing_onnx_raises(self, swapper_mod, ModelSwapper, ModelType, tmp_path, monkeypatch):
+    # Same as above: unlock the catalog gate so this exercises ONNX validation.
+    monkeypatch.setattr(swapper_mod.catalog, 'unlocked', lambda: True)
+
     models_dir = tmp_path / 'models' / 'driving'
     model_dir = models_dir / 'incomplete_model'
     model_dir.mkdir(parents=True)
@@ -201,3 +208,130 @@ class TestSwapModelValidation:
     with patch.object(swapper, 'get_active_model', return_value='unknown'), \
          pytest.raises(ValueError, match="missing required ONNX"):
       swapper.swap_model('incomplete_model')
+
+
+CATALOG_FIXTURE = {
+  'driving': [{'id': 'good_model', 'name': 'Good', 'date': '2025-10-20',
+               'commit': 'c' * 40, 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
+               'verified_on': ['0.11.1']},
+              {'id': 'stock_0.11.1', 'name': 'Release default', 'date': '2026-05-18',
+               'source': 'shipped', 'verified_on': ['0.11.1'], 'baseline_for': ['0.11.1']}],
+  'dm': [],
+}
+
+
+def _build_swapper(swapper_mod, tmp_path, monkeypatch):
+  """A DRIVING swapper rooted in tmp_path.
+
+  Built with __new__ like the other tests in this file: ModelSwapper.__init__
+  mkdirs under the real BASE_DATA_DIR, which a test must not touch.
+  """
+  models_dir = tmp_path / 'models' / 'driving'
+  models_dir.mkdir(parents=True)
+  active = tmp_path / 'active'
+  active.mkdir()
+
+  sw = swapper_mod.ModelSwapper.__new__(swapper_mod.ModelSwapper)
+  sw.model_type = swapper_mod.ModelType.DRIVING
+  sw.config = swapper_mod.ModelSwapper.MODEL_CONFIGS[swapper_mod.ModelType.DRIVING]
+  sw.models_dir = models_dir
+  sw.active_model_file = models_dir.parent / 'active_driving_model'
+  sw.onnx_files = sw.config['onnx_files']
+  sw.pkl_patterns = sw.config['pkl_patterns']
+  sw.required_pkl_stems = sw.config['required_pkl_stems']
+  sw.display_name = sw.config['display_name']
+  monkeypatch.setattr(swapper_mod.ModelSwapper, 'ACTIVE_DIR', active)
+  return sw
+
+
+def _point_catalog_at(tmp_path, monkeypatch, data):
+  """Redirect the catalog module at a temp catalog, version.h and marker."""
+  import plugins.model_selector.catalog as cat
+  version_h = tmp_path / 'version.h'
+  version_h.write_text('#define COMMA_VERSION "0.11.1"\n')
+  monkeypatch.setattr(cat, 'VERSION_H', version_h)
+  monkeypatch.setattr(cat, 'CATALOG_FILE', tmp_path / 'catalog.json')
+  monkeypatch.setattr(cat, 'UNLOCK_MARKER', tmp_path / '.unlocked')
+  (tmp_path / 'catalog.json').write_text(json.dumps(data))
+  return cat
+
+
+class TestCatalogGate:
+  @pytest.fixture
+  def gated(self, swapper_mod, tmp_path, monkeypatch):
+    cat = _point_catalog_at(tmp_path, monkeypatch, CATALOG_FIXTURE)
+    return _build_swapper(swapper_mod, tmp_path, monkeypatch), cat, tmp_path
+
+  def _install(self, sw, model_id, date='2025-10-20'):
+    d = sw.models_dir / model_id
+    d.mkdir(parents=True)
+    for f in sw.onnx_files:
+      (d / f).write_bytes(b'onnx')
+    (d / 'model_info.json').write_text(json.dumps({'name': model_id, 'date': date}))
+    return d
+
+  def test_list_models_flags_verified(self, gated):
+    sw, _, _ = gated
+    self._install(sw, 'good_model')
+    self._install(sw, 'mystery_model')
+    by_id = {m['id']: m for m in sw.list_models()}
+    assert by_id['good_model']['verified'] is True
+    assert by_id['mystery_model']['verified'] is False
+
+  def test_list_models_no_longer_hides_old_models(self, gated):
+    sw, _, _ = gated
+    self._install(sw, 'ancient_model', date='2024-01-01')
+    assert 'ancient_model' in {m['id'] for m in sw.list_models()}
+
+  def test_swap_refuses_unverified(self, gated):
+    sw, _, _ = gated
+    self._install(sw, 'mystery_model')
+    with pytest.raises(ValueError, match='not verified'):
+      sw.swap_model('mystery_model')
+
+  def test_swap_allows_unverified_when_unlocked(self, gated):
+    sw, cat, tmp_path = gated
+    self._install(sw, 'mystery_model')
+    cat.UNLOCK_MARKER.write_text('')
+    sw.swap_model('mystery_model')
+    assert sw.get_active_model() == 'mystery_model'
+
+  def test_swap_allows_verified(self, gated):
+    sw, _, _ = gated
+    self._install(sw, 'good_model')
+    sw.swap_model('good_model')
+    assert sw.get_active_model() == 'good_model'
+
+
+class TestImportStock:
+  @pytest.fixture
+  def stocked(self, swapper_mod, tmp_path, monkeypatch):
+    _point_catalog_at(tmp_path, monkeypatch, CATALOG_FIXTURE)
+    sw = _build_swapper(swapper_mod, tmp_path, monkeypatch)
+    for f in sw.onnx_files:
+      (sw.ACTIVE_DIR / f).write_bytes(b'shipped-onnx')
+    return sw
+
+  def test_imports_when_no_tracker(self, stocked):
+    assert stocked.import_stock() is True
+    dest = stocked.models_dir / 'stock_0.11.1'
+    assert (dest / 'driving_vision.onnx').read_bytes() == b'shipped-onnx'
+    assert json.loads((dest / 'model_info.json').read_text())['source'] == 'shipped'
+
+  def test_is_idempotent(self, stocked):
+    assert stocked.import_stock() is True
+    assert stocked.import_stock() is False
+
+  def test_skips_when_tracker_exists(self, stocked):
+    stocked.active_model_file.write_text(json.dumps({'id': 'something_else'}))
+    assert stocked.import_stock() is False
+    assert not (stocked.models_dir / 'stock_0.11.1').exists()
+
+  def test_skips_when_active_dir_incomplete(self, stocked):
+    (stocked.ACTIVE_DIR / 'driving_policy.onnx').unlink()
+    assert stocked.import_stock() is False
+
+  def test_imported_stock_is_listed_and_verified(self, stocked):
+    stocked.import_stock()
+    by_id = {m['id']: m for m in stocked.list_models()}
+    assert by_id['stock_0.11.1']['verified'] is True
