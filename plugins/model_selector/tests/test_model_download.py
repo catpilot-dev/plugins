@@ -234,3 +234,69 @@ class TestCompatibilityHeuristicSuperseded:
     monkeypatch.setattr(md, 'download_file', lambda url, dest, desc=None: calls.append(url))
     assert md.download_model(md.ModelType.DRIVING, 'new_registry_model') == 0
     assert len(calls) == 2
+
+
+def _commit(sha, message, date='2025-12-01T00:00:00Z'):
+  return {'sha': sha, 'commit': {'message': message, 'committer': {'date': date}}}
+
+
+class TestScanUpstreamModels:
+  def test_parses_a_standard_model_commit(self):
+    out = md.scan_upstream_models([_commit('a' * 40, 'Nice Model (#37727)')])
+    assert len(out['candidates']) == 1
+    c = out['candidates'][0]
+    assert c['id'] == 'nice_model_37727'
+    assert c['name'] == 'Nice Model'
+    assert c['commit'] == 'a' * 40
+    assert c['pr'] == '(#37727)'
+    assert c['type'] == 'driving'
+    assert c['files'] == ['driving_vision.onnx', 'driving_policy.onnx']
+    assert c['upstream_reverted'] is None
+
+  def test_detects_dm_models(self):
+    out = md.scan_upstream_models([_commit('b' * 40, 'DM: Sharp Eyes (#37800)')])
+    c = out['candidates'][0]
+    assert c['type'] == 'dm'
+    assert c['files'] == ['dmonitoring_model.onnx']
+    assert c['name'] == 'Sharp Eyes'
+
+  def test_skips_commits_before_the_firehose_floor(self):
+    out = md.scan_upstream_models([_commit('c' * 40, 'Old Model (#100)', '2025-01-01T00:00:00Z')])
+    assert out['candidates'] == []
+
+  def test_revert_commit_itself_is_never_a_candidate(self):
+    revert = _commit('d' * 40, f"Revert \"Nice Model (#37727)\"\n\nThis reverts commit {'a' * 40}.")
+    out = md.scan_upstream_models([revert])
+    assert out['candidates'] == []
+    assert out['reverted'] == {'a' * 40: 'd' * 40}
+
+  def test_reverted_model_stays_a_candidate_and_is_marked(self):
+    """A revert is not a road test — the model must remain drivable and catalogable."""
+    revert = _commit('d' * 40, f"Revert \"Nice Model (#37727)\"\n\nThis reverts commit {'a' * 40}.")
+    model = _commit('a' * 40, 'Nice Model (#37727)')
+    out = md.scan_upstream_models([revert, model])
+    ids = [c['id'] for c in out['candidates']]
+    assert ids == ['nice_model_37727']
+    assert out['candidates'][0]['upstream_reverted'] == 'd' * 40
+
+  def test_pr_fallback_when_message_has_no_pr_number(self, monkeypatch):
+    class _Resp:
+      def raise_for_status(self): pass
+      def json(self): return [{'number': 12345, 'title': 'Fallback Model'}]
+    monkeypatch.setattr(md.requests, 'get', lambda *a, **k: _Resp())
+    out = md.scan_upstream_models([_commit('e' * 40, 'some model bump')])
+    c = out['candidates'][0]
+    assert c['pr'] == '#12345'
+    assert c['name'] == 'Fallback Model'
+    assert c['id'] == 'fallback_model_12345'
+
+  def test_pr_fallback_failure_drops_the_commit(self, monkeypatch):
+    def _boom(*a, **k):
+      raise RuntimeError('network down')
+    monkeypatch.setattr(md.requests, 'get', _boom)
+    assert md.scan_upstream_models([_commit('f' * 40, 'unlabelled bump')])['candidates'] == []
+
+  def test_id_matches_the_catalog_format(self):
+    """Catalog ids like pop_model_37727 come from this function — they must agree."""
+    out = md.scan_upstream_models([_commit('0' * 40, 'POP model (#37727)')])
+    assert out['candidates'][0]['id'] == 'pop_model_37727'

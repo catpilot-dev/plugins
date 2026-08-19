@@ -9,6 +9,8 @@ Model registry: /data/models/model_registry.json
 """
 import argparse
 import json
+import os
+import re
 import sys
 import requests
 from pathlib import Path
@@ -503,14 +505,120 @@ def add_model_from_pr(pr_number: int, model_type: str = 'driving'):
     )
 
 
+def _github_headers() -> dict:
+    """Auth GitHub API calls when a token is available.
+
+    CI must send this: unauthenticated calls share a 60/hr per-IP budget on
+    shared runners and will flake. On device the env var is absent and the call
+    falls back to unauthenticated, which is fine at one run per tap.
+    """
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+# Firehose model onward — earlier commits predate the current model interface
+_MODEL_COMMIT_FLOOR = "2025-09-05"
+
+
+def _parse_reverts(commits_data: list) -> dict:
+    """Map reverted commit sha -> the sha of the commit that reverted it."""
+    reverted = {}
+    for commit_data in commits_data:
+        message = commit_data['commit']['message']
+        if not message.split('\n')[0].lower().startswith('revert'):
+            continue
+        match = re.search(r'reverts commit ([0-9a-f]{40})', message, re.IGNORECASE)
+        if match:
+            reverted[match.group(1)] = commit_data['sha']
+    return reverted
+
+
+def scan_upstream_models(commits_data: list) -> dict:
+    """Parse GitHub commits touching the model dir into model candidates.
+
+    Pure: no network except the PR-title fallback, no disk, no registry. Shared
+    by the device CLI (update-registry) and the CI watch job so that one revert
+    policy governs both.
+
+    A model whose commit was later reverted upstream stays a candidate, marked
+    with `upstream_reverted`. comma reverts for many reasons — a metric
+    regression, infrastructure, a competing model winning — and none of them is
+    a road test on this fork. Only the revert commit itself is excluded, because
+    it is not a model.
+    """
+    reverted = _parse_reverts(commits_data)
+    candidates = []
+
+    for commit_data in commits_data:
+        commit_hash = commit_data['sha']
+        commit_message = commit_data['commit']['message']
+        commit_date = commit_data['commit']['committer']['date'][:10]
+
+        if commit_date < _MODEL_COMMIT_FLOOR:
+            continue
+
+        # The revert commit itself is not a model
+        if commit_message.split('\n')[0].lower().startswith('revert'):
+            continue
+
+        if '(#' not in commit_message:
+            try:
+                pr_resp = requests.get(
+                    f"https://api.github.com/repos/commaai/openpilot/commits/{commit_hash}/pulls",
+                    headers=_github_headers(),
+                    timeout=10,
+                )
+                pr_resp.raise_for_status()
+                prs = pr_resp.json()
+                if not prs:
+                    continue
+                pr_number = f"#{prs[0]['number']}"
+                model_name = prs[0]['title'].strip()
+            except Exception:
+                continue
+        else:
+            pr_match = commit_message.find('(#')
+            pr_end = commit_message.find(')', pr_match)
+            pr_number = commit_message[pr_match:pr_end + 1]
+            model_name = commit_message[:pr_match].strip()
+
+        if 'DM:' in model_name or 'dmonitoring' in commit_message.lower():
+            model_type = 'dm'
+            model_name = model_name.replace('DM:', '').strip()
+            files = ['dmonitoring_model.onnx']
+        else:
+            model_type = 'driving'
+            files = ['driving_vision.onnx', 'driving_policy.onnx']
+
+        clean_name = re.sub(r'[^a-z0-9_]', '', model_name.lower().replace(' ', '_'))
+        pr_id = pr_number.strip('#()') if pr_number else commit_hash[:7]
+
+        candidates.append({
+            'id': f"{clean_name}_{pr_id}",
+            'name': model_name,
+            'commit': commit_hash,
+            'date': commit_date,
+            'pr': pr_number,
+            'files': files,
+            'type': model_type,
+            'upstream_reverted': reverted.get(commit_hash),
+        })
+
+    return {'candidates': candidates, 'reverted': reverted}
+
+
 def update_registry_from_github():
     """Fetch latest model commits from GitHub and update registry
 
     Three-Layer Filtering System:
     1. Date Filter: Exclude models older than Firehose (2025-09-05) from registry ingestion
-    2. Revert Filter: Exclude reverted models and revert commits themselves
-       - Detects "Revert" commits and parses which commit was reverted
-       - Removes reverted models from registry
+    2. Revert Filter: Excludes revert commits themselves from candidacy
+       - Detects "Revert" commits and MARKS the reverted model with
+         `upstream_reverted`; it is never removed. A revert is not a verdict on
+         whether the model drives — only a test drive is.
     3. Already Downloaded Filter: Applied in check_updates() to show only uninstalled models
 
     Note: Filter #3 is intentionally in check_updates(), not here, because the registry
@@ -528,7 +636,7 @@ def update_registry_from_github():
     }
 
     try:
-        response = requests.get(github_api_url, params=params)
+        response = requests.get(github_api_url, params=params, headers=_github_headers())
         response.raise_for_status()
         commits_data = response.json()
     except Exception as e:
@@ -539,157 +647,73 @@ def update_registry_from_github():
     with open(REGISTRY_FILE) as f:
         registry = json.load(f)
 
+    scan = scan_upstream_models(commits_data)
+
     existing_commits = set()
     for models_dict in [registry['driving_models'], registry['dm_models']]:
         for model_info in models_dict.values():
             existing_commits.add(model_info['commit'])
 
-    # PHASE 1: Parse all commits to find reverted commit hashes
-    import re
-    reverted_commits = set()
-
-    for commit_data in commits_data:
-        commit_message = commit_data['commit']['message']
-
-        # Check if this is a revert commit
-        if commit_message.split('\n')[0].lower().startswith('revert'):
-            # Parse commit message to extract reverted commit hash
-            # Format: "This reverts commit <hash>."
-            revert_match = re.search(r'reverts commit ([0-9a-f]{40})', commit_message, re.IGNORECASE)
-            if revert_match:
-                reverted_hash = revert_match.group(1)
-                reverted_commits.add(reverted_hash)
-                print(f"  🔍 Found revert: {reverted_hash[:12]} was reverted")
-
-    # PHASE 2: Remove reverted models from registry
-    models_removed = 0
+    # Mark — never delete — registry entries whose commit was reverted upstream.
+    # A revert is not a verdict on whether the model drives; see DESIGN.md.
+    models_marked = 0
     for registry_key in ['driving_models', 'dm_models']:
-        models_to_remove = []
         for model_id, model_info in registry[registry_key].items():
-            if model_info['commit'] in reverted_commits:
-                models_to_remove.append(model_id)
-                print(f"  🗑️  Removing reverted model: {model_id} (commit {model_info['commit'][:12]})")
-
-        for model_id in models_to_remove:
-            del registry[registry_key][model_id]
-            models_removed += 1
+            revert_sha = scan['reverted'].get(model_info['commit'])
+            if revert_sha and model_info.get('upstream_reverted') != revert_sha:
+                model_info['upstream_reverted'] = revert_sha
+                models_marked += 1
+                print(f"  ⚠️  Upstream reverted (kept): {model_id}")
 
     new_models_added = 0
-
-    # PHASE 3: Parse commits for new model updates
-    for commit_data in commits_data:
-        commit_hash = commit_data['sha']
-        commit_hash_short = commit_hash[:7]
-        commit_message = commit_data['commit']['message']
-        commit_date = commit_data['commit']['committer']['date'][:10]  # YYYY-MM-DD
-
-        # Skip if already in registry
-        if commit_hash in existing_commits:
+    for cand in scan['candidates']:
+        if cand['commit'] in existing_commits:
             continue
 
-        # FILTER 1: Exclude models older than Firehose model (2025-09-05)
-        # Only include models from Firehose onwards for v0.10.1+ compatibility
-        if commit_date < "2025-09-05":
-            continue
+        registry_key = 'dm_models' if cand['type'] == 'dm' else 'driving_models'
 
-        # FILTER 2a: Exclude revert commits themselves
-        # Only skip commits that ARE revert commits (title starts with "Revert")
-        if commit_message.split('\n')[0].lower().startswith('revert'):
-            continue
-
-        # FILTER 2b: Exclude commits that were later reverted
-        if commit_hash in reverted_commits:
-            continue
-
-        # Parse commit message for model info
-        # Expected format: "Model Name 🎯 (#12345)"
-        # Fallback: look up associated PR via GitHub API for non-standard messages
-        if '(#' not in commit_message:
-            try:
-                pr_resp = requests.get(
-                    f"https://api.github.com/repos/commaai/openpilot/commits/{commit_hash}/pulls",
-                    headers={"Accept": "application/vnd.github.v3+json"},
-                    timeout=10,
-                )
-                pr_resp.raise_for_status()
-                prs = pr_resp.json()
-                if not prs:
-                    continue
-                pr_data = prs[0]
-                pr_number = f"#{pr_data['number']}"
-                model_name = pr_data['title'].strip()
-            except Exception:
-                continue
-        else:
-            # Extract PR number
-            pr_match = commit_message.find('(#')
-            pr_end = commit_message.find(')', pr_match)
-            pr_number = commit_message[pr_match:pr_end+1]
-            model_name = commit_message[:pr_match].strip()
-
-        # Determine model type
-        if 'DM:' in model_name or 'dmonitoring' in commit_message.lower():
-            model_type = 'dm'
-            model_name = model_name.replace('DM:', '').strip()
-            registry_key = 'dm_models'
-            files = ['dmonitoring_model.onnx']
-        else:
-            model_type = 'driving'
-            registry_key = 'driving_models'
-            files = ['driving_vision.onnx', 'driving_policy.onnx']
-
-        # Generate model ID - deduplicate by PR number
-        import re
-        clean_name = model_name.lower().replace(' ', '_')
-        clean_name = re.sub(r'[^a-z0-9_]', '', clean_name)
-
-        # Check if registry already has a model from this PR
+        # Deduplicate by PR: a re-pushed model reuses its existing entry id
+        pr_str = cand['pr'].strip('#()')
         existing_id = None
-        if pr_number:
-            pr_str = pr_number.strip('#()')
-            for mid, minfo in registry[registry_key].items():
-                if minfo.get('pr', '').strip('#()') == pr_str:
-                    existing_id = mid
-                    break
-        pr_id = pr_number.strip('#()') if pr_number else commit_hash_short
-        model_id = existing_id or f"{clean_name}_{pr_id}"
+        for mid, minfo in registry[registry_key].items():
+            if minfo.get('pr', '').strip('#()') == pr_str:
+                existing_id = mid
+                break
+        model_id = existing_id or cand['id']
 
-        # Create model entry (updates existing if same PR)
-        model_entry = {
-            'name': model_name,
-            'commit': commit_hash,
-            'date': commit_date,
-            'description': f'Model from {commit_date}',
-            'pr': pr_number,
-            'files': files
+        registry[registry_key][model_id] = {
+            'name': cand['name'],
+            'commit': cand['commit'],
+            'date': cand['date'],
+            'description': f"Model from {cand['date']}",
+            'pr': cand['pr'],
+            'files': cand['files'],
+            'upstream_reverted': cand['upstream_reverted'],
         }
-
-        # Add/update registry
-        registry[registry_key][model_id] = model_entry
         new_models_added += 1
 
-        print(f"✅ Found new {model_type} model: {model_name}")
+        print(f"✅ Found new {cand['type']} model: {cand['name']}")
         print(f"   ID: {model_id}")
-        print(f"   Commit: {commit_hash_short}")
-        print(f"   Date: {commit_date}")
-        print(f"   PR: {pr_number}")
+        print(f"   Commit: {cand['commit'][:7]}")
+        print(f"   Date: {cand['date']}")
+        print(f"   PR: {cand['pr']}")
+        if cand['upstream_reverted']:
+            print("   NOTE: reverted upstream — still eligible, test drive decides")
         print()
 
-    if new_models_added > 0 or models_removed > 0:
-        # Update last_updated timestamp
+    if new_models_added > 0 or models_marked > 0:
         registry['last_updated'] = datetime.now().strftime('%Y-%m-%d')
 
-        # Save updated registry
         with open(REGISTRY_FILE, 'w') as f:
             json.dump(registry, f, indent=2)
 
         if new_models_added > 0:
             print(f"✅ Added {new_models_added} new model(s) to registry")
-        if models_removed > 0:
-            print(f"🗑️  Removed {models_removed} reverted model(s) from registry")
+        if models_marked > 0:
+            print(f"⚠️  Marked {models_marked} model(s) reverted upstream (kept in registry)")
         print(f"📄 Registry updated: {REGISTRY_FILE}")
     else:
-        print("✅ Registry is up to date - no new models found, no reverted models detected")
+        print("✅ Registry is up to date")
 
     return 0
 
