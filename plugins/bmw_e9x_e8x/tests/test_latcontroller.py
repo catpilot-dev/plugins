@@ -1415,6 +1415,62 @@ class TestLowSpeedLkaReference:
     assert torques[0] == pytest.approx(torques[1], rel=1e-9)
 
 
+class TestIntersectionGainFloor:
+  """Route 411 seg 2 (2026-08-19): a 90 deg intersection at 14-19 km/h ramped
+  to 9.9 Nm and could not be overridden by hand. The 8.5 m/s gain floor stands
+  in for constant rack friction with a FAKE v^2, so below 30 km/h it
+  over-delivers by 72.25/v_true^2 — 2.9x at 18 km/h — and the P law saturates,
+  carrying no information about how wrong the wheel actually is.
+
+  Fix: fade the floor 8.5 -> 2.778 m/s (30 -> 10 km/h) across the intersection
+  curvature band. Below the band nothing changes at any speed; above 8.5 m/s
+  true speed wins regardless, so every route tuned at speed is untouched.
+  DCC cannot engage below 30 km/h, so a sub-30 change is LKA-scoped by
+  construction — no DCC state needed in the controller."""
+
+  def test_below_the_band_keeps_the_30kph_floor(self, monkeypatch):
+    """Straights and mild curves are unchanged at EVERY speed — the property
+    that makes this safe to ship without re-validating the at-speed routes."""
+    _, _, mod, _ = _make_controller(monkeypatch)
+    for v_true in (1.0, 5.0, 8.0):
+      assert mod.gain_reference_speed(v_true, 0.005) == pytest.approx(8.5)
+
+  def test_intersection_band_uses_true_speed(self, monkeypatch):
+    """18 km/h through a tight turn: the gain references actual speed."""
+    _, _, mod, _ = _make_controller(monkeypatch)
+    assert mod.gain_reference_speed(5.0, 0.11) == pytest.approx(5.0)
+
+  def test_floor_still_binds_at_walking_pace(self, monkeypatch):
+    """5 km/h tight turn: true v^2 alone would command 0.6-1.6 Nm — all below
+    the ~2.75 Nm breakaway knee, i.e. no steering at all. The 10 km/h floor is
+    the friction headroom the v^2 term cannot supply."""
+    _, _, mod, _ = _make_controller(monkeypatch)
+    assert mod.gain_reference_speed(1.389, 0.11) == pytest.approx(2.778)
+
+  def test_inert_above_30kph_at_any_curvature(self, monkeypatch):
+    _, _, mod, _ = _make_controller(monkeypatch)
+    for k in (0.0, 0.005, 0.03, 0.11):
+      assert mod.gain_reference_speed(10.0, k) == pytest.approx(10.0)
+
+  def test_floor_fades_monotonically_across_the_band(self, monkeypatch):
+    _, _, mod, _ = _make_controller(monkeypatch)
+    floors = [mod.gain_reference_speed(1.0, k) for k in (0.010, 0.013, 0.016, 0.020)]
+    assert floors[0] == pytest.approx(8.5)
+    assert floors[-1] == pytest.approx(2.778)
+    assert all(a > b for a, b in zip(floors, floors[1:])), floors
+
+  def test_intersection_torque_now_tracks_true_speed(self, monkeypatch):
+    """The behavioral counterpart of test_torque_gains_keep_30kph_floor: in
+    the intersection band 5 m/s must NO LONGER command what 8.5 m/s commands."""
+    torques = []
+    for v in (5.0, 8.5):
+      lac, fake_sm, mod, state = _make_controller(monkeypatch)
+      _set_measured(fake_sm, v, 0.024)
+      _call_update(lac, 0.025, v_ego=v)
+      torques.append(abs(state['torque']))
+    assert torques[0] < torques[1] * 0.6, torques
+
+
 # ============================================================
 # Driver-override observers, phase 1 (2026-08-17). Four detectors that COUNT
 # driver-override signatures and act on NOTHING. The E90 has no driver-torque
