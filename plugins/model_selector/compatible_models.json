@@ -5,9 +5,28 @@
       "name": "Release default",
       "date": "2026-05-18",
       "source": "shipped",
-      "verified_on": ["0.11.1"],
-      "baseline_for": ["0.11.1"],
+      "verified_on": [
+        "0.11.1"
+      ],
+      "baseline_for": [
+        "0.11.1"
+      ],
       "notes": "driving_vision.onnx + driving_policy.onnx shipped in catpilot v0.11.1"
+    },
+    {
+      "id": "pop_model_37727",
+      "name": "POP model",
+      "date": "2026-03-24",
+      "commit": "62bf6fb072880905a4c490f0f4f4a6b3c23346ec",
+      "pr": "#37727",
+      "files": [
+        "driving_vision.onnx",
+        "driving_policy.onnx"
+      ],
+      "verified_on": [
+        "0.11.1"
+      ],
+      "notes": "test driven on catpilot v0.11.1; the model running on the reference C3 as of 2026-08-19"
     }
   ],
   "dm": [
@@ -16,8 +35,12 @@
       "name": "Release default DM",
       "date": "2026-05-18",
       "source": "shipped",
-      "verified_on": ["0.11.1"],
-      "baseline_for": ["0.11.1"],
+      "verified_on": [
+        "0.11.1"
+      ],
+      "baseline_for": [
+        "0.11.1"
+      ],
       "notes": "dmonitoring_model.onnx shipped in catpilot v0.11.1"
     }
   ]
