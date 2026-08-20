@@ -31,20 +31,115 @@ WATCH_REPO = 'commaai/openpilot'
 MODEL_PATH = 'selfdrive/modeld/models'
 MAINTAINER = '@OxygenLiu'
 
+# The ONNX files THIS fork actually loads, per model type. The watcher follows
+# these files rather than the directory: a commit that touches the directory
+# without touching one of them is a refactor, a path move, or a model built for
+# an interface this fork cannot load — upstream has since replaced
+# driving_vision/driving_policy with a single driving_supercombo.onnx. Watching
+# the directory reported all of those as installable candidates.
+# Kept in step with ModelSwapper.MODEL_CONFIGS by a test.
+WATCH_FILES = {
+    'driving': ['driving_vision.onnx', 'driving_policy.onnx'],
+    'dm': ['dmonitoring_model.onnx'],
+}
+
 
 def fetch_commits(per_page: int = 100) -> list:
-    # 100 is GitHub's max per_page — same single request as per_page=30, no
-    # extra cost — and it widens the window this job looks back through.
-    # That matters for reverts specifically: plan_issues only reconciles
-    # commits inside this window, so a revert of a model old enough to have
-    # scrolled out of it is never reported at all, not even late.
+    """Commits touching an ONNX file this fork loads, deduped by sha.
+
+    Each returned commit carries `_watch_type` — the model type inferred from
+    the file that changed, which is structural evidence and beats guessing the
+    type from the commit message.
+
+    100 is GitHub's max per_page — same single request per file as a smaller
+    page, no extra cost — and it widens the window this job looks back through.
+    That matters for reverts specifically: plan_issues only reconciles commits
+    inside this window, so a revert of a model old enough to have scrolled out
+    of it is never reported at all, not even late.
+    """
+    seen = {}
+    for model_type, filenames in WATCH_FILES.items():
+        for filename in filenames:
+            resp = requests.get(
+                f"https://api.github.com/repos/{WATCH_REPO}/commits",
+                params={'path': f"{MODEL_PATH}/{filename}", 'per_page': per_page},
+                headers=_github_headers(), timeout=30,
+            )
+            resp.raise_for_status()
+            for commit in resp.json():
+                # First file to claim a sha wins; the two driving files agree.
+                seen.setdefault(commit['sha'], dict(commit, _watch_type=model_type))
+    return list(seen.values())
+
+
+# A model this fork can install is one whose ONNX was added or modified.
+# A removal (upstream's move to a single supercombo model) or a rename (a
+# directory move) still shows up in a path-filtered commit query but changes
+# no model this fork could load.
+_MODEL_FILE_STATUSES = ('added', 'modified')
+
+
+def fetch_commit_files(sha: str) -> list:
+    """(filename, status) for every file in a commit. One API call per commit."""
     resp = requests.get(
-        f"https://api.github.com/repos/{WATCH_REPO}/commits",
-        params={'path': MODEL_PATH, 'per_page': per_page},
+        f"https://api.github.com/repos/{WATCH_REPO}/commits/{sha}",
         headers=_github_headers(), timeout=30,
     )
     resp.raise_for_status()
-    return resp.json()
+    return [(f['filename'].split('/')[-1], f['status'])
+            for f in resp.json().get('files', [])]
+
+
+def filter_by_file_status(candidates: list) -> list:
+    """Keep only candidates that add or modify an ONNX file of their own type.
+
+    Costs one API call per candidate, which is why it runs last — after the
+    path query and the catalog/issue reconciliation have already narrowed the
+    set.
+    """
+    kept = []
+    for cand in candidates:
+        watched = set(WATCH_FILES.get(cand['type'], ()))
+        changed = fetch_commit_files(cand['commit'])
+        if any(name in watched and status in _MODEL_FILE_STATUSES
+               for name, status in changed):
+            kept.append(cand)
+    return kept
+
+
+def drop_non_model_candidates(planned: list, candidates: list) -> list:
+    """Drop planned candidate issues whose commit changed no model this fork loads.
+
+    Runs on the planned list, not the whole window: the status check costs an
+    API call per commit, and on a normal day nothing is planned at all. Revert
+    issues pass through untouched — a revert is news about a model already
+    reported, and its own model change was vetted when it was first filed.
+    """
+    by_sha = {c['commit']: c for c in candidates}
+    keep = []
+    for item in planned:
+        if item['kind'] != 'candidate':
+            keep.append(item)
+            continue
+        cand = by_sha.get(item['sha'])
+        if cand and filter_by_file_status([cand]):
+            keep.append(item)
+    return keep
+
+
+def apply_watch_types(scan: dict, type_by_sha: dict) -> None:
+    """Set each candidate's type/files from the file that actually changed.
+
+    scan_upstream_models infers type from the commit message ("DM:" in the
+    title, "dmonitoring" in the body), which misfiled commits like
+    "dmonitoringmodeld: clean up data structures". The file that changed is
+    evidence; the message is a guess.
+    """
+    for cand in scan['candidates']:
+        model_type = type_by_sha.get(cand['commit'])
+        if model_type:
+            cand['type'] = model_type
+            cand['files'] = list(WATCH_FILES[model_type])
 
 
 WATCH_LABELS = ('model-candidate', 'model-revert')
@@ -95,6 +190,17 @@ def reported_shas(issues: list) -> set:
 
 def _catalog_ids(cat: dict) -> set:
     return {e['id'] for entries in cat.values() for e in entries}
+
+
+def _catalog_commits(cat: dict) -> set:
+    """Commit shas already catalogued.
+
+    Entry ids are keyed on a PR number for some models and a short sha for
+    others, so id matching alone re-filed a model that was already catalogued.
+    The commit sha is the only unambiguous key. Shipped entries carry no commit
+    and are matched by id instead.
+    """
+    return {e['commit'] for entries in cat.values() for e in entries if e.get('commit')}
 
 
 def _candidate_body(cand: dict) -> str:
@@ -174,12 +280,14 @@ A revert is not a verdict on whether the model drives well.
 def plan_issues(scan: dict, cat: dict, reported: set) -> list:
     planned = []
     catalogued = _catalog_ids(cat)
+    catalogued_commits = _catalog_commits(cat)
 
     for cand in scan['candidates']:
         sha = cand['commit']
         revert_sha = cand.get('upstream_reverted')
 
-        if sha not in reported and cand['id'] not in catalogued:
+        if (sha not in reported and cand['id'] not in catalogued
+                and sha not in catalogued_commits):
             # Never reported: one candidate issue, carrying revert status in the
             # body. Not a candidate issue plus a revert issue.
             planned.append({
@@ -192,7 +300,7 @@ def plan_issues(scan: dict, cat: dict, reported: set) -> list:
 
         # Already known. Only a revert is news, and only once.
         if revert_sha and revert_sha not in reported:
-            in_catalog = cand['id'] in catalogued
+            in_catalog = cand['id'] in catalogued or sha in catalogued_commits
             prefix = "Upstream revert (in catalog)" if in_catalog else "Upstream revert"
             planned.append({
                 'kind': 'revert', 'sha': revert_sha,
@@ -227,7 +335,10 @@ def main(argv=None) -> int:
         print("error: --repo or GITHUB_REPOSITORY required", file=sys.stderr)
         return 2
 
-    scan = scan_upstream_models(fetch_commits())
+    commits = fetch_commits()
+    scan = scan_upstream_models(commits)
+    # File evidence beats the message heuristic for model type.
+    apply_watch_types(scan, {c['sha']: c['_watch_type'] for c in commits})
     cat = catalog.load_catalog()
     if not cat:
         # load_catalog() fails CLOSED (returns {}) on any read/parse problem —
@@ -245,6 +356,7 @@ def main(argv=None) -> int:
     reported = reported_shas(fetch_issues(args.repo))
 
     planned = plan_issues(scan, cat, reported)
+    planned = drop_non_model_candidates(planned, scan['candidates'])
     print(f"{len(scan['candidates'])} candidates upstream, "
           f"{len(reported)} already reported, {len(planned)} to file")
 

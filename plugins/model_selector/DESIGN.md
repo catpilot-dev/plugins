@@ -180,7 +180,17 @@ revert commit itself is never treated as a model.
 ### Upstream watch (CI)
 
 `.github/workflows/model-watch.yml` runs `.github/scripts/model_watch.py` daily.
-It reads the commits API for `selfdrive/modeld/models`, reconciles against
+It reads the commits API once per ONNX file this fork loads
+(`driving_vision.onnx`, `driving_policy.onnx`, `dmonitoring_model.onnx`) rather
+than for the whole models directory, then keeps only commits that **added or
+modified** one of them. Watching the directory reported every refactor, path
+move and foreign-interface model as an installable candidate; a removal or
+rename touches the path without changing a model this fork can load. Upstream
+has since replaced `driving_vision`/`driving_policy` with a single
+`driving_supercombo.onnx`, so those commits are correctly filtered out — this
+fork cannot load them without a rebase, and the watcher going quiet is the
+truthful answer rather than a fault. The file that changed also decides the
+model type, which is evidence; the commit message was a guess. It reconciles against
 `compatible_models.json` and against existing GitHub issues, and files a
 `model-candidate` issue per new model (and `model-revert` for a revert of
 something already reported or catalogued). Dedup state is the issues themselves,
