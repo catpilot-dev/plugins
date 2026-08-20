@@ -150,8 +150,10 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
 
   def _send_all_bmw_rx_checks(self):
     """Send all 6 BMW RX_CHECKS messages to satisfy frequency validation"""
-    # BMW RX_CHECKS require these messages (from bmw.h)
-    # CruiseControlStalk NOT in RX_CHECKS (following dzid's minimal approach)
+    # BMW RX_CHECKS require these messages (from bmw.h). CruiseControlStalk
+    # joined the list 2026-08-20: safety_rx_hook only dispatches whitelisted
+    # addresses to the mode hook, and the stalk is now a controls_allowed
+    # latch source (LKA engagement below DCC's 30 km/h floor).
     rx_check_msgs = [
       self._engine_brake_msg(brake_pressed=False),    # 0xA8 - 100Hz
       self._acc_pedal_msg(gas_pressed=False),         # 0xAA - 100Hz
@@ -159,6 +161,7 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
       self._transmission_msg(8),                      # 0x1D2 - 5Hz (Drive position)
       self._dynamic_cruise_msg(engaged=False),        # 0x193 - 5Hz (Default: disabled, enable per-test as needed)
       self._stepper_status_msg(0, soft_off=False),    # 0x22F - 100Hz
+      self._cruise_stalk_msg(bus=BMW_F_CAN),          # 0x194 - 5Hz (idle, no buttons)
     ]
 
     # Send all messages to satisfy RX_CHECKS
@@ -551,9 +554,15 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
     data[2] = int(torque) & 0xFF  # Raw torque as int8 (BMW RX hook: int8_t torque_meas_new = to_push->data[2])
     return libsafety_py.make_CANPacket(0x22F, BMW_F_CAN, bytes(data))
 
-  def _cruise_stalk_msg(self, cancel=False, bus=BMW_PT_CAN):
-    """Generate BMW_CruiseControlStalk message (0x194) using DBC"""
-    values = {"cancel": cancel, "setMe_0xFC": 0xFC}
+  def _cruise_stalk_msg(self, cancel=False, bus=BMW_PT_CAN, plus1=False, plus5=False,
+                        minus1=False, minus5=False, resume=False):
+    """Generate BMW_CruiseControlStalk message (0x194) using DBC.
+
+    plus1/plus5/minus1/minus5 are the speed-set presses openpilot engages on
+    (update_button_enable -> accelCruise/decelCruise). resume is deliberately
+    NOT an engage gesture on this car — see test_stalk_resume_does_not_latch."""
+    values = {"cancel": cancel, "setMe_0xFC": 0xFC, "plus1": plus1, "plus5": plus5,
+              "minus1": minus1, "minus5": minus5, "resume": resume}
     return self.packer.make_can_msg_panda("CruiseControlStalk", bus, values)
 
   def _stepper_command_msg(self, torque, steer_req=1):
@@ -689,6 +698,69 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
     self.safety.safety_rx_hook(self._brake_msg(1))
     self.assertTrue(self.safety.get_controls_allowed(),
                     "brake means drop-to-LKA (openpilot side), not kill steering")
+
+  # ---- LKA engagement below DCC's minimum speed (user ruling 2026-08-20) ----
+  # DCC cannot engage below 30 km/h, so the DCC-status rising edge that latches
+  # controls_allowed never happens down there. Without a second latch source
+  # the driver gets the LKA badge and NO steering at all.
+  #
+  # openpilot engages on the stalk (pcmCruise=False -> update_button_enable
+  # latches on the accelCruise/decelCruise RELEASE edge), so panda latches on
+  # the SAME driver action. Keep the two in sync if either side changes.
+  #
+  # Our own stalk emulation cannot self-authorize: panda never receives its own
+  # transmissions. Measured on route 414 seg 3 — RX 0x194 holds the SZL's
+  # 5.2/s idle while we burst 10.2/s on the same address and the same bus.
+
+  def test_stalk_set_latches_controls_from_cold(self):
+    """No DCC engagement, ever: a speed-set press must allow controls."""
+    for sig in ("plus1", "plus5", "minus1", "minus5"):
+      with self.subTest(sig=sig):
+        self.safety.set_controls_allowed(0)
+        self._send_all_bmw_rx_checks()
+        self.assertFalse(self.safety.get_controls_allowed())
+        self.safety.safety_rx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN, **{sig: True}))
+        self.assertTrue(self.safety.get_controls_allowed(), f"{sig} must latch controls")
+
+  def test_stalk_resume_does_not_latch(self):
+    """Option A (user ruling 2026-08-20): resume is NOT an engage gesture.
+    update_button_enable ignores resumeCruise, and resume is already overloaded
+    three ways on this car (long press = gap adjust, short press while engaged =
+    speed-limit confirm, short press while not engaged = resumeCruise)."""
+    self.safety.set_controls_allowed(0)
+    self._send_all_bmw_rx_checks()
+    self.safety.safety_rx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN, resume=True))
+    self.assertFalse(self.safety.get_controls_allowed(), "resume must not latch")
+
+  def test_stalk_cancel_does_not_latch(self):
+    """Cancel is a disengage gesture; it must never grant authority."""
+    self.safety.set_controls_allowed(0)
+    self._send_all_bmw_rx_checks()
+    self.safety.safety_rx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN, cancel=True))
+    self.assertFalse(self.safety.get_controls_allowed(), "cancel must not latch")
+
+  def test_stalk_latch_is_rising_edge_only(self):
+    """A HELD stalk must not re-latch after a heartbeat-mismatch disengage —
+    otherwise a stuck or held switch would keep re-authorising every 200 ms."""
+    self.safety.set_controls_allowed(0)
+    self._send_all_bmw_rx_checks()
+    self.safety.safety_rx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN, plus1=True))
+    self.assertTrue(self.safety.get_controls_allowed())
+
+    self.safety.set_controls_allowed(0)          # e.g. heartbeat mismatch
+    self.safety.safety_rx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN, plus1=True))
+    self.assertFalse(self.safety.get_controls_allowed(), "held stalk must not re-latch")
+
+    self.safety.safety_rx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN))  # release
+    self.safety.safety_rx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN, plus1=True))
+    self.assertTrue(self.safety.get_controls_allowed(), "a fresh press must latch")
+
+  def test_dcc_latch_still_works_alongside_the_stalk(self):
+    """The original DCC-status latch is unchanged by the new source."""
+    self.safety.set_controls_allowed(0)
+    self._send_all_bmw_rx_checks()
+    self.safety.safety_rx_hook(self._dynamic_cruise_msg(engaged=True))
+    self.assertTrue(self.safety.get_controls_allowed())
 
 
 if __name__ == "__main__":

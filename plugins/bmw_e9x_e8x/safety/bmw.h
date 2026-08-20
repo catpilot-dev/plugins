@@ -46,6 +46,8 @@
 #define CAN_ACTUATOR_TQ_FAC 0.125
 
 static float bmw_speed = 0.0f;
+// Rising-edge tracker for the driver's speed-set stalk (see bmw_rx_hook).
+static bool bmw_stalk_set_prev = false;
 
 
 static void bmw_rx_hook(const CANPacket_t *msg) {
@@ -73,6 +75,34 @@ static void bmw_rx_hook(const CANPacket_t *msg) {
       controls_allowed = true;
     }
     cruise_engaged_prev = cruise_engaged;
+  } else if ((addr == BMW_CruiseControlStalk) &&
+             ((bus == (int)BMW_F_CAN) || (bus == (int)BMW_PT_CAN))) {
+    // Second latch source: the driver's speed-set stalk (user ruling
+    // 2026-08-20). DCC cannot engage below 30 km/h, so the DCC-status rising
+    // edge above never happens down there — without this, LKA below 30 gets
+    // the badge and NO steering, because lateral.h blocks every nonzero
+    // torque while !controls_allowed.
+    //
+    // Mask 0x0F = plus1|plus5|minus1|minus5, byte 2 (DBC CruiseControlStalk
+    // bits 16..19). That is EXACTLY the set openpilot engages on:
+    // pcmCruise=False, so update_button_enable() latches on the
+    // accelCruise/decelCruise release edge. resume (0x40) and cancel (0x10)
+    // are excluded — resume is not an engage gesture here and is already
+    // overloaded three ways. Keep this mask and update_button_enable in sync.
+    //
+    // Our own stalk emulation cannot self-authorize through this branch:
+    // panda never receives its own transmissions (bxCAN does not self-receive;
+    // safety_rx_hook is called only from the RX-FIFO handler). Measured on
+    // route 414 seg 3 — RX 0x194 holds the SZL's 5.2/s idle while we burst
+    // 10.2/s on the same address and the same bus.
+    //
+    // Rising edge only: a held or stuck switch must not re-authorise every
+    // frame after a heartbeat-mismatch disengage.
+    bool stalk_set = ((msg->data[2] & 0x0FU) != 0U);
+    if (stalk_set && !bmw_stalk_set_prev) {
+      controls_allowed = true;
+    }
+    bmw_stalk_set_prev = stalk_set;
   }
 
   // BMW TransmissionDataDisplay not needed for safety
@@ -198,6 +228,11 @@ static safety_config bmw_init(uint16_t param) {
              {BMW_CruiseControlStatus, BMW_PT_CAN, 8, .frequency = 5U,
               .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
              { 0 }}},
+    {.msg = {{BMW_CruiseControlStalk, BMW_F_CAN, 4, .frequency = 5U,
+              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
+             {BMW_CruiseControlStalk, BMW_PT_CAN, 4, .frequency = 5U,
+              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
+             { 0 }}},
     {.msg = {{STEPPER_STEERING_STATUS,  BMW_F_CAN, 8, .ignore_counter = true, .frequency = 100U,
               .ignore_quality_flag = true, .ignore_checksum = true},
              {STEPPER_STEERING_STATUS,  BMW_AUX_CAN, 8, .ignore_counter = true, .frequency = 100U,
@@ -217,6 +252,7 @@ static safety_config bmw_init(uint16_t param) {
 
   bmw_speed = 0.0f;
   cruise_engaged_prev = false;
+  bmw_stalk_set_prev = false;
 
   safety_config ret = BUILD_SAFETY_CFG(bmw_rx_checks, BMW_TX_MSGS);
   ret.disable_forwarding = true;
