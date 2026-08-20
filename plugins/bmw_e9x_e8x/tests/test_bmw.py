@@ -311,3 +311,79 @@ class TestSteerFaultDebounce:
     """7 on, 1 off, 7 on should not trigger."""
     results = self._simulate([True] * 7 + [False] + [True] * 7)
     assert results[-1] == (7, False)
+
+
+# ============================================================
+# Engagement (update_button_enable)
+# ============================================================
+
+class TestButtonEnable:
+  """How openpilot engages on this car.
+
+  Despite the name, update_button_enable() IGNORED its buttonEvents argument
+  and fired purely on the DCC ENGAGEMENT rising edge — which is why every
+  gesture that brings DCC up (plus, minus, AND resume) engages openpilot.
+
+  Below DCC's 30 km/h floor that edge never arrives, so openpilot could not
+  engage at all down there. User ruling 2026-08-20: below minEnableSpeed the
+  stalk itself is the engage control, matching the panda's stalk latch
+  (bmw.h mask 0x0F — plus/minus only, resume excluded).
+  """
+
+  MIN_ENABLE = 30 / 3.6
+
+  @pytest.fixture(autouse=True)
+  def _cereal_mocks(self, monkeypatch):
+    """bmw.carstate imports cereal.messaging at module scope."""
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _call(self, events=(), *, dcc_now=False, dcc_prev=False, v_ego=0.0):
+    from bmw.carstate import should_button_enable
+    return should_button_enable(list(events), dcc_engaged=dcc_now,
+                                dcc_engaged_prev=dcc_prev, v_ego=v_ego,
+                                min_enable_speed=self.MIN_ENABLE)
+
+  def _btn(self, btype, pressed):
+    from types import SimpleNamespace
+    return SimpleNamespace(type=btype, pressed=pressed)
+
+  def _stalk(self, pressed=False, kind='accelCruise'):
+    import bmw.carstate as cs
+    return [self._btn(getattr(cs.ButtonType, kind), pressed)]
+
+  # --- existing behaviour: DCC drives engagement -------------------------
+  def test_dcc_rising_edge_engages(self):
+    assert self._call(dcc_now=True, dcc_prev=False, v_ego=15.0) is True
+
+  def test_dcc_steady_does_not_engage(self):
+    assert self._call(dcc_now=True, dcc_prev=True, v_ego=15.0) is False
+
+  def test_dcc_off_at_speed_does_not_engage(self):
+    """Above minEnableSpeed the stalk is NOT an engage source — DCC will come
+    up on its own and its rising edge handles it."""
+    assert self._call(self._stalk(), v_ego=15.0) is False
+
+  # --- new: stalk engages LKA below DCC's floor --------------------------
+  def test_stalk_release_engages_below_min_speed(self):
+    for kind in ('accelCruise', 'decelCruise'):
+      assert self._call(self._stalk(kind=kind), v_ego=5.5) is True, kind
+
+  def test_stalk_press_does_not_engage(self):
+    """Release edge only — mirrors opendbc's own enable convention."""
+    assert self._call(self._stalk(pressed=True), v_ego=5.5) is False
+
+  def test_resume_does_not_engage_below_min_speed(self):
+    """Ruling A: resume stays out of the engage set, matching the panda mask."""
+    assert self._call(self._stalk(kind='resumeCruise'), v_ego=5.5) is False
+
+  def test_cancel_does_not_engage(self):
+    assert self._call(self._stalk(kind='cancel'), v_ego=5.5) is False
+
+  def test_no_stalk_events_does_not_engage(self):
+    assert self._call(v_ego=5.5) is False
+
+  def test_stalk_ignored_below_min_speed_while_dcc_already_on(self):
+    """Setpoint adjustment with DCC somehow live below the floor is not an
+    engage request."""
+    assert self._call(self._stalk(), dcc_now=True, dcc_prev=True, v_ego=5.5) is False

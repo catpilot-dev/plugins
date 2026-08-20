@@ -28,6 +28,41 @@ def toggle_speed_limit_confirm():
     pass
 
 
+def should_button_enable(buttonEvents, *, dcc_engaged, dcc_engaged_prev,
+                        v_ego, min_enable_speed):
+  """Should openpilot engage this frame?  (CarStateBase.update_button_enable)
+
+  Two sources, because this car has two engagement regimes:
+
+  1. DCC rising edge — the normal path. Despite the base method's name this
+     never looked at buttonEvents: openpilot follows DCC in, so ANY gesture
+     that brings DCC up (plus, minus, and resume) engages openpilot.
+
+  2. The stalk itself, but only below minEnableSpeed. DCC cannot engage under
+     30 km/h, so source 1 never fires down there and openpilot could not
+     engage at all — no LKA, at any speed the driver would actually want it
+     for. The release edge of accelCruise/decelCruise is the engage gesture,
+     matching the panda's stalk latch (bmw.h, mask 0x0F). resume is excluded
+     on both sides (user ruling 2026-08-20): it is not an engage gesture here
+     and is already overloaded three ways (long press = gapAdjustCruise, short
+     press while DCC engaged = speed-limit confirm, short press otherwise =
+     resumeCruise).
+
+  Source 2 is gated on v_ego AND on DCC being off, so a setpoint adjustment
+  never reads as an engage request. Kept as a free function so it is testable
+  without constructing a CarState (CarStateBase is mocked in the plugin suite).
+  """
+  if dcc_engaged and not dcc_engaged_prev:
+    return True
+
+  if not dcc_engaged and v_ego < min_enable_speed:
+    for b in buttonEvents:
+      if b.type in (ButtonType.accelCruise, ButtonType.decelCruise) and not b.pressed:
+        return True
+
+  return False
+
+
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
@@ -244,9 +279,11 @@ class CarState(CarStateBase):
     return ret
 
   def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
-    if self.cruise_state_enabled and not self.out.cruiseState.enabled:
-      return True
-    return False
+    return should_button_enable(buttonEvents,
+                                dcc_engaged=self.cruise_state_enabled,
+                                dcc_engaged_prev=self.out.cruiseState.enabled,
+                                v_ego=self.out.vEgo,
+                                min_enable_speed=self.CP.minEnableSpeed)
 
   @staticmethod
   def _load_steer_angle_offset():
