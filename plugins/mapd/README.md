@@ -1,10 +1,23 @@
 # Mapd — OpenStreetMap Data
 
-**Status: enabled — mapd is the sole provider of OSM road context.**
+**Status: active (v2.3.1), Phase 1 — telemetry only.**
 
-speedlimitd consumes the `mapdOut` message; it no longer reads map tiles
-itself. Tiles are downloaded by COD's web UI into `/data/media/0/osm/offline/`,
-which is exactly where mapd reads them.
+mapd runs and publishes `mapdOut`, but it does **not** drive control yet.
+speedlimitd still derives every control decision from the offline tile reader
+(`osm_query.OsmTileReader`); it consumes `mapdOut` through
+`mapd_source.telemetry_from_mapd` purely as observation, logged into
+`speedLimitState` for comparison against the tile reader. Actuation is
+byte-identical with mapd running or absent, and a missing `mapdOut` service
+degrades to vision-only rather than failing.
+
+Tiles are downloaded by COD's web UI into `/data/media/0/osm/offline/`, which is
+exactly where mapd reads them.
+
+**Phase 2 — cutting control over to mapd (`mapd_source.result_from_mapd`, then
+deleting `osm_query.py`, `osm_reader.capnp`, `generate_hw_tiles.py` and the
+margin-release machinery) — is NOT started.** It is gated on a Phase 1 drive that
+has never happened: `mapdRefAgree` rate, mapd uptime, S20 coverage delta and
+selType distribution are all still unmeasured.
 
 ## What it's for
 
@@ -36,12 +49,12 @@ binaries are kept in `/data/media/0/osm/mapd_backups/`.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| MapdVersion | string | v2.3.0 | Version tracked/pinned by `mapd_manager.py` |
+| MapdVersion | string | v2.3.1 | Version tracked/pinned by `mapd_manager.py` |
 
-The v2.3.0 pin is deliberate, for two independent reasons.
+The v2.3.1 pin is deliberate, for two independent reasons.
 
 **Schema coupling.** Cap'n Proto is additive, so a newer binary publishing into
-our `cereal/slot19.capnp` silently drops any field we have not declared —
+our `cereal/slot17-19.capnp` silently drops any field we have not declared —
 `highwayClass` would read as `unknown` and speedlimitd would mis-classify every
 road, with no error anywhere. Bumping the pin requires diffing mapd's
 `cereal/custom/custom.capnp` against our slot files first.
@@ -65,47 +78,50 @@ itself, and plugind respawns it with speedlimitd degrading to vision-only
 meanwhile. Do not set any of them slotted without re-auditing the slot
 budget of that queue AND fixing the slot leak upstream.
 
-## DORMANT — binary inactive, interface warm (2026-08-19)
+## Re-activated 2026-08-21 (v2.3.1)
 
-`plugin.json` declares **no process**, so the Go binary never launches. Nothing
-in the control path notices: speedlimitd has always driven control from the
-offline tile reader (`osm_query.OsmTileReader`, "replaces mapd Go binary for
-real-time queries"), and `mapdOut` fed only Phase-1 observation telemetry
-(`mapd_source.telemetry_from_mapd`), which already has a `(None, False)` path
-for an absent service (`speedlimitd.py:1285`). OSM road context therefore comes
-straight from the tiles in `/data/media/0/osm/offline{,_hw}`.
+Dormant from 2026-08-19 to 2026-08-21. mapd v2.3.0 shipped gomsgq **v0.1.10**, whose
+ungated `panic("Invalid Msgq message size")` killed the process on a shadow reader's
+*expected* torn read — measured as a restart every 1-2 min while parked. Worse, a Go
+panic exits without deregistering, so each respawn leaked a reader slot, and once a
+queue passed `NUM_READERS=15` gomsgq zeroed the whole reader table and **killed
+loggerd** (route 410 seg 4, truncated rlog). The plugin stayed installed and
+`.enforced` throughout, declaring no process, because `.disabled` would have reverted
+slots 17-19 to the `CustomReservedN` stub and dropped the `mapdOut` service — tearing
+down the very interface we were keeping warm.
 
-The plugin stays **installed and enforced**, NOT `.disabled` — `.disabled` makes
-`custom_capnp.py` revert slots 17–19 to the `CustomReservedN` stub and
-`services.py` drop `mapdOut`, which would tear down the very interface we are
-keeping warm. Slots, service, schemas, `mapd_source.py` and the binary on disk
-all stay exactly as they are.
+**v2.3.1 (2026-08-21) pins gomsgq v0.1.11** (mapd `497a4f4`, merge `fe45d10`,
+PR #133): the panic is gated to non-shadow readers and shadow readers get
+`ShadowValid()`, which turns a torn read into a re-sync. The `processes` entry is
+restored and the pin bumped.
 
-**Why dormant:** mapd v2.3.0 ships gomsgq v0.1.10, whose
-`panic("Invalid Msgq message size")` is ungated — a shadow reader's *expected*
-torn read kills the process (measured 2026-08-18: a restart every 1–2 min while
-parked). Upstream fixed it in gomsgq v0.1.11 (mapd commit `fe45d10`, PR #133):
-the panic is now gated to non-shadow readers and shadow readers get
-`ShadowValid()`, turning a torn read into a re-sync. That commit is on mapd
-`main` but **not in any release** (latest is v2.3.0, Aug 12).
+**Every `subscriber` entry stays `shadow: true`.** v0.1.11 fixed the panic, not the
+leak — readers still only `Reset()`, with no deregistration, so a slotted reader
+still leaks a slot per death. Upstream's own defaults leave four of the five queues
+slotted, which is exactly why we override all five. Going slotted would additionally
+need a per-queue budget audit: measured 2026-08-18 offroad, `selfdriveState` was
+already **15/15 full**, modelV2 13/15, gpsLocation 9/15, carState 4/15.
 
-**Re-activation, when pfeiferj cuts the release:**
-1. Restore the process entry in `plugin.json`:
-   `"processes": [{"name": "mapd", "module": "mapd_runner", "condition": "always_run"}]`
-2. Bump `MAX_ALLOWED_VERSION` in `mapd_manager.py` to the new tag.
-3. Keep every `subscriber` entry in `mapd_defaults.json` on `shadow: true` —
-   v0.1.11 still has **no deregistration** (readers only `Reset()`), so slotted
-   readers still leak a slot per death. Slotted mode additionally needs a
-   per-queue budget audit: measured 2026-08-18 (offroad) `selfdriveState` was
-   already **15/15 full**, modelV2 13/15, gpsLocation 9/15, carState 4/15.
-4. Success criterion: one long-lived mapd PID across a whole drive (versus the
-   1–2 min flap baseline above).
+**Schema delta adopted with the pin.** v2.3.1 added `loopRateAverage @4` and
+`loopRateMin @5` to `MapdExtendedOut`; both are declared in `cereal/slot17.capnp`.
+`MapdIn` and `MapdOut` were unchanged. v2.3.1 also moved publishing to its own
+thread for a constant 20 Hz rate (we measured 19.7 Hz on v2.3.0) and made large
+main-loop performance improvements — `loopRateMin` is the field that shows whether
+those hold up on a C3.
 
-Nothing to do for the health hook: `hook.py` reads this manifest, so it reports
-`status: ok, dormant: true` while no process is declared and re-arms the
-"mapd process not running" warning the moment step 1 restores the entry. That
-indirection exists so a permanently-expected warning never desensitises the
-reader to a real post-re-activation failure.
+**Success criterion, still unverified on the road:** one long-lived mapd PID across a
+whole drive, versus the 1-2 min flap baseline. The Phase 1 telemetry drive
+(`mapdRefAgree`, mapd uptime, S20 coverage delta, selType distribution) has never
+happened — mapd went dormant before it could.
+
+`hook.py` needs no edit either way: it reads this manifest, so it reported
+`status: ok, dormant: true` while no process was declared and re-armed the
+"mapd process not running" warning the moment the entry came back. That indirection
+exists so a permanently-expected warning never desensitises the reader to a real
+failure.
+
+An upstream release is watched automatically — see `.github/scripts/mapd_watch.py`,
+which files a GitHub Issue with the schema and crash-fix verdicts precomputed.
 
 ## Settings
 
@@ -114,7 +130,7 @@ what mapd is allowed to do — nothing: every control feature off, shadow
 carState on. `mapd_runner.py` writes it to the **MapdSettings param** on every
 start, which survives openpilot wiping `/data/params/d/` on boot.
 
-Do NOT place a `/data/openpilot/mapd_defaults.json` — on mapd v2.3.0 the
+Do NOT place a `/data/openpilot/mapd_defaults.json` — on mapd v2.3.0/v2.3.1 the
 custom-defaults file path panics at startup regardless of content
 (`settings.go` `Default()` parses with gabs, so JSON numbers arrive as
 float64, but the version check and migration cast expect uint64; version

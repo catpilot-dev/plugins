@@ -53,15 +53,20 @@ class TestService:
 
 
 class TestProcess:
-  def test_no_process_declared_binary_is_dormant(self):
-    """mapd is interface-only (2026-08-19): no process, so the binary never runs.
+  def test_exactly_one_process_declared_binary_is_active(self):
+    """mapd is ACTIVE again: it declares its process, so the binary runs.
 
-    speedlimitd's control path is osm_query.OsmTileReader; mapdOut was Phase-1
-    observation telemetry only. Dormant until a release ships gomsgq v0.1.11
-    (mapd fe45d10) — re-activation restores a {'name': 'mapd', 'module':
-    'mapd_runner'} entry here.
+    This is the same tripwire as before, inverted. It read `processes == []`
+    while mapd was dormant on gomsgq v0.1.10's shadow-reader panic; v2.3.1
+    carries the fix (mapd fe45d10), so the entry is back. Deactivating mapd
+    must stay a deliberate edit to this assertion, never a silent drift — and
+    a SECOND process entry is just as much a surprise as zero.
     """
-    assert _manifest()['processes'] == []
+    procs = _manifest()['processes']
+    assert len(procs) == 1
+    assert procs[0]['name'] == 'mapd'
+    assert procs[0]['module'] == 'mapd_runner'
+    assert procs[0]['condition'] == 'always_run'
 
   def test_interface_survives_the_dormant_binary(self):
     """The cereal slots and mapdOut service MUST stay declared while dormant.
@@ -83,15 +88,33 @@ class TestHooks:
 
 
 class TestVersionPin:
-  def test_manifest_default_is_v230(self):
-    assert _manifest()['params']['MapdVersion']['default'] == 'v2.3.0'
+  """The pin is v2.3.1, and it is stated in two files that must never drift.
 
-  def test_manager_max_allowed_is_v230(self):
+  MapdVersion is what mapd_manager downloads; MAX_ALLOWED_VERSION is the
+  ceiling it refuses to exceed. A default ABOVE the ceiling installs nothing at
+  all; a default BELOW it silently runs an older binary than the slot schemas
+  were diffed against — which is the exact class of failure the slot files are
+  there to prevent. Both are asserted literally AND against each other, so
+  bumping one alone fails here rather than on the car.
+  """
+
+  @staticmethod
+  def _max_allowed_version():
     with open(os.path.join(PLUGIN_DIR, 'mapd_manager.py')) as f:
       src = f.read()
     match = re.search(r'^MAX_ALLOWED_VERSION\s*=\s*"([^"]+)"', src, re.M)
     assert match is not None
-    assert match.group(1) == 'v2.3.0'
+    return match.group(1)
+
+  def test_manifest_default_is_the_active_pin(self):
+    assert _manifest()['params']['MapdVersion']['default'] == 'v2.3.1'
+
+  def test_manager_max_allowed_is_the_active_pin(self):
+    assert self._max_allowed_version() == 'v2.3.1'
+
+  def test_pin_and_manifest_default_never_drift(self):
+    assert self._max_allowed_version() == \
+        _manifest()['params']['MapdVersion']['default']
 
 
 class TestDefaults:

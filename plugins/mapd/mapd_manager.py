@@ -27,7 +27,7 @@ GITHUB_API_URL = "https://api.github.com/repos/pfeiferj/mapd/releases/latest"
 # would read as 'unknown' and speedlimitd would mis-classify every road with no
 # error anywhere. Check mapd's cereal/custom/custom.capnp MapdOut against
 # cereal/slot19.capnp before changing this.
-MAX_ALLOWED_VERSION = "v2.3.0"
+MAX_ALLOWED_VERSION = "v2.3.1"
 
 def _version_tuple(v):
   """'v2.10.0' -> (2, 10, 0), for ORDERING comparisons.
