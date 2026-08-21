@@ -822,6 +822,123 @@ class TestUnwindStepBoost:
     assert got == pytest.approx(-0.05 - 0.10, abs=1e-6), got
 
 
+def _kappa_for_delta_err(kappa_des, delta_err, L=2.66):
+  """κ_meas that makes δ_err come out exactly `delta_err`.
+
+  δ_err = atan(κ_des·L) − atan(κ_meas·L), so invert the second atan. Solving
+  it rather than approximating κ_des − δ_err/L matters here: the band is
+  1.2·HOLD_BAND = 0.0012 rad wide and at the intersection operating point
+  (κ ≈ 0.1) the atan is well off its linear region.
+  """
+  return math.tan(math.atan(kappa_des * L) - delta_err) / L
+
+
+def _cancel_tol_tick(monkeypatch, *, v, torque, delta_err, kappa_des=0.10,
+                     tick_count=2):
+  """One tick arranged to land in cancel_tol, with the cadence part-spent.
+
+  Mirrors the measured route-418 seg-4 exit: a converged push ramp
+  (target_frac == torque) still in flight when δ_err transits the on-target
+  band. lat_delay=0.6 → model_action_t 0.65 → cadence 6 livePose ticks, the
+  production value, so a part-spent tick_count=2 cannot reach the cadence
+  inside the tick and the counter itself stays observable.
+  """
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _set_measured(sm, v, _kappa_for_delta_err(kappa_des, delta_err))
+  state['torque'] = torque
+  state['target_frac'] = torque      # converged — the retarget is a no-op
+  state['ramp_frames'] = 8           # a ramp still in flight
+  state['action'] = 'ramp'
+  state['tick_count'] = tick_count
+  _call_update(lac, kappa_des, v_ego=v, lat_delay=0.6)
+  return state, mod
+
+
+class TestCancelTolCadenceOnReversal:
+  """Route 418 (2026-08-22), what was left of the intersection-exit fight.
+
+  With the relax-dwell freeze gone and the unwind step boosted, the seg-4
+  exit still took 560 ms to shed 3.12 Nm while the wheel came back at up to
+  228 deg/s. The telemetry shows where it went: hold_f was 1.0, so cancel_tol's
+  retarget (held = hold_f·torque) equalled the standing torque exactly and
+  re-armed nothing — its ONLY effect was `tick_count = 0`. ramp_frames then ran
+  out, the action fell to `idle`, and torque sat frozen at 0.2598 frac for five
+  ticks until the cadence came round again. 250 ms of the 560 was pure
+  rescheduling.
+
+  cancel_tol cannot tell ARRIVAL from TRANSIT. It fires on |δ_err| ≤
+  1.2·HOLD_BAND whichever way the error is travelling. On arrival, restarting
+  the cadence is right: the error is settling and an immediate re-decision
+  would only re-push. On transit — δ_err crossing zero on its way out the far
+  side, which is what a driver hauling the wheel back looks like — restarting
+  it is exactly wrong, and buys a full extra cadence of stale standing torque.
+
+  Transit is readable without new state: δ_err and the standing torque on
+  opposite sides means the next P target opposes what we hold, i.e. the next
+  decision sheds (target_nm ∝ δ_err). So on reversal the cadence is left to
+  run and the decision lands on its original schedule.
+
+  Kept narrow, per the LKA-only ruling that shaped the dwell gate:
+    - below LKA_MAX_V only, the same regime conjunct the unwind boost uses;
+    - only past UNWIND_CADENCE_TQ of standing torque. Below one step_max
+      there is nothing to gain — the next decision can shed it whole in a
+      single step whenever it lands — and holding the reset there keeps
+      straight-line band hygiene, and its settling behaviour, untouched.
+  """
+
+  V_LKA = 4.0        # 14 km/h, an intersection
+  TORQUE = 0.26      # the measured seg-4 exit hold (3.1 Nm)
+  DERR = 0.0005      # inside 1.2·HOLD_BAND (0.0012 rad) either way
+
+  def test_reversal_below_30kph_keeps_the_cadence_running(self, monkeypatch):
+    """δ_err has crossed to the far side of the standing torque: the next
+    decision would shed, so it must not be pushed a cadence out."""
+    state, _ = _cancel_tol_tick(monkeypatch, v=self.V_LKA, torque=self.TORQUE,
+                                delta_err=-self.DERR)
+    assert state['action'] == 'cancel_tol'
+    assert state['tick_count'] == 3        # 2 + 1, cadence preserved
+
+  def test_arrival_below_30kph_still_restarts_the_cadence(self, monkeypatch):
+    """Same band, same speed, error still on the torque's own side — an
+    ordinary arrival. Settling behaviour is unchanged."""
+    state, _ = _cancel_tol_tick(monkeypatch, v=self.V_LKA, torque=self.TORQUE,
+                                delta_err=self.DERR)
+    assert state['action'] == 'cancel_tol'
+    assert state['tick_count'] == 0
+
+  def test_reversal_at_30kph_still_restarts_the_cadence(self, monkeypatch):
+    """Boundary: at LKA_MAX_V and above, nothing changes."""
+    import bmw.latcontroller as mod
+    state, _ = _cancel_tol_tick(monkeypatch, v=mod.LKA_MAX_V, torque=self.TORQUE,
+                                delta_err=-self.DERR)
+    assert state['action'] == 'cancel_tol'
+    assert state['tick_count'] == 0
+
+  def test_reversal_at_speed_still_restarts_the_cadence(self, monkeypatch):
+    state, _ = _cancel_tol_tick(monkeypatch, v=20.0, torque=self.TORQUE,
+                                delta_err=-self.DERR)
+    assert state['action'] == 'cancel_tol'
+    assert state['tick_count'] == 0
+
+  def test_reversal_below_the_torque_gate_still_restarts_the_cadence(self, monkeypatch):
+    """Straight-line band hygiene: too little standing torque to be worth
+    rescheduling for."""
+    import bmw.latcontroller as mod
+    state, _ = _cancel_tol_tick(monkeypatch, v=self.V_LKA,
+                                torque=mod.UNWIND_CADENCE_TQ * 0.5,
+                                delta_err=-self.DERR)
+    assert state['action'] == 'cancel_tol'
+    assert state['tick_count'] == 0
+
+  def test_cancel_tol_primary_job_is_untouched_on_reversal(self, monkeypatch):
+    """The cadence change must not disturb what cancel_tol is FOR. With
+    hold_f = 1 the retarget is a no-op, exactly as measured on seg 4 — the
+    standing command is left alone, not dumped."""
+    state, _ = _cancel_tol_tick(monkeypatch, v=self.V_LKA, torque=self.TORQUE,
+                                delta_err=-self.DERR)
+    assert state['target_frac'] == pytest.approx(self.TORQUE)
+
+
 class TestStepMaxSpeedSchedule:
   """`step_max = interp(vEgo, STEP_MAX_V=[15, 28], STEP_MAX_BP=[0.10, 0.05])`.
 

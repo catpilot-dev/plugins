@@ -197,6 +197,12 @@ V_GAIN_FLOOR = 2.778       # m/s (10 km/h), was 8.5 (30 km/h) -- user ruling
 # the wheel. See deep_relax and the unwind step boost.
 LKA_MAX_V = 8.5            # m/s (30 km/h)
 UNWIND_STEP_GAIN = 3.0     # step-cap multiplier while shedding torque in LKA
+UNWIND_CADENCE_TQ = 0.10   # frac (1.2 Nm): standing torque past which a
+                           # cancel_tol on a REVERSING error leaves the cadence
+                           # running instead of restarting it. One base
+                           # step_max — below it the next decision sheds the
+                           # lot in a single step whenever it lands, so
+                           # rescheduling buys nothing. See the cancel_tol block.
 
 
 def gain_reference_speed(v_true):
@@ -1101,7 +1107,37 @@ def on_lat_controller_init(result, lac, CP):
           state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
           state['ramp_frames'] = spread_frames
         state['action'] = 'cancel_tol'
-        state['tick_count'] = 0
+        # Cadence: restart it on ARRIVAL, leave it running on TRANSIT.
+        #
+        # Route 418 seg 4 (2026-08-22). cancel_tol fires on |δ_err| ≤
+        # 1.2·HOLD_BAND whichever way the error is travelling, and restarting
+        # the cadence assumes the error is settling. When it is instead
+        # crossing the band on its way out the far side — a driver hauling the
+        # wheel back through centre — the restart costs a whole extra cadence
+        # of stale standing torque. Measured: hold_f was 1.0 so the retarget
+        # above equalled the standing 0.2598 frac and re-armed nothing; the
+        # reset was cancel_tol's ONLY effect, ramp_frames ran out, the action
+        # fell to idle, and 3.1 Nm sat frozen for five ticks while the wheel
+        # came back at up to 228 deg/s. 250 ms of a 560 ms shed was rescheduling.
+        #
+        # Transit needs no new state to read: target_nm ∝ δ_err, so δ_err on
+        # the opposite side from the standing torque means the next P target
+        # opposes what we hold — the next decision sheds. Leaving the counter
+        # to run lands that decision on its ORIGINAL schedule; it does not
+        # force an out-of-cadence one, so decision bandwidth is unchanged.
+        #
+        # Narrow, on the same terms as the dwell gate and the unwind boost
+        # (user ruling: LKA at intersections only, normal HOLD untouched):
+        # below LKA_MAX_V, and only past UNWIND_CADENCE_TQ of standing torque.
+        # Under one step_max there is nothing to gain — whenever the decision
+        # lands it can shed the lot in one step — so straight-line band
+        # hygiene, and its settling behaviour, keep the restart.
+        _shed_next = delta_err * state['torque'] < 0.0
+        if (v_true < LKA_MAX_V and _shed_next
+            and abs(state['torque']) > UNWIND_CADENCE_TQ):
+          state['tick_count'] += 1
+        else:
+          state['tick_count'] = 0
       else:
         state['tick_count'] += 1
         # Expire transient action labels once their ramp completes (parked
