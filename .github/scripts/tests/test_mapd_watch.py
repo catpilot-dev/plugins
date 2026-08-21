@@ -503,6 +503,16 @@ class TestSchemaSection:
 
 
 class TestCommitSection:
+  """The gate is RETIRED (`REQUIRED_COMMIT = \'\'`) now that we are pinned to a
+  release carrying the gomsgq fix, so these tests arm it explicitly. They stay
+  because the mechanism is re-armable: the next upstream fix that blocks us the
+  same way sets the constant again, and this is the coverage proving it works.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _armed(self, monkeypatch):
+    monkeypatch.setattr(mw, 'REQUIRED_COMMIT', 'fe45d10')
+
   @pytest.mark.parametrize('status', ['ahead', 'identical'])
   def test_ahead_or_identical_means_the_fix_is_in(self, status):
     section = mw.commit_section('v2.4.0', status)
@@ -517,6 +527,15 @@ class TestCommitSection:
 
   def test_unrecognised_status_asks_for_a_hand_check(self):
     assert 'by hand' in mw.commit_section('v2.4.0', 'wat')
+
+  def test_retired_gate_is_the_shipped_default(self):
+    """The autouse fixture arms the gate; the shipped constant must be empty,
+    or every issue carries a stale blocker section for a fix we already have."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('mapd_watch_fresh', mw.__file__)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert fresh.REQUIRED_COMMIT == ''
 
   def test_empty_required_commit_drops_the_section(self, monkeypatch):
     monkeypatch.setattr(mw, 'REQUIRED_COMMIT', '')

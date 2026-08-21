@@ -47,12 +47,14 @@ WATCH_REPO = 'pfeiferj/mapd'
 LABEL = 'mapd-release'
 MAINTAINER = '@OxygenLiu'
 
-# TEMPORARY, despite the constant's clothes. mapd v2.3.0 ships gomsgq v0.1.10,
-# whose ungated `panic("Invalid Msgq message size")` kills the binary on a
-# shadow reader's expected torn read; upstream fixed it in this commit
-# (PR #133, gomsgq v0.1.11), which is on main but in no release. Set this to ''
-# once mapd is re-activated and the whole section drops out of the issue body.
-REQUIRED_COMMIT = 'fe45d10'
+# A commit a release must contain before it is worth anything to us; '' disables
+# the check and drops the section from the issue body. Empty since 2026-08-21:
+# it held `fe45d10` (PR #133, gomsgq v0.1.11) while mapd was dormant over the
+# ungated `panic("Invalid Msgq message size")` that killed the binary on a
+# shadow reader's expected torn read. v2.3.1 carries that fix and we are pinned
+# to it, so every future release contains it too and the section would be noise.
+# Set it again if a future upstream fix ever gates us the same way.
+REQUIRED_COMMIT = ''
 
 # mapd's copy of the schema, and ours. We consume THREE upstream structs, one
 # per cereal slot, and a field added to any of them drops just as silently as
