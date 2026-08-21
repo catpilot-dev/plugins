@@ -148,6 +148,7 @@ OV_EOD_RATE_DPS = 40.0     # against-command rate; sustained OV_EOD_TICKS
 OV_EOD_TICKS = 10          # 100 ms
 OV_EOD_MIN_TQ = 0.05
 OV_SAT_SAFE_DEG = 10.0     # toward-center motion from beyond this = SAT-explainable, not driver
+OV_SAT_MAX_TQ = 0.25       # frac (3 Nm): above this the SAT excuse cannot hold — see the EOD block
 OV_HOLD_TQ = 0.25          # frac (3 Nm, user ruling): static friction cannot hold past the knee
 OV_HOLD_TICKS = 50         # 0.5 s
 OV_CRAWL_TQ = 0.30
@@ -814,9 +815,25 @@ def on_lat_controller_init(result, lac, CP):
         # in the clean set coincides exactly with a v2 trip).
         # SAT exclusion: fast motion TOWARD center from beyond
         # OV_SAT_SAFE_DEG is what self-aligning torque does unaided.
+        # SAT exclusion, torque-aware since 2026-08-21 (route 417 seg 2).
+        # It used to be purely geometric — any toward-center motion from
+        # beyond OV_SAT_SAFE_DEG was written off as self-aligning torque. That
+        # swallowed a real override: through the relax_dwell freeze the wheel
+        # came back from -160 deg at ~85 deg/s while we pushed 3.9 Nm INTO the
+        # turn, and EOD counted nothing.
+        #
+        # SAT returns a FREE wheel; it cannot drag one back against a
+        # supra-knee push. Measured steady SAT is 0.08-0.15 frac and scales
+        # with v², so past OV_SAT_MAX_TQ (3 Nm, the same physical scale as
+        # OV_HOLD_TQ) the motion is not self-aligning torque and the excuse
+        # no longer applies. Below it the geometric rule governs unchanged, so
+        # ordinary self-centring still never reads as a driver.
+        _sat_explains = (a * rate < 0.0
+                         and abs(a) > OV_SAT_SAFE_DEG
+                         and abs(tq) < OV_SAT_MAX_TQ)
         _eod_hit = (cmd != 0.0
                     and rate * cmd < -OV_EOD_RATE_DPS
-                    and not (a * rate < 0.0 and abs(a) > OV_SAT_SAFE_DEG)
+                    and not _sat_explains
                     and state['sb_block'] == 0)
         _ov_bump('ov_eod', _eod_hit, OV_EOD_TICKS, 1, _ov_brake)
 

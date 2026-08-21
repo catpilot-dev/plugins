@@ -1684,13 +1684,13 @@ _OV_EOD_FIRE_J = 28
 _OV_EOD_KAPPA = 0.004
 
 
-def _ov_eod_run(lac, a0, ticks, **kw):
+def _ov_eod_run(lac, a0, ticks, torque=-0.1, **kw):
   """Warm up frozen at a0, then sweep right. Yields (j, a) per moved tick."""
   for _ in range(25):
-    _ov_tick(lac, a0, torque=-0.1, kappa_des=_OV_EOD_KAPPA, **kw)
+    _ov_tick(lac, a0, torque=torque, kappa_des=_OV_EOD_KAPPA, **kw)
   for j in range(1, ticks + 1):
     a = a0 - j * _OV_EOD_STEP
-    _ov_tick(lac, a, torque=-0.1, kappa_des=_OV_EOD_KAPPA, **kw)
+    _ov_tick(lac, a, torque=torque, kappa_des=_OV_EOD_KAPPA, **kw)
     yield j, a
 
 
@@ -1869,6 +1869,30 @@ class TestOverrideObservers:
     for _, last in _ov_eod_run(lac, 30.0, 40):
       pass
     assert last > mod.OV_SAT_SAFE_DEG          # stayed excluded the whole way
+    assert state['ov_eod'] == 0
+
+  def test_eod_sat_exclusion_lifted_by_supra_sat_push(self, monkeypatch):
+    """Route 417 seg 2 (2026-08-21): through the relax_dwell freeze the wheel
+    came back from -160 deg at ~85 deg/s while we pushed 3.9 Nm INTO the turn,
+    and EOD stayed silent — the geometric SAT exclusion swallowed it.
+
+    SAT returns a FREE wheel. It cannot drag one back against a supra-knee
+    push: measured steady SAT is 0.08-0.15 frac and scales with v², so beyond
+    OV_SAT_MAX_TQ the motion cannot be self-aligning torque and the exclusion
+    must not apply. Same sweep as the pin above, only the push is larger."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    last = None
+    for _, last in _ov_eod_run(lac, 30.0, 40, torque=-0.30):
+      pass
+    assert last > mod.OV_SAT_SAFE_DEG          # still the excluded geometry
+    assert state['ov_eod'] >= 1, 'a supra-SAT push must lift the exclusion'
+
+  def test_eod_sat_exclusion_holds_just_below_the_torque_gate(self, monkeypatch):
+    """BOUNDARY PIN: at sub-SAT push the geometric exclusion still governs, so
+    ordinary self-centring never counts as a driver."""
+    lac, sm, mod, state = _ov_make(monkeypatch)
+    for _ in _ov_eod_run(lac, 30.0, 40, torque=-(mod.OV_SAT_MAX_TQ - 0.01)):
+      pass
     assert state['ov_eod'] == 0
 
   # ---- (3) HOLD ----------------------------------------------------------
