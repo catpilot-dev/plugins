@@ -665,6 +665,59 @@ class TestFrictionGatesDeleted:
     assert state['relax_ticks'] == before + 1
 
 
+
+class TestRelaxDwellLowSpeedGate:
+  """Route 417 (2026-08-21): at LKA intersection EXITS the dwell froze torque
+  at 3.9 Nm for its full 1.0 s while the driver hauled the wheel back from
+  -160 to -75 deg and delta_err grew to -0.097. The wheel's return was late
+  and had to be fought. Seg 2 09:43:53.5-54.5 is the reference case; seg 16
+  is the milder variant where kappa_des crossed zero and aborted the dwell
+  early (its only escape is a SIGN flip -- a merely decaying reference is
+  bridged for the whole second no matter how large the overshoot grows).
+
+  The dwell guards ONE failure: surrender torque mid-turn -> SAT flings the
+  freed wheel ~20 deg out of the curve -> slow step-capped rebuild. SAT scales
+  with v^2, so that hazard fades at low speed -- and on this rack stiction
+  HOLDS the angle at zero torque (the stall/breakaway story), the opposite of
+  being flung. Below 30 km/h the dwell insures against a hazard that is not
+  present, and route 417 shows it actively fighting the driver instead.
+
+  Scope is SPEED ONLY (user ruling 2026-08-21: must not affect normal HOLD).
+  The 'intersection' half is already inherent -- deep_relax needs
+  |kappa_meas| > RELAX_DWELL_KAPPA -- so this cannot leak into straight-line
+  driving, and gating on curvature as well would repeat the gain-floor
+  mistake of putting a cliff on the kappa axis. Below 30 km/h is LKA by
+  construction: DCC cannot engage there.
+  """
+
+  def _arm_attempt(self, monkeypatch, v):
+    """One tick that WOULD arm the dwell; returns the relax_ticks increment."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(sm, v, 0.012)          # deep curve, |κ_meas| > RELAX_DWELL_KAPPA
+    state['torque'] = 0.30
+    state['action'] = 'hold_curve'
+    state['tick_count'] = 0
+    before = state['relax_ticks']
+    # overshoot-side error: desired same side but smaller than measured
+    _call_update(lac, 0.008, steering_angle_deg=0.0, v_ego=v)
+    return state['relax_ticks'] - before
+
+  def test_dwell_disarmed_below_30kph(self, monkeypatch):
+    """The route 417 regime: 18 km/h intersection exit."""
+    assert self._arm_attempt(monkeypatch, 5.0) == 0
+
+  def test_dwell_disarmed_at_walking_pace(self, monkeypatch):
+    assert self._arm_attempt(monkeypatch, 2.0) == 0
+
+  def test_dwell_still_arms_at_30kph(self, monkeypatch):
+    """Boundary: the dwell's own hairpin validation was at ~9 m/s."""
+    assert self._arm_attempt(monkeypatch, 8.5) == 1
+
+  def test_dwell_still_arms_at_speed(self, monkeypatch):
+    """Normal HOLD behaviour is untouched — the whole point of the ruling."""
+    for v in (12.0, 20.0, 30.0):
+      assert self._arm_attempt(monkeypatch, v) == 1, v
+
 # ============================================================
 # STEP_MAX speed schedule (route 39b seg 18, 2026-07-09 — user safety call)
 # and the steeringAngleDeg getattr guard.
@@ -690,6 +743,83 @@ def _decide_from_zero(lac, sm, state, *, v, desired):
   state['tick_count'] = 999          # force the cadence decision this tick
   _set_measured(sm, v, 0.0)
   _call_update(lac, desired, v_ego=v)
+
+
+def _decide_from_torque(lac, sm, state, *, v, desired, torque):
+  """One cadence decision with STANDING torque, so the step DIRECTION matters.
+
+  measured = 0 keeps the relax-dwell disarmed and makes delta_err == delta_des;
+  `desired` opposite in sign to `torque` keeps the hold-floor out of the way
+  (it needs target_frac * held_target > 0).
+  """
+  state['torque'] = torque
+  state['target_frac'] = torque
+  state['ramp_frames'] = 0
+  state['action'] = 'idle'
+  state['tick_count'] = 999          # force the cadence decision this tick
+  _set_measured(sm, v, 0.0)
+  _call_update(lac, desired, v_ego=v)
+
+
+class TestUnwindStepBoost:
+  """Route 417 (2026-08-21), the second half of the intersection-exit fight.
+
+  After the relax-dwell gate removes the 1.0 s freeze, ~0.8 s of resistance
+  remains: STEP_MAX bounds the decay at ~0.33 frac/s (~4 Nm/s), so shedding
+  the 3.9 Nm held through an intersection takes about a second and the wheel's
+  return is still fought.
+
+  STEP_MAX exists to stop abrupt APPLICATION — route 39b/seg 27, where single
+  decisions swinging 0.69 frac drove 150 deg/s wheel bursts. Releasing torque
+  carries no such hazard in the LKA regime: below 30 km/h SAT cannot fling the
+  freed wheel and this rack's stiction holds the angle at zero torque. The
+  controller's own comment puts it plainly — "unwinding is instant and free,
+  rebuilding is slow and fought".
+
+  So below LKA_MAX_V, and ONLY while the step moves torque toward zero, the
+  cap is multiplied by UNWIND_STEP_GAIN. Building torque is untouched at every
+  speed, and so is everything at or above 30 km/h.
+
+  Deliberately NOT gated on curvature: kappa_meas collapses through
+  RELAX_DWELL_KAPPA partway through the exit (route 417 seg 2: 0.037 -> 0.003
+  during the return), so a curvature conjunct would switch the fast decay off
+  at exactly the moment it is needed.
+  """
+
+  DESIRED = -0.02      # deep target: P saturates, so the step cap is what binds
+  TORQUE = 0.60        # standing push, opposite sign to the target
+
+  def _target(self, monkeypatch, v, torque=TORQUE):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _decide_from_torque(lac, sm, state, v=v, desired=self.DESIRED, torque=torque)
+    return state['target_frac'], mod
+
+  def test_unwind_boosted_below_30kph(self, monkeypatch):
+    """18 km/h intersection exit: the step toward zero gets the boost."""
+    got, mod = self._target(monkeypatch, 5.0)
+    expected = self.TORQUE - 0.10 * mod.UNWIND_STEP_GAIN
+    assert got == pytest.approx(expected, abs=1e-6), got
+
+  def test_unwind_not_boosted_at_30kph(self, monkeypatch):
+    """Boundary: at/above LKA_MAX_V the schedule is untouched."""
+    got, mod = self._target(monkeypatch, 8.5)
+    assert got == pytest.approx(self.TORQUE - 0.10, abs=1e-6), got
+
+  def test_unwind_not_boosted_at_speed(self, monkeypatch):
+    got, mod = self._target(monkeypatch, 20.0)
+    step = 0.10 + (20.0 - 15.0) / (28.0 - 15.0) * (0.05 - 0.10)
+    assert got == pytest.approx(self.TORQUE - step, abs=1e-6), got
+
+  def test_building_torque_is_not_boosted_below_30kph(self, monkeypatch):
+    """From rest the step BUILDS torque — normal cap, no boost. This is the
+    conjunct that keeps the seg-27 abrupt-application hazard covered."""
+    got, mod = self._target(monkeypatch, 5.0, torque=0.0)
+    assert got == pytest.approx(-0.10, abs=1e-6), got
+
+  def test_boost_stops_once_torque_reverses(self, monkeypatch):
+    """Past zero the step is building in the NEW direction — normal cap."""
+    got, mod = self._target(monkeypatch, 5.0, torque=-0.05)
+    assert got == pytest.approx(-0.05 - 0.10, abs=1e-6), got
 
 
 class TestStepMaxSpeedSchedule:

@@ -188,6 +188,15 @@ OV_WSD_INTENT_KAPPA = 0.001
 # is not. Do not reintroduce the band.
 V_GAIN_FLOOR = 2.778       # m/s (10 km/h), was 8.5 (30 km/h) -- user ruling
 
+# --- LKA regime (routes 411/417) -------------------------------------------
+# DCC cannot engage below 30 km/h, so v_true < LKA_MAX_V IS the LKA regime and
+# nothing else has to be plumbed in to identify it. Two behaviours key off it,
+# both because the plant is different down here: SAT (∝ v²) is weak, and this
+# rack's stiction HOLDS the angle at zero torque instead of letting SAT fling
+# the wheel. See deep_relax and the unwind step boost.
+LKA_MAX_V = 8.5            # m/s (30 km/h)
+UNWIND_STEP_GAIN = 3.0     # step-cap multiplier while shedding torque in LKA
+
 
 def gain_reference_speed(v_true):
   """Speed the TORQUE PARAMETERS reference (gains and caps), not the plant.
@@ -1007,7 +1016,29 @@ def on_lat_controller_init(result, lac, CP):
       # — a tracked |κ_meas| > 0.010 curve implies SAT-scale held torque. If
       # torque somehow IS ~0 here, the dwell bridges at ~0, indistinguishable
       # from not arming.)
-      deep_relax = (abs(state['measured']) > RELAX_DWELL_KAPPA
+      # Low-speed gate (route 417, 2026-08-21). At LKA intersection EXITS the
+      # dwell froze torque at 3.9 Nm for its full second while the driver
+      # hauled the wheel -160 -> -75 deg and delta_err grew to -0.097: the
+      # wheel's return was late and had to be fought. The dwell's only escape
+      # is a kappa_des SIGN flip, so a merely decaying reference (seg 2:
+      # kappa_des fell to 0.014 without crossing zero) is bridged for the
+      # whole second however large the overshoot gets.
+      #
+      # The hazard the dwell buys off is v²-scaled: surrender torque mid-turn
+      # and SAT flings the freed wheel ~20 deg out of the curve. Below 30 km/h
+      # that hazard is weak, and this rack does the OPPOSITE — stiction holds
+      # the angle at zero torque (the stall/breakaway story), so a surrendered
+      # wheel stays put rather than being flung. Insurance against an absent
+      # hazard, charged as a fight with the driver.
+      #
+      # SPEED ONLY (user ruling): normal HOLD behaviour must not change. The
+      # "intersection" half needs no gate — deep_relax already requires
+      # |κ_meas| > RELAX_DWELL_KAPPA, so this cannot reach straight-line
+      # driving, and adding a κ conjunct would repeat the gain-floor mistake
+      # of putting a cliff on the κ axis. Below 30 km/h is LKA by
+      # construction (DCC cannot engage), so this is LKA-scoped for free.
+      deep_relax = (v_true >= LKA_MAX_V
+                    and abs(state['measured']) > RELAX_DWELL_KAPPA
                     and state['desired'] * state['measured'] > 0.0
                     and delta_err * delta_des < 0.0)
       state['relax_ticks'] = state['relax_ticks'] + 1 if deep_relax else 0
@@ -1175,6 +1206,24 @@ def on_lat_controller_init(result, lac, CP):
           # slew is now ~0.33 frac/s (~4 Nm/s); the P-law reverses on
           # overshoot, speedlimitd handles curve-entry speed (a_y bound).
           step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
+          # Fast unwind in the LKA regime (route 417, 2026-08-21). STEP_MAX
+          # exists to stop abrupt APPLICATION — seg 27's single decisions
+          # swinging 0.69 frac drove 150 deg/s wheel bursts. RELEASING torque
+          # carries no such hazard below 30 km/h: SAT cannot fling the freed
+          # wheel and stiction holds the angle at zero torque. Without this,
+          # shedding the ~3.9 Nm held through an intersection takes ~1 s at
+          # 4 Nm/s and the driver fights the wheel's return the whole way.
+          #
+          # Only while the step moves torque TOWARD zero. Once past zero the
+          # step is building in the new direction and the normal cap applies
+          # again, so the seg-27 hazard stays covered in both directions.
+          #
+          # NOT gated on curvature: κ_meas collapses through
+          # RELAX_DWELL_KAPPA partway through the exit (seg 2: 0.037 -> 0.003
+          # during the return), so a κ conjunct would switch the fast decay
+          # off exactly when it is needed.
+          if v_true < LKA_MAX_V and (target_frac - state['torque']) * state['torque'] < 0.0:
+            step_max *= UNWIND_STEP_GAIN
           step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
           target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
           # Post-trip block: no same-side re-push while the release is
