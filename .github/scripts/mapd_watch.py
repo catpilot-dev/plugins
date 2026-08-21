@@ -54,12 +54,21 @@ MAINTAINER = '@OxygenLiu'
 # once mapd is re-activated and the whole section drops out of the issue body.
 REQUIRED_COMMIT = 'fe45d10'
 
-# mapd's copy of the schema, and ours. MapdOut at v2.3.0 is field-identical to
-# slot19.capnp (ordinals 0-26); the enums it references live in standalone.capnp.
+# mapd's copy of the schema, and ours. We consume THREE upstream structs, one
+# per cereal slot, and a field added to any of them drops just as silently as
+# one added to MapdOut — so all three are watched. Checking only MapdOut is
+# worse than checking nothing: it launders two unchecked structs as a clean
+# verdict, which is exactly how v2.3.1's two new `MapdExtendedOut` fields got
+# reported as "schema-safe. No new fields."
 UPSTREAM_CAPNP_PATH = 'cereal/custom/custom.capnp'
-MAPD_STRUCT = 'MapdOut'
-SLOT19_CAPNP = REPO_ROOT / 'plugins' / 'mapd' / 'cereal' / 'slot19.capnp'
-STANDALONE_CAPNP = REPO_ROOT / 'plugins' / 'mapd' / 'cereal' / 'standalone.capnp'
+_CEREAL_DIR = REPO_ROOT / 'plugins' / 'mapd' / 'cereal'
+WATCHED_STRUCTS = {
+    'MapdExtendedOut': _CEREAL_DIR / 'slot17.capnp',
+    'MapdIn': _CEREAL_DIR / 'slot18.capnp',
+    'MapdOut': _CEREAL_DIR / 'slot19.capnp',
+}
+# The enums every watched struct's fields resolve against, ours in one file.
+STANDALONE_CAPNP = _CEREAL_DIR / 'standalone.capnp'
 
 
 class SchemaError(Exception):
@@ -149,11 +158,11 @@ def _extract_block(text: str, kind: str, name: str):
     raise SchemaError(f"unterminated {kind} {name}")
 
 
-def parse_fields(text: str, struct: str = MAPD_STRUCT) -> dict:
+def parse_fields(text: str, struct: str) -> dict:
     """`{name: {'ordinal': int, 'type': str}}` for a struct's declared fields.
 
     Handles both shapes this watch has to read: mapd's `custom.capnp` wraps the
-    fields in `struct MapdOut @0x... { ... }`, while our `slot19.capnp` is a
+    fields in `struct MapdOut @0x... { ... }`, while each of our slot files is a
     bare fragment of field lines that `custom_capnp.py` splices into the real
     struct at install time — there is no enclosing block to find.
     """
@@ -204,34 +213,68 @@ def fetch_upstream_capnp(tag: str) -> str:
     return b64decode(resp.json()['content']).decode('utf-8')
 
 
-def diff_schema(theirs: str, ours_fields_text: str, ours_enums_text: str) -> dict:
-    """Compare upstream's MapdOut against our slot19 fields and standalone enums.
+def read_local_slots() -> dict:
+    """`{struct: slot file text}` for every watched struct."""
+    return {struct: path.read_text() for struct, path in WATCHED_STRUCTS.items()}
 
-    capnp is additive, so a newer binary publishing into an older slot19
-    silently DROPS every field we have not declared — `highwayClass` would read
-    back as `unknown` and speedlimitd would mis-classify every road, with no
-    error anywhere. A new enumerant is that same silent failure in a different
-    shape: an out-of-range value arriving in a field we believe we understand.
+
+def slot_name(struct: str) -> str:
+    """Repo-relative path of the slot file a struct's fields must land in."""
+    return str(WATCHED_STRUCTS[struct].relative_to(REPO_ROOT))
+
+
+def diff_schema(theirs: str, ours_by_struct: dict, ours_enums_text: str) -> dict:
+    """Compare every watched upstream struct against its slot file, plus enums.
+
+    capnp is additive, so a newer binary publishing into an older slot silently
+    DROPS every field we have not declared — `highwayClass` would read back as
+    `unknown` and speedlimitd would mis-classify every road, with no error
+    anywhere. A new enumerant is that same silent failure in a different shape:
+    an out-of-range value arriving in a field we believe we understand.
+
+    Every watched struct is diffed and reported separately, and the single
+    `identical` verdict is true only when every struct AND every enum is clean —
+    a per-struct check that rolled up optimistically would be the bug it exists
+    to prevent.
     """
-    theirs_fields = parse_fields(theirs)
-    ours_fields = parse_fields(ours_fields_text)
-    if not theirs_fields or not ours_fields:
-        raise SchemaError(
-            f"parsed {len(theirs_fields)} upstream / {len(ours_fields)} local "
-            f"fields — a side with none means the parse failed, not that the "
-            f"schema is empty")
+    structs, theirs_by_struct = {}, {}
+    for struct in WATCHED_STRUCTS:
+        theirs_fields = parse_fields(theirs, struct)
+        ours_fields = parse_fields(ours_by_struct[struct], struct)
+        if not theirs_fields or not ours_fields:
+            raise SchemaError(
+                f"{struct}: parsed {len(theirs_fields)} upstream / "
+                f"{len(ours_fields)} local fields — a side with none means the "
+                f"parse failed, not that the schema is empty")
+        theirs_by_struct[struct] = theirs_fields
 
-    added = [(n, m['ordinal'], m['type']) for n, m in theirs_fields.items()
-             if n not in ours_fields]
-    removed = [(n, m['ordinal'], m['type']) for n, m in ours_fields.items()
-               if n not in theirs_fields]
-    changed = [(n, ours_fields[n], m) for n, m in theirs_fields.items()
-               if n in ours_fields and (
-                   ours_fields[n]['ordinal'] != m['ordinal'] or
-                   ours_fields[n]['type'] != m['type'])]
+        added = [(n, m['ordinal'], m['type']) for n, m in theirs_fields.items()
+                 if n not in ours_fields]
+        removed = [(n, m['ordinal'], m['type']) for n, m in ours_fields.items()
+                   if n not in theirs_fields]
+        changed = [(n, ours_fields[n], m) for n, m in theirs_fields.items()
+                   if n in ours_fields and (
+                       ours_fields[n]['ordinal'] != m['ordinal'] or
+                       ours_fields[n]['type'] != m['type'])]
+        structs[struct] = {
+            'name': struct, 'slot': slot_name(struct),
+            'theirs_field_count': len(theirs_fields),
+            'ours_field_count': len(ours_fields),
+            'added': added, 'removed': removed, 'changed': changed,
+            'identical': not (added or removed or changed),
+        }
+
+    # The union across every watched struct, not just MapdOut's: an enum that
+    # reaches us through `MapdIn` gains enumerants the same way and matters the
+    # same amount.
+    enum_names = []
+    for fields in theirs_by_struct.values():
+        for name in referenced_enums(fields, theirs):
+            if name not in enum_names:
+                enum_names.append(name)
 
     enums = []
-    for enum_name in referenced_enums(theirs_fields, theirs):
+    for enum_name in enum_names:
         theirs_members = parse_enum(theirs, enum_name)
         ours_members = parse_enum(ours_enums_text, enum_name)
         if ours_members is None:
@@ -248,11 +291,9 @@ def diff_schema(theirs: str, ours_fields_text: str, ours_enums_text: str) -> dic
 
     dirty_enums = [e for e in enums if e['missing'] or e['added'] or e['changed']]
     return {
-        'theirs_field_count': len(theirs_fields),
-        'ours_field_count': len(ours_fields),
-        'added': added, 'removed': removed, 'changed': changed,
+        'structs': structs,
         'enums': enums,
-        'identical': not (added or removed or changed or dirty_enums),
+        'identical': all(s['identical'] for s in structs.values()) and not dirty_enums,
     }
 
 
@@ -264,42 +305,55 @@ def schema_section(tag: str, fetch=fetch_upstream_capnp) -> str:
     is stated rather than implied.
     """
     try:
-        diff = diff_schema(fetch(tag), SLOT19_CAPNP.read_text(),
+        diff = diff_schema(fetch(tag), read_local_slots(),
                            STANDALONE_CAPNP.read_text())
     except Exception as exc:  # noqa: BLE001 — any failure degrades the same way
+        slots = ', '.join(f'`{slot_name(s)}`' for s in WATCHED_STRUCTS)
         return ("### Schema\n\n"
                 f"**Could not be checked** (`{exc}`) — diff "
                 f"`{UPSTREAM_CAPNP_PATH}` at `{tag}` against "
-                "`plugins/mapd/cereal/slot19.capnp` by hand before bumping.\n")
+                f"{slots} by hand before bumping.\n")
 
-    counts = (f"_{MAPD_STRUCT} upstream: {diff['theirs_field_count']} fields; "
-              f"slot19.capnp: {diff['ours_field_count']} fields._")
+    # Per-struct counts, always rendered: a differ that parsed nothing would
+    # otherwise be free to report "identical" vacuously.
+    counts = "\n".join(
+        f"- `{s['name']}` upstream: {s['theirs_field_count']} fields; "
+        f"`{s['slot']}`: {s['ours_field_count']} fields"
+        for s in diff['structs'].values())
     if diff['identical']:
         return ("### Schema\n\n"
-                "**Identical — the pin bump is schema-safe.** No new fields and "
-                f"no new enumerants.\n\n{counts}\n")
+                "**Identical — the pin bump is schema-safe.** No new fields in "
+                "any watched struct and no new enumerants.\n\n"
+                f"{counts}\n")
 
     lines = ["### Schema\n",
              "**Must land in our slots before the pin moves.** capnp is "
-             "additive: a newer binary publishing into an older `slot19` "
-             "silently drops every field we have not declared.\n"]
-    if diff['added']:
-        lines.append(f"New fields in `{MAPD_STRUCT}` "
-                     "(add to `plugins/mapd/cereal/slot19.capnp`):\n")
-        lines += [f"- `{n} @{o} :{t};`" for n, o, t in diff['added']]
-        lines.append("")
-    if diff['removed']:
-        lines.append("Fields we declare that upstream no longer has "
-                     "(harmless to read, but the pin bump is not a pure add):\n")
-        lines += [f"- `{n} @{o} :{t};`" for n, o, t in diff['removed']]
-        lines.append("")
-    if diff['changed']:
-        lines.append("**Fields whose ordinal or type changed — a wire break, "
-                     "not an addition:**\n")
-        lines += [f"- `{n}`: ours `@{ours['ordinal']} :{ours['type']}` vs "
-                  f"upstream `@{theirs['ordinal']} :{theirs['type']}`"
-                  for n, ours, theirs in diff['changed']]
-        lines.append("")
+             "additive: a newer binary publishing into an older slot silently "
+             "drops every field we have not declared.\n"]
+    for s in diff['structs'].values():
+        if s['identical']:
+            lines.append(f"- `{s['name']}` → `{s['slot']}`: identical.")
+            continue
+        lines.append(f"\n**`{s['name']}` → `{s['slot']}` differs:**\n")
+        if s['added']:
+            lines.append(f"New fields in `{s['name']}` "
+                         f"(add to `{s['slot']}`):\n")
+            lines += [f"- `{n} @{o} :{t};`" for n, o, t in s['added']]
+            lines.append("")
+        if s['removed']:
+            lines.append("Fields we declare that upstream no longer has "
+                         "(harmless to read, but the pin bump is not a pure "
+                         "add):\n")
+            lines += [f"- `{n} @{o} :{t};`" for n, o, t in s['removed']]
+            lines.append("")
+        if s['changed']:
+            lines.append("**Fields whose ordinal or type changed — a wire "
+                         "break, not an addition:**\n")
+            lines += [f"- `{n}`: ours `@{ours['ordinal']} :{ours['type']}` vs "
+                      f"upstream `@{theirs['ordinal']} :{theirs['type']}`"
+                      for n, ours, theirs in s['changed']]
+            lines.append("")
+    lines.append("")
     for enum in diff['enums']:
         if enum['missing']:
             lines.append(f"- enum `{enum['name']}` is not declared in "
@@ -312,7 +366,7 @@ def schema_section(tag: str, fetch=fetch_upstream_capnp) -> str:
         for name, ours, theirs in enum['changed']:
             lines.append(f"- enumerant `{enum['name']}.{name}` renumbered: "
                          f"ours `@{ours}` vs upstream `@{theirs}`")
-    lines.append(f"\n{counts}\n")
+    lines.append(f"\nField counts:\n\n{counts}\n")
     return "\n".join(lines)
 
 

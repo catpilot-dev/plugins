@@ -12,17 +12,108 @@ sys.modules['mapd_watch'] = mw
 _spec.loader.exec_module(mw)
 
 
-# mapd v2.3.0's cereal/custom/custom.capnp, trimmed to the parts this watch
-# reads: MapdOut, the enums it references, and one unrelated struct that must
-# not leak into MapdOut's field list. Verbatim upstream text — the clean case
-# needs a real fixture, or "identical" only ever proves the parser agrees with
-# itself.
+# mapd v2.3.0's cereal/custom/custom.capnp, verbatim but for the sixteen empty
+# `CustomReserved` structs. All THREE structs we consume are here — MapdIn,
+# MapdExtendedOut and MapdOut — plus the enums they reference and the plain
+# structs that must not leak into anyone's field list. Verbatim upstream text:
+# the clean case needs a real fixture, or "identical" only ever proves the
+# parser agrees with itself.
 _V230_CUSTOM_CAPNP = """using Go = import "/go.capnp";
 @0xb526ba661d550a59;
+$Go.package("custom");
+$Go.import("pfeifer.dev/mapd/cereal/custom");
+
+# custom.capnp: a home for empty structs reserved for custom forks
+# These structs are guaranteed to remain reserved and empty in mainline
+# cereal, so use these if you want custom events in your fork.
+
+# DO rename the structs
+# DON'T change the identifier (e.g. @0x81c2f05a394cf4af)
+
+struct MapdDownloadLocationDetails @0xff889853e7b0987f {
+  location @0 :Text;
+  totalFiles @1 :UInt32;
+  downloadedFiles @2 :UInt32;
+}
+
+struct MapdDownloadProgress @0xfaa35dcac85073a2 {
+  active @0 :Bool;
+  cancelled @1 :Bool;
+  totalFiles @2 :UInt32;
+  downloadedFiles @3 :UInt32;
+  locations @4 :List(Text);
+  locationDetails @5 :List(MapdDownloadLocationDetails);
+}
+
+struct MapdPathPoint @0xd6f78acca1bc3939 {
+  latitude @0 :Float64;
+  longitude @1 :Float64;
+  curvature @2 :Float32;
+  targetVelocity @3 :Float32;
+}
 
 struct MapdPosition @0xde9705979aca8339 {
   latitude @0 :Float64;
   longitude @1 :Float64;
+}
+
+struct MapdExtendedOut @0xa30662f84033036c {
+  downloadProgress @0 :MapdDownloadProgress;
+  settings @1 :Text;
+  path @2 :List(MapdPathPoint);
+  position @3 :MapdPosition;
+}
+
+enum MapdInputType {
+  download @0;
+  reloadSettings @9;
+  saveSettings @10;
+  loadDefaultSettings @21;
+  loadRecommendedSettings @22;
+  loadPersistentSettings @26;
+  cancelDownload @27;
+  setJsonPathFloat @43;
+  setJsonPathText @44;
+  setJsonPathBool @45;
+  acceptSpeedLimit @34;
+
+  # DEPRECATED settings inputs
+  setLogLevel @6;
+  setLogSource @29;
+  setLogJson @28;
+  setTargetLateralAccel @1;
+  setSpeedLimitOffset @2;
+  setSpeedLimitControl @3;
+  setMapCurveSpeedControl @4;
+  setVisionCurveSpeedControl @5;
+  setVisionCurveTargetLatA @7;
+  setVisionCurveMinTargetV @8;
+  setEnableSpeed @11;
+  setVisionCurveUseEnableSpeed @12;
+  setMapCurveUseEnableSpeed @13;
+  setSpeedLimitUseEnableSpeed @14;
+  setHoldLastSeenSpeedLimit @15;
+  setTargetSpeedJerk @16;
+  setTargetSpeedAccel @17;
+  setTargetSpeedTimeOffset @18;
+  setDefaultLaneWidth @19;
+  setMapCurveTargetLatA @20;
+  setSlowDownForNextSpeedLimit @23;
+  setSpeedUpForNextSpeedLimit @24;
+  setHoldSpeedLimitWhileChangingSetSpeed @25;
+  setExternalSpeedLimitControl @30;
+  setExternalSpeedLimit @31;
+  setSpeedLimitPriority @32;
+  setSpeedLimitChangeRequiresAccept @33;
+  setPressGasToAcceptSpeedLimit @35;
+  setAdjustSetSpeedToAcceptSpeedLimit @36;
+  setAcceptSpeedLimitTimeout @37;
+  setPressGasToOverrideSpeedLimit @38;
+  setConditionalSpeedLimitControl @39;
+  setShadowCarState @40;
+  setShadowModelV2 @41;
+  setShadowGpsLocation @42;
+  setShadowGpsLocationExternal @46;
 }
 
 enum WaySelectionType {
@@ -33,6 +124,19 @@ enum WaySelectionType {
   fail @4;
 }
 
+enum SpeedLimitOffsetType {
+  static @0;
+  percent @1;
+}
+
+struct MapdIn @0xc86a3d38d13eb3ef {
+  type @0 :MapdInputType;
+  float @1 :Float32;
+  str @2 :Text;
+  bool @3 :Bool;
+  jsonPath @4 :Text;
+}
+
 enum RoadContext {
   freeway @0;
   city @1;
@@ -40,7 +144,10 @@ enum RoadContext {
 }
 
 # WARNING: must be kept in perfect sync (names and values) with the
-# HighwayClass enum in cereal/offline/offline.capnp
+# HighwayClass enum in cereal/offline/offline.capnp — state.go casts directly
+# between the two generated enum types.
+# unknown either means the way's highway tag was not one of the listed values
+# or the loaded map tiles predate this field.
 enum HighwayClass {
   unknown @0;
   motorway @1;
@@ -89,7 +196,18 @@ struct MapdOut @0xa4f1eb3323f5f582 {
 }
 """
 
-_OURS_FIELDS = mw.SLOT19_CAPNP.read_text()
+# v2.3.1 changed exactly this and nothing else — and the single-struct differ
+# this file now guards against called it "schema-safe. No new fields." (issue
+# #30), because MapdOut really was untouched.
+_V231_CUSTOM_CAPNP = _V230_CUSTOM_CAPNP.replace(
+    '  position @3 :MapdPosition;\n',
+    '  position @3 :MapdPosition;\n'
+    '  loopRateAverage @4 :Float32;\n  loopRateMin @5 :Float32;\n')
+
+# The real slot files, read from disk rather than fixtured: that makes every
+# "identical" assertion below a live guard against OUR schema drifting too.
+_OURS = mw.read_local_slots()
+_OURS_FIELDS = _OURS['MapdOut']
 _OURS_ENUMS = mw.STANDALONE_CAPNP.read_text()
 
 
@@ -119,37 +237,60 @@ class _FakeResponse:
     return self._payload
 
 
+class TestWatchedStructs:
+  def test_every_slot_file_we_ship_is_watched(self):
+    """A slot file nobody diffs is a field drop waiting to happen — the exact
+    shape of the bug that let v2.3.1 through."""
+    shipped = {p.name for p in mw._CEREAL_DIR.glob('slot*.capnp')}
+    assert {p.name for p in mw.WATCHED_STRUCTS.values()} == shipped
+
+  def test_slot_names_are_repo_relative_for_the_issue_body(self):
+    assert mw.slot_name('MapdExtendedOut') == 'plugins/mapd/cereal/slot17.capnp'
+
+
 class TestParseFields:
-  """Two shapes, one parser: mapd wraps MapdOut in a struct block, our
-  slot19.capnp is a bare fragment of field lines that custom_capnp.py splices
-  into the real struct at install time."""
+  """Two shapes, one parser: mapd wraps each struct in a struct block, our slot
+  files are bare fragments of field lines that custom_capnp.py splices into the
+  real struct at install time."""
 
   def test_parses_the_wrapped_upstream_struct(self):
-    fields = mw.parse_fields(_V230_CUSTOM_CAPNP)
+    fields = mw.parse_fields(_V230_CUSTOM_CAPNP, 'MapdOut')
     assert len(fields) == 27
     assert sorted(f['ordinal'] for f in fields.values()) == list(range(27))
     assert fields['highwayClass'] == {'ordinal': 24, 'type': 'HighwayClass'}
 
   def test_parses_our_bare_fragment(self):
-    fields = mw.parse_fields(_OURS_FIELDS)
+    fields = mw.parse_fields(_OURS_FIELDS, 'MapdOut')
     assert len(fields) == 27
     assert sorted(f['ordinal'] for f in fields.values()) == list(range(27))
     assert fields['conditionalSpeedLimit'] == {'ordinal': 26, 'type': 'Text'}
 
+  def test_parses_the_other_two_watched_structs(self):
+    """MapdExtendedOut and MapdIn are consumed exactly like MapdOut."""
+    assert mw.parse_fields(_V230_CUSTOM_CAPNP, 'MapdExtendedOut') == {
+        'downloadProgress': {'ordinal': 0, 'type': 'MapdDownloadProgress'},
+        'settings': {'ordinal': 1, 'type': 'Text'},
+        'path': {'ordinal': 2, 'type': 'List(MapdPathPoint)'},
+        'position': {'ordinal': 3, 'type': 'MapdPosition'},
+    }
+    assert set(mw.parse_fields(_V230_CUSTOM_CAPNP, 'MapdIn')) == {
+        'type', 'float', 'str', 'bool', 'jsonPath'}
+
   def test_does_not_absorb_fields_from_neighbouring_structs(self):
     """MapdPosition's latitude/longitude sit above MapdOut in the same file."""
-    assert 'latitude' not in mw.parse_fields(_V230_CUSTOM_CAPNP)
+    assert 'latitude' not in mw.parse_fields(_V230_CUSTOM_CAPNP, 'MapdOut')
 
   def test_missing_struct_in_a_file_with_blocks_is_an_error_not_a_scrape(self):
     """A rename or deletion must fail loudly. Falling back to bare-fragment
     mode here would scrape every field line in the file and report a
     plausible-looking diff against a struct that no longer exists."""
     with pytest.raises(mw.SchemaError):
-      mw.parse_fields(_V230_CUSTOM_CAPNP.replace('struct MapdOut', 'struct MapdOutV2'))
+      mw.parse_fields(_V230_CUSTOM_CAPNP.replace('struct MapdOut',
+                                                 'struct MapdOutV2'), 'MapdOut')
 
   def test_ignores_commented_out_field_lines(self):
     text = _OURS_FIELDS + "\n  # futureField @27 :Text;\n"
-    assert 'futureField' not in mw.parse_fields(text)
+    assert 'futureField' not in mw.parse_fields(text, 'MapdOut')
 
 
 class TestParseEnum:
@@ -161,45 +302,91 @@ class TestParseEnum:
     assert mw.parse_enum(_OURS_ENUMS, 'NoSuchEnum') is None
 
   def test_referenced_enums_are_derived_from_the_field_types(self):
-    fields = mw.parse_fields(_V230_CUSTOM_CAPNP)
+    fields = mw.parse_fields(_V230_CUSTOM_CAPNP, 'MapdOut')
     assert set(mw.referenced_enums(fields, _V230_CUSTOM_CAPNP)) == {
         'RoadContext', 'WaySelectionType', 'HighwayClass'}
+
+  def test_struct_typed_fields_are_not_mistaken_for_enums(self):
+    """MapdExtendedOut's fields are all structs and lists — no enums at all."""
+    fields = mw.parse_fields(_V230_CUSTOM_CAPNP, 'MapdExtendedOut')
+    assert mw.referenced_enums(fields, _V230_CUSTOM_CAPNP) == []
 
 
 class TestDiffSchema:
   def test_v230_is_identical_to_our_slots(self):
-    """The real baseline: MapdOut at v2.3.0 is field-identical to slot19.capnp,
-    ordinals 0-26. The counts are asserted too — a differ that parsed nothing
-    would otherwise report 'identical' vacuously."""
-    diff = mw.diff_schema(_V230_CUSTOM_CAPNP, _OURS_FIELDS, _OURS_ENUMS)
+    """The real baseline: all three structs at v2.3.0 are field-identical to
+    slot17/18/19.capnp. The counts are asserted too — a differ that parsed
+    nothing would otherwise report 'identical' vacuously."""
+    diff = mw.diff_schema(_V230_CUSTOM_CAPNP, _OURS, _OURS_ENUMS)
     assert diff['identical']
-    assert diff['theirs_field_count'] == 27
-    assert diff['ours_field_count'] == 27
-    assert diff['added'] == diff['removed'] == diff['changed'] == []
+    assert set(diff['structs']) == set(mw.WATCHED_STRUCTS)
+    counts = {n: (s['theirs_field_count'], s['ours_field_count'])
+              for n, s in diff['structs'].items()}
+    assert counts == {'MapdExtendedOut': (4, 4), 'MapdIn': (5, 5),
+                      'MapdOut': (27, 27)}
+    for s in diff['structs'].values():
+      assert s['identical']
+      assert s['added'] == s['removed'] == s['changed'] == []
+
+  def test_v231_extended_out_fields_are_not_missed(self):
+    """REGRESSION (issue #30). v2.3.1 added loopRateAverage/loopRateMin to
+    MapdExtendedOut and left MapdOut alone. A differ that only reads MapdOut
+    calls this release schema-safe and the two fields silently drop into
+    slot17."""
+    diff = mw.diff_schema(_V231_CUSTOM_CAPNP, _OURS, _OURS_ENUMS)
+    assert not diff['identical']
+    assert diff['structs']['MapdOut']['identical']
+    assert diff['structs']['MapdIn']['identical']
+    extended = diff['structs']['MapdExtendedOut']
+    assert not extended['identical']
+    assert extended['added'] == [('loopRateAverage', 4, 'Float32'),
+                                 ('loopRateMin', 5, 'Float32')]
+    assert extended['slot'] == 'plugins/mapd/cereal/slot17.capnp'
 
   def test_reports_an_upstream_added_field(self):
     theirs = _V230_CUSTOM_CAPNP.replace(
         '  conditionalSpeedLimit @26 :Text;',
         '  conditionalSpeedLimit @26 :Text;\n  tollRoad @27 :Bool;')
-    diff = mw.diff_schema(theirs, _OURS_FIELDS, _OURS_ENUMS)
+    diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
     assert not diff['identical']
-    assert diff['added'] == [('tollRoad', 27, 'Bool')]
-    assert diff['theirs_field_count'] == 28
+    assert diff['structs']['MapdOut']['added'] == [('tollRoad', 27, 'Bool')]
+    assert diff['structs']['MapdOut']['theirs_field_count'] == 28
+
+  def test_reports_a_field_added_to_mapd_in(self):
+    """MapdIn is what WE publish, so an upstream addition there is a command we
+    cannot send — silent in exactly the same way."""
+    theirs = _V230_CUSTOM_CAPNP.replace(
+        '  jsonPath @4 :Text;\n}', '  jsonPath @4 :Text;\n  int @5 :Int64;\n}')
+    diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
+    assert not diff['identical']
+    assert diff['structs']['MapdIn']['added'] == [('int', 5, 'Int64')]
+    assert diff['structs']['MapdOut']['identical']
 
   def test_reports_an_upstream_added_enumerant(self):
     theirs = _V230_CUSTOM_CAPNP.replace(
         '  livingStreet @13;', '  livingStreet @13;\n  service @14;')
-    diff = mw.diff_schema(theirs, _OURS_FIELDS, _OURS_ENUMS)
+    diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
     assert not diff['identical']
-    assert diff['added'] == []
+    assert diff['structs']['MapdOut']['added'] == []
     highway = next(e for e in diff['enums'] if e['name'] == 'HighwayClass')
     assert highway['added'] == [('service', 14)]
+
+  def test_diffs_an_enum_reached_only_through_mapd_in(self):
+    """MapdInputType is referenced by no MapdOut field at all. A new input type
+    we cannot name is a command we cannot send."""
+    theirs = _V230_CUSTOM_CAPNP.replace(
+        '  setShadowGpsLocationExternal @46;',
+        '  setShadowGpsLocationExternal @46;\n  setShadowLiveDelay @47;')
+    diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
+    assert not diff['identical']
+    inputs = next(e for e in diff['enums'] if e['name'] == 'MapdInputType')
+    assert inputs['added'] == [('setShadowLiveDelay', 47)]
 
   def test_reports_a_renumbered_field_as_changed(self):
     theirs = _V230_CUSTOM_CAPNP.replace('  wayId @25 :Int64;',
                                         '  wayId @25 :UInt64;')
-    diff = mw.diff_schema(theirs, _OURS_FIELDS, _OURS_ENUMS)
-    assert [n for n, _, _ in diff['changed']] == ['wayId']
+    diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
+    assert [n for n, _, _ in diff['structs']['MapdOut']['changed']] == ['wayId']
 
   def test_reports_an_enum_we_do_not_declare_at_all(self):
     theirs = _V230_CUSTOM_CAPNP.replace(
@@ -207,20 +394,31 @@ class TestDiffSchema:
         '  conditionalSpeedLimit @26 :Text;\n  surface @27 :SurfaceType;'
     ).replace('struct MapdOut',
               'enum SurfaceType {\n  paved @0;\n  gravel @1;\n}\n\nstruct MapdOut')
-    diff = mw.diff_schema(theirs, _OURS_FIELDS, _OURS_ENUMS)
+    diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
     surface = next(e for e in diff['enums'] if e['name'] == 'SurfaceType')
     assert surface['missing']
 
   def test_a_side_that_parsed_to_nothing_is_an_error_not_a_clean_diff(self):
     with pytest.raises(mw.SchemaError):
-      mw.diff_schema('', _OURS_FIELDS, _OURS_ENUMS)
+      mw.diff_schema('', _OURS, _OURS_ENUMS)
+
+  def test_a_struct_upstream_dropped_is_an_error_not_a_clean_diff(self):
+    """Only MapdOut renamed — the other two still parse. The verdict must not
+    be 'two of three are fine'."""
+    with pytest.raises(mw.SchemaError):
+      mw.diff_schema(_V230_CUSTOM_CAPNP.replace('struct MapdExtendedOut',
+                                                'struct MapdExtendedOutV2'),
+                     _OURS, _OURS_ENUMS)
 
 
 class TestSchemaSection:
   def test_clean_diff_says_schema_safe(self):
     section = mw.schema_section('v2.4.0', fetch=lambda tag: _V230_CUSTOM_CAPNP)
     assert 'schema-safe' in section
-    assert '27 fields' in section
+    # Per-struct counts, so a vacuous "identical" stays impossible.
+    assert '`MapdOut` upstream: 27 fields' in section
+    assert '`MapdExtendedOut` upstream: 4 fields' in section
+    assert '`MapdIn` upstream: 5 fields' in section
 
   def test_added_field_is_listed_by_name_and_ordinal(self):
     theirs = _V230_CUSTOM_CAPNP.replace(
@@ -228,7 +426,22 @@ class TestSchemaSection:
         '  conditionalSpeedLimit @26 :Text;\n  tollRoad @27 :Bool;')
     section = mw.schema_section('v2.4.0', fetch=lambda tag: theirs)
     assert '`tollRoad @27 :Bool;`' in section
+    assert 'add to `plugins/mapd/cereal/slot19.capnp`' in section
     assert 'schema-safe' not in section
+
+  def test_v231_section_names_the_struct_and_the_slot_file(self):
+    """REGRESSION (issue #30): the filed issue said 'schema-safe. No new
+    fields.' It must now name MapdExtendedOut and point at slot17."""
+    section = mw.schema_section('v2.3.1', fetch=lambda tag: _V231_CUSTOM_CAPNP)
+    assert 'schema-safe' not in section
+    assert 'slot17' in section
+    assert 'add to `plugins/mapd/cereal/slot17.capnp`' in section
+    assert '`loopRateAverage @4 :Float32;`' in section
+    assert '`loopRateMin @5 :Float32;`' in section
+    # The clean structs are still named, with their counts, so "we checked all
+    # three" is visible rather than assumed.
+    assert '`MapdOut` → `plugins/mapd/cereal/slot19.capnp`: identical.' in section
+    assert '`MapdOut` upstream: 27 fields' in section
 
   def test_unfetchable_file_still_yields_a_section_stating_the_gap(self):
     """The one exception to fail-loudly: a release notification is worth more
@@ -239,6 +452,9 @@ class TestSchemaSection:
     section = mw.schema_section('v2.4.0', fetch=_boom)
     assert 'Could not be checked' in section
     assert 'by hand' in section
+    # Every slot the reader has to diff by hand is named.
+    for slot in ('slot17.capnp', 'slot18.capnp', 'slot19.capnp'):
+      assert slot in section
 
 
 class TestCommitSection:
