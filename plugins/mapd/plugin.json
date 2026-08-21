@@ -39,13 +39,7 @@
       "priority": 50
     }
   },
-  "processes": [
-    {
-      "name": "mapd",
-      "module": "mapd_runner",
-      "condition": "always_run"
-    }
-  ],
+  "processes": [],
   "params": {
     "MapdVersion": {
       "type": "string",

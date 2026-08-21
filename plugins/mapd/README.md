@@ -1,14 +1,16 @@
 # Mapd — OpenStreetMap Data
 
-**Status: active (v2.3.1), Phase 1 — telemetry only.**
+**Status: DORMANT again since 2026-08-21 — v2.3.1 crashes too, in a new place.**
 
-mapd runs and publishes `mapdOut`, but it does **not** drive control yet.
-speedlimitd still derives every control decision from the offline tile reader
-(`osm_query.OsmTileReader`); it consumes `mapdOut` through
-`mapd_source.telemetry_from_mapd` purely as observation, logged into
-`speedLimitState` for comparison against the tile reader. Actuation is
-byte-identical with mapd running or absent, and a missing `mapdOut` service
-degrades to vision-only rather than failing.
+The binary does not run: `plugin.json` declares no process. The cereal interface
+is deliberately kept warm — slots 17-19 and the `mapdOut` service stay injected,
+so the plugin remains installed and `.enforced` and is NOT `.disabled`.
+
+Nothing in the control path notices. speedlimitd has always derived every control
+decision from the offline tile reader (`osm_query.OsmTileReader`); it consumes
+`mapdOut` through `mapd_source.telemetry_from_mapd` purely as Phase-1 observation,
+logged into `speedLimitState` for comparison. Actuation is byte-identical with mapd
+running or absent, and an absent service degrades to vision-only rather than failing.
 
 Tiles are downloaded by COD's web UI into `/data/media/0/osm/offline/`, which is
 exactly where mapd reads them.
@@ -78,7 +80,54 @@ itself, and plugind respawns it with speedlimitd degrading to vision-only
 meanwhile. Do not set any of them slotted without re-auditing the slot
 budget of that queue AND fixing the slot leak upstream.
 
-## Re-activated 2026-08-21 (v2.3.1)
+## DORMANT — v2.3.1 activation attempt, 2026-08-21
+
+Activated and reverted the same day. **v2.3.1 fixes the bug we waited for and
+introduces a different one.**
+
+Observed on the C3: mapd `SIGBUS`es reliably ~80 s after start (≈1600 messages at
+20 Hz — consistent with a ring-buffer wrap), and plugind respawns it every ~85 s.
+
+```
+[signal SIGBUS: bus error code=0x2 addr=0x7f46e20e20]
+gomsgq@v0.1.11/publisher.go:65   MsgqPublisher.Send
+mapd/cereal/publisher.go:119     autoPublishLoop
+                                 StartAutoPublish
+```
+
+That is the **publisher**, not a subscriber — it is v2.3.1's new "publishing on its
+own thread at a constant 20 Hz" feature faulting while writing into the msgq shared
+memory. The v0.1.10 bug we went dormant over (`panic("Invalid Msgq message size")`
+in a *shadow reader*) is genuinely fixed by v0.1.11; this is unrelated and new.
+
+**What did NOT recur: the loggerd kill chain.** That needed leaked reader *slots*,
+and every subscriber is `shadow: true`, so mapd consumes zero slots and its deaths
+leak nothing. loggerd held steady across the whole flap. Keep all five shadow — the
+mitigation is load-bearing independently of either crash.
+
+Confirmed good in the attempt, worth keeping: the pin, the binary
+(sha256 matches the v2.3.1 asset), the adopted `slot17` fields, and the publish rate
+— measured **20.02 Hz**, up from 19.7 on v2.3.0, so the strict-rate work does what it
+claims for the ~80 s it survives.
+
+**Debugging note:** plugind opens the process log with `'w'`, truncating it on every
+respawn, so a crash trace is erased ~85 s later. To catch one, poll
+`/tmp/plugin_logs/plugin_mapd.log` every second and copy it the moment it is
+non-empty.
+
+### Re-activation, when a release fixes the publisher fault
+1. Restore the process entry in `plugins/mapd/plugin.json`:
+   `"processes": [{"name": "mapd", "module": "mapd_runner", "condition": "always_run"}]`
+2. Bump `MAX_ALLOWED_VERSION` in `mapd_manager.py`, paired with a slot schema diff.
+3. Keep every `subscriber` entry on `shadow: true` (see above).
+4. Deploy, then **reboot** — plugind freezes manifests at discovery, so a
+   `processes` change needs plugind restarted, not just `.needs_restart`.
+5. Success criterion: one long-lived mapd PID across a whole drive. Watch the
+   spawn cadence in swaglog (`plugin process 'mapd' spawned`), which is how the
+   ~85 s flap was measured.
+
+### History: why it was dormant before this attempt (2026-08-19)
+
 
 Dormant from 2026-08-19 to 2026-08-21. mapd v2.3.0 shipped gomsgq **v0.1.10**, whose
 ungated `panic("Invalid Msgq message size")` killed the process on a shadow reader's
@@ -92,8 +141,9 @@ down the very interface we were keeping warm.
 
 **v2.3.1 (2026-08-21) pins gomsgq v0.1.11** (mapd `497a4f4`, merge `fe45d10`,
 PR #133): the panic is gated to non-shadow readers and shadow readers get
-`ShadowValid()`, which turns a torn read into a re-sync. The `processes` entry is
-restored and the pin bumped.
+`ShadowValid()`, which turns a torn read into a re-sync. That fix is real and
+verified — it is simply not sufficient, because v2.3.1 faults in the publisher
+instead (see above).
 
 **Every `subscriber` entry stays `shadow: true`.** v0.1.11 fixed the panic, not the
 leak — readers still only `Reset()`, with no deregistration, so a slotted reader

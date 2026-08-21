@@ -53,20 +53,19 @@ class TestService:
 
 
 class TestProcess:
-  def test_exactly_one_process_declared_binary_is_active(self):
-    """mapd is ACTIVE again: it declares its process, so the binary runs.
+  def test_no_process_declared_binary_is_dormant(self):
+    """mapd declares NO process, so the Go binary never launches.
 
-    This is the same tripwire as before, inverted. It read `processes == []`
-    while mapd was dormant on gomsgq v0.1.10's shadow-reader panic; v2.3.1
-    carries the fix (mapd fe45d10), so the entry is back. Deactivating mapd
-    must stay a deliberate edit to this assertion, never a silent drift — and
-    a SECOND process entry is just as much a surprise as zero.
+    Dormant since 2026-08-19 and again since 2026-08-21. v2.3.0 died on gomsgq
+    v0.1.10's shadow-reader panic; v2.3.1 fixes that and then SIGBUSes in its new
+    publisher thread (`autoPublishLoop`) ~80 s after start, so plugind respawns it
+    every ~85 s. Neither release survives a drive.
+
+    This assertion is a tripwire: re-activating mapd must be a deliberate edit
+    here, never silent drift. Flip it only alongside a release that fixes the
+    publisher fault — see the re-activation checklist in README.md.
     """
-    procs = _manifest()['processes']
-    assert len(procs) == 1
-    assert procs[0]['name'] == 'mapd'
-    assert procs[0]['module'] == 'mapd_runner'
-    assert procs[0]['condition'] == 'always_run'
+    assert _manifest()['processes'] == []
 
   def test_interface_survives_the_dormant_binary(self):
     """The cereal slots and mapdOut service MUST stay declared while dormant.
