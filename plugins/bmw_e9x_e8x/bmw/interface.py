@@ -2,7 +2,7 @@
 from opendbc.car import structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car import get_safety_config
-from bmw.values import CanBus, BmwFlags
+from bmw.values import CanBus, BmwFlags, CruiseSettings
 from opendbc.car.interfaces import CarInterfaceBase
 from bmw.carcontroller import CarController
 from bmw.carstate import CarState
@@ -76,9 +76,9 @@ class CarInterface(CarInterfaceBase):
       ret.steerRatio = 18.5
 
     if ret.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
-      ret.minEnableSpeed = 30. * CV.KPH_TO_MS
+      ret.minEnableSpeed = CruiseSettings.MIN_ENABLE_SPEED_KPH * CV.KPH_TO_MS
     if ret.flags & BmwFlags.NORMAL_CRUISE_CONTROL:
-      ret.minEnableSpeed = 30. * CV.KPH_TO_MS
+      ret.minEnableSpeed = CruiseSettings.MIN_ENABLE_SPEED_KPH * CV.KPH_TO_MS
 
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.bmw)]
     ret.safetyConfigs[0].safetyParam = 0

@@ -16,12 +16,22 @@ Stage-2 detection keys on the cancel press's RISING edge: buttonCancel fires on
 both press and release edges, and the stage-1 release lands after DCC has
 already dropped — acting on the release would cascade straight to OFF.
 
+On the entry side the filter clears exactly one event, resumeBlocked, on the
+sub-30 stalk engage gesture; see the note in filter().
+
 Everything else (DM escalation, doors, seatbelt, steering faults, soft
 disables) passes through untouched and still fully disengages. Stripping
 pedalPressed while engaged also neutralizes DisengageOnAccelerator on this car.
 
 Brief: .superpowers/sdd/2026-08-14-bmw-lka-mode/lka-mode-brief.md
 """
+
+
+# CarInterface's ret.minEnableSpeed, in m/s. Duplicated from
+# bmw.values.CruiseSettings rather than imported: this module runs inside
+# selfdrived, whose import graph must stay clear of the car interface.
+# tests/test_lka_mode.py guards the two against drift.
+MIN_ENABLE_SPEED = 30. / 3.6
 
 
 class LkaModeFilter:
@@ -42,7 +52,27 @@ class LkaModeFilter:
         self.cancel_press_in_lka = op_enabled and not dcc_on
 
     if not op_enabled:
-      return  # stock entry behavior (NO_ENTRY alerts) untouched
+      # Fresh-start engage block (route 418 seg 0, 2026-08-22). card.py only
+      # calls initialize_v_cruise on the carControl.enabled rising edge, so
+      # carState.vCruise sits at V_CRUISE_UNSET (255) until openpilot has
+      # engaged once in the drive. Stock then refuses entry on any
+      # accelCruise/resumeCruise event while vCruise > 250 — a guard against
+      # resuming a cruise that was never set. But below minEnableSpeed this
+      # port's own engage gesture IS an accelCruise release edge
+      # (carstate.should_button_enable source 2), so the request and the block
+      # land on the same frame and LKA can never be entered on a fresh boot.
+      #
+      # Nothing the guard protects is at risk here: card initializes v_cruise
+      # on the enable edge either way, and LKA holds no longitudinal authority
+      # at all. So clear it on exactly the frames the port calls an engage
+      # gesture — DCC off, below minEnableSpeed, accel/decelCruise release —
+      # and leave it standing everywhere else, including a resume press and
+      # any press at DCC speeds. Every other NO_ENTRY alert passes through.
+      if not dcc_on and CS.vEgo < MIN_ENABLE_SPEED and any(
+          be.type in (ButtonType.accelCruise, ButtonType.decelCruise) and not be.pressed
+          for be in CS.buttonEvents):
+        events.events[:] = [e for e in events.events if e != EventName.resumeBlocked]
+      return  # stock entry behavior otherwise untouched
 
     strip = {EventName.pedalPressed}
     if not (self.cancel_press_in_lka and not dcc_on):

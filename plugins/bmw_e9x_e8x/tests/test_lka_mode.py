@@ -29,6 +29,7 @@ class EventName(IntEnum):
   wrongGear = 5
   pcmDisable = 6
   gasPressedOverride = 7
+  resumeBlocked = 8
 
 
 class ButtonType(IntEnum):
@@ -36,6 +37,7 @@ class ButtonType(IntEnum):
   cancel = 0
   resumeCruise = 1
   accelCruise = 2
+  decelCruise = 3
 
 
 class GearShifter(IntEnum):
@@ -70,15 +72,19 @@ class FakeEvents:
     self.events.append(name)
 
 
-def make_cs(dcc_on=False, cancel_press=None, gear=GearShifter.drive):
-  """cancel_press: True = rising edge event, False = release edge, None = no event."""
+def make_cs(dcc_on=False, cancel_press=None, gear=GearShifter.drive,
+            v_ego=0.0, buttons=()):
+  """cancel_press: True = rising edge event, False = release edge, None = no event.
+  buttons: extra (type, pressed) pairs appended to buttonEvents."""
   btns = []
   if cancel_press is not None:
     btns.append(SimpleNamespace(type=ButtonType.cancel, pressed=cancel_press))
+  btns += [SimpleNamespace(type=t, pressed=p) for t, p in buttons]
   return SimpleNamespace(
     cruiseState=SimpleNamespace(enabled=dcc_on),
     buttonEvents=btns,
     gearShifter=gear,
+    vEgo=v_ego,
   )
 
 
@@ -94,6 +100,92 @@ class TestNotEngaged:
     events = FakeEvents([EventName.buttonCancel, EventName.pedalPressed])
     filt.filter(events, make_cs(dcc_on=False, cancel_press=True), make_cs(), op_enabled=False)
     assert events.events == [EventName.buttonCancel, EventName.pedalPressed]
+
+
+class TestFreshStartEngage:
+  """Entry side: the sub-30 stalk engage gesture must survive stock's
+  resumeBlocked guard on a fresh boot, where carState.vCruise is still
+  V_CRUISE_UNSET because card.py has never seen an enable edge."""
+  SUB30 = 4.0    # m/s, 14 km/h — an intersection
+  OVER30 = 10.0  # m/s, 36 km/h — DCC's regime
+
+  def _run(self, filt, *, dcc_on=False, v_ego=SUB30, buttons=(),
+           events=(EventName.resumeBlocked,)):
+    evs = FakeEvents(events)
+    cs = make_cs(dcc_on=dcc_on, v_ego=v_ego, buttons=buttons)
+    filt.filter(evs, cs, make_cs(), op_enabled=False)
+    return evs.events
+
+  def test_accel_release_below_min_speed_clears_the_block(self, filt):
+    assert self._run(filt, buttons=[(ButtonType.accelCruise, False)]) == []
+
+  def test_decel_release_below_min_speed_clears_the_block(self, filt):
+    assert self._run(filt, buttons=[(ButtonType.decelCruise, False)]) == []
+
+  def test_press_edge_is_not_an_engage_gesture(self, filt):
+    kept = self._run(filt, buttons=[(ButtonType.accelCruise, True)])
+    assert kept == [EventName.resumeBlocked]
+
+  def test_resume_is_not_an_engage_gesture(self, filt):
+    kept = self._run(filt, buttons=[(ButtonType.resumeCruise, False)])
+    assert kept == [EventName.resumeBlocked]
+
+  def test_block_kept_at_dcc_speed(self, filt):
+    kept = self._run(filt, v_ego=self.OVER30,
+                     buttons=[(ButtonType.accelCruise, False)])
+    assert kept == [EventName.resumeBlocked]
+
+  def test_block_kept_while_dcc_is_up(self, filt):
+    kept = self._run(filt, dcc_on=True,
+                     buttons=[(ButtonType.accelCruise, False)])
+    assert kept == [EventName.resumeBlocked]
+
+  def test_only_resume_blocked_is_stripped(self, filt):
+    kept = self._run(filt, buttons=[(ButtonType.accelCruise, False)],
+                     events=(EventName.wrongGear, EventName.resumeBlocked,
+                             EventName.doorOpen))
+    assert kept == [EventName.wrongGear, EventName.doorOpen]
+
+  def test_no_button_event_leaves_the_block(self, filt):
+    assert self._run(filt) == [EventName.resumeBlocked]
+
+
+class TestFreshStartEngageMirrorsThePort:
+  """The strip must fire on exactly the frames carstate.should_button_enable
+  calls an engage gesture. Drift between the two would either resurrect the
+  alert or suppress it on frames that are not engage requests."""
+
+  @pytest.fixture
+  def port_gate(self, monkeypatch):
+    import bmw.carstate as cs_mod
+    # should_button_enable reads ButtonType off its module globals; point it at
+    # the same identities lka_mode sees through the cereal mock.
+    monkeypatch.setattr(cs_mod, 'ButtonType', ButtonType)
+    return cs_mod.should_button_enable
+
+  @pytest.mark.parametrize('dcc_on', [False, True])
+  @pytest.mark.parametrize('v_ego', [0.0, 4.0, 8.3, 8.4, 10.0])
+  @pytest.mark.parametrize('btn', [ButtonType.accelCruise, ButtonType.decelCruise,
+                                   ButtonType.resumeCruise, ButtonType.cancel])
+  @pytest.mark.parametrize('pressed', [False, True])
+  def test_strip_matches_the_engage_gesture(self, filt, port_gate, dcc_on,
+                                            v_ego, btn, pressed):
+    import lka_mode
+    btns = [SimpleNamespace(type=btn, pressed=pressed)]
+    # Source 2 only: DCC is off on both edges, so the DCC-rising-edge branch
+    # cannot fire and the port gate reduces to the stalk gesture.
+    engages = port_gate(btns, dcc_engaged=dcc_on, dcc_engaged_prev=dcc_on,
+                        v_ego=v_ego, min_enable_speed=lka_mode.MIN_ENABLE_SPEED)
+    evs = FakeEvents([EventName.resumeBlocked])
+    cs = make_cs(dcc_on=dcc_on, v_ego=v_ego, buttons=[(btn, pressed)])
+    filt.filter(evs, cs, make_cs(dcc_on=dcc_on), op_enabled=False)
+    stripped = EventName.resumeBlocked not in evs.events
+    assert stripped == engages
+
+  def test_min_enable_speed_matches_the_car_interface(self):
+    import lka_mode
+    from bmw.values import CruiseSettings
+    assert lka_mode.MIN_ENABLE_SPEED == CruiseSettings.MIN_ENABLE_SPEED_KPH / 3.6
 
 
 class TestFullMode:

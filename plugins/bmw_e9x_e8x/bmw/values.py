@@ -50,6 +50,7 @@ class BmwFlags(IntFlag):
 class CruiseSettings:
   CLUSTER_OFFSET = 2 # kph
   MIN_SPEED_BUFFER = 5.0  # km/h - add to minEnableSpeed to avoid disengagement
+  MIN_ENABLE_SPEED_KPH = 30.  # CC and DCC both refuse to engage below this
 
 class CanBus:
   PT_CAN = 0
