@@ -800,10 +800,15 @@ class TestUnwindStepBoost:
     expected = self.TORQUE - 0.10 * mod.UNWIND_STEP_GAIN
     assert got == pytest.approx(expected, abs=1e-6), got
 
-  def test_unwind_not_boosted_at_30kph(self, monkeypatch):
-    """Boundary: at/above LKA_MAX_V the schedule is untouched."""
+  def test_unwind_fully_boosted_at_30kph(self, monkeypatch):
+    """Band floor. This assertion FLIPPED on 2026-08-24: it used to pin the
+    cliff (no boost at exactly LKA_MAX_V). LKA_MAX_V is now the lower edge of
+    a blend band, so full boost holds AT 30 km/h and fades to 1.0 by
+    LKA_BLEND_V — see TestLkaSpeedBlend. Everything strictly below 30 and
+    everything at/above 43 km/h is unchanged."""
     got, mod = self._target(monkeypatch, 8.5)
-    assert got == pytest.approx(self.TORQUE - 0.10, abs=1e-6), got
+    expected = self.TORQUE - 0.10 * mod.UNWIND_STEP_GAIN
+    assert got == pytest.approx(expected, abs=1e-6), got
 
   def test_unwind_not_boosted_at_speed(self, monkeypatch):
     got, mod = self._target(monkeypatch, 20.0)
@@ -820,6 +825,142 @@ class TestUnwindStepBoost:
     """Past zero the step is building in the NEW direction — normal cap."""
     got, mod = self._target(monkeypatch, 5.0, torque=-0.05)
     assert got == pytest.approx(-0.05 - 0.10, abs=1e-6), got
+
+
+def _dwell_tick(monkeypatch, *, v, relax_ticks):
+  """One decision that WOULD dwell: deep measured curve, standing torque, and
+  an overshoot-side kappa_des dip on the same side. relax_ticks is the value
+  BEFORE the tick — deep_relax increments it before `dwelling` is evaluated,
+  so the dwell is tested against relax_ticks + 1."""
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _set_measured(sm, v, 0.012)          # |κ_meas| > RELAX_DWELL_KAPPA
+  state['torque'] = -0.3
+  state['target_frac'] = -0.3
+  state['ramp_frames'] = 0
+  state['action'] = 'hold_curve'
+  state['relax_ticks'] = relax_ticks
+  state['tick_count'] = 999            # force the cadence decision
+  _call_update(lac, 0.001, v_ego=v)
+  return state['action'], mod
+
+
+class TestLkaSpeedBlend:
+  """Route 41b (2026-08-24): LKA_MAX_V was a cliff on the v axis. Three
+  behaviours flipped together at 30 km/h and all in the same direction, so a
+  turn one side of the line got a wholly different controller from a turn on
+  the other. Seg 33 12:01:37 is the reference case — a driver turn entered at
+  31.8 km/h, 1.8 km/h over the line, got relax_dwell armed (1.46 Nm pinned
+  flat for a full second) and no unwind boost, then decelerated THROUGH 30
+  mid-turn and switched regime halfway. 13-19% of that drive sat within
+  +-1.8 km/h of the line.
+
+  Crossings were rare (3-4 per segment), so this is not chatter and hysteresis
+  would buy nothing. The mismatch is that LKA_MAX_V is a good MODE detector
+  (DCC cannot engage below 30, so it identifies the LKA regime for free) being
+  used as a PLANT threshold — and the plant does not step at 30 km/h. SAT at
+  29.9 and 30.1 km/h is the same number.
+
+  Fix: keep v as the axis, replace the boolean with a ramp over
+  [LKA_MAX_V, LKA_BLEND_V]. Both endpoints reproduce the previously verified
+  behaviour exactly (np.interp clamps outside the range); only the band
+  between them changes. The one exception is v == LKA_MAX_V itself, where the
+  old strict `<` gave no boost — an arbitrary tie-break with no physical
+  meaning, now folded into the full-boost edge.
+
+  Deliberately still SPEED ONLY: no curvature conjunct (that would repeat the
+  gain-floor cliff on the kappa axis, see the deep_relax comment).
+  """
+  DESIRED = -0.02
+  TORQUE = 0.60
+
+  def _target(self, monkeypatch, v):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _decide_from_torque(lac, sm, state, v=v, desired=self.DESIRED,
+                        torque=self.TORQUE)
+    return state['target_frac'], mod
+
+  def _gain(self, monkeypatch, v):
+    """Recover the applied unwind gain from the step actually taken. Below
+    15 m/s the base STEP_MAX schedule clamps to 0.10, so the step is
+    0.10 * gain for every speed this class exercises."""
+    got, mod = self._target(monkeypatch, v)
+    return (self.TORQUE - got) / 0.10, mod
+
+  # --- band definition ---
+  def test_band_ceiling_is_12_ms(self, monkeypatch):
+    import bmw.latcontroller as mod
+    assert mod.LKA_BLEND_V == 12.0
+    assert mod.LKA_BLEND_V > mod.LKA_MAX_V
+
+  # --- unwind step gain across the band ---
+  def test_gain_is_full_below_the_band(self, monkeypatch):
+    g, mod = self._gain(monkeypatch, 5.0)
+    assert g == pytest.approx(mod.UNWIND_STEP_GAIN, abs=1e-6), g
+
+  def test_gain_is_full_at_the_band_floor(self, monkeypatch):
+    g, mod = self._gain(monkeypatch, 8.5)
+    assert g == pytest.approx(mod.UNWIND_STEP_GAIN, abs=1e-6), g
+
+  def test_gain_is_half_way_down_at_the_band_midpoint(self, monkeypatch):
+    g, mod = self._gain(monkeypatch, 10.25)
+    assert g == pytest.approx(1.0 + (mod.UNWIND_STEP_GAIN - 1.0) / 2.0,
+                              abs=1e-6), g
+
+  def test_gain_is_gone_at_the_band_ceiling(self, monkeypatch):
+    g, mod = self._gain(monkeypatch, 12.0)
+    assert g == pytest.approx(1.0, abs=1e-6), g
+
+  def test_gain_is_monotonic_through_the_band(self, monkeypatch):
+    gains = [self._gain(monkeypatch, v)[0]
+             for v in (8.5, 9.4, 10.25, 11.1, 12.0)]
+    assert all(a > b for a, b in zip(gains, gains[1:])), gains
+
+  def test_gain_stays_gone_above_the_band(self, monkeypatch):
+    """Nothing at highway speed may inherit the boost — STEP_MAX exists to
+    move LESS per decision as v rises."""
+    got, mod = self._target(monkeypatch, 20.0)
+    step = 0.10 + (20.0 - 15.0) / (28.0 - 15.0) * (0.05 - 0.10)
+    assert got == pytest.approx(self.TORQUE - step, abs=1e-6), got
+
+  # --- relax dwell length across the band ---
+  def _max_dwell(self, monkeypatch, v, cap=40):
+    """Longest dwell the bridge will sustain at speed v, in ticks (0 = it can
+    never form). Probed rather than read off RELAX_DWELL_TICKS, which is a
+    local inside on_lat_controller_init and not reachable from the module."""
+    n = 0
+    for t in range(cap):
+      action, _ = _dwell_tick(monkeypatch, v=v, relax_ticks=t)
+      if action != 'relax_dwell':
+        break
+      n = t + 1
+    return n
+
+  def test_dwell_never_engages_at_the_band_floor(self, monkeypatch):
+    """30 km/h: dwell length interpolates to 0, so the bridge cannot form —
+    the previously verified e748434 behaviour. deep_relax still counts its
+    ticks, so the rlx telemetry column keeps its meaning."""
+    assert self._max_dwell(monkeypatch, 8.5) == 0
+
+  def test_dwell_never_engages_below_the_band(self, monkeypatch):
+    assert self._max_dwell(monkeypatch, 5.0) == 0
+
+  def test_dwell_is_full_length_at_the_band_ceiling(self, monkeypatch):
+    """43 km/h and above is untouched — normal HOLD is the thing this must
+    not disturb."""
+    full = self._max_dwell(monkeypatch, 12.0)
+    assert full > 0
+    assert self._max_dwell(monkeypatch, 20.0) == full
+    assert self._max_dwell(monkeypatch, 30.0) == full
+
+  def test_dwell_is_half_length_at_the_band_midpoint(self, monkeypatch):
+    full = self._max_dwell(monkeypatch, 12.0)
+    assert self._max_dwell(monkeypatch, 10.25) == full // 2
+
+  def test_dwell_grows_monotonically_through_the_band(self, monkeypatch):
+    lens = [self._max_dwell(monkeypatch, v)
+            for v in (8.5, 9.4, 10.25, 11.1, 12.0)]
+    assert all(a <= b for a, b in zip(lens, lens[1:])), lens
+    assert lens[0] == 0 and lens[-1] > 0, lens
 
 
 def _kappa_for_delta_err(kappa_des, delta_err, L=2.66):

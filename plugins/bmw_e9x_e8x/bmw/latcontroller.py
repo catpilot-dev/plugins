@@ -195,7 +195,32 @@ V_GAIN_FLOOR = 2.778       # m/s (10 km/h), was 8.5 (30 km/h) -- user ruling
 # both because the plant is different down here: SAT (∝ v²) is weak, and this
 # rack's stiction HOLDS the angle at zero torque instead of letting SAT fling
 # the wheel. See deep_relax and the unwind step boost.
-LKA_MAX_V = 8.5            # m/s (30 km/h)
+LKA_MAX_V = 8.5            # m/s (30 km/h) -- LOWER edge of the blend band
+LKA_BLEND_V = 12.0         # m/s (43 km/h) -- UPPER edge of the blend band.
+# Route 41b (2026-08-24): LKA_MAX_V used to be a hard threshold, and both
+# behaviours above flipped at it in the SAME direction, so a turn at 30.1 km/h
+# got a wholly different controller from one at 29.9. Seg 33 12:01:37 is the
+# case: a turn entered at 31.8 km/h -- 1.8 km/h over the line -- ran with
+# relax_dwell armed (1.46 Nm pinned flat for a full second) and no unwind
+# boost, then decelerated THROUGH 30 mid-turn and switched regime halfway.
+# 13-19% of that drive sat within +-1.8 km/h of the line.
+#
+# Crossings were rare (3-4 per 60 s segment), so this is not chatter and
+# hysteresis would fix nothing. The real mismatch: LKA_MAX_V is an excellent
+# MODE detector (DCC cannot engage below 30, so it identifies the LKA regime
+# for free) doing duty as a PLANT threshold -- and the plant does not step at
+# 30 km/h. SAT is proportional to v^2 and stiction fades smoothly; SAT at 29.9
+# and 30.1 km/h is the same number.
+#
+# So keep v as the axis (a curvature conjunct would repeat the gain-floor
+# cliff on the kappa axis -- see deep_relax) and ramp instead of switching.
+# np.interp clamps, so both ENDPOINTS reproduce the previously on-car-verified
+# behaviour exactly: below 30 km/h is e748434 untouched, at/above 43 km/h is
+# stock HOLD untouched. Only the band between them changes. The single
+# exception is v == LKA_MAX_V itself, where the old strict `<` gave no boost --
+# an arbitrary tie-break with no physical meaning, now folded into the
+# full-boost edge. Upper edge chosen by the user 2026-08-24; it is a judgement
+# call, not a measurement.
 UNWIND_STEP_GAIN = 3.0     # step-cap multiplier while shedding torque in LKA
 UNWIND_CADENCE_TQ = 0.10   # frac (1.2 Nm): standing torque past which a
                            # cancel_tol on a REVERSING error leaves the cadence
@@ -1065,7 +1090,14 @@ def on_lat_controller_init(result, lac, CP):
                     and state['desired'] * state['measured'] > 0.0
                     and delta_err * delta_des < 0.0)
       state['relax_ticks'] = state['relax_ticks'] + 1 if deep_relax else 0
-      dwelling = 0 < state['relax_ticks'] <= RELAX_DWELL_TICKS
+      # Dwell LENGTH rides the blend band: 0 ticks at LKA_MAX_V (no bridge can
+      # form -- e748434's disarm, unchanged) growing to the full
+      # RELAX_DWELL_TICKS by LKA_BLEND_V. deep_relax keeps its own `>=
+      # LKA_MAX_V` conjunct so relax_ticks stays 0 below 30 km/h and the rlx
+      # telemetry column keeps meaning what it has always meant.
+      dwell_ticks = float(np.interp(v_true, [LKA_MAX_V, LKA_BLEND_V],
+                                    [0.0, float(RELAX_DWELL_TICKS)]))
+      dwelling = 0 < state['relax_ticks'] <= dwell_ticks
 
       # a_y_meas / jerk_pred: TELEMETRY ONLY since 2026-07-28. The ISO accel/
       # jerk cancel guard that used to read these (the `overshooting` predicate
@@ -1275,8 +1307,14 @@ def on_lat_controller_init(result, lac, CP):
           # RELAX_DWELL_KAPPA partway through the exit (seg 2: 0.037 -> 0.003
           # during the return), so a κ conjunct would switch the fast decay
           # off exactly when it is needed.
-          if v_true < LKA_MAX_V and (target_frac - state['torque']) * state['torque'] < 0.0:
-            step_max *= UNWIND_STEP_GAIN
+          if (target_frac - state['torque']) * state['torque'] < 0.0:
+            # Full boost at/below LKA_MAX_V, fading to none by LKA_BLEND_V.
+            # Building torque is still untouched at every speed -- that
+            # conjunct is what keeps the seg-27 abrupt-application hazard
+            # covered, and STEP_MAX's own schedule (move LESS per decision as
+            # v rises) must not be inverted at highway speed.
+            step_max *= float(np.interp(v_true, [LKA_MAX_V, LKA_BLEND_V],
+                                        [UNWIND_STEP_GAIN, 1.0]))
           step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
           target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
           # Post-trip block: no same-side re-push while the release is
