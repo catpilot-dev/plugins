@@ -480,11 +480,102 @@ class TestCruiseBurstCounter:
     """We yield the bus to the driver, so DCC follows SZL — resync on resume."""
     assert 1 <= self._resume_delta(0.30, human=True) <= 7
 
-  def test_counter_advances_by_one_within_a_burst(self):
-    """The handoff latch must not fire during a live burst: our frames still
-    have to be a contiguous +1 sequence, or the overwrite stops outrunning SZL."""
+  def test_counter_stays_forward_within_a_burst(self):
+    """The handoff latch must not fire during a live burst: every frame stays a
+    forward step inside DCC's window, so the burst keeps outrunning SZL. Steps
+    are 1 or 2 under the slot law (see TestCounterSlotLaw), not a flat +1."""
     events = self._replay([(1.0, 0.0, 24.0, False), (0.60, -0.8, 22.0, False)])
     ours = [c for (_t, w, c) in events if w == 'OP']
     assert len(ours) > 15, f"expected a sustained burst, got {len(ours)} frames"
     for prev, nxt in zip(ours, ours[1:]):
-      assert (nxt - prev) % 15 == 1, f"burst counter jumped {prev} -> {nxt}"
+      assert 1 <= (nxt - prev) % 15 <= 7, f"burst counter jumped {prev} -> {nxt}"
+
+
+class TestCounterSlotLaw:
+  """The counter step is decoupled from the frame rate.
+
+  Advancing +1 per frame makes our counter outrun SZL by (frames_per_slot - 1)
+  every 200 ms slot. The lead L = (ours - SZL) mod 15 must stay <= 7 at each SZL
+  tick or DCC treats SZL's idle frame as fresh again and takes the stock stalk
+  back mid-ramp. Only a per-slot advance of 0 mod 15 keeps L stationary, i.e.
+  exactly 1 or 16 frames per slot (5 Hz or 80 Hz) — and 80 Hz needs 12.5 ms
+  spacing, impossible on a 100 Hz loop. So no cadence can fix it; the counter
+  step has to stop being tied to the frame.
+
+  Measured on route 444 segs 19-22 with +1 per frame: DCC accepted 72% of our
+  command frames and SZL won 50% of in-burst slots. Under this law, replayed on
+  the same frame timings: 99% and 9%.
+  """
+
+  SZL_TICK = 0.2
+  STEP = 0.01
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _run(self, burst_s=2.0):
+    """Sustained burst. Returns the interleaved bus [(t, 'SZL'|'OP', counter)]."""
+    import importlib
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    CP = MagicMock()
+    CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+    CP.minEnableSpeed = 30 / 3.6
+    cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    events, t, szl = [], 0.0, 0
+    for dur, accel, v_target in [(1.0, 0.0, 24.0), (burst_s, -0.8, 22.0)]:
+      for _ in range(int(round(dur / self.STEP))):
+        t += self.STEP
+        if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+          szl = (szl + 1) % 15
+          events.append((t, 'SZL', szl))
+        _, sends = cc.update(make_stalk_carcontrol(accel, v_target),
+                             make_stalk_carstate(szl), int(round(t * 1e9)))
+        for addr, dat, _bus in sends:
+          if addr == 404:
+            events.append((t, 'OP', dat[1] & 0xF))
+    return events
+
+  def test_every_frame_is_a_forward_step(self):
+    """I1 — each of our frames must advance 1-7 from the previous, or DCC drops
+    it as stale/duplicate."""
+    ours = [c for (_t, w, c) in self._run() if w == 'OP']
+    assert len(ours) > 40, f"expected a sustained burst, got {len(ours)}"
+    for prev, nxt in zip(ours, ours[1:]):
+      step = (nxt - prev) % 15
+      assert 1 <= step <= 7, f"counter step {prev} -> {nxt} = {step}, outside DCC's window"
+
+  def test_first_frame_is_forward_from_szl(self):
+    """I3 — at burst start DCC's accepted counter is SZL's, so our opening frame
+    has to be a forward step from it."""
+    events = self._run()
+    first = next(i for i, e in enumerate(events) if e[1] == 'OP')
+    szl_now = [c for (_t, w, c) in events[:first] if w == 'SZL'][-1]
+    assert 1 <= (events[first][2] - szl_now) % 15 <= 7
+
+  def test_szl_idle_frames_stay_stale_through_a_long_burst(self):
+    """I2 — the regression this law exists for. Every SZL idle frame that lands
+    inside the burst must be rejected by DCC, not just the first slot's."""
+    events = self._run(burst_s=2.0)
+    acc, takeovers, in_burst, last_op = None, 0, 0, -9.0
+    for t, who, c in events:
+      if acc is None:
+        acc = c
+        continue
+      ok = 1 <= ((c - acc) % 15) <= 7
+      if ok:
+        acc = c
+      if who == 'OP':
+        last_op = t
+      elif t - last_op < 0.25:
+        in_burst += 1
+        takeovers += ok
+    assert in_burst >= 8, f"expected several in-burst SZL ticks, saw {in_burst}"
+    assert takeovers == 0, f"stock stalk took the bus back {takeovers}/{in_burst} slots"
