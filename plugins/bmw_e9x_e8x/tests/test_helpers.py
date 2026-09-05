@@ -185,3 +185,82 @@ def install_all_mocks(monkeypatch):
     monkeypatch.setitem(__import__('sys').modules, mod_name, mod_mock)
   for mod_name, mod_mock in make_cereal_mocks().items():
     monkeypatch.setitem(__import__('sys').modules, mod_name, mod_mock)
+
+
+# ============================================================
+# CarController scaffolding
+# ============================================================
+# bmw.carcontroller is the one module whose behaviour is a *state machine over
+# time* (the 0x194 counter-overwrite burst), so unlike the rest of the suite it
+# has to be exercised by really constructing the controller and stepping it,
+# not by re-implementing the rule in the test. That needs a handful of real
+# stubs rather than MagicMocks: a MagicMock base class swallows the instance
+# attributes __init__ sets, and MagicMock conversion factors poison the speed
+# arithmetic.
+
+class CarControllerBase:
+  """Real stand-in — CarController.__init__ calls super().__init__ and the
+  subclass then sets instance attributes that a MagicMock base would shadow."""
+  def __init__(self, dbc_name, CP):
+    self.CP = CP
+    self.frame = 0
+
+
+class StalkCANPacker:
+  """Packs CruiseControlStalk (0x194) to the real DBC layout so tests can read
+  the counter straight off the emitted frame. Only 0x194 is needed — the
+  StepperServoCAN path is off unless BmwFlags.STEPPER_SERVO_CAN is set."""
+  _ACTION_BIT = {'plus1': 0, 'plus5': 1, 'minus1': 2, 'minus5': 3,
+                 'cancel': 4, 'resume': 6, 'cancel_lever_up': 7}
+
+  def __init__(self, dbc_name): pass
+
+  def make_can_msg(self, name, bus, values):
+    assert name == 'CruiseControlStalk', f"unexpected message {name}"
+    actions = 0
+    for key, bit in self._ACTION_BIT.items():
+      if values.get(key):
+        actions |= 1 << bit
+    dat = bytes([
+      values.get('Checksum_0x194', 0) & 0xFF,
+      ((values.get('requests_0xF', 0) & 0xF) << 4) | (values.get('Counter_0x194', 0) & 0xF),
+      actions,
+      values.get('setMe_0xFC', 0) & 0xFF,
+    ])
+    return (404, dat, bus)
+
+
+def make_carcontroller_mocks() -> dict:
+  """make_opendbc_mocks() plus the real stubs bmw.carcontroller needs."""
+  mods = make_opendbc_mocks()
+  mods['opendbc.car.interfaces'].CarControllerBase = CarControllerBase
+  mods['opendbc.car'].DT_CTRL = 0.01
+  conv = mods['opendbc.car.common.conversions'].Conversions
+  conv.MS_TO_KPH = 3.6
+  conv.MS_TO_MPH = 2.23694
+  conv.KPH_TO_MS = 1 / 3.6
+  conv.MPH_TO_MS = 0.44704
+  mods['opendbc.can'].CANPacker = StalkCANPacker
+  return mods
+
+
+class _Bag:
+  """Attribute bag for CarState/CarControl stand-ins."""
+  def __init__(self, **kw): self.__dict__.update(kw)
+
+
+def make_stalk_carstate(szl_counter, v_ego=24.0, setpoint=24.5, human_pressing=False):
+  out = _Bag(vEgo=v_ego, vEgoCluster=v_ego, gasPressed=False, brakePressed=False,
+             steeringTorqueEps=0.0,
+             cruiseState=_Bag(enabled=True, available=True,
+                              speed=setpoint, speedCluster=setpoint))
+  return _Bag(out=out, is_metric=True, cruise_stalk_counter=szl_counter,
+              cruise_stalk_resume=human_pressing, cruise_stalk_cancel=False,
+              cruise_stalk_speed=0)
+
+
+def make_stalk_carcontrol(accel, v_target):
+  return _Bag(enabled=True, latActive=False,
+              actuators=_Bag(speed=v_target, accel=accel,
+                             as_builder=lambda: _Bag(speed=0.0, torque=0.0,
+                                                     torqueOutputCan=0.0)))

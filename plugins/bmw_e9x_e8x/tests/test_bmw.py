@@ -387,3 +387,104 @@ class TestButtonEnable:
     """Setpoint adjustment with DCC somehow live below the floor is not an
     engage request."""
     assert self._call(self._stalk(), dcc_now=True, dcc_prev=True, v_ego=5.5) is False
+
+
+# ============================================================
+# Cruise stalk burst counter (0x194)
+# ============================================================
+
+class TestCruiseBurstCounter:
+  """DCC accepts a 0x194 frame only if its counter is a forward step —
+  (counter - accepted) mod 15 in [1, 7]. Anything else is dropped as stale,
+  and a persistent rollback is what stores 5ECE.
+
+  During a burst we deliberately outrun SZL so DCC follows our sequence. The
+  hazard is the handoff back: once we fall silent long enough for SZL's idle
+  frame to be accepted, DCC's accepted counter is SZL's again, and resuming on
+  our own stale sequence is a rollback.
+
+  Regression: BURST_LIVE_WINDOW (0.5 s) is longer than SZL's 200 ms idle slot,
+  so a 200-500 ms pause used to resume mid-sequence. Measured on route 444:
+  14 rollbacks in 4 minutes, e.g. a 280 ms pause where SZL had reached 9 and we
+  resumed at 3 (delta 9).
+  """
+
+  SZL_TICK = 0.2      # stock idle cadence
+  STEP = 0.01         # control loop
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _controller(self):
+    import importlib
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    CP = MagicMock()
+    CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL   # cruise on F-CAN, servo path off
+    CP.minEnableSpeed = 30 / 3.6
+    return mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+
+  def _replay(self, phases):
+    """phases: list of (duration_s, accel, v_target, human_pressing).
+    Returns the interleaved bus as [(t, 'SZL'|'OP', counter), ...]."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc = self._controller()
+    events, t, szl = [], 0.0, 0
+    for dur, accel, v_target, human in phases:
+      for _ in range(int(round(dur / self.STEP))):
+        t += self.STEP
+        if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+          szl = (szl + 1) % 15
+          events.append((t, 'SZL', szl))
+        CS = make_stalk_carstate(szl, human_pressing=human)
+        CC = make_stalk_carcontrol(accel, v_target)
+        _, sends = cc.update(CC, CS, int(round(t * 1e9)))
+        for addr, dat, _bus in sends:
+          if addr == 404:
+            events.append((t, 'OP', dat[1] & 0xF))
+    return events
+
+  def _resume_delta(self, pause_s, human=False):
+    """Burst, then pause, then command again. Returns the first resumed frame's
+    counter delta from the newest SZL counter (which is DCC's accepted value
+    once the handoff has happened)."""
+    idle    = (1.0,  0.0, 24.0, False)    # anchor SZL phase, nothing commanded
+    burst   = (0.25, -0.8, 22.0, False)   # decel burst
+    pause   = (pause_s, 0.0, 24.0, human) # deadzone / driver on the stalk
+    resume  = (0.20, -0.8, 22.0, False)
+    events = self._replay([idle, burst, pause, resume])
+    # first OP frame emitted after the pause began
+    t_pause_start = 1.25 + self.STEP / 2
+    first = next(e for e in events if e[1] == 'OP' and e[0] > t_pause_start + pause_s)
+    szl_now = [c for (t, w, c) in events if w == 'SZL' and t <= first[0]][-1]
+    return (first[2] - szl_now) % 15
+
+  @pytest.mark.parametrize('pause_ms', [210, 250, 280, 300, 350, 400, 450])
+  def test_resume_within_burst_live_window_is_forward(self, pause_ms):
+    """The regression: pauses shorter than BURST_LIVE_WINDOW but longer than
+    SZL's idle slot must still resync, not resume the stale sequence."""
+    delta = self._resume_delta(pause_ms / 1000.0)
+    assert 1 <= delta <= 7, f"rollback after {pause_ms} ms pause: delta={delta}"
+
+  def test_resume_after_long_pause_is_forward(self):
+    """The path BURST_LIVE_WINDOW already covered stays correct."""
+    assert 1 <= self._resume_delta(0.60) <= 7
+
+  def test_resume_after_driver_stalk_press_is_forward(self):
+    """We yield the bus to the driver, so DCC follows SZL — resync on resume."""
+    assert 1 <= self._resume_delta(0.30, human=True) <= 7
+
+  def test_counter_advances_by_one_within_a_burst(self):
+    """The handoff latch must not fire during a live burst: our frames still
+    have to be a contiguous +1 sequence, or the overwrite stops outrunning SZL."""
+    events = self._replay([(1.0, 0.0, 24.0, False), (0.60, -0.8, 22.0, False)])
+    ours = [c for (_t, w, c) in events if w == 'OP']
+    assert len(ours) > 15, f"expected a sustained burst, got {len(ours)} frames"
+    for prev, nxt in zip(ours, ours[1:]):
+      assert (nxt - prev) % 15 == 1, f"burst counter jumped {prev} -> {nxt}"

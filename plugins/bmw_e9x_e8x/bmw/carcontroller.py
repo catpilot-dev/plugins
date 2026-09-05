@@ -70,6 +70,11 @@ class CarController(CarControllerBase):
     self.cruise_burst_frames = 0
     self.cruise_burst_interval = SINGLE_INTERVAL
     self.cruise_in_lead_window_prev = False
+    # Handoff latch: set once DCC has been observed to take SZL's counter back
+    # (see the handoff block at the end of update). Forces the next command to
+    # start a fresh burst resynced from RX instead of resuming a stale sequence.
+    self.cruise_burst_released = False
+    self.cruise_release_rx_cnt = -1
 
     self.cruise_bus = CanBus.PT_CAN
     if CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
@@ -100,7 +105,10 @@ class CarController(CarControllerBase):
         self.last_cruise_rx_timestamp = now_nanos
     self.rx_cruise_stalk_counter_last = CS.cruise_stalk_counter
 
+    tx_this_cycle = False
+
     def cruise_cmd(cmd, interval):
+      nonlocal tx_this_cycle
       if self.last_cruise_rx_timestamp == 0:
         return False
 
@@ -128,14 +136,20 @@ class CarController(CarControllerBase):
       elif dt_tx < interval - DT_CTRL / 2:
         return False
 
-      # Sync TX counter from RX on burst start (after a long pause); within a
-      # burst, carry our independent sequence forward so DCC's "must advance"
-      # check is satisfied even if stock's intermittent ticks have rotated rx.
-      burst_dead = self.tx_cruise_stalk_counter < 0 or dt_tx > BURST_LIVE_WINDOW
+      # Sync TX counter from RX on burst start; within a burst, carry our
+      # independent sequence forward so DCC's "must advance" check is satisfied
+      # even if stock's intermittent ticks have rotated rx. A burst is over
+      # either because nothing was sent for BURST_LIVE_WINDOW, or because the
+      # handoff latch fired — the latter is the one that matters in practice,
+      # since BURST_LIVE_WINDOW (0.5 s) outlives SZL's 200 ms idle slot.
+      burst_dead = self.tx_cruise_stalk_counter < 0 or dt_tx > BURST_LIVE_WINDOW \
+                   or self.cruise_burst_released
       if burst_dead:
         self.tx_cruise_stalk_counter = self.rx_cruise_stalk_counter_last
         self.cruise_burst_slots = 0
         self.cruise_burst_frames = 0
+        self.cruise_burst_released = False
+        self.cruise_release_rx_cnt = -1
       self.tx_cruise_stalk_counter = (self.tx_cruise_stalk_counter + 1) % 15
       self.cruise_burst_frames += 1
       # Count one slot per lead-window entry edge — the lead-window TX is the
@@ -147,6 +161,7 @@ class CarController(CarControllerBase):
         self.cruise_burst_interval = interval
       can_sends.append(bmwcan.create_accel_command(self.packer, cmd, self.cruise_bus, self.tx_cruise_stalk_counter))
       self.last_cruise_tx_timestamp = now_nanos
+      tx_this_cycle = True
       return True
 
     def cruise_burst_release_safe():
@@ -199,6 +214,28 @@ class CarController(CarControllerBase):
                   and (now_nanos - self.last_cruise_tx_timestamp) / 1e9 < BURST_LIVE_WINDOW
     if burst_alive and not cruise_stalk_human_pressing and not cruise_burst_release_safe():
       cruise_cmd(None, self.cruise_burst_interval)
+
+    # Burst handoff detection. cruise_burst_release_safe() means "if SZL's idle
+    # frame lands now, DCC accepts it as a forward step". So the moment we fall
+    # silent with release safe — or yield the bus to the driver — SZL's next
+    # tick becomes DCC's accepted counter, and our private sequence is left
+    # BEHIND it. Resuming on that stale sequence is a counter rollback, the
+    # 5ECE case: measured 14 times in 4 minutes on route 444 (e.g. a 280 ms
+    # pause where SZL had reached 9 and we resumed at 3, delta 9 — outside
+    # DCC's accepted [1, 7] window). BURST_LIVE_WINDOW alone cannot catch this,
+    # because at 0.5 s it outlives SZL's 200 ms idle slot.
+    #
+    # Two-step latch: arm on the first silent cycle, fire once SZL's counter
+    # actually moves while we are still silent. Arming is cleared by any TX, so
+    # the mid-burst gaps between our own 20-40 Hz frames never trip it — only a
+    # real silence spanning an SZL tick does.
+    if tx_this_cycle:
+      self.cruise_release_rx_cnt = -1
+    elif self.tx_cruise_stalk_counter >= 0 and (cruise_stalk_human_pressing or cruise_burst_release_safe()):
+      if self.cruise_release_rx_cnt < 0:
+        self.cruise_release_rx_cnt = self.rx_cruise_stalk_counter_last
+      elif self.rx_cruise_stalk_counter_last != self.cruise_release_rx_cnt:
+        self.cruise_burst_released = True
 
     if self.flags & BmwFlags.STEPPER_SERVO_CAN:
       if CC.enabled and CC.latActive:
