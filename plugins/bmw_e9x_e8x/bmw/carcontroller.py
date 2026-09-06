@@ -32,25 +32,6 @@ CRUISE_STALK_IDLE_TICK_STOCK = 0.2
 # At burst end, DCC accepts SZL's resumption only if (1 + M − K) mod 15 ∈ [1,7]
 # where M = slots overwritten, K = total frames. Until that holds, keep
 # transmitting (with neutral act=0 if openpilot has stopped commanding).
-# Counter law. Our counter advances by exactly CRUISE_SLOT_STEPS per stock idle
-# slot rather than +1 per frame. 16 = 1 (mod 15), so the lead over SZL is
-# stationary from slot to slot instead of walking, and 16*15 = 0 (mod 15) so it
-# stays consistent across the counter's own wrap. Advancing +1 per frame makes
-# the lead grow by (frames_per_slot - 1) each slot; the moment it passes 7,
-# SZL's idle frame looks fresh to DCC again and the stock stalk takes the bus
-# back mid-ramp. No cadence avoids that: only 1 or 16 frames per slot (5 Hz /
-# 80 Hz) hold the lead fixed, and 80 Hz needs a 12.5 ms spacing the 100 Hz
-# control loop cannot place. Measured on route 444 segs 19-22 with +1 per frame,
-# DCC accepted 72% of our command frames and SZL won 50% of in-burst slots.
-CRUISE_SLOT_STEPS = 16
-# Where we sit inside DCC's rejection band. The delta SZL sees at each tick is
-# (1 - CRUISE_LEAD_OFFSET - k) mod 15 with k = floor(CRUISE_SLOT_STEPS * phase)
-# of our last frame; the PRE_TICK_LEAD frame pins k to 14-15, which is why that
-# frame is load-bearing for this law and not just for freshness. Offsets 1..8
-# all keep SZL stale; 5 is the middle and measured best on replay (99% of our
-# commands accepted, stock takeovers 50% -> 9%).
-CRUISE_LEAD_OFFSET = 5
-
 HOLD_INTERVAL = 0.025         # 40 Hz — used when commanded accel ≥ ACCEL_HOLD_THRESHOLD
 SINGLE_INTERVAL = 0.050       # 20 Hz — single-press cadence
 PRE_TICK_LEAD = 0.015         # lead window 15 ms — wide enough to catch ≥1 OP cycle (10 ms) with phase jitter
@@ -84,15 +65,16 @@ class CarController(CarControllerBase):
     self.last_cruise_tx_timestamp = 0
     self.rx_cruise_stalk_counter_last = -1
     self.tx_cruise_stalk_counter = -1
-    # Burst anchors for the slot counter law: SZL's counter when the burst
-    # started, and the counter we opened on.
-    self.cruise_burst_rx_start = 0
-    self.cruise_burst_c_start = 0
+    # Burst counter-overwrite tracking: M slots, K frames, last cadence used.
+    self.cruise_burst_slots = 0
+    self.cruise_burst_frames = 0
     self.cruise_burst_interval = SINGLE_INTERVAL
+    self.cruise_in_lead_window_prev = False
     # Handoff latch: set once DCC has been observed to take SZL's counter back
     # (see the handoff block at the end of update). Forces the next command to
     # start a fresh burst resynced from RX instead of resuming a stale sequence.
     self.cruise_burst_released = False
+    self.cruise_release_rx_cnt = -1
 
     self.cruise_bus = CanBus.PT_CAN
     if CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
@@ -136,6 +118,11 @@ class CarController(CarControllerBase):
       elapsed_in_slot_ns = (now_nanos - self.last_cruise_rx_timestamp) % slot_period_ns
       in_lead_window = elapsed_in_slot_ns >= slot_period_ns - PRE_TICK_LEAD * 1e9
 
+      # Track lead-window edge BEFORE any early returns so M counter stays
+      # correct across throttled OP cycles that don't TX.
+      crossing_into_lead = in_lead_window and not self.cruise_in_lead_window_prev
+      self.cruise_in_lead_window_prev = in_lead_window
+
       # Force an "overwrite" frame in the final PRE_TICK_LEAD of each slot: our
       # next counter lands first on PT-CAN and advances DCC's accepted counter
       # past stock's pending value. Stock's idle frame (same-or-earlier counter)
@@ -158,26 +145,17 @@ class CarController(CarControllerBase):
       burst_dead = self.tx_cruise_stalk_counter < 0 or dt_tx > BURST_LIVE_WINDOW \
                    or self.cruise_burst_released
       if burst_dead:
-        # Open on SZL's counter plus the lead offset: a forward step for DCC,
-        # which is still following SZL at this point.
-        self.cruise_burst_rx_start = self.rx_cruise_stalk_counter_last
-        self.cruise_burst_c_start = (self.cruise_burst_rx_start + CRUISE_LEAD_OFFSET) % 15
-        self.tx_cruise_stalk_counter = self.cruise_burst_c_start
+        self.tx_cruise_stalk_counter = self.rx_cruise_stalk_counter_last
+        self.cruise_burst_slots = 0
+        self.cruise_burst_frames = 0
         self.cruise_burst_released = False
-      else:
-        # Target = anchor + 16 per elapsed slot + the fraction of this slot so
-        # far. Slot count is taken from SZL's own counter, and wraps harmlessly
-        # because 16*15 = 0 (mod 15).
-        slots = (self.rx_cruise_stalk_counter_last - self.cruise_burst_rx_start) % 15
-        phase = elapsed_in_slot_ns / slot_period_ns
-        target = (self.cruise_burst_c_start + CRUISE_SLOT_STEPS * slots
-                  + int(CRUISE_SLOT_STEPS * phase)) % 15
-        # Every frame still has to be a forward step inside DCC's [1, 7] window:
-        # never repeat a counter (two frames inside one 1/16 slot bucket), never
-        # jump further than DCC will accept.
-        step = (target - self.tx_cruise_stalk_counter) % 15
-        step = 1 if step == 0 else min(step, 7)
-        self.tx_cruise_stalk_counter = (self.tx_cruise_stalk_counter + step) % 15
+        self.cruise_release_rx_cnt = -1
+      self.tx_cruise_stalk_counter = (self.tx_cruise_stalk_counter + 1) % 15
+      self.cruise_burst_frames += 1
+      # Count one slot per lead-window entry edge — the lead-window TX is the
+      # frame that overwrites that slot's stock idle.
+      if crossing_into_lead:
+        self.cruise_burst_slots += 1
       # Track cadence for trailing-frame replication after commanding ends.
       if cmd is not None:
         self.cruise_burst_interval = interval
@@ -186,19 +164,14 @@ class CarController(CarControllerBase):
       tx_this_cycle = True
       return True
 
-    def cruise_handoff_counter():
-      # Under the slot law our lead is stationary, so SZL's idle frames stay
-      # stale for as long as we transmit — they never become a forward step on
-      # their own the way the old M/K drift arithmetic waited for. The handoff
-      # therefore has to be made deliberately: emit one frame carrying SZL's
-      # OWN current counter, and its next tick is +1 from DCC's accepted value,
-      # a clean forward step. Only reachable while that lands inside DCC's
-      # [1, 7] window, which is about 40% of each slot, so the caller keeps the
-      # neutral overwrite running until it opens.
-      handoff = self.rx_cruise_stalk_counter_last
-      if 1 <= (handoff - self.tx_cruise_stalk_counter) % 15 <= 7:
-        return handoff
-      return None
+    def cruise_burst_release_safe():
+      # DCC accepts SZL's resumption as forward iff (1 + M − K) mod 15 ∈ [1, 7].
+      # Requires at least one overwritten slot (M ≥ 1) so SZL is observed to be
+      # behind DCC's accepted counter at handoff.
+      if self.cruise_burst_slots < 1:
+        return False
+      delta = (1 + self.cruise_burst_slots - self.cruise_burst_frames) % 15
+      return 1 <= delta <= 7
 
     if not CC.enabled and self.cruise_enabled_prev:
       self.cruise_cancel = True
@@ -210,15 +183,12 @@ class CarController(CarControllerBase):
 
     cruise_stalk_human_pressing = CS.cruise_stalk_resume or CS.cruise_stalk_cancel or CS.cruise_stalk_speed != 0
 
-    commanding = False
     if not cruise_stalk_human_pressing and CS.out.cruiseState.enabled:
       if self.cruise_cancel:
         cruise_cmd(CruiseStalk.cancel, SINGLE_INTERVAL)
-        commanding = True
       elif CC.enabled:
         if CS.out.gasPressed:
           cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL)
-          commanding = True
         else:
           setpoint_error = v_target - CS.out.cruiseState.speed
 
@@ -226,7 +196,6 @@ class CarController(CarControllerBase):
             cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
             interval = HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL
             cruise_cmd(cmd, interval)
-            commanding = True
 
           elif v_error < -V_ERROR_DEADZONE and accel < 0 and setpoint_error < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
@@ -235,27 +204,38 @@ class CarController(CarControllerBase):
             step = 5 if cmd == CruiseStalk.minus5 else 1
             if headroom_kmh >= step:
               cruise_cmd(cmd, interval)
-              commanding = True
 
-    # Trailing overwrite and handoff. While commanding is paused but the burst
-    # is still live, keep the neutral act=0 frames going so DCC stays on our
-    # sequence, and take the first opening to hand the bus back deliberately.
-    # Yields immediately when the driver is on the stalk: we stop transmitting,
-    # our counter freezes, and SZL's own frames catch up within a few ticks.
+    # Trailing counter overwrite. If commanding stopped (or is briefly idle in
+    # a deadzone) but the burst is still live, keep transmitting at the burst's
+    # cadence with neutral act=0 frames until SZL's natural counter has caught
+    # up enough that handoff back to stock is a forward step. Yields the bus
+    # immediately when the driver is on the stalk.
     burst_alive = self.tx_cruise_stalk_counter >= 0 \
                   and (now_nanos - self.last_cruise_tx_timestamp) / 1e9 < BURST_LIVE_WINDOW
-    if burst_alive and not self.cruise_burst_released:
-      if cruise_stalk_human_pressing:
+    if burst_alive and not cruise_stalk_human_pressing and not cruise_burst_release_safe():
+      cruise_cmd(None, self.cruise_burst_interval)
+
+    # Burst handoff detection. cruise_burst_release_safe() means "if SZL's idle
+    # frame lands now, DCC accepts it as a forward step". So the moment we fall
+    # silent with release safe — or yield the bus to the driver — SZL's next
+    # tick becomes DCC's accepted counter, and our private sequence is left
+    # BEHIND it. Resuming on that stale sequence is a counter rollback, the
+    # 5ECE case: measured 14 times in 4 minutes on route 444 (e.g. a 280 ms
+    # pause where SZL had reached 9 and we resumed at 3, delta 9 — outside
+    # DCC's accepted [1, 7] window). BURST_LIVE_WINDOW alone cannot catch this,
+    # because at 0.5 s it outlives SZL's 200 ms idle slot.
+    #
+    # Two-step latch: arm on the first silent cycle, fire once SZL's counter
+    # actually moves while we are still silent. Arming is cleared by any TX, so
+    # the mid-burst gaps between our own 20-40 Hz frames never trip it — only a
+    # real silence spanning an SZL tick does.
+    if tx_this_cycle:
+      self.cruise_release_rx_cnt = -1
+    elif self.tx_cruise_stalk_counter >= 0 and (cruise_stalk_human_pressing or cruise_burst_release_safe()):
+      if self.cruise_release_rx_cnt < 0:
+        self.cruise_release_rx_cnt = self.rx_cruise_stalk_counter_last
+      elif self.rx_cruise_stalk_counter_last != self.cruise_release_rx_cnt:
         self.cruise_burst_released = True
-      elif not commanding:
-        handoff = cruise_handoff_counter()
-        if handoff is None:
-          cruise_cmd(None, self.cruise_burst_interval)
-        else:
-          can_sends.append(bmwcan.create_accel_command(self.packer, None, self.cruise_bus, handoff))
-          self.tx_cruise_stalk_counter = handoff
-          self.last_cruise_tx_timestamp = now_nanos
-          self.cruise_burst_released = True
 
     if self.flags & BmwFlags.STEPPER_SERVO_CAN:
       if CC.enabled and CC.latActive:
