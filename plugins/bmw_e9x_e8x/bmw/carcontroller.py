@@ -76,11 +76,46 @@ class CarController(CarControllerBase):
     self.cruise_burst_released = False
     self.cruise_release_rx_cnt = -1
 
+    # CruiseCadence — debug A/B knob, default off. 'hold' or 'single' pins the
+    # stalk cadence regardless of demanded accel; anything else keeps the normal
+    # accel-driven choice. It exists because openpilot picks the command AND the
+    # cadence from the same demanded accel, so HOLD and SINGLE cells can never
+    # be matched observationally — 46 decel bursts over 25 segments left the
+    # question open (one gap bin showed HOLD much stronger, two did not, and the
+    # cells differed in speed). Pinning it breaks that entanglement: drive the
+    # same road once pinned 'hold' and once pinned 'single', then compare decel
+    # at matched setpoint gaps.
+    #
+    # This changes frame SPACING only. Counter steps stay +1, so it carries none
+    # of the 5ECE exposure that the 16-per-slot counter law did (see DESIGN.md).
+    #
+    # Restart-scoped, read once here, matching HoldHysteresis/StallBreakaway:
+    # controlsd is onroad-only so the file is re-read at every drive start, and
+    # a mid-drive flip would contaminate the very A/B this exists for. Import at
+    # function scope so a partial deploy missing config.py just defaults to off.
+    try:
+      from config import read_plugin_param
+      self.cruise_cadence_pin = read_plugin_param('bmw_e9x_e8x', 'CruiseCadence', '').strip().lower()
+    except Exception:
+      self.cruise_cadence_pin = ''
+    if self.cruise_cadence_pin not in ('hold', 'single'):
+      self.cruise_cadence_pin = ''
+    if self.cruise_cadence_pin:
+      print(f"[bmw] CruiseCadence pinned to {self.cruise_cadence_pin.upper()} - debug A/B, not for normal driving")
+
     self.cruise_bus = CanBus.PT_CAN
     if CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
       self.cruise_bus = CanBus.F_CAN
 
     self.packer = CANPacker(dbc_name[Bus.pt])
+
+  def pin_cadence(self, interval):
+    """Apply the CruiseCadence debug override to a demand-chosen interval."""
+    if self.cruise_cadence_pin == 'hold':
+      return HOLD_INTERVAL
+    if self.cruise_cadence_pin == 'single':
+      return SINGLE_INTERVAL
+    return interval
 
   def update(self, CC, CS, now_nanos):
 
@@ -188,19 +223,19 @@ class CarController(CarControllerBase):
         cruise_cmd(CruiseStalk.cancel, SINGLE_INTERVAL)
       elif CC.enabled:
         if CS.out.gasPressed:
-          cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL)
+          cruise_cmd(CruiseStalk.plus1, self.pin_cadence(SINGLE_INTERVAL))
         else:
           setpoint_error = v_target - CS.out.cruiseState.speed
 
           if v_error > V_ERROR_DEADZONE and accel > 0 and setpoint_error > 0:
             cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
-            interval = HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL
+            interval = self.pin_cadence(HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
             cruise_cmd(cmd, interval)
 
           elif v_error < -V_ERROR_DEADZONE and accel < 0 and setpoint_error < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
             cmd = CruiseStalk.minus5 if -accel >= DECEL_STEP5_THRESHOLD else CruiseStalk.minus1
-            interval = HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL
+            interval = self.pin_cadence(HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
             step = 5 if cmd == CruiseStalk.minus5 else 1
             if headroom_kmh >= step:
               cruise_cmd(cmd, interval)

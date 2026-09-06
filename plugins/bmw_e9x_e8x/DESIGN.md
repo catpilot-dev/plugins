@@ -119,22 +119,82 @@ current speed and the DCC set-speed, and issues stalk pulses:
   chosen by accel magnitude thresholds; decel is blocked below the cruise
   minimum + buffer.
 - **Cadence encodes magnitude** — DCC infers accel magnitude from press
-  *rate*: `HOLD_INTERVAL` (40 Hz) for large accel, `SINGLE_INTERVAL` (20 Hz)
-  otherwise. The calibration table (PLUS1+HOLD ≈ +0.4 m/s², PLUS5+HOLD ≈
-  +1.2, MINUS1 ≈ −0.6, MINUS5 ≈ −1.2 m/s²) is noted inline.
-- **Counter-overwrite machinery (the 0x194 / DTC-5ECE fix)** — the stock SZL
-  module emits its own 0x194 counter open-loop at 5 Hz (+1 per 200 ms slot).
-  To keep DCC accepting openpilot's frames without raising DTC 5ECE, the
-  controller injects a frame inside a `PRE_TICK_LEAD` (15 ms) window at the
-  end of each stock idle slot so **our** counter lands first on PT-CAN and
-  stock's later same-or-earlier-counter idle frame is dropped as stale. Every
-  in-burst slot must be overwritten (SZL drifts +7/slot on HOLD, +3 on
-  SINGLE). Handoff back to stock is only released when
-  `(1 + M − K) mod 15 ∈ [1, 7]` (M = slots overwritten, K = frames sent);
-  until then it keeps transmitting neutral `act=0` frames.
-  `bmwcan.create_accel_command` builds the frame with the special
-  zero-initialised 0x194 checksum. This counter-collision handling is what
-  keeps DCC from raising the 5ECE rollback fault.
+  *rate*: `HOLD_INTERVAL` for large accel, `SINGLE_INTERVAL` otherwise. Note
+  the constants are 25 ms / 50 ms but 25 ms is not representable on the 10 ms
+  control grid: `dt_tx < interval - DT_CTRL / 2` puts HOLD's threshold exactly
+  on a tick, so HOLD actually transmits at ~20 ms — measured **48 Hz on-car,
+  not the 40 Hz the constant implies**. SINGLE is unaffected and measures
+  20.1 Hz. The calibration table (PLUS1+HOLD ≈ +0.4 m/s², PLUS5+HOLD ≈ +1.2,
+  MINUS1 ≈ −0.6, MINUS5 ≈ −1.2 m/s²) was measured against the real 48 Hz
+  behaviour, so do not "correct" the cadence without re-measuring it.
+
+### `CruiseCadence` — debug A/B param (default off)
+
+Pins the stalk cadence regardless of demanded accel, so a HOLD-vs-SINGLE
+comparison can be driven. Read once at `CarController.__init__`, so it applies
+from the next drive start.
+
+```sh
+ssh c3 'echo hold   > /data/plugins-runtime/bmw_e9x_e8x/data/CruiseCadence'  # pin 48 Hz
+ssh c3 'echo single > /data/plugins-runtime/bmw_e9x_e8x/data/CruiseCadence'  # pin 20 Hz
+ssh c3 'rm -f        /data/plugins-runtime/bmw_e9x_e8x/data/CruiseCadence'   # back to normal
+```
+
+It exists because openpilot picks the command **and** the cadence from the same
+demanded accel, so the two cells can never be matched observationally — 46 decel
+bursts over 25 segments left the question open (gap bin [0.5, 2) showed HOLD at
+−0.284 m/s² vs SINGLE at −0.075, but two other bins were a tie or a slight
+reversal, and the cells differed in speed by 24 km/h). Drive the same road once
+pinned `hold` and once pinned `single`, then compare decel at matched setpoint
+gaps.
+
+Changes frame **spacing only** — counter steps stay +1, so it carries none of
+the 5ECE exposure described below. Any unrecognised value falls back to normal
+demand-driven behaviour.
+
+### How DCC accepts 0x194 — read this before touching the counter
+
+> **The rule.** DSC/DCC ignores the stock SZL frame when an emulated frame
+> arrives a few milliseconds ahead of it. **Suppression is by TIMING, not by
+> comparing counters.** The counter's only job is to increment by **exactly
+> +1** on the stream that survives that timing filter.
+>
+> **Never emit a step other than +1 on 0x194.**
+
+The stock SZL module emits its own 0x194 counter open-loop at 5 Hz (+1 per
+200 ms slot). The controller injects a frame inside a `PRE_TICK_LEAD` (15 ms)
+window at the end of each stock idle slot so ours lands first and stock's
+arrives into the suppression shadow. `bmwcan.create_accel_command` builds the
+frame with the special zero-initialised 0x194 checksum.
+
+Because SZL's frames are only *sometimes* overwritten, our counter has to stay
++1 relative to whatever DCC last processed — which may be an SZL frame that got
+through. That is what `cruise_burst_released` handles: after a pause long
+enough for SZL to slip through, the next command resyncs from RX rather than
+resuming our own sequence (see `carcontroller.py`).
+
+**Correction, 2026-09-06.** This section previously stated that DCC accepts a
+frame iff `(1 + M − K) mod 15 ∈ [1, 7]`, and that the counter-overwrite works by
+keeping our counter inside a forward window. **That is not the mechanism**, and
+building on it put DTC 5ECE + CD95 on the car twice (routes 44c seg 24, 450 seg
+18): a change that advanced the counter 16 per slot instead of +1 per frame
+dropped the merged stream's +1 rate from ~94% to ~55%, and DCC matured the fault
+after ~95 s of engaged driving and latched cruise off. Reverted in `12a3f57`.
+
+`cruise_burst_release_safe()` still carries the old `(1 + M − K) mod 15` test.
+It is retained because it is what currently gates when the trailing `act=0`
+overwrite stops, and that behaviour is field-proven — but its stated rationale
+is wrong, and it should be revisited against the timing rule rather than
+extended.
+
+Evidence — merged 0x194 stream after timing suppression, fraction of +1 steps:
+
+| route | build | +1 rate | outcome |
+|-------|-------|---------|---------|
+| 444 | pre resume-fix | 94.6% | no 5ECE |
+| 44b | resume fix | 93.9% | no DTC, 11 segments |
+| 44c | 16-per-slot counter | 55.9% | **5ECE + CD95** |
+| 450 | 16-per-slot counter | 54.8% | **5ECE + CD95** |
 
 ## Steering command (`carcontroller.py` + `bmwcan.py`)
 

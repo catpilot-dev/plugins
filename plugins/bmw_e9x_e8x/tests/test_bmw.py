@@ -488,3 +488,94 @@ class TestCruiseBurstCounter:
     assert len(ours) > 15, f"expected a sustained burst, got {len(ours)} frames"
     for prev, nxt in zip(ours, ours[1:]):
       assert (nxt - prev) % 15 == 1, f"burst counter jumped {prev} -> {nxt}"
+
+
+class TestCruiseCadencePin:
+  """CruiseCadence debug param — pins the stalk cadence so a HOLD-vs-SINGLE A/B
+  can be driven without openpilot's demand choosing the cadence for us.
+
+  openpilot picks the command and the cadence from the same demanded accel, so
+  observationally the two cells are never matched: 46 decel bursts over 25
+  segments left the question open (gap bin [0.5,2) showed HOLD at -0.284 vs
+  SINGLE at -0.075, but two other bins were a tie or a slight reversal, and the
+  cells differed in speed by 24 km/h). Pinning breaks the entanglement.
+
+  Safety: this must change frame SPACING only. Counter steps stay +1 — that is
+  what the 16-per-slot counter law violated, setting 5ECE + CD95 on-car.
+  """
+
+  SZL_TICK = 0.2
+  STEP = 0.01
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _run(self, pin, accel):
+    """Drive one burst at `accel`, with CruiseCadence set to `pin`.
+    Returns (median TX interval in ms, counter steps seen)."""
+    import importlib
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    monkey = {'bmw_e9x_e8x': {'CruiseCadence': pin}}
+    import config as cfg
+    orig = cfg.read_plugin_param
+    cfg.read_plugin_param = lambda pid, key, default='': monkey.get(pid, {}).get(key, default)
+    try:
+      CP = MagicMock()
+      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+      CP.minEnableSpeed = 30 / 3.6
+      cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    finally:
+      cfg.read_plugin_param = orig
+    t, szl, sent = 0.0, 0, []
+    v_target = 24.0 + (2.0 if accel > 0 else -2.0)
+    for dur, a, vt in [(1.0, 0.0, 24.0), (1.2, accel, v_target)]:
+      for _ in range(int(round(dur / self.STEP))):
+        t += self.STEP
+        if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+          szl = (szl + 1) % 15
+        _, msgs = cc.update(make_stalk_carcontrol(a, vt),
+                            make_stalk_carstate(szl), int(round(t * 1e9)))
+        for addr, dat, _bus in msgs:
+          if addr == 404 and dat[2]:
+            sent.append((t, dat[1] & 0xF))
+    assert len(sent) > 8, f"expected a burst, got {len(sent)} frames"
+    import statistics
+    iv = statistics.median((sent[i + 1][0] - sent[i][0]) * 1000 for i in range(len(sent) - 1))
+    steps = {(sent[i + 1][1] - sent[i][1]) % 15 for i in range(len(sent) - 1)}
+    return iv, steps
+
+  def test_default_follows_demand(self):
+    """Unset: gentle decel picks SINGLE (50 ms), firm decel picks HOLD."""
+    slow, _ = self._run('', -0.15)
+    fast, _ = self._run('', -0.80)
+    assert slow > fast, f"gentle {slow:.0f} ms should be slower than firm {fast:.0f} ms"
+    assert slow > 35, f"gentle decel should use SINGLE cadence, got {slow:.0f} ms"
+    assert fast < 35, f"firm decel should use HOLD cadence, got {fast:.0f} ms"
+
+  def test_pin_hold_forces_fast_cadence_on_gentle_decel(self):
+    iv, _ = self._run('hold', -0.15)
+    assert iv < 35, f"pinned HOLD should transmit fast, got {iv:.0f} ms"
+
+  def test_pin_single_forces_slow_cadence_on_firm_decel(self):
+    iv, _ = self._run('single', -0.80)
+    assert iv > 35, f"pinned SINGLE should transmit slowly, got {iv:.0f} ms"
+
+  def test_unknown_value_falls_back_to_demand(self):
+    """A typo must not silently pin anything."""
+    assert self._run('HOLDD', -0.80)[0] < 35
+    assert self._run('yes', -0.15)[0] > 35
+
+  @pytest.mark.parametrize('pin', ['', 'hold', 'single'])
+  @pytest.mark.parametrize('accel', [-0.15, -0.80])
+  def test_counter_always_steps_by_one(self, pin, accel):
+    """The safety invariant. Pinning must never touch counter values."""
+    _, steps = self._run(pin, accel)
+    assert steps == {1}, f"pin={pin!r} accel={accel} produced counter steps {steps}"
