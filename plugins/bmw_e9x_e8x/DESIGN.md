@@ -196,6 +196,28 @@ park the setpoint ~12 km/h high on the way — a +1.1 m/s² lurch. This covers
 the 96% of decel episodes that end normally; exits that stop us commanding
 entirely (disengage, brake) are the debt ledger's job.
 
+**The debt ledger.** The restore branch only runs while openpilot is driving,
+so every exit that stops us commanding parks the bias in DCC's setpoint memory:
+the driver resumes expecting their set speed and gets one up to 12 km/h low,
+braking into it. `setpoint_debt` tracks km/h taken and not yet given back,
+accounted at the call sites (so a step DCC silently drops is still owed) and
+capped at `SETPOINT_BIAS_MAX`.
+
+It is a ledger rather than a "restore to `vCruise`" policy because while
+openpilot is disengaged `v_cruise` does *not* track the driver's stalk presses
+— `_update_v_cruise_non_pcm` returns early when not enabled — so there is no
+live signal to reconcile against. The only safe rule is to repay exactly what
+we took, and to drop the claim entirely the moment the driver touches the
+stalk. Losing `cruiseState.available` clears it too: the setpoint memory is
+gone, so nothing is owed.
+
+The repay always lands **after a standby round-trip**, never during the
+disengage itself: an openpilot disengage raises `cruise_cancel`, which outranks
+the repay and takes DCC to standby first. The debt survives standby and is
+settled when the driver brings DCC back — `CC.enabled` is still false at that
+point, which is the state the repay branch is written for. It repays with
+`plus1` at `SINGLE` for the same reason the restore branch does.
+
 **Duty cycle is the risk to watch.** This raises decel commanding from 6.7% to
 ~47% of engaged time — 7× the 0x194 counter-overwrite exposure — while
 direction flips stay flat (~4/min), so it is sustained commanding, not chatter

@@ -249,18 +249,19 @@ class _Bag:
   def __init__(self, **kw): self.__dict__.update(kw)
 
 
-def make_stalk_carstate(szl_counter, v_ego=24.0, setpoint=24.5, human_pressing=False):
+def make_stalk_carstate(szl_counter, v_ego=24.0, setpoint=24.5, human_pressing=False,
+                       dcc_enabled=True, available=True):
   out = _Bag(vEgo=v_ego, vEgoCluster=v_ego, gasPressed=False, brakePressed=False,
              steeringTorqueEps=0.0,
-             cruiseState=_Bag(enabled=True, available=True,
+             cruiseState=_Bag(enabled=dcc_enabled, available=available,
                               speed=setpoint, speedCluster=setpoint))
   return _Bag(out=out, is_metric=True, cruise_stalk_counter=szl_counter,
               cruise_stalk_resume=human_pressing, cruise_stalk_cancel=False,
               cruise_stalk_speed=0)
 
 
-def make_stalk_carcontrol(accel, v_target):
-  return _Bag(enabled=True, latActive=False,
+def make_stalk_carcontrol(accel, v_target, enabled=True):
+  return _Bag(enabled=enabled, latActive=False,
               actuators=_Bag(speed=v_target, accel=accel,
                              as_builder=lambda: _Bag(speed=0.0, torque=0.0,
                                                      torqueOutputCan=0.0)))

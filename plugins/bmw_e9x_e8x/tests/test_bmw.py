@@ -780,3 +780,188 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-0.5, v_ego_kmh=86.0, v_target_kmh=85.8,
                            setpoint_kmh=90.0, bias='')
     assert 'minus1' in acts, acts
+
+
+class TestSetpointDebtLedger:
+  """Every downward bias is borrowed and has to be repaid.
+
+  A setpoint left low keeps braking — the plant is symmetric — and the branches
+  that restore it only run while openpilot is driving. So every exit that stops
+  us commanding (openpilot disengaging, the driver braking) parks the bias in
+  DCC's setpoint memory: the driver resumes expecting their set speed and gets
+  one up to SETPOINT_BIAS_MAX low, braking into it. The ledger is what makes
+  that recoverable.
+
+  It is a ledger and not a "restore to vCruise" policy on purpose. While
+  openpilot is disengaged, v_cruise does not track the driver's stalk presses
+  (_update_v_cruise_non_pcm returns early when not enabled), so there is no
+  live signal to reconcile against — the only safe rule is to repay exactly
+  what we took, and to drop the claim entirely once the driver touches the
+  stalk.
+  """
+
+  SZL_TICK = 0.2
+  STEP = 0.01
+  KPH = 1 / 3.6
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
+
+  def _cc(self, bias=''):
+    import importlib
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    monkey = {'bmw_e9x_e8x': {'SetpointBias': bias}}
+    import config as cfg
+    orig = cfg.read_plugin_param
+    cfg.read_plugin_param = lambda pid, key, default='': monkey.get(pid, {}).get(key, default)
+    try:
+      CP = MagicMock()
+      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+      CP.minEnableSpeed = 30 / 3.6
+      return mod.CarController({0: 'bmw_e9x_e8x'}, CP), mod
+    finally:
+      cfg.read_plugin_param = orig
+
+  def _phases(self, cc, phases):
+    """phases: list of (seconds, dict of update kwargs). Returns actions seen
+    per phase, so a repay can be told apart from the decel that caused it.
+
+    The clock lives on the controller, not this call: cruise_cmd throttles on
+    now_nanos - last_cruise_tx_timestamp, so restarting time between calls
+    makes dt_tx negative and silently drops every frame."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    t = getattr(cc, '_test_t', 0.0)
+    szl = getattr(cc, '_test_szl', 0)
+    out = []
+    for dur, kw in phases:
+      acts = set()
+      for _ in range(int(round(dur / self.STEP))):
+        t += self.STEP
+        if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+          szl = (szl + 1) % 15
+        cs = make_stalk_carstate(szl,
+                                 v_ego=kw.get('v_ego_kmh', 86.0) * self.KPH,
+                                 setpoint=kw.get('setpoint_kmh', 86.0) * self.KPH,
+                                 human_pressing=kw.get('human', False),
+                                 dcc_enabled=kw.get('dcc', True),
+                                 available=kw.get('available', True))
+        ccx = make_stalk_carcontrol(kw.get('accel', 0.0),
+                                    kw.get('v_target_kmh', 86.0) * self.KPH,
+                                    enabled=kw.get('enabled', True))
+        _, msgs = cc.update(ccx, cs, int(round(t * 1e9)))
+        for addr, dat, _bus in msgs:
+          if addr == 404:
+            acts |= {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+      out.append(acts)
+    cc._test_t, cc._test_szl = t, szl
+    return out
+
+  def test_debt_accrues_on_decel(self):
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (1.5, {'accel': -0.8})])
+    assert cc.setpoint_debt > 0
+
+  def test_debt_is_capped(self):
+    cc, mod = self._cc()
+    self._phases(cc, [(1.0, {}), (8.0, {'accel': -3.0})])
+    assert cc.setpoint_debt <= mod.SETPOINT_BIAS_MAX
+
+  def test_debt_repaid_by_restore_branch(self):
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (1.5, {'accel': -0.8})])
+    owed = cc.setpoint_debt
+    assert owed > 0
+    self._phases(cc, [(3.0, {'accel': 0.0, 'setpoint_kmh': 76.0})])
+    assert cc.setpoint_debt < owed
+
+  def test_pending_cancel_outranks_the_repay(self):
+    """An openpilot disengage raises cruise_cancel, and that must win: the
+    repay is never allowed to hold the bus while a cancel is outstanding.
+
+    This is also why the repay only ever lands after a standby round-trip —
+    disengaging always cancels first, so the debt waits for the driver to
+    bring DCC back (see test_debt_survives_dcc_standby)."""
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (1.5, {'accel': -0.8})])
+    assert cc.setpoint_debt > 0
+    acts, = self._phases(cc, [(2.0, {'enabled': False, 'setpoint_kmh': 76.0})])
+    assert acts == {'cancel'}, acts
+
+  def test_repay_never_uses_plus5(self):
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (2.0, {'accel': -2.5}),
+                      (1.0, {'enabled': False, 'dcc': False})])
+    acts, = self._phases(cc, [(2.0, {'enabled': False, 'setpoint_kmh': 74.0})])
+    assert 'plus1' in acts, acts
+    assert 'plus5' not in acts, "plus5 repay parks the setpoint high — a lurch"
+
+  def test_driver_on_the_stalk_cancels_the_claim(self):
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (1.5, {'accel': -0.8})])
+    assert cc.setpoint_debt > 0
+    self._phases(cc, [(0.3, {'enabled': False, 'human': True, 'setpoint_kmh': 76.0})])
+    assert cc.setpoint_debt == 0.0
+    acts, = self._phases(cc, [(1.0, {'enabled': False, 'setpoint_kmh': 76.0})])
+    assert 'plus1' not in acts, acts
+
+  def test_losing_dcc_availability_clears_the_claim(self):
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (1.5, {'accel': -0.8})])
+    assert cc.setpoint_debt > 0
+    self._phases(cc, [(0.3, {'enabled': False, 'available': False})])
+    assert cc.setpoint_debt == 0.0
+
+  def test_debt_survives_dcc_standby(self):
+    """A brake takes DCC to standby but the setpoint memory — and the debt —
+    outlive it, so the repay lands when the driver brings DCC back."""
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (1.5, {'accel': -0.8})])
+    owed = cc.setpoint_debt
+    self._phases(cc, [(1.0, {'enabled': False, 'dcc': False})])
+    assert cc.setpoint_debt == owed
+    acts, = self._phases(cc, [(2.0, {'enabled': False, 'setpoint_kmh': 76.0})])
+    assert 'plus1' in acts, acts
+    assert cc.setpoint_debt < owed
+
+  def test_no_repay_below_the_deadzone(self):
+    cc, _ = self._cc()
+    acts, = self._phases(cc, [(2.0, {'enabled': False, 'setpoint_kmh': 86.0})])
+    assert 'plus1' not in acts, acts
+
+  def test_param_off_keeps_no_ledger(self):
+    cc, _ = self._cc(bias='0')
+    self._phases(cc, [(1.0, {}), (2.0, {'accel': -0.8, 'v_target_kmh': 80.0}),
+                      (1.0, {'enabled': False, 'dcc': False})])
+    acts, = self._phases(cc, [(2.0, {'enabled': False, 'setpoint_kmh': 76.0})])
+    assert 'plus1' not in acts, acts
+
+  def test_counter_steps_by_one_through_a_repay(self):
+    """The 5ECE/CD95 axis, on the one path that transmits with openpilot out."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (2.0, {'accel': -2.5}),
+                      (1.0, {'enabled': False, 'dcc': False})])
+    t, szl, sent = cc._test_t, cc._test_szl, []
+    for _ in range(300):
+      t += self.STEP
+      if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+        szl = (szl + 1) % 15
+      _, msgs = cc.update(
+        make_stalk_carcontrol(0.0, 86.0 * self.KPH, enabled=False),
+        make_stalk_carstate(szl, v_ego=86.0 * self.KPH, setpoint=74.0 * self.KPH),
+        int(round(t * 1e9)))
+      for addr, dat, _bus in msgs:
+        if addr == 404:
+          sent.append(dat[1] & 0xF)
+    assert len(sent) > 4, sent
+    steps = {(sent[i + 1] - sent[i]) % 15 for i in range(len(sent) - 1)}
+    assert steps <= {1}, steps
