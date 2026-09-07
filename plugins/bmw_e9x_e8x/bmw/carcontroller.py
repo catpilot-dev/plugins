@@ -42,7 +42,9 @@ V_ERROR_DEADZONE = 0.5 / 3.6   # m/s (~0.5 km/h) — deadzone for entry and burs
 ACCEL_HOLD_THRESHOLD = 0.3     # m/s² — use HOLD_INTERVAL above this, SINGLE_INTERVAL below
 ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — use +5 above this, +1 below (midpoint of 0.4–1.2)
 DECEL_HOLD_THRESHOLD = 0.3
-DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint of 0.6–1.2)
+DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint of 0.6–1.2).
+                               # Only the SetpointBias=0 rollback path uses this now;
+                               # DECEL_STEP5_KMH below replaces it.
 
 # DCC Calibration
 # PLUS1 + HOLD = +0.4 m/s²
@@ -77,6 +79,24 @@ DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint
 K_DCC = 0.1                    # m/s² of DCC response per km/h of setpoint gap
 SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
 SETPOINT_DEADZONE = 1.0        # km/h — one whole step; below this, don't command
+
+# Step size keys on the setpoint error, not on accel. Under the old clamped
+# setpoint the two were nearly the same question, because the setpoint could
+# never get further from v_target than the plan already was. This law breaks
+# that: the setpoint can already be deep (nothing to do) while demand is large,
+# or sitting high (10 km/h to go) while demand is mild. Measured against what
+# the setpoint actually had to move, the accel-keyed rule agreed only 35.7% of
+# the time and was too timid in 64.1% of cases — minus1 where >= 3 km/h was
+# needed — against 0.2% the other way.
+#
+# It also costs duty, which is the counter-overwrite exposure that matters
+# here: 7.88 presses to close the gap accel-keyed against 2.41 error-keyed.
+#
+# 3 km/h is the crossover. Below it minus5 overshoots by at most 2 km/h
+# (0.19 m/s², the same size as the restore transient, in the safe direction,
+# and pulled straight back by the restore branch); above it minus1 needs three
+# or more presses where one would do.
+DECEL_STEP5_KMH = 3.0          # km/h of remaining setpoint move — use -5 at or above this
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
@@ -327,9 +347,19 @@ class CarController(CarControllerBase):
 
           elif accel < 0 and decel_gate and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
-            cmd = CruiseStalk.minus5 if -accel >= DECEL_STEP5_THRESHOLD else CruiseStalk.minus1
+            if self.setpoint_bias_on:
+              use_step5 = -setpoint_error * 3.6 >= DECEL_STEP5_KMH
+            else:
+              use_step5 = -accel >= DECEL_STEP5_THRESHOLD
+            cmd = CruiseStalk.minus5 if use_step5 else CruiseStalk.minus1
+            # Cadence still keys on accel. Under this law the setpoint gap is
+            # the only magnitude channel DCC needs, which makes cadence a
+            # redundant second one — but the evidence that it is inert is thin
+            # (slew -2.13 HOLD vs -2.11 SINGLE, n=25/13) and runs against the
+            # seat, so it waits for the CruiseCadence A/B rather than riding
+            # along with this change.
             interval = self.pin_cadence(HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
-            step = 5 if cmd == CruiseStalk.minus5 else 1
+            step = 5 if use_step5 else 1
             if headroom_kmh >= step and cruise_cmd(cmd, interval):
               self.setpoint_debt = min(SETPOINT_BIAS_MAX, self.setpoint_debt + step)
 

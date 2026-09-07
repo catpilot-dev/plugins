@@ -683,7 +683,7 @@ class TestSetpointBias:
     """The band the old v_error gate threw away: at the set speed, planner
     asking for -0.5. It blocked 51% of the a_cmd -0.4..-0.3 samples."""
     acts, _, _ = self._run(accel=-0.5)
-    assert 'minus1' in acts, acts
+    assert acts & {'minus1', 'minus5'}, acts
 
   def test_no_command_when_setpoint_already_deep_enough(self):
     """Deadzone: setpoint 6 km/h under vEgo already covers a -0.5 ask."""
@@ -694,9 +694,23 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-1.1, setpoint_kmh=80.0)
     assert 'minus5' in acts, acts
 
-  def test_step5_above_threshold(self):
-    acts, _, _ = self._run(accel=-1.0)
+  def test_step_size_keys_on_setpoint_error_not_accel(self):
+    """Mild demand, but the setpoint is 4 km/h high: that is a minus5. The
+    accel-keyed rule would have sent minus1 and needed four presses."""
+    acts, _, _ = self._run(accel=-0.4, v_ego_kmh=86.0, setpoint_kmh=86.0)
     assert 'minus5' in acts and 'minus1' not in acts, acts
+
+  def test_large_demand_still_uses_minus1_when_little_is_owed(self):
+    """The mirror case. accel -1.5 would be minus5 under the old rule, but the
+    setpoint only has 2 km/h left to travel, so one step is the right one."""
+    acts, _, _ = self._run(accel=-1.5, v_ego_kmh=86.0, setpoint_kmh=76.0)
+    assert 'minus1' in acts and 'minus5' not in acts, acts
+
+  def test_rollback_path_keeps_the_accel_keyed_step(self):
+    acts, _, _ = self._run(accel=-1.0, v_target_kmh=80.0, setpoint_kmh=86.0, bias='0')
+    assert 'minus5' in acts, acts
+    acts, _, _ = self._run(accel=-0.4, v_target_kmh=80.0, setpoint_kmh=86.0, bias='0')
+    assert 'minus1' in acts and 'minus5' not in acts, acts
 
   def test_floor_still_blocks(self):
     """min_cruise_setpoint is 35 km/h and the branch guard still owns it."""
@@ -779,7 +793,7 @@ class TestSetpointBias:
   def test_bias_on_commands_that_same_case(self):
     acts, _, _ = self._run(accel=-0.5, v_ego_kmh=86.0, v_target_kmh=85.8,
                            setpoint_kmh=90.0, bias='')
-    assert 'minus1' in acts, acts
+    assert acts & {'minus1', 'minus5'}, acts
 
 
 class TestSetpointDebtLedger:

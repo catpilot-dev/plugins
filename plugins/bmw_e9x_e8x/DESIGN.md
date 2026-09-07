@@ -196,6 +196,26 @@ park the setpoint ~12 km/h high on the way — a +1.1 m/s² lurch. This covers
 the 96% of decel episodes that end normally; exits that stop us commanding
 entirely (disengage, brake) are the debt ledger's job.
 
+**Step size keys on the setpoint error**, not on accel. Under the old clamped
+setpoint the two were nearly the same question; this law breaks that, because
+the setpoint can already be deep while demand is large, or sitting high while
+demand is mild. Measured against what the setpoint actually had to move, the
+accel-keyed rule agreed only **35.7%** of the time and was too timid in
+**64.1%** of cases (minus1 where ≥3 km/h was needed) against 0.2% the other
+way — and cost **7.88 presses** to close the gap against **2.41** error-keyed.
+That is duty, and duty is counter exposure. `DECEL_STEP5_KMH` = 3 km/h is the
+crossover: below it minus5 overshoots by at most 2 km/h (0.19 m/s², safe
+direction, pulled straight back by the restore branch); above it minus1 needs
+three or more presses where one would do. `DECEL_STEP5_THRESHOLD` survives only
+on the `SetpointBias=0` rollback path.
+
+Cadence still keys on accel. Under this law the setpoint gap is the only
+magnitude channel DCC needs, which makes cadence a redundant second one and
+argues for pinning it to `SINGLE` (half the per-slot counter drift, +3 vs +7).
+It has not been changed, because the evidence that cadence is inert is thin
+(slew −2.13 HOLD vs −2.11 SINGLE, n=25/13) and runs against the seat — that is
+what `CruiseCadence` is deployed to settle.
+
 **The debt ledger.** The restore branch only runs while openpilot is driving,
 so every exit that stops us commanding parks the bias in DCC's setpoint memory:
 the driver resumes expecting their set speed and gets one up to 12 km/h low,
