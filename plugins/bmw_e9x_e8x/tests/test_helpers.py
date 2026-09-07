@@ -250,9 +250,13 @@ class _Bag:
 
 
 def make_stalk_carstate(szl_counter, v_ego=24.0, setpoint=24.5, human_pressing=False,
-                       dcc_enabled=True, available=True):
+                       dcc_enabled=True, available=True, v_cruise=None):
+  # vCruise is the driver's set speed in km/h (card.py: v_cruise_helper
+  # .v_cruise_kph), not m/s like the rest of these. Defaults to the setpoint,
+  # i.e. nothing borrowed yet.
   out = _Bag(vEgo=v_ego, vEgoCluster=v_ego, gasPressed=False, brakePressed=False,
              steeringTorqueEps=0.0,
+             vCruise=setpoint * 3.6 if v_cruise is None else v_cruise,
              cruiseState=_Bag(enabled=dcc_enabled, available=available,
                               speed=setpoint, speedCluster=setpoint))
   return _Bag(out=out, is_metric=True, cruise_stalk_counter=szl_counter,

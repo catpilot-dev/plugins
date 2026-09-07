@@ -164,13 +164,16 @@ class CarController(CarControllerBase):
     if not self.setpoint_bias_on:
       print("[bmw] SetpointBias disabled - setpoint tracks v_target (pre-2026-09 behaviour)")
 
-    # Debt ledger — km/h of setpoint we have taken and not yet given back.
-    # Every downward bias is borrowed from the driver's set speed and has to be
-    # repaid, because a setpoint left low keeps braking: the plant is symmetric.
-    # Accounted at the call sites rather than inferred from cruiseState.speed,
-    # so a step DCC silently drops is still owed. Capped at SETPOINT_BIAS_MAX
-    # so no accounting slip can accumulate into a large repay.
-    self.setpoint_debt = 0.0
+    # Hand-back point — the driver's set speed in km/h, latched while openpilot
+    # is driving. Every downward bias is borrowed from it and has to be given
+    # back, because a setpoint left low keeps braking: the plant is symmetric.
+    #
+    # Latched rather than read live because v_cruise only tracks the driver's
+    # stalk presses while openpilot is enabled (_update_v_cruise_non_pcm returns
+    # early otherwise), so the value is only trustworthy at the moment we still
+    # have the car. Zero means nothing is owed.
+    self.setpoint_handback_kmh = 0.0
+    self.setpoint_debt = 0.0     # derived each cycle, kept for logging and tests
 
     self.cruise_bus = CanBus.PT_CAN
     if CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
@@ -287,15 +290,31 @@ class CarController(CarControllerBase):
 
     cruise_stalk_human_pressing = CS.cruise_stalk_resume or CS.cruise_stalk_cancel or CS.cruise_stalk_speed != 0
 
-    # The ledger is only ours while the setpoint is only ours. A driver on the
-    # stalk is setting the speed themselves, and repaying over that would fight
-    # them — note v_cruise does NOT track their presses while openpilot is
-    # disengaged (_update_v_cruise_non_pcm returns early when not enabled), so
-    # there is no live signal to reconcile against. Drop the debt and let their
-    # value stand. Losing cruiseState.available (ignition, main switch) means
-    # the setpoint memory is gone too, so nothing is owed.
+    # Latch the hand-back point while we still have the car. Range-checked the
+    # same way register.py's cruise-ceiling memory does, so an unset or garbage
+    # v_cruise can never become a repay target.
+    if CC.enabled and CS.out.cruiseState.enabled and 30.0 <= CS.out.vCruise <= 145.0:
+      self.setpoint_handback_kmh = CS.out.vCruise
+
+    # The claim is only ours while the setpoint is only ours. A driver on the
+    # stalk is setting the speed themselves and repaying over that would fight
+    # them, and there is no live v_cruise to reconcile against once openpilot is
+    # out — so drop the claim and let their value stand. Losing
+    # cruiseState.available (ignition, main switch) takes the setpoint memory
+    # with it, so nothing is owed either.
     if cruise_stalk_human_pressing or not CS.out.cruiseState.available:
-      self.setpoint_debt = 0.0
+      self.setpoint_handback_kmh = 0.0
+
+    # Debt is *measured*, not accounted. An earlier version counted transmitted
+    # frames, which pinned it to the cap after 4 frames (60 ms) because DCC only
+    # steps the setpoint once per 200 ms slot, and made the repay declare itself
+    # settled after 0.6 s having actually returned about 3 km/h. Reading the
+    # setpoint back instead is self-correcting: a step DCC drops is still
+    # visible as debt, and the repay simply continues.
+    self.setpoint_debt = 0.0
+    if self.setpoint_bias_on and self.setpoint_handback_kmh > 0.0:
+      self.setpoint_debt = min(SETPOINT_BIAS_MAX,
+                               self.setpoint_handback_kmh - CS.out.cruiseState.speed * 3.6)
 
     if not cruise_stalk_human_pressing and CS.out.cruiseState.enabled:
       if self.cruise_cancel:
@@ -342,8 +361,7 @@ class CarController(CarControllerBase):
           if v_error > V_ERROR_DEADZONE and accel > 0 and setpoint_error > 0:
             cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
             interval = self.pin_cadence(HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
-            if cruise_cmd(cmd, interval):
-              self.setpoint_debt = max(0.0, self.setpoint_debt - (5 if cmd == CruiseStalk.plus5 else 1))
+            cruise_cmd(cmd, interval)
 
           elif accel < 0 and decel_gate and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
@@ -360,8 +378,8 @@ class CarController(CarControllerBase):
             # along with this change.
             interval = self.pin_cadence(HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
             step = 5 if use_step5 else 1
-            if headroom_kmh >= step and cruise_cmd(cmd, interval):
-              self.setpoint_debt = min(SETPOINT_BIAS_MAX, self.setpoint_debt + step)
+            if headroom_kmh >= step:
+              cruise_cmd(cmd, interval)
 
           # Restore. The bias is a debt: the setpoint is parked below where the
           # demand now justifies, and every path out of a decel leaves it there
@@ -377,8 +395,7 @@ class CarController(CarControllerBase):
           # demand releases, and this branch follows it. Only exits that stop
           # us commanding entirely (disengage, brake) need the debt ledger.
           elif self.setpoint_bias_on and setpoint_error > setpoint_deadzone:
-            if cruise_cmd(CruiseStalk.plus1, self.pin_cadence(SINGLE_INTERVAL)):
-              self.setpoint_debt = max(0.0, self.setpoint_debt - 1)
+            cruise_cmd(CruiseStalk.plus1, self.pin_cadence(SINGLE_INTERVAL))
 
       # Repay while openpilot is not driving. The branches above only run with
       # CC.enabled, so every exit that stops us commanding — openpilot
@@ -397,9 +414,8 @@ class CarController(CarControllerBase):
       # anything, so the debt waits — it survives standby because only losing
       # cruiseState.available clears it — and is settled when the driver
       # brings DCC back.
-      elif self.setpoint_debt >= SETPOINT_DEADZONE and self.setpoint_bias_on:
-        if cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL):
-          self.setpoint_debt = max(0.0, self.setpoint_debt - 1)
+      elif self.setpoint_debt >= SETPOINT_DEADZONE:
+        cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL)
 
     # Trailing counter overwrite. If commanding stopped (or is briefly idle in
     # a deadzone) but the burst is still live, keep transmitting at the burst's

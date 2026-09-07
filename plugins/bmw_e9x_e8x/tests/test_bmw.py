@@ -849,32 +849,54 @@ class TestSetpointDebtLedger:
     """phases: list of (seconds, dict of update kwargs). Returns actions seen
     per phase, so a repay can be told apart from the decel that caused it.
 
-    The clock lives on the controller, not this call: cruise_cmd throttles on
-    now_nanos - last_cruise_tx_timestamp, so restarting time between calls
-    makes dt_tx negative and silently drops every frame."""
+    Closes the loop on the setpoint. Debt is now *measured* off
+    cruiseState.speed rather than counted off transmitted frames, so a harness
+    that held the setpoint fixed would show no debt no matter what we sent.
+    DCC moves the setpoint one step per 200 ms slot in which it saw a command
+    (measured: a 3-frame minus5 burst moves it 5-10 km/h, a sub-slot minus1
+    burst often moves it not at all), so that is what this models.
+
+    The clock and the setpoint live on the controller, not this call:
+    cruise_cmd throttles on now_nanos - last_cruise_tx_timestamp, so restarting
+    time between calls makes dt_tx negative and silently drops every frame.
+    """
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
     t = getattr(cc, '_test_t', 0.0)
     szl = getattr(cc, '_test_szl', 0)
     out = []
+    STEP_KMH = {'minus1': -1, 'minus5': -5, 'plus1': 1, 'plus5': 5}
     for dur, kw in phases:
+      if not hasattr(cc, '_sim_setpoint'):
+        cc._sim_setpoint = kw.get('setpoint_kmh', 86.0)
+        cc._sim_vcruise = kw.get('v_cruise_kmh', cc._sim_setpoint)
       acts = set()
+      slot_acts = set()
       for _ in range(int(round(dur / self.STEP))):
         t += self.STEP
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
+          # slot boundary: DCC applies at most one step from what it saw
+          for a in ('minus5', 'minus1', 'plus5', 'plus1'):
+            if a in slot_acts:
+              cc._sim_setpoint = max(0.0, cc._sim_setpoint + STEP_KMH[a])
+              break
+          slot_acts = set()
         cs = make_stalk_carstate(szl,
                                  v_ego=kw.get('v_ego_kmh', 86.0) * self.KPH,
-                                 setpoint=kw.get('setpoint_kmh', 86.0) * self.KPH,
+                                 setpoint=cc._sim_setpoint * self.KPH,
                                  human_pressing=kw.get('human', False),
                                  dcc_enabled=kw.get('dcc', True),
-                                 available=kw.get('available', True))
+                                 available=kw.get('available', True),
+                                 v_cruise=cc._sim_vcruise)
         ccx = make_stalk_carcontrol(kw.get('accel', 0.0),
                                     kw.get('v_target_kmh', 86.0) * self.KPH,
                                     enabled=kw.get('enabled', True))
         _, msgs = cc.update(ccx, cs, int(round(t * 1e9)))
         for addr, dat, _bus in msgs:
           if addr == 404:
-            acts |= {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+            seen = {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+            acts |= seen
+            slot_acts |= seen
       out.append(acts)
     cc._test_t, cc._test_szl = t, szl
     return out
@@ -979,3 +1001,35 @@ class TestSetpointDebtLedger:
     assert len(sent) > 4, sent
     steps = {(sent[i + 1] - sent[i]) % 15 for i in range(len(sent) - 1)}
     assert steps <= {1}, steps
+
+  def test_debt_tracks_real_setpoint_movement_not_frames(self):
+    """Regression. The first ledger counted transmitted frames, so it hit the
+    SETPOINT_BIAS_MAX cap after 4 frames (60 ms) while DCC had moved the
+    setpoint by at most one step. Debt must equal what the setpoint actually
+    lost, and must not be pinned to the cap on the way there."""
+    cc, mod = self._cc()
+    self._phases(cc, [(1.0, {}), (0.5, {'accel': -0.8})])
+    assert cc.setpoint_debt < mod.SETPOINT_BIAS_MAX, "pinned to the cap again"
+    assert cc.setpoint_debt == pytest.approx(cc._sim_vcruise - cc._sim_setpoint, abs=1e-6)
+
+  def test_repay_continues_until_the_setpoint_really_returns(self):
+    """The other half of that bug: decrementing per frame let the repay call
+    itself settled after ~0.6 s having actually returned about 3 km/h. The
+    setpoint has to come all the way back."""
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (4.0, {'accel': -1.2}),
+                      (1.0, {'enabled': False, 'dcc': False})])
+    borrowed = cc._sim_vcruise - cc._sim_setpoint
+    assert borrowed > 4, borrowed
+    self._phases(cc, [(8.0, {'enabled': False})])
+    assert cc._sim_vcruise - cc._sim_setpoint < 1.0, (
+      f"setpoint still {cc._sim_vcruise - cc._sim_setpoint:.1f} km/h low")
+    assert cc.setpoint_debt < 1.0
+
+  def test_repay_stops_at_the_handback_point(self):
+    """It must not run the setpoint past the driver's set speed."""
+    cc, _ = self._cc()
+    self._phases(cc, [(1.0, {}), (4.0, {'accel': -1.2}),
+                      (1.0, {'enabled': False, 'dcc': False}),
+                      (12.0, {'enabled': False})])
+    assert cc._sim_setpoint <= cc._sim_vcruise + 1e-6, (cc._sim_setpoint, cc._sim_vcruise)

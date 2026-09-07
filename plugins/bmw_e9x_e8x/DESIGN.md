@@ -219,17 +219,27 @@ what `CruiseCadence` is deployed to settle.
 **The debt ledger.** The restore branch only runs while openpilot is driving,
 so every exit that stops us commanding parks the bias in DCC's setpoint memory:
 the driver resumes expecting their set speed and gets one up to 12 km/h low,
-braking into it. `setpoint_debt` tracks km/h taken and not yet given back,
-accounted at the call sites (so a step DCC silently drops is still owed) and
-capped at `SETPOINT_BIAS_MAX`.
+braking into it. `setpoint_debt` is how many km/h the setpoint is still
+below the point we borrowed it from, capped at `SETPOINT_BIAS_MAX`.
 
-It is a ledger rather than a "restore to `vCruise`" policy because while
-openpilot is disengaged `v_cruise` does *not* track the driver's stalk presses
-— `_update_v_cruise_non_pcm` returns early when not enabled — so there is no
-live signal to reconcile against. The only safe rule is to repay exactly what
-we took, and to drop the claim entirely the moment the driver touches the
-stalk. Losing `cruiseState.available` clears it too: the setpoint memory is
-gone, so nothing is owed.
+The hand-back point is `CS.out.vCruise`, **latched while openpilot is
+driving**. It cannot be read live at repay time: `v_cruise` only tracks the
+driver's stalk presses while openpilot is enabled
+(`_update_v_cruise_non_pcm` returns early otherwise), so the value is
+trustworthy only while we still have the car. It is range-checked 30–145 km/h,
+the same way `register.py`'s cruise-ceiling memory does. The claim is dropped
+entirely the moment the driver touches the stalk — their value stands, and
+there is nothing live to reconcile against — and when `cruiseState.available`
+goes away, since the setpoint memory goes with it.
+
+Debt is **measured, not accounted**: `handback − cruiseState.speed`, capped.
+An earlier version counted transmitted frames and was wrong — it pinned to the
+cap after 4 frames (60 ms), because DCC only steps the setpoint once per 200 ms
+slot, and the repay then declared itself settled after 0.6 s having actually
+returned about 3 km/h. Reading the setpoint back is self-correcting: a step DCC
+drops is still visible as debt and the repay simply continues. The tests model
+DCC's one-step-per-slot behaviour for the same reason — a harness that holds
+the setpoint fixed cannot see this class of bug at all.
 
 The repay always lands **after a standby round-trip**, never during the
 disengage itself: an openpilot disengage raises `cruise_cancel`, which outranks
