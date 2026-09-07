@@ -92,11 +92,30 @@ SETPOINT_DEADZONE = 1.0        # km/h — one whole step; below this, don't comm
 # It also costs duty, which is the counter-overwrite exposure that matters
 # here: 7.88 presses to close the gap accel-keyed against 2.41 error-keyed.
 #
-# 3 km/h is the crossover. Below it minus5 overshoots by at most 2 km/h
-# (0.19 m/s², the same size as the restore transient, in the safe direction,
-# and pulled straight back by the restore branch); above it minus1 needs three
-# or more presses where one would do.
-DECEL_STEP5_KMH = 3.0          # km/h of remaining setpoint move — use -5 at or above this
+# The two commands are NOT interchangeable actuators, and the loop cannot see
+# fast enough to treat them as one. Measured:
+#   - 0x193 reports the setpoint back at only ~5 Hz, so after commanding we are
+#     blind for up to 200 ms. That is the real control period here.
+#   - minus5 is accepted on ~67% of transmitted frames, 5 km/h each. Peak slew
+#     observed 39 km/h/s at SINGLE and 137 km/h/s at HOLD.
+#   - minus1 is accepted on ~17%, and a held minus1 auto-repeats at only
+#     ~3.6 km/h/s sustained — the way a real stalk hold does.
+#
+# So one blind window commits 0.7 km/h of minus1, but 7.8 km/h of minus5 at
+# SINGLE and 27 km/h at HOLD — 2.6 m/s² of braking nobody asked for, arriving
+# before a single observation comes back. SETPOINT_BIAS_MAX does not protect
+# against this: it caps the target, not the overshoot past it.
+#
+# Hence a dedicated cadence for the big step, decoupled from HOLD/SINGLE. At
+# 10 Hz a blind window holds about two frames, so ~1.3 accepted steps: ~6.7 km/h
+# committed, a 0.63 m/s² worst transient, and still 33 km/h/s of slew — the
+# 12 km/h bias lands in ~0.4 s. Overshoot past that is self-correcting, since
+# the restore branch pulls it straight back once it becomes visible.
+DECEL_STEP5_INTERVAL = 0.1     # s — step-5 cadence, held well under the 5 Hz observation rate
+
+# 5 km/h is one whole step: below it minus5 is guaranteed to overshoot, so let
+# minus1 have the range it can actually resolve.
+DECEL_STEP5_KMH = 5.0          # km/h of remaining setpoint move — use -5 at or above this
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
@@ -370,13 +389,15 @@ class CarController(CarControllerBase):
             else:
               use_step5 = -accel >= DECEL_STEP5_THRESHOLD
             cmd = CruiseStalk.minus5 if use_step5 else CruiseStalk.minus1
-            # Cadence still keys on accel. Under this law the setpoint gap is
-            # the only magnitude channel DCC needs, which makes cadence a
-            # redundant second one — but the evidence that it is inert is thin
-            # (slew -2.13 HOLD vs -2.11 SINGLE, n=25/13) and runs against the
-            # seat, so it waits for the CruiseCadence A/B rather than riding
-            # along with this change.
-            interval = self.pin_cadence(HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
+            # minus5 gets its own cadence — see DECEL_STEP5_INTERVAL. minus1
+            # keeps the accel-keyed HOLD/SINGLE choice: it is rate-limited by
+            # DCC's own auto-repeat (~3.6 km/h/s) rather than by our frame
+            # rate, so a blind window commits under 1 km/h either way and the
+            # cadence question there is still the CruiseCadence A/B's to settle.
+            if use_step5:
+              interval = self.pin_cadence(DECEL_STEP5_INTERVAL)
+            else:
+              interval = self.pin_cadence(HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
             step = 5 if use_step5 else 1
             if headroom_kmh >= step:
               cruise_cmd(cmd, interval)

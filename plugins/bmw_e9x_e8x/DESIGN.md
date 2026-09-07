@@ -196,6 +196,35 @@ park the setpoint ~12 km/h high on the way — a +1.1 m/s² lurch. This covers
 the 96% of decel episodes that end normally; exits that stop us commanding
 entirely (disengage, brake) are the debt ledger's job.
 
+### The loop is blind for 200 ms — size the steps for that
+
+`0x193` reports the setpoint back at only **~5 Hz** (measured median gap 0.199 s
+/ 0.131 s across the two routes). That is the observation quantum, and it is
+the real control period here. It is **not** a limit on how fast DCC moves the
+setpoint — DCC steps as fast as accepted stalk frames arrive, up to ~40 Hz. Do
+not confuse the two, and do not confuse either with SZL's 200 ms idle transmit
+period, which is a third unrelated 5 Hz clock.
+
+Per transmitted frame, measured:
+
+| command | accepted | per step | sustained |
+|---|---|---|---|
+| `minus5` | ~67% of frames | 5 km/h | peak 39 km/h/s at SINGLE, **137 at HOLD** |
+| `minus1` | ~17% of frames | 1 km/h | ~3.6 km/h/s — DCC's own auto-repeat, not our frame rate |
+
+So one blind window commits 0.7 km/h of minus1 but **27 km/h of minus5 at
+HOLD — 2.6 m/s² of braking nobody asked for**, all of it before a single
+observation returns. `SETPOINT_BIAS_MAX` does not protect against this: it caps
+the target, not the overshoot past it.
+
+Hence `DECEL_STEP5_INTERVAL` = 100 ms, a cadence for the big step that is
+decoupled from HOLD/SINGLE and held well under the observation rate. A blind
+window then holds about two frames — ~1.3 accepted steps, ~6.7 km/h, a
+0.63 m/s² worst transient — while still giving 33 km/h/s of slew, so the 12 km/h
+bias lands in ~0.4 s. Whatever overshoot remains is self-correcting: the
+restore branch pulls it back as soon as it becomes visible. `minus1` keeps the
+accel-keyed HOLD/SINGLE choice, because DCC's auto-repeat rate-limits it for us.
+
 **Step size keys on the setpoint error**, not on accel. Under the old clamped
 setpoint the two were nearly the same question; this law breaks that, because
 the setpoint can already be deep while demand is large, or sitting high while
@@ -203,18 +232,16 @@ demand is mild. Measured against what the setpoint actually had to move, the
 accel-keyed rule agreed only **35.7%** of the time and was too timid in
 **64.1%** of cases (minus1 where ≥3 km/h was needed) against 0.2% the other
 way — and cost **7.88 presses** to close the gap against **2.41** error-keyed.
-That is duty, and duty is counter exposure. `DECEL_STEP5_KMH` = 3 km/h is the
-crossover: below it minus5 overshoots by at most 2 km/h (0.19 m/s², safe
-direction, pulled straight back by the restore branch); above it minus1 needs
-three or more presses where one would do. `DECEL_STEP5_THRESHOLD` survives only
+That is duty, and duty is counter exposure. `DECEL_STEP5_KMH` = 5 km/h is the
+crossover — one whole step, below which minus5 could only overshoot, so minus1
+owns that range. `DECEL_STEP5_THRESHOLD` survives only
 on the `SetpointBias=0` rollback path.
 
-Cadence still keys on accel. Under this law the setpoint gap is the only
-magnitude channel DCC needs, which makes cadence a redundant second one and
-argues for pinning it to `SINGLE` (half the per-slot counter drift, +3 vs +7).
-It has not been changed, because the evidence that cadence is inert is thin
-(slew −2.13 HOLD vs −2.11 SINGLE, n=25/13) and runs against the seat — that is
-what `CruiseCadence` is deployed to settle.
+Cadence for `minus1` still keys on accel, and the earlier claim here that
+cadence is inert was wrong — it came from averaging whole bursts (−2.13 HOLD vs
+−2.11 SINGLE) under the old clamped law, where bursts were too short to show
+anything. Peak slew says the opposite, 137 km/h/s at HOLD against 39 at SINGLE.
+`CruiseCadence` is still what settles the `minus1` question.
 
 **The debt ledger.** The restore branch only runs while openpilot is driving,
 so every exit that stops us commanding parks the bias in DCC's setpoint memory:

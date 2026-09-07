@@ -483,7 +483,10 @@ class TestCruiseBurstCounter:
   def test_counter_advances_by_one_within_a_burst(self):
     """The handoff latch must not fire during a live burst: our frames still
     have to be a contiguous +1 sequence, or the overwrite stops outrunning SZL."""
-    events = self._replay([(1.0, 0.0, 24.0, False), (0.60, -0.8, 22.0, False)])
+    # accel chosen so the setpoint error stays under one whole step: that keeps
+    # this on minus1 at HOLD, the sustained command. minus5 deliberately
+    # transmits at only 10 Hz now, so it is no longer a burst at all.
+    events = self._replay([(1.0, 0.0, 24.0, False), (0.60, -0.3, 24.0, False)])
     ours = [c for (_t, w, c) in events if w == 'OP']
     assert len(ours) > 15, f"expected a sustained burst, got {len(ours)} frames"
     for prev, nxt in zip(ours, ours[1:]):
@@ -542,7 +545,8 @@ class TestCruiseCadencePin:
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
         _, msgs = cc.update(make_stalk_carcontrol(a, vt),
-                            make_stalk_carstate(szl), int(round(t * 1e9)))
+                            make_stalk_carstate(szl, setpoint=23.0 if accel < 0 else 24.5),
+                            int(round(t * 1e9)))
         for addr, dat, _bus in msgs:
           if addr == 404 and dat[2]:
             sent.append((t, dat[1] & 0xF))
@@ -553,7 +557,11 @@ class TestCruiseCadencePin:
     return iv, steps
 
   def test_default_follows_demand(self):
-    """Unset: gentle decel picks SINGLE (50 ms), firm decel picks HOLD."""
+    """Unset: gentle decel picks SINGLE (50 ms), firm decel picks HOLD.
+
+    Scenarios sit inside minus1's range on purpose — minus5 has had its own
+    cadence since the 5 Hz observation rate was measured, so HOLD/SINGLE no
+    longer governs it."""
     slow, _ = self._run('', -0.15)
     fast, _ = self._run('', -0.80)
     assert slow > fast, f"gentle {slow:.0f} ms should be slower than firm {fast:.0f} ms"
@@ -695,10 +703,15 @@ class TestSetpointBias:
     assert 'minus5' in acts, acts
 
   def test_step_size_keys_on_setpoint_error_not_accel(self):
-    """Mild demand, but the setpoint is 4 km/h high: that is a minus5. The
-    accel-keyed rule would have sent minus1 and needed four presses."""
-    acts, _, _ = self._run(accel=-0.4, v_ego_kmh=86.0, setpoint_kmh=86.0)
+    """Mild demand, but the setpoint is 6 km/h high: that is a minus5. The
+    accel-keyed rule would have sent minus1 and needed six presses."""
+    acts, _, _ = self._run(accel=-0.6, v_ego_kmh=86.0, setpoint_kmh=86.0)
     assert 'minus5' in acts and 'minus1' not in acts, acts
+
+  def test_small_error_stays_on_minus1_whatever_the_demand(self):
+    """Under one whole step, minus5 could only overshoot."""
+    acts, _, _ = self._run(accel=-0.4, v_ego_kmh=86.0, setpoint_kmh=86.0)
+    assert 'minus1' in acts and 'minus5' not in acts, acts
 
   def test_large_demand_still_uses_minus1_when_little_is_owed(self):
     """The mirror case. accel -1.5 would be minus5 under the old rule, but the
@@ -849,12 +862,21 @@ class TestSetpointDebtLedger:
     """phases: list of (seconds, dict of update kwargs). Returns actions seen
     per phase, so a repay can be told apart from the decel that caused it.
 
-    Closes the loop on the setpoint. Debt is now *measured* off
-    cruiseState.speed rather than counted off transmitted frames, so a harness
-    that held the setpoint fixed would show no debt no matter what we sent.
-    DCC moves the setpoint one step per 200 ms slot in which it saw a command
-    (measured: a 3-frame minus5 burst moves it 5-10 km/h, a sub-slot minus1
-    burst often moves it not at all), so that is what this models.
+    Models the car, not a convenient abstraction, because the first version of
+    this harness stepped the setpoint once per 200 ms and that was wrong in the
+    way that hides overshoot. Measured on routes 452 + 453:
+
+      - 0x193 reports the setpoint back at only ~5 Hz. That is the observation
+        quantum, and it is what makes the loop blind for up to 200 ms — it is
+        NOT a limit on how fast DCC moves the setpoint.
+      - minus5/plus5 are accepted on ~67% of transmitted frames, 5 km/h each
+        (modelled deterministically as two frames in every three).
+      - minus1/plus1 are rate-limited by DCC's own auto-repeat, ~3.6 km/h/s
+        sustained, however fast we transmit.
+
+    So the harness keeps a true setpoint that moves at frame rate and an
+    observed one that only refreshes at 5 Hz, and feeds the controller the
+    observed one.
 
     The clock and the setpoint live on the controller, not this call:
     cruise_cmd throttles on now_nanos - last_cruise_tx_timestamp, so restarting
@@ -864,23 +886,25 @@ class TestSetpointDebtLedger:
     t = getattr(cc, '_test_t', 0.0)
     szl = getattr(cc, '_test_szl', 0)
     out = []
-    STEP_KMH = {'minus1': -1, 'minus5': -5, 'plus1': 1, 'plus5': 5}
+    STEP1_PERIOD = 0.28          # s between auto-repeat steps -> ~3.6 km/h/s
+    OBS_PERIOD = 0.2             # s — 0x193 report rate
     for dur, kw in phases:
-      if not hasattr(cc, '_sim_setpoint'):
-        cc._sim_setpoint = kw.get('setpoint_kmh', 86.0)
-        cc._sim_vcruise = kw.get('v_cruise_kmh', cc._sim_setpoint)
+      if not hasattr(cc, '_sim_true'):
+        cc._sim_true = kw.get('setpoint_kmh', 86.0)
+        cc._sim_setpoint = cc._sim_true
+        cc._sim_vcruise = kw.get('v_cruise_kmh', cc._sim_true)
+        cc._sim_f5 = 0
+        cc._sim_t1 = -9.0
+        cc._sim_obs = 0.0
+        cc._sim_min_true = cc._sim_true
       acts = set()
-      slot_acts = set()
       for _ in range(int(round(dur / self.STEP))):
         t += self.STEP
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
-          # slot boundary: DCC applies at most one step from what it saw
-          for a in ('minus5', 'minus1', 'plus5', 'plus1'):
-            if a in slot_acts:
-              cc._sim_setpoint = max(0.0, cc._sim_setpoint + STEP_KMH[a])
-              break
-          slot_acts = set()
+        if t - cc._sim_obs >= OBS_PERIOD:          # 5 Hz observation
+          cc._sim_obs = t
+          cc._sim_setpoint = cc._sim_true
         cs = make_stalk_carstate(szl,
                                  v_ego=kw.get('v_ego_kmh', 86.0) * self.KPH,
                                  setpoint=cc._sim_setpoint * self.KPH,
@@ -893,10 +917,20 @@ class TestSetpointDebtLedger:
                                     enabled=kw.get('enabled', True))
         _, msgs = cc.update(ccx, cs, int(round(t * 1e9)))
         for addr, dat, _bus in msgs:
-          if addr == 404:
-            seen = {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
-            acts |= seen
-            slot_acts |= seen
+          if addr != 404:
+            continue
+          seen = {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+          acts |= seen
+          if seen & {'minus5', 'plus5'}:           # ~67% accepted, per frame
+            cc._sim_f5 += 1
+            if cc._sim_f5 % 3:
+              cc._sim_true += -5 if 'minus5' in seen else 5
+          elif seen & {'minus1', 'plus1'}:         # DCC auto-repeat, not frame rate
+            if t - cc._sim_t1 >= STEP1_PERIOD:
+              cc._sim_t1 = t
+              cc._sim_true += -1 if 'minus1' in seen else 1
+          cc._sim_true = max(0.0, cc._sim_true)
+          cc._sim_min_true = min(cc._sim_min_true, cc._sim_true)
       out.append(acts)
     cc._test_t, cc._test_szl = t, szl
     return out
@@ -1010,7 +1044,7 @@ class TestSetpointDebtLedger:
     cc, mod = self._cc()
     self._phases(cc, [(1.0, {}), (0.5, {'accel': -0.8})])
     assert cc.setpoint_debt < mod.SETPOINT_BIAS_MAX, "pinned to the cap again"
-    assert cc.setpoint_debt == pytest.approx(cc._sim_vcruise - cc._sim_setpoint, abs=1e-6)
+    assert cc.setpoint_debt == pytest.approx(cc._sim_vcruise - cc._sim_true, abs=1e-6)
 
   def test_repay_continues_until_the_setpoint_really_returns(self):
     """The other half of that bug: decrementing per frame let the repay call
@@ -1019,11 +1053,11 @@ class TestSetpointDebtLedger:
     cc, _ = self._cc()
     self._phases(cc, [(1.0, {}), (4.0, {'accel': -1.2}),
                       (1.0, {'enabled': False, 'dcc': False})])
-    borrowed = cc._sim_vcruise - cc._sim_setpoint
+    borrowed = cc._sim_vcruise - cc._sim_true
     assert borrowed > 4, borrowed
     self._phases(cc, [(8.0, {'enabled': False})])
-    assert cc._sim_vcruise - cc._sim_setpoint < 1.0, (
-      f"setpoint still {cc._sim_vcruise - cc._sim_setpoint:.1f} km/h low")
+    assert cc._sim_vcruise - cc._sim_true < 1.0, (
+      f"setpoint still {cc._sim_vcruise - cc._sim_true:.1f} km/h low")
     assert cc.setpoint_debt < 1.0
 
   def test_repay_stops_at_the_handback_point(self):
@@ -1032,4 +1066,34 @@ class TestSetpointDebtLedger:
     self._phases(cc, [(1.0, {}), (4.0, {'accel': -1.2}),
                       (1.0, {'enabled': False, 'dcc': False}),
                       (12.0, {'enabled': False})])
-    assert cc._sim_setpoint <= cc._sim_vcruise + 1e-6, (cc._sim_setpoint, cc._sim_vcruise)
+    assert cc._sim_true <= cc._sim_vcruise + 1e-6, (cc._sim_true, cc._sim_vcruise)
+
+  def test_blind_window_overshoot_is_bounded(self):
+    """The hazard the 5 Hz observation rate creates. minus5 is accepted on ~67%
+    of frames at 5 km/h each, so at HOLD (48 Hz) a single 200 ms blind window
+    commits ~27 km/h of setpoint — 2.6 m/s² of braking nobody asked for, all of
+    it before one observation comes back. SETPOINT_BIAS_MAX does not help: it
+    caps the target, not the overshoot past it.
+
+    Hold a demand that pins the bias to the cap and check the setpoint never
+    runs far past where the law asked it to go."""
+    cc, mod = self._cc()
+    v_ego = 86.0
+    self._phases(cc, [(1.0, {}), (6.0, {'accel': -3.0, 'v_ego_kmh': v_ego})])
+    floor = v_ego - mod.SETPOINT_BIAS_MAX
+    overshoot = floor - cc._sim_min_true
+    assert overshoot <= 7.0, (
+      f"setpoint reached {cc._sim_min_true:.1f}, {overshoot:.1f} km/h past the "
+      f"{floor:.1f} floor = {overshoot * 0.0935:.2f} m/s2 of unasked-for braking")
+
+  def test_step5_cadence_is_pinned_below_the_observation_rate(self):
+    import bmw.carcontroller as mod
+    assert mod.DECEL_STEP5_INTERVAL >= 2 * mod.HOLD_INTERVAL
+    assert mod.DECEL_STEP5_INTERVAL >= mod.SINGLE_INTERVAL
+    # a 200 ms blind window must hold only a couple of frames
+    assert 0.2 / mod.DECEL_STEP5_INTERVAL <= 2.5
+
+  def test_step5_needs_a_whole_step_of_room(self):
+    """Below one full step minus5 can only overshoot, so minus1 owns that range."""
+    import bmw.carcontroller as mod
+    assert mod.DECEL_STEP5_KMH >= 5.0
