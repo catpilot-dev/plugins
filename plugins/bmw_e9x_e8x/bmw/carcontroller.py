@@ -116,6 +116,45 @@ SETPOINT_DEADZONE = 1.0        # km/h — one whole step; below this, don't comm
 # gain 61% -> 57% of demand, unwanted braking -0.002 m/s².
 DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 
+# Command selection: pick the largest step whose measured yield fits the error
+# that is left, one decision per SZL slot.
+#
+# What a burst is worth was measured per burst, not per frame or per second —
+# neither cadence nor hold length moves it. Over 4 routes, a minus1 burst drops
+# the setpoint 1 km/h and a minus5 burst 10 km/h (median; 2-frame and 3-frame
+# bursts both land there, and a 1-frame burst has n=1, so the 10 is not dialable
+# down by shortening it).
+#
+# Deciding once per 200 ms slot matters because 0x193 reports the setpoint back
+# at only ~5 Hz: without it a 10 km/h error draws minus5 twice before the first
+# one is visible and overshoots by a whole yield, 0.9 m/s² of braking nobody
+# asked for. setpoint_pending carries what has been commanded since the last
+# fresh report for the same reason.
+#
+# Closed-loop bench over 53 real episodes from 452/453/454 (planner surrogate,
+# measured plant, 5 Hz observation), validated by minus1-only reproducing the
+# 50% of demand actually measured on route 454:
+#
+#   minus1 only              50% of demand   median overshoot 1.6 km/h (0.15 m/s²)
+#   minus5 at err >= 5      *68%*                             3.5 km/h (0.33)
+#   minus5 at err >= 10      54%                              1.6 km/h (0.15)
+#
+# 5 km/h is chosen knowing it overshoots by construction — minus5's yield is
+# 10 km/h against a 12 km/h total bias budget, so any threshold low enough to be
+# useful overshoots. A threshold of 10 is overshoot-free and recovers almost
+# nothing. The overshoot is in the safe direction, is pulled back by the restore
+# branch, and minus5 fires only about once a minute, so it stays a rare
+# intervention for the hard cases rather than a routine command.
+DECEL_STEP5_KMH = 5.0          # km/h of remaining error at or above which minus5 is used
+MINUS5_YIELD_KMH = 10.0        # measured median setpoint drop from one minus5 burst
+MINUS1_YIELD_KMH = 1.0
+PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
+                               # Without it, a DCC that stops acting on us never
+                               # moves the setpoint, so the reading never changes,
+                               # so pending never clears and we fall silent for
+                               # good. 0.5 s is 2-3 report periods: anything sent
+                               # has either landed or been lost by then.
+
 # Step size keys on the setpoint error, not on accel. Under the old clamped
 # setpoint the two were nearly the same question, because the setpoint could
 # never get further from v_target than the plan already was. This law breaks
@@ -223,6 +262,14 @@ class CarController(CarControllerBase):
     # Concordance state: vTarget history for a_dv, and the braking latch.
     self.v_target_hist = deque(maxlen=int(round(DV_WINDOW / DT_CTRL)) + 1)
     self.setpoint_braking = False
+
+    # Per-slot command selection: what was decided this slot, and how much
+    # setpoint we have asked for but not yet seen arrive.
+    self.slot_cmd = None
+    self.slot_decided_ns = 0
+    self.setpoint_pending = 0.0
+    self.setpoint_pending_ns = 0
+    self.setpoint_last_seen = None
 
     # Hand-back point — the driver's set speed in km/h, latched while openpilot
     # is driving. Every downward bias is borrowed from it and has to be given
@@ -365,6 +412,17 @@ class CarController(CarControllerBase):
       self.setpoint_braking = False
     # else: the two estimates disagree — hold the state we are already in.
 
+    # A changed setpoint reading is a fresh 0x193 report, and it already
+    # contains everything we have sent, so nothing is in flight any more.
+    if CS.out.cruiseState.speed != self.setpoint_last_seen:
+      self.setpoint_last_seen = CS.out.cruiseState.speed
+      self.setpoint_pending = 0.0
+    elif (now_nanos - self.setpoint_pending_ns) / 1e9 > PENDING_TIMEOUT:
+      self.setpoint_pending = 0.0
+    if not self.setpoint_braking:
+      self.setpoint_pending = 0.0
+      self.slot_cmd = None
+
     cruise_stalk_human_pressing = CS.cruise_stalk_resume or CS.cruise_stalk_cancel or CS.cruise_stalk_speed != 0
 
     # Latch the hand-back point while we still have the car. Range-checked the
@@ -445,14 +503,31 @@ class CarController(CarControllerBase):
           elif accel < 0 and decel_gate and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
             if self.setpoint_bias_on:
-              cmd, interval, step = CruiseStalk.minus1, self.pin_cadence(HOLD_INTERVAL), 1
+              # One decision per SZL slot; hold it for the rest of the slot so
+              # the burst is long enough for DCC to act on (a sub-0.06 s
+              # assertion produced nothing 80% of the time).
+              if (now_nanos - self.slot_decided_ns) / 1e9 >= CRUISE_STALK_IDLE_TICK_STOCK:
+                self.slot_decided_ns = now_nanos
+                err_kmh = -setpoint_error * 3.6 - self.setpoint_pending
+                if err_kmh >= DECEL_STEP5_KMH and headroom_kmh >= 5:
+                  self.slot_cmd = CruiseStalk.minus5
+                  self.setpoint_pending += MINUS5_YIELD_KMH
+                  self.setpoint_pending_ns = now_nanos
+                elif err_kmh >= SETPOINT_DEADZONE and headroom_kmh >= 1:
+                  self.slot_cmd = CruiseStalk.minus1
+                  self.setpoint_pending += MINUS1_YIELD_KMH
+                  self.setpoint_pending_ns = now_nanos
+                else:
+                  self.slot_cmd = None
+              if self.slot_cmd is not None:
+                cruise_cmd(self.slot_cmd, self.pin_cadence(SINGLE_INTERVAL))
             else:
               use_step5 = -accel >= DECEL_STEP5_THRESHOLD
               cmd = CruiseStalk.minus5 if use_step5 else CruiseStalk.minus1
               interval = self.pin_cadence(HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
               step = 5 if use_step5 else 1
-            if headroom_kmh >= step:
-              cruise_cmd(cmd, interval)
+              if headroom_kmh >= step:
+                cruise_cmd(cmd, interval)
 
           # Restore. The bias is a debt: the setpoint is parked below where the
           # demand now justifies, and every path out of a decel leaves it there

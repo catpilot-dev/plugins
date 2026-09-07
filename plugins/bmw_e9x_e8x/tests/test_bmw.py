@@ -394,6 +394,22 @@ class TestButtonEnable:
 # Cruise stalk burst counter (0x194)
 # ============================================================
 
+
+def _steps_within_bursts(sent, gap=0.12):
+  """Counter deltas between consecutive frames of the SAME burst.
+
+  Across bursts the sequence is deliberately resynced from RX — that is what the
+  handoff latch is for, and treating a resync as a rollback is a measurement
+  error, not a fault. Commanding became intermittent once the law started
+  deciding once per SZL slot, so the old whole-stream version began reporting
+  those resyncs as counter jumps.
+  """
+  out = set()
+  for i in range(len(sent) - 1):
+    if sent[i + 1][0] - sent[i][0] <= gap:
+      out.add((sent[i + 1][1] - sent[i][1]) % 15)
+  return out
+
 class TestCruiseBurstCounter:
   """DCC accepts a 0x194 frame only if its counter is a forward step —
   (counter - accepted) mod 15 in [1, 7]. Anything else is dropped as stale,
@@ -422,14 +438,30 @@ class TestCruiseBurstCounter:
       monkeypatch.setitem(sys.modules, mod_name, mod_mock)
 
   def _controller(self):
+    """Built with SetpointBias=0 on purpose.
+
+    The counter-overwrite machinery is shared by both paths and is what these
+    tests are about. The bias path decides once per SZL slot and discounts what
+    it has already asked for against the setpoint it reads back, so a harness
+    that pins cruiseState.speed to a constant makes it fall silent — an
+    artefact of the fixture, not of the burst logic. TestSetpointBias and
+    TestSetpointDebtLedger cover the counter invariant on the bias path with a
+    setpoint that actually responds.
+    """
     import importlib
     import bmw.carcontroller as mod
     importlib.reload(mod)
     from bmw.values import BmwFlags
-    CP = MagicMock()
-    CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL   # cruise on F-CAN, servo path off
-    CP.minEnableSpeed = 30 / 3.6
-    return mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    import config as cfg
+    orig = cfg.read_plugin_param
+    cfg.read_plugin_param = lambda pid, key, default='': '0' if key == 'SetpointBias' else default
+    try:
+      CP = MagicMock()
+      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL   # cruise on F-CAN, servo path off
+      CP.minEnableSpeed = 30 / 3.6
+      return mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    finally:
+      cfg.read_plugin_param = orig
 
   def _replay(self, phases):
     """phases: list of (duration_s, accel, v_target, human_pressing).
@@ -489,10 +521,12 @@ class TestCruiseBurstCounter:
     # accel chosen so the setpoint error stays under one whole step: that keeps
     # this on minus1 at HOLD, the sustained command. minus5 deliberately
     # transmits at only 10 Hz now, so it is no longer a burst at all.
-    events = self._replay([(1.0, 0.0, 24.0, False), (0.60, -0.3, 24.0, False)])
-    ours = [c for (_t, w, c) in events if w == 'OP']
+    events = self._replay([(1.0, 0.0, 24.0, False), (0.60, -0.3, 23.0, False)])
+    ours = [(t, c) for (t, w, c) in events if w == 'OP']
     assert len(ours) > 15, f"expected a sustained burst, got {len(ours)} frames"
-    for prev, nxt in zip(ours, ours[1:]):
+    for (t0, prev), (t1, nxt) in zip(ours, ours[1:]):
+      if t1 - t0 > 0.12:
+        continue            # a new burst resyncs from RX, by design
       assert (nxt - prev) % 15 == 1, f"burst counter jumped {prev} -> {nxt}"
 
 
@@ -529,7 +563,10 @@ class TestCruiseCadencePin:
     importlib.reload(mod)
     from bmw.values import BmwFlags
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    monkey = {'bmw_e9x_e8x': {'CruiseCadence': pin}}
+    # SetpointBias=0 for the same reason as TestCruiseBurstCounter._controller:
+    # the bias path's per-slot accounting needs a setpoint that responds, and
+    # pin_cadence is exercised on both paths.
+    monkey = {'bmw_e9x_e8x': {'CruiseCadence': pin, 'SetpointBias': '0'}}
     import config as cfg
     orig = cfg.read_plugin_param
     cfg.read_plugin_param = lambda pid, key, default='': monkey.get(pid, {}).get(key, default)
@@ -558,7 +595,7 @@ class TestCruiseCadencePin:
     assert len(sent) > 8, f"expected a burst, got {len(sent)} frames"
     import statistics
     iv = statistics.median((sent[i + 1][0] - sent[i][0]) * 1000 for i in range(len(sent) - 1))
-    steps = {(sent[i + 1][1] - sent[i][1]) % 15 for i in range(len(sent) - 1)}
+    steps = _steps_within_bursts(sent)
     return iv, steps
 
   def test_default_follows_demand(self):
@@ -658,7 +695,18 @@ class TestSetpointBias:
     # v_target ramps at the demanded accel. The concordance gate differentiates
     # vTarget over DV_WINDOW, so a harness that holds it flat reports a_dv = 0
     # and the braking latch can never engage — the trace has to be consistent.
-    for phase_dur, a, vt0 in [(1.0, 0.0, v_ego), (dur, accel, v_target)]:
+    #
+    # The setpoint has to respond too: the law decides once per SZL slot and
+    # discounts what it has already asked for against the setpoint it reads
+    # back, so pinning cruiseState.speed makes it fall silent. DCC applies one
+    # burst's measured yield per slot (minus1 1 km/h, minus5 10) and 0x193
+    # reports it back at 5 Hz.
+    sp_true = setpoint
+    sp_obs = sp_true
+    slot_acts, tobs = set(), 0.0
+    YIELD = {'minus1': -1.0, 'minus5': -10.0, 'plus1': 1.0, 'plus5': 5.0}
+    settle_vt = v_target if v_target_kmh is not None else v_ego
+    for phase_dur, a, vt0 in [(1.0, 0.0, settle_vt), (dur, accel, v_target)]:
       elapsed = 0.0
       for _ in range(int(round(phase_dur / self.STEP))):
         t += self.STEP
@@ -666,14 +714,23 @@ class TestSetpointBias:
         vt = vt0 + (a if v_target_rate is None else v_target_rate) * elapsed
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
+          for name in ('minus5', 'minus1', 'plus5', 'plus1'):
+            if name in slot_acts:
+              sp_true = max(0.0, sp_true + YIELD[name] * self.KPH)
+              break
+          slot_acts = set()
+        if t - tobs >= 0.20:
+          tobs, sp_obs = t, sp_true
         _, msgs = cc.update(make_stalk_carcontrol(a, vt),
-                            make_stalk_carstate(szl, v_ego=v_ego, setpoint=setpoint),
+                            make_stalk_carstate(szl, v_ego=v_ego, setpoint=sp_obs),
                             int(round(t * 1e9)))
         for addr, dat, _bus in msgs:
-          if addr == 404 and t > 1.0:
-            sent.append((t, dat[1] & 0xF, dat[2]))
+          if addr == 404:
+            slot_acts |= {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+            if t > 1.0:
+              sent.append((t, dat[1] & 0xF, dat[2]))
     acts = {self.ACTION[b] for _, _, a2 in sent for b in self.ACTION if a2 & (1 << b)}
-    steps = {(sent[i + 1][1] - sent[i][1]) % 15 for i in range(len(sent) - 1)}
+    steps = _steps_within_bursts(sent)
     import statistics
     iv = (statistics.median((sent[i + 1][0] - sent[i][0]) * 1000
                             for i in range(len(sent) - 1)) if len(sent) > 1 else None)
@@ -706,33 +763,40 @@ class TestSetpointBias:
 
   def test_no_command_when_setpoint_already_deep_enough(self):
     """Deadzone: setpoint 6 km/h under vEgo already covers a -0.5 ask."""
-    acts, _, _ = self._run(accel=-0.5, setpoint_kmh=80.0)
+    acts, _, _ = self._run(accel=-0.5, setpoint_kmh=81.0, v_target_rate=0.0)
     assert 'minus1' not in acts and 'minus5' not in acts, acts
 
   def test_deeper_demand_reopens_commanding(self):
     acts, _, _ = self._run(accel=-1.1, setpoint_kmh=80.0)
-    assert 'minus1' in acts, acts
+    assert acts & {'minus1', 'minus5'}, acts
 
-  @pytest.mark.parametrize('accel,setpoint_kmh', [
-    (-0.4, 86.0), (-0.6, 86.0), (-1.2, 86.0), (-2.5, 86.0), (-1.2, 80.0),
-  ])
-  def test_bias_path_is_minus1_only(self, accel, setpoint_kmh):
-    """minus5 is parked. It bought transient response (78% of demand against
-    68%) at 7x the blind-window exposure — 6.7 km/h committed per 200 ms
-    against 0.9 — and minus1 alone already sustains 1.28 m/s2, above the
-    SETPOINT_BIAS_MAX ceiling of 1.12."""
-    acts, _, _ = self._run(accel=accel, v_ego_kmh=86.0, setpoint_kmh=setpoint_kmh)
+  def test_big_error_picks_minus5(self):
+    """minus5's measured yield is 10 km/h, so it is the right tool only when
+    that much setpoint is owed. Closed-loop bench: firing it at err >= 5 lifts
+    delivered decel from 50% to 68% of demand."""
+    acts, _, _ = self._run(accel=-1.2, v_ego_kmh=86.0, setpoint_kmh=90.0)
+    assert 'minus5' in acts, acts
+
+  def test_small_error_picks_minus1(self):
+    """Under DECEL_STEP5_KMH a minus5 could only overshoot — its yield is ten
+    times minus1's and there is nowhere to put it."""
+    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=86.0)
     assert 'minus1' in acts and 'minus5' not in acts, acts
 
-  def test_bias_path_decel_uses_hold(self):
-    _, _, iv = self._run(accel=-0.6, v_ego_kmh=86.0, setpoint_kmh=86.0)
-    assert iv < 35, f"expected HOLD cadence, got {iv:.0f} ms"
+  def test_bias_path_decel_uses_single(self):
+    """Cadence does not set the step rate — yield is per burst — so SINGLE,
+    which halves frames on the 0x194 counter-overwrite axis."""
+    _, _, iv = self._run(accel=-0.6, v_ego_kmh=86.0, setpoint_kmh=88.0)
+    assert iv > 35, f"expected SINGLE cadence, got {iv:.0f} ms"
 
   def test_large_demand_still_uses_minus1_when_little_is_owed(self):
-    """The mirror case. accel -1.5 would be minus5 under the old rule, but the
-    setpoint only has 2 km/h left to travel, so one step is the right one."""
-    acts, _, _ = self._run(accel=-1.5, v_ego_kmh=86.0, setpoint_kmh=76.0)
-    assert 'minus1' in acts and 'minus5' not in acts, acts
+    """The step follows the remaining error, not the demand: accel -1.5 with the
+    setpoint already 10 km/h down has only a couple of km/h left to travel."""
+    # v_target matches the setpoint through the settling phase, or the restore
+    # branch lifts the setpoint back up and destroys the premise
+    acts, _, _ = self._run(accel=-1.5, v_ego_kmh=86.0, setpoint_kmh=76.0,
+                           v_target_kmh=76.0)
+    assert 'minus5' not in acts, acts
 
   def test_concordance_blocks_a_cmd_noise_alone(self):
     """a_cmd dips negative but vTarget is flat: that is noise, not intent, so
@@ -746,7 +810,7 @@ class TestSetpointBias:
   def test_concordance_allows_a_real_decel(self):
     """Same demand, but vTarget is falling with it — both agree, so brake."""
     acts, _, _ = self._run(accel=-0.6, v_ego_kmh=86.0, setpoint_kmh=86.0)
-    assert 'minus1' in acts, acts
+    assert acts & {'minus1', 'minus5'}, acts
 
   def test_disagreement_holds_state_rather_than_releasing(self):
     """The rule is three-state: both negative brakes, both positive releases,
@@ -777,6 +841,96 @@ class TestSetpointBias:
     # a_cmd 0.0 and a_dv 0.0 -> neither branch fires -> state held
     assert cc.setpoint_braking, "disagreement/neutral must hold, not release"
 
+  def _drive(self, accel, v_ego_kmh, setpoint_kmh, seconds, respond=True,
+             v_target_kmh=None):
+    """Explicit loop that exposes the controller, for the per-slot machinery.
+
+    respond=False pins the setpoint, which is what a DCC that has stopped
+    acting on us looks like.
+    """
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    CP = MagicMock()
+    CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+    CP.minEnableSpeed = 30 / 3.6
+    cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    YIELD = {'minus1': -1.0, 'minus5': -10.0, 'plus1': 1.0, 'plus5': 5.0}
+    v_ego = v_ego_kmh * self.KPH
+    vt0 = (v_target_kmh if v_target_kmh is not None else v_ego_kmh)
+    sp_true = setpoint_kmh
+    sp_obs = sp_true
+    # DCC's first step lands ~0.13 s after a burst starts (measured), and the
+    # 0x193 report is asynchronous to our slot. Applying the yield instantly at
+    # the slot boundary would hide exactly the lag that makes pending necessary.
+    STEP_LATENCY = 0.13
+    t, szl, tobs = 0.0, 0, 0.09
+    queued = []
+    slot_acts, sent, max_pending, sp_min = set(), [], 0.0, sp_true
+    for phase, (a, dur) in enumerate([(0.0, 1.0), (accel, seconds)]):
+      el = 0.0
+      for _ in range(int(round(dur / self.STEP))):
+        t += self.STEP; el += self.STEP
+        vt = (vt0 + a * el * 3.6) * self.KPH
+        if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+          szl = (szl + 1) % 15
+          if respond:
+            for n in ('minus5', 'minus1', 'plus5', 'plus1'):
+              if n in slot_acts:
+                queued.append((t + STEP_LATENCY, YIELD[n])); break
+          slot_acts = set()
+        while queued and queued[0][0] <= t:
+          sp_true = max(0.0, sp_true + queued.pop(0)[1])
+        if t - tobs >= 0.20:
+          tobs, sp_obs = t, sp_true
+        _, msgs = cc.update(make_stalk_carcontrol(a, vt),
+                            make_stalk_carstate(szl, v_ego=v_ego,
+                                                setpoint=sp_obs * self.KPH),
+                            int(round(t * 1e9)))
+        for addr, dat, _bus in msgs:
+          if addr == 404 and dat[2]:
+            names = {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+            slot_acts |= names
+            if phase: sent.append((t, names))
+        max_pending = max(max_pending, cc.setpoint_pending)
+        sp_min = min(sp_min, sp_true)
+    return cc, sent, max_pending, sp_true, sp_min
+
+  def test_pending_stops_a_second_minus5_before_the_first_is_visible(self):
+    """The setpoint is only reported back at ~5 Hz. Without discounting what is
+    already in flight, a 10 km/h error draws minus5 in two consecutive slots and
+    overshoots by a whole yield — 10 km/h, 0.9 m/s2 of braking nobody asked
+    for."""
+    import bmw.carcontroller as mod
+    _, sent, max_pending, _, sp_min = self._drive(accel=-2.0, v_ego_kmh=86.0,
+                                                  setpoint_kmh=95.0, seconds=1.5)
+    assert any('minus5' in n for _, n in sent), "expected a minus5 for this error"
+    floor = 86.0 - mod.SETPOINT_BIAS_MAX
+    # without the discount the setpoint runs a second full yield past the floor
+    assert sp_min >= floor - mod.MINUS5_YIELD_KMH - 1.0, (
+      f"setpoint reached {sp_min:.1f}, more than one yield past the {floor:.1f} floor")
+    assert max_pending <= 2 * mod.MINUS5_YIELD_KMH + 1.0, (
+      f"pending reached {max_pending:.1f}")
+
+  def test_at_most_one_command_decision_per_slot(self):
+    """Deciding every 10 ms cycle instead of once per SZL slot books a yield per
+    cycle, so pending overtakes the error within a single slot and the law
+    silences itself before DCC has done anything: 3 frames against 26."""
+    _, sent, _, _, _ = self._drive(accel=-2.0, v_ego_kmh=86.0,
+                                   setpoint_kmh=95.0, seconds=1.5)
+    assert len(sent) >= 10, (
+      f"only {len(sent)} frames — the law talked itself out of commanding")
+
+  def test_commanding_resumes_if_the_setpoint_never_moves(self):
+    """A DCC that stops acting on us never changes the reading, so pending would
+    never clear and we would fall silent for good. PENDING_TIMEOUT is what
+    bounds that."""
+    _, sent, _, _, _ = self._drive(accel=-1.0, v_ego_kmh=86.0, setpoint_kmh=95.0,
+                                   seconds=2.5, respond=False)
+    late = [t for t, _ in sent if t > 2.0]
+    assert late, "went silent for good against an unresponsive DCC"
+
   def test_dv_window_spans_several_model_frames(self):
     """modelV2 runs at 20 Hz, so 300 ms is 6 predictions — enough to average
     the plan's per-frame jitter without lagging real intent."""
@@ -792,7 +946,8 @@ class TestSetpointBias:
 
   def test_floor_still_blocks(self):
     """min_cruise_setpoint is 35 km/h and the branch guard still owns it."""
-    acts, _, _ = self._run(accel=-1.0, v_ego_kmh=40.0, setpoint_kmh=35.0)
+    acts, _, _ = self._run(accel=-1.0, v_ego_kmh=40.0, setpoint_kmh=35.0,
+                           v_target_kmh=35.0, v_target_rate=0.0)
     assert 'minus1' not in acts and 'minus5' not in acts, acts
 
   # ---- restore -----------------------------------------------------------
@@ -989,14 +1144,13 @@ class TestSetpointDebtLedger:
             continue
           seen = {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
           acts |= seen
-          if seen & {'minus5', 'plus5'}:           # ~67% accepted, per frame
-            cc._sim_f5 += 1
-            if cc._sim_f5 % 3:
-              cc._sim_true += -5 if 'minus5' in seen else 5
-          elif seen & {'minus1', 'plus1'}:         # DCC auto-repeat, not frame rate
-            if t - cc._sim_t1 >= STEP1_PERIOD:
-              cc._sim_t1 = t
-              cc._sim_true += -1 if 'minus1' in seen else 1
+          # yield is per burst, not per frame: one step's worth per SZL slot
+          if t - cc._sim_t1 >= STEP1_PERIOD:
+            cc._sim_t1 = t
+            if 'minus5' in seen: cc._sim_true -= 10.0
+            elif 'minus1' in seen: cc._sim_true -= 1.0
+            elif 'plus5' in seen: cc._sim_true += 5.0
+            elif 'plus1' in seen: cc._sim_true += 1.0
           cc._sim_true = max(0.0, cc._sim_true)
           cc._sim_min_true = min(cc._sim_min_true, cc._sim_true)
       out.append(acts)

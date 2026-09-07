@@ -284,6 +284,53 @@ Two things that do **not** work, both tried on 454's trace:
   low-pass removes signal before it removes the wander (tau 1.0 s: flips 8.1
   but gain down to 49%).
 
+### Command selection — one decision per SZL slot
+
+What a burst is worth was measured **per burst**: neither cadence nor hold
+length moves it. Over four routes a `minus1` burst drops the setpoint 1 km/h and
+a `minus5` burst **10 km/h** (median; 2- and 3-frame bursts both land there, and
+a 1-frame burst has n=1, so the 10 is not dialable down by shortening it).
+
+```
+err = (setpoint_observed - sp_target) - setpoint_pending      [km/h]
+if   err >= DECEL_STEP5_KMH:   minus5
+elif err >= SETPOINT_DEADZONE: minus1
+else (err <= -deadzone):       plus1 via the restore branch
+```
+
+decided once per 200 ms slot and held for the rest of it, because an assertion
+under 0.06 s produced no step 80% of the time while 0.10–0.15 s produced one
+99% of the time.
+
+**`setpoint_pending` is load-bearing.** 0x193 reports the setpoint back at ~5 Hz
+and DCC's first step lands ~0.13 s after a burst starts, so without discounting
+what is already asked for, a 10 km/h error draws `minus5` in two consecutive
+slots and overshoots by a whole yield — measured in the bench as the setpoint
+running to 54 km/h instead of 64 against a 74 km/h floor. `PENDING_TIMEOUT`
+clears it after 0.5 s regardless: a DCC that has stopped acting on us never
+changes the reading, so pending would never clear and the law would fall silent
+for good.
+
+Closed-loop bench over 53 real episodes from 452/453/454 — planner surrogate,
+measured plant, 5 Hz observation — validated by `minus1`-only reproducing the
+50% of demand actually measured on route 454:
+
+| law | delivered | median overshoot |
+|---|---|---|
+| `minus1` only | 50% | 1.6 km/h (0.15 m/s²) |
+| `minus5` at err ≥ 5 | **68%** | 3.5 km/h (0.33 m/s²) |
+| `minus5` at err ≥ 8 | 58% | 1.7 km/h (0.16) |
+| `minus5` at err ≥ 10 | 54% | 1.6 km/h (0.15) |
+
+`DECEL_STEP5_KMH` = 5 overshoots by construction — a 10 km/h yield against a
+12 km/h bias budget means any useful threshold does. A threshold of 10 is
+overshoot-free and recovers almost nothing. The overshoot is in the safe
+direction, the restore branch pulls it back, and `minus5` fires about once a
+minute, so it stays a rare intervention rather than a routine command.
+
+Do **not** add lead compensation: `longitudinalActuatorDelay` is 0.7 for this
+car, so the planner already computes vTarget/aTarget at that horizon.
+
 **The debt ledger.** The restore branch only runs while openpilot is driving,
 so every exit that stops us commanding parks the bias in DCC's setpoint memory:
 the driver resumes expecting their set speed and gets one up to 12 km/h low,
