@@ -557,13 +557,13 @@ class TestCruiseCadencePin:
     return iv, steps
 
   def test_default_follows_demand(self):
-    """Unset: gentle decel picks SINGLE (50 ms), firm decel picks HOLD.
+    """Unset: gentle demand picks SINGLE (50 ms), firm demand picks HOLD.
 
-    Scenarios sit inside minus1's range on purpose — minus5 has had its own
-    cadence since the 5 Hz observation rate was measured, so HOLD/SINGLE no
-    longer governs it."""
-    slow, _ = self._run('', -0.15)
-    fast, _ = self._run('', -0.80)
+    Exercised on the accel side. The decel path is minus1 pinned to HOLD since
+    DCC's minus1 step rate was measured independent of our frame rate, so
+    demand no longer chooses the cadence there."""
+    slow, _ = self._run('', 0.15)
+    fast, _ = self._run('', 0.80)
     assert slow > fast, f"gentle {slow:.0f} ms should be slower than firm {fast:.0f} ms"
     assert slow > 35, f"gentle decel should use SINGLE cadence, got {slow:.0f} ms"
     assert fast < 35, f"firm decel should use HOLD cadence, got {fast:.0f} ms"
@@ -578,8 +578,8 @@ class TestCruiseCadencePin:
 
   def test_unknown_value_falls_back_to_demand(self):
     """A typo must not silently pin anything."""
-    assert self._run('HOLDD', -0.80)[0] < 35
-    assert self._run('yes', -0.15)[0] > 35
+    assert self._run('HOLDD', 0.80)[0] < 35
+    assert self._run('yes', 0.15)[0] > 35
 
   @pytest.mark.parametrize('pin', ['', 'hold', 'single'])
   @pytest.mark.parametrize('accel', [-0.15, -0.80])
@@ -700,18 +700,22 @@ class TestSetpointBias:
 
   def test_deeper_demand_reopens_commanding(self):
     acts, _, _ = self._run(accel=-1.1, setpoint_kmh=80.0)
-    assert 'minus5' in acts, acts
+    assert 'minus1' in acts, acts
 
-  def test_step_size_keys_on_setpoint_error_not_accel(self):
-    """Mild demand, but the setpoint is 6 km/h high: that is a minus5. The
-    accel-keyed rule would have sent minus1 and needed six presses."""
-    acts, _, _ = self._run(accel=-0.6, v_ego_kmh=86.0, setpoint_kmh=86.0)
-    assert 'minus5' in acts and 'minus1' not in acts, acts
-
-  def test_small_error_stays_on_minus1_whatever_the_demand(self):
-    """Under one whole step, minus5 could only overshoot."""
-    acts, _, _ = self._run(accel=-0.4, v_ego_kmh=86.0, setpoint_kmh=86.0)
+  @pytest.mark.parametrize('accel,setpoint_kmh', [
+    (-0.4, 86.0), (-0.6, 86.0), (-1.2, 86.0), (-2.5, 86.0), (-1.2, 80.0),
+  ])
+  def test_bias_path_is_minus1_only(self, accel, setpoint_kmh):
+    """minus5 is parked. It bought transient response (78% of demand against
+    68%) at 7x the blind-window exposure — 6.7 km/h committed per 200 ms
+    against 0.9 — and minus1 alone already sustains 1.28 m/s2, above the
+    SETPOINT_BIAS_MAX ceiling of 1.12."""
+    acts, _, _ = self._run(accel=accel, v_ego_kmh=86.0, setpoint_kmh=setpoint_kmh)
     assert 'minus1' in acts and 'minus5' not in acts, acts
+
+  def test_bias_path_decel_uses_hold(self):
+    _, _, iv = self._run(accel=-0.6, v_ego_kmh=86.0, setpoint_kmh=86.0)
+    assert iv < 35, f"expected HOLD cadence, got {iv:.0f} ms"
 
   def test_large_demand_still_uses_minus1_when_little_is_owed(self):
     """The mirror case. accel -1.5 would be minus5 under the old rule, but the
@@ -886,7 +890,7 @@ class TestSetpointDebtLedger:
     t = getattr(cc, '_test_t', 0.0)
     szl = getattr(cc, '_test_szl', 0)
     out = []
-    STEP1_PERIOD = 0.28          # s between auto-repeat steps -> ~3.6 km/h/s
+    STEP1_PERIOD = 0.22          # s between steps -> ~4.5 km/h/s, measured
     OBS_PERIOD = 0.2             # s — 0x193 report rate
     for dur, kw in phases:
       if not hasattr(cc, '_sim_true'):
@@ -1044,7 +1048,11 @@ class TestSetpointDebtLedger:
     cc, mod = self._cc()
     self._phases(cc, [(1.0, {}), (0.5, {'accel': -0.8})])
     assert cc.setpoint_debt < mod.SETPOINT_BIAS_MAX, "pinned to the cap again"
-    assert cc.setpoint_debt == pytest.approx(cc._sim_vcruise - cc._sim_true, abs=1e-6)
+    # against the OBSERVED setpoint, not the true one: debt is read off 0x193
+    # at ~5 Hz, so it lags the real setpoint by up to one report period. That
+    # lag is the thing the blind-window bound exists to keep small.
+    assert cc.setpoint_debt == pytest.approx(cc._sim_vcruise - cc._sim_setpoint, abs=1e-6)
+    assert cc._sim_setpoint - cc._sim_true <= 2.0, "observation lagging by more than 2 steps"
 
   def test_repay_continues_until_the_setpoint_really_returns(self):
     """The other half of that bug: decrementing per frame let the repay call
@@ -1069,11 +1077,13 @@ class TestSetpointDebtLedger:
     assert cc._sim_true <= cc._sim_vcruise + 1e-6, (cc._sim_true, cc._sim_vcruise)
 
   def test_blind_window_overshoot_is_bounded(self):
-    """The hazard the 5 Hz observation rate creates. minus5 is accepted on ~67%
-    of frames at 5 km/h each, so at HOLD (48 Hz) a single 200 ms blind window
-    commits ~27 km/h of setpoint — 2.6 m/s² of braking nobody asked for, all of
-    it before one observation comes back. SETPOINT_BIAS_MAX does not help: it
-    caps the target, not the overshoot past it.
+    """The hazard the 5 Hz observation rate creates. We command blind for up to
+    200 ms, so whatever the command commits in that window lands before any of
+    it is visible. minus5 at HOLD committed ~27 km/h — 2.6 m/s² of braking
+    nobody asked for — which is the main reason it is parked. minus1 commits
+    under 1 km/h over the same window, so the bound here is tight.
+    SETPOINT_BIAS_MAX does not help with this: it caps the target, not the
+    overshoot past it.
 
     Hold a demand that pins the bias to the cap and check the setpoint never
     runs far past where the law asked it to go."""
@@ -1082,18 +1092,7 @@ class TestSetpointDebtLedger:
     self._phases(cc, [(1.0, {}), (6.0, {'accel': -3.0, 'v_ego_kmh': v_ego})])
     floor = v_ego - mod.SETPOINT_BIAS_MAX
     overshoot = floor - cc._sim_min_true
-    assert overshoot <= 7.0, (
+    assert overshoot <= 2.0, (
       f"setpoint reached {cc._sim_min_true:.1f}, {overshoot:.1f} km/h past the "
       f"{floor:.1f} floor = {overshoot * 0.0935:.2f} m/s2 of unasked-for braking")
 
-  def test_step5_cadence_is_pinned_below_the_observation_rate(self):
-    import bmw.carcontroller as mod
-    assert mod.DECEL_STEP5_INTERVAL >= 2 * mod.HOLD_INTERVAL
-    assert mod.DECEL_STEP5_INTERVAL >= mod.SINGLE_INTERVAL
-    # a 200 ms blind window must hold only a couple of frames
-    assert 0.2 / mod.DECEL_STEP5_INTERVAL <= 2.5
-
-  def test_step5_needs_a_whole_step_of_room(self):
-    """Below one full step minus5 can only overshoot, so minus1 owns that range."""
-    import bmw.carcontroller as mod
-    assert mod.DECEL_STEP5_KMH >= 5.0
