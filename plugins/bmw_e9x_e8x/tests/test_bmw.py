@@ -579,3 +579,204 @@ class TestCruiseCadencePin:
     """The safety invariant. Pinning must never touch counter values."""
     _, steps = self._run(pin, accel)
     assert steps == {1}, f"pin={pin!r} accel={accel} produced counter steps {steps}"
+
+
+class TestSetpointBias:
+  """Accel-derived setpoint on the decel side.
+
+  Before this, the setpoint was driven to v_target and stopped there. That gate
+  is a clamp, not a rate limit: measured over routes 452 + 453 the setpoint
+  reached it in a median of 0.00 s, so no choice of step size or cadence could
+  buy authority, and the closed loop delivered a_ego = 0.611 * a_cmd. The plant
+  is linear and symmetric (0.0935 m/s² per km/h of gap on the decel side,
+  0.0912 on the accel side), so ask for the gap the demand actually needs.
+
+  The invariants worth holding onto:
+    - the accel branch is untouched (sp_target == v_target whenever accel >= 0),
+      so the setpoint is never pushed above the driver's set speed;
+    - counter steps stay +1 (the 5ECE/CD95 axis);
+    - every downward bias is repaid, with plus1 and not plus5.
+  """
+
+  SZL_TICK = 0.2
+  STEP = 0.01
+  KPH = 1 / 3.6
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
+
+  def _run(self, accel, v_ego_kmh=86.0, setpoint_kmh=86.0, v_target_kmh=None,
+           bias='', dur=1.2):
+    """Hold one steady operating point and report what we transmit.
+
+    Returns (set of action names emitted, set of counter steps, median TX
+    interval in ms). v_target defaults to v_ego so v_error sits at zero — the
+    case the old v_error gate silently dropped.
+    """
+    import importlib
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    monkey = {'bmw_e9x_e8x': {'SetpointBias': bias}}
+    import config as cfg
+    orig = cfg.read_plugin_param
+    cfg.read_plugin_param = lambda pid, key, default='': monkey.get(pid, {}).get(key, default)
+    try:
+      CP = MagicMock()
+      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+      CP.minEnableSpeed = 30 / 3.6
+      cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    finally:
+      cfg.read_plugin_param = orig
+
+    v_ego = v_ego_kmh * self.KPH
+    setpoint = setpoint_kmh * self.KPH
+    v_target = (v_ego_kmh if v_target_kmh is None else v_target_kmh) * self.KPH
+
+    t, szl, sent = 0.0, 0, []
+    for phase_dur, a, vt in [(1.0, 0.0, v_ego), (dur, accel, v_target)]:
+      for _ in range(int(round(phase_dur / self.STEP))):
+        t += self.STEP
+        if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+          szl = (szl + 1) % 15
+        _, msgs = cc.update(make_stalk_carcontrol(a, vt),
+                            make_stalk_carstate(szl, v_ego=v_ego, setpoint=setpoint),
+                            int(round(t * 1e9)))
+        for addr, dat, _bus in msgs:
+          if addr == 404 and t > 1.0:
+            sent.append((t, dat[1] & 0xF, dat[2]))
+    acts = {self.ACTION[b] for _, _, a2 in sent for b in self.ACTION if a2 & (1 << b)}
+    steps = {(sent[i + 1][1] - sent[i][1]) % 15 for i in range(len(sent) - 1)}
+    import statistics
+    iv = (statistics.median((sent[i + 1][0] - sent[i][0]) * 1000
+                            for i in range(len(sent) - 1)) if len(sent) > 1 else None)
+    return acts, steps, iv
+
+  # ---- the target itself -------------------------------------------------
+
+  def test_sp_target_is_vego_plus_bias_on_decel(self):
+    """a_cmd -0.8 wants an 8 km/h gap, so a setpoint 8 km/h under vEgo."""
+    import bmw.carcontroller as mod
+    assert -0.8 / mod.K_DCC == pytest.approx(-8.0)
+
+  def test_bias_is_capped(self):
+    import bmw.carcontroller as mod
+    assert max(-3.0 / mod.K_DCC, -mod.SETPOINT_BIAS_MAX) == -mod.SETPOINT_BIAS_MAX
+    assert mod.SETPOINT_BIAS_MAX == 12.0
+
+  def test_k_dcc_is_conservative_vs_measured_plant(self):
+    """0.1 rather than the measured 0.0935 — every ask lands ~7% shallow."""
+    import bmw.carcontroller as mod
+    assert 0.9 < 0.0935 / mod.K_DCC < 1.0
+
+  # ---- decel side --------------------------------------------------------
+
+  def test_commands_decel_when_v_error_is_zero(self):
+    """The band the old v_error gate threw away: at the set speed, planner
+    asking for -0.5. It blocked 51% of the a_cmd -0.4..-0.3 samples."""
+    acts, _, _ = self._run(accel=-0.5)
+    assert 'minus1' in acts, acts
+
+  def test_no_command_when_setpoint_already_deep_enough(self):
+    """Deadzone: setpoint 6 km/h under vEgo already covers a -0.5 ask."""
+    acts, _, _ = self._run(accel=-0.5, setpoint_kmh=80.0)
+    assert 'minus1' not in acts and 'minus5' not in acts, acts
+
+  def test_deeper_demand_reopens_commanding(self):
+    acts, _, _ = self._run(accel=-1.1, setpoint_kmh=80.0)
+    assert 'minus5' in acts, acts
+
+  def test_step5_above_threshold(self):
+    acts, _, _ = self._run(accel=-1.0)
+    assert 'minus5' in acts and 'minus1' not in acts, acts
+
+  def test_floor_still_blocks(self):
+    """min_cruise_setpoint is 35 km/h and the branch guard still owns it."""
+    acts, _, _ = self._run(accel=-1.0, v_ego_kmh=40.0, setpoint_kmh=35.0)
+    assert 'minus1' not in acts and 'minus5' not in acts, acts
+
+  # ---- restore -----------------------------------------------------------
+
+  def test_restores_with_plus1_when_demand_releases(self):
+    """Setpoint parked 10 km/h low, demand gone: walk it back."""
+    acts, _, iv = self._run(accel=0.0, setpoint_kmh=76.0)
+    assert 'plus1' in acts, acts
+    assert 'plus5' not in acts, "plus5 would park the setpoint high — a lurch"
+    assert iv == pytest.approx(50.0, abs=6), iv
+
+  def test_restore_stops_inside_the_deadzone(self):
+    acts, _, _ = self._run(accel=0.0, setpoint_kmh=85.5)
+    assert 'plus1' not in acts, acts
+
+  def test_restore_runs_while_decel_demand_is_still_easing(self):
+    """accel still negative but shallower than the parked bias — climb back."""
+    acts, _, _ = self._run(accel=-0.2, setpoint_kmh=76.0)
+    assert 'plus1' in acts, acts
+
+  def test_never_pushes_setpoint_above_v_target(self):
+    """Ceiling: at the set speed with no demand, nothing is sent."""
+    acts, _, _ = self._run(accel=0.0, setpoint_kmh=86.0, v_target_kmh=86.0)
+    assert 'plus1' not in acts and 'plus5' not in acts, acts
+
+  # ---- the accel branch is untouched -------------------------------------
+
+  @pytest.mark.parametrize('accel', [0.2, 0.5, 0.8])
+  def test_accel_branch_identical_with_and_without_bias(self, accel):
+    on = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0, bias='')
+    off = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0, bias='0')
+    assert on[0] == off[0], (on[0], off[0])
+    assert on[2] == pytest.approx(off[2], abs=1e-6)
+
+  # ---- the param ---------------------------------------------------------
+
+  def test_param_off_restores_old_clamp(self):
+    """With the bias off, a zero v_error decel is dropped again."""
+    acts, _, _ = self._run(accel=-0.5, bias='0')
+    assert 'minus1' not in acts and 'minus5' not in acts, acts
+
+  def test_param_off_sends_no_restore(self):
+    acts, _, _ = self._run(accel=0.0, setpoint_kmh=76.0, bias='0')
+    assert 'plus1' not in acts, acts
+
+  # ---- the safety invariant ----------------------------------------------
+
+  @pytest.mark.parametrize('bias', ['', '0'])
+  @pytest.mark.parametrize('accel,setpoint_kmh', [
+    (-0.5, 86.0), (-1.0, 86.0), (-2.5, 86.0), (0.0, 76.0), (-0.2, 76.0), (0.5, 86.0),
+  ])
+  def test_counter_always_steps_by_one(self, bias, accel, setpoint_kmh):
+    """The 5ECE/CD95 axis. Nothing here may emit a step other than +1."""
+    _, steps, _ = self._run(accel=accel, setpoint_kmh=setpoint_kmh,
+                            v_target_kmh=92.0 if accel > 0 else None, bias=bias)
+    assert steps <= {1}, f"bias={bias!r} accel={accel} produced counter steps {steps}"
+
+  def test_never_asks_shallower_than_the_old_law(self):
+    """Monotonicity: sp_target is min'd against v_target, the old target, so
+    the bias can only deepen the ask. v_target here is long_plan.vTarget — a
+    ~0.5 s horizon plan speed close to vEgo, not the driver's set speed."""
+    import bmw.carcontroller as mod
+    for accel in (-0.05, -0.3, -0.8, -2.0):
+      for v_ego, v_target in [(24.0, 24.0), (24.0, 23.0), (24.0, 25.0)]:
+        bias = max(accel / mod.K_DCC, -mod.SETPOINT_BIAS_MAX) / 3.6
+        assert min(v_target, v_ego + bias) <= v_target
+
+  def test_param_off_keeps_the_v_error_gate(self):
+    """SetpointBias=0 must be a true rollback. A v_error inside the deadzone
+    with the setpoint above v_target is the case that separates the old gate
+    from the new one: the old code blocks on v_error, and off must too."""
+    acts, _, _ = self._run(accel=-0.5, v_ego_kmh=86.0, v_target_kmh=85.8,
+                           setpoint_kmh=90.0, bias='0')
+    assert 'minus1' not in acts and 'minus5' not in acts, acts
+
+  def test_bias_on_commands_that_same_case(self):
+    acts, _, _ = self._run(accel=-0.5, v_ego_kmh=86.0, v_target_kmh=85.8,
+                           setpoint_kmh=90.0, bias='')
+    assert 'minus1' in acts, acts

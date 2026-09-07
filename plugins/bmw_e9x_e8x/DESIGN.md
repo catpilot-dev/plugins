@@ -114,10 +114,11 @@ control is done by **emulating cruise-stalk (0x194) presses** — `plus1`,
 `actuators.speed` (= planner `vTarget`, injected by `post_actuators`) against
 current speed and the DCC set-speed, and issues stalk pulses:
 
-- **Command selection** — direction gated by a `V_ERROR_DEADZONE` (~0.5 km/h)
-  plus accel sign and set-speed headroom; `plus5/minus5` vs `plus1/minus1`
-  chosen by accel magnitude thresholds; decel is blocked below the cruise
-  minimum + buffer.
+- **Command selection** — `plus5/minus5` vs `plus1/minus1` chosen by accel
+  magnitude thresholds; decel is blocked below the cruise minimum + buffer.
+  The **accel** side is gated by `V_ERROR_DEADZONE` (~0.5 km/h) plus accel sign
+  and set-speed headroom. The **decel** side is gated by the setpoint deadzone
+  instead — see *The setpoint is a torque request* below.
 - **Cadence encodes magnitude** — DCC infers accel magnitude from press
   *rate*: `HOLD_INTERVAL` for large accel, `SINGLE_INTERVAL` otherwise. Note
   the constants are 25 ms / 50 ms but 25 ms is not representable on the 10 ms
@@ -127,6 +128,83 @@ current speed and the DCC set-speed, and issues stalk pulses:
   20.1 Hz. The calibration table (PLUS1+HOLD ≈ +0.4 m/s², PLUS5+HOLD ≈ +1.2,
   MINUS1 ≈ −0.6, MINUS5 ≈ −1.2 m/s²) was measured against the real 48 Hz
   behaviour, so do not "correct" the cadence without re-measuring it.
+
+### The setpoint is a torque request, not a speed
+
+Measured over routes 452 + 453 (25.6 engaged min, 2026-09-05), DCC's response
+is a clean linear function of the setpoint gap:
+
+```
+a_ego = 0.0935 * (setpoint - vEgo)   [km/h]     n = 21952, decel side
+a_ego = 0.0912 * (setpoint - vEgo)               n = 103609, accel side
+```
+
+One symmetric constant, linear out to a −11 km/h gap, saturating near
+−1.4 m/s². **10.7 km/h of gap buys 1 m/s².**
+
+DCC's own speed loop is slow — implied horizon ≈ 2.8 s against the planner's
+≈ 0.8 s — so a setpoint driven to `v_target` asks for a gap 1.8–2.9× too
+shallow across the entire decel range. The measured closed loop was
+`a_ego = 0.611 * a_cmd`: **61% of the deceleration openpilot asked for**, with
+the best `a_cmd → a_ego` correlation at a 2.0 s lag.
+
+The old `setpoint_error < 0` gate is a **clamp, not a rate limit**. It blocked
+82–92% of the time below `a_cmd` −0.9, and the setpoint reached it in a median
+of **0.00 s** — so no choice of `DECEL_STEP5_THRESHOLD` or
+`DECEL_HOLD_THRESHOLD` could ever buy authority; step size and cadence only
+control how fast you arrive at a clamp you are already sitting on. Matched on
+demand, the only times the car braked properly were `minus5` overshoots that
+punched through it:
+
+| `a_cmd` | setpoint ≈ `v_target` | setpoint < `v_target` − 2 |
+|---|---|---|
+| −0.6 | gap −2.6 → **−0.33** | gap −5.8 → **−0.84** |
+| −0.8 | gap −3.3 → **−0.27** | gap −7.9 → **−0.95** |
+| −1.05 | gap −3.4 → **−0.35** | gap −9.2 → **−0.87** |
+
+So the decel setpoint inverts the plant instead:
+
+```
+sp_target = min(v_target, vEgo + max(accel / K_DCC, -SETPOINT_BIAS_MAX))
+```
+
+`K_DCC = 0.1` is deliberately shallower than the measured 0.0935: it makes
+every ask ~7% conservative, landing at a flat **92–93% of demand** rather than
+overshooting wherever the plant is stiffer than measured. `SETPOINT_BIAS_MAX`
+= 12 km/h caps the ask at −1.12 m/s²; above that the car under-brakes on
+purpose and the driver finishes the stop.
+
+Three things to keep straight:
+
+- **`v_target` is not the driver's set speed.** It is `long_plan.vTarget`, the
+  MPC trajectory speed at `action_t` (~0.5 s ahead), and it sits close to vEgo
+  (median +1.1 km/h, p10 −2.1, p90 +3.7). The driver's set speed is
+  `CS.out.vCruise`. Staying under it remains the planner's job — it caps
+  `v_target` at `v_cruise` — exactly as before.
+- **The new target is min'd against the old one**, so this law can only ever
+  ask for a *deeper* setpoint than the pre-2026-09 code, never a shallower one.
+- **The accel side is untouched.** `sp_target == v_target` whenever
+  `accel >= 0`, so that branch is bit-identical.
+
+**Restore.** The bias is a debt — a setpoint left low keeps braking, because
+the plant is symmetric. As demand releases, `sp_target` rises back to
+`v_target` on its own and a third branch walks the setpoint after it with
+`plus1` at `SINGLE`. That keeps the setpoint ≤1–2 km/h above vEgo, so the
+restore transient is **≤0.19 m/s²**, and costs 1.0 s at the p90 debt of
+5.2 km/h (3.2 s at the worst observed 16.0). `plus5` would repay in 0.2 s but
+park the setpoint ~12 km/h high on the way — a +1.1 m/s² lurch. This covers
+the 96% of decel episodes that end normally; exits that stop us commanding
+entirely (disengage, brake) are the debt ledger's job.
+
+**Duty cycle is the risk to watch.** This raises decel commanding from 6.7% to
+~47% of engaged time — 7× the 0x194 counter-overwrite exposure — while
+direction flips stay flat (~4/min), so it is sustained commanding, not chatter
+(an LPF on `accel` changes nothing). Every step is still +1 and every in-burst
+slot is still overwritten, but sustained holds of this length are beyond
+anything driven so far; the longest healthy hold on record is 6.28 s on route
+44b. **Check the merged +1 rate on the first drive** — it should stay in the
+94% band, not the 55% that flagged the slot law. `SetpointBias=0` rolls the
+whole thing back on the car without a redeploy.
 
 ### `CruiseCadence` — debug A/B param (default off)
 
@@ -273,6 +351,8 @@ Params are **files in the plugin's `data/` dir** (runtime:
 | `TemperatureOverlay` | on | yes (read each frame) | coolant/oil temps on the HUD; Driving-panel toggle |
 | `CruiseCeilingMemory` | on | yes (read on engage) | restore last set-speed ceiling on re-engage within a drive |
 | `SteerAngleOffset` | 0.0 | yes (1 Hz) | persisted steering-angle zero offset; updated from the `steer_angle_offset` plugin-bus topic, **not** a user-facing toggle |
+| `SetpointBias` | on | no (read at init) | accel-derived decel setpoint. `0` reverts to the pre-2026-09 `v_target` setpoint, v_error gate included — a true rollback, not a third behaviour |
+| `CruiseCadence` | off | no (read at init) | debug A/B: `hold` / `single` pins the stalk cadence. Not for normal driving |
 
 `torque_params.toml` (LAT_ACCEL_FACTOR / MAX_LAT_ACCEL_MEASURED / FRICTION per
 platform) is folded into opendbc's torque params at load time. Lateral-timing

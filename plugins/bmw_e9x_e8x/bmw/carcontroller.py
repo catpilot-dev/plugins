@@ -50,6 +50,34 @@ DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint
 # MINUS1 + HOLD = -0.6 m/s²
 # MINUS5 + HOLD = -1.2 m/s²
 
+# Accel-derived setpoint (decel side).
+#
+# DCC's response is a clean linear function of the setpoint gap. Measured over
+# routes 452 + 453 (25.6 engaged min): a_ego = 0.0935 * (setpoint − vEgo) in
+# km/h on the decel side, 0.0912 on the accel side — one symmetric constant,
+# linear out to a −11 km/h gap and saturating near −1.4 m/s².
+#
+# DCC's own speed loop is slow (implied horizon ≈ 2.8 s), so driving the
+# setpoint to v_target — what this file did before — asks for a gap 1.8–2.9x
+# too shallow across the entire decel range. The measured closed loop was
+# a_ego = 0.611 * a_cmd: we delivered 61% of the demanded deceleration, and the
+# best a_cmd → a_ego correlation sat at a 2.0 s lag. Worse, the old
+# `setpoint_error < 0` gate is a *clamp*: once the setpoint reaches v_target we
+# stop, whatever the demand. It blocked 82–92% of the time below a_cmd −0.9,
+# and the setpoint reached that clamp in a median of 0.00 s — so neither step
+# size nor cadence could ever buy authority. Matched on demand, the only times
+# the car braked properly were minus5 overshoots that punched through it
+# (a_cmd −0.8: clamped −0.27 m/s², deep −0.95).
+#
+# So invert the plant instead: ask for the gap the demanded accel needs.
+#
+# K_DCC is deliberately 0.1, not the measured 0.0935. That makes every ask ~7%
+# shallow, landing at a flat 92–93% of demand across the whole linear range
+# rather than overshooting wherever the plant is stiffer than measured.
+K_DCC = 0.1                    # m/s² of DCC response per km/h of setpoint gap
+SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
+SETPOINT_DEADZONE = 1.0        # km/h — one whole step; below this, don't command
+
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
     super().__init__(dbc_name, CP)
@@ -102,6 +130,19 @@ class CarController(CarControllerBase):
       self.cruise_cadence_pin = ''
     if self.cruise_cadence_pin:
       print(f"[bmw] CruiseCadence pinned to {self.cruise_cadence_pin.upper()} - debug A/B, not for normal driving")
+
+    # SetpointBias — accel-derived setpoint on the decel side. Default ON;
+    # `echo 0 > /data/plugins-runtime/bmw_e9x_e8x/data/SetpointBias` falls back
+    # to the old v_target setpoint without a redeploy, which matters because
+    # this raises 0x194 commanding duty ~7x and counter faults (5ECE/CD95)
+    # latch DCC off until an OBD clear. Restart-scoped like the params above.
+    try:
+      from config import read_plugin_param
+      self.setpoint_bias_on = read_plugin_param('bmw_e9x_e8x', 'SetpointBias', '') != '0'
+    except Exception:
+      self.setpoint_bias_on = True
+    if not self.setpoint_bias_on:
+      print("[bmw] SetpointBias disabled - setpoint tracks v_target (pre-2026-09 behaviour)")
 
     self.cruise_bus = CanBus.PT_CAN
     if CP.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
@@ -225,20 +266,69 @@ class CarController(CarControllerBase):
         if CS.out.gasPressed:
           cruise_cmd(CruiseStalk.plus1, self.pin_cadence(SINGLE_INTERVAL))
         else:
-          setpoint_error = v_target - CS.out.cruiseState.speed
+          # Setpoint target. Decel side only: whenever accel >= 0 this is
+          # v_target, so the accel branch below is bit-identical to before.
+          #
+          # v_target is long_plan.vTarget — the MPC trajectory speed at
+          # action_t (~0.5 s ahead), not the driver's set speed (that is
+          # CS.out.vCruise). It sits close to vEgo: median +1.1 km/h, p10 −2.1,
+          # p90 +3.7. So min(v_target, ...) is a ceiling just above current
+          # speed, and because the new target is min'd against the old one this
+          # law can only ever ask for a *deeper* setpoint than before, never a
+          # shallower one. Staying under the driver's set speed is still the
+          # planner's job, exactly as before: it caps v_target at v_cruise.
+          #
+          # The min_cruise_setpoint floor stays with the branch guard below.
+          sp_target = v_target
+          if self.setpoint_bias_on and accel < 0:
+            bias = max(accel / K_DCC, -SETPOINT_BIAS_MAX) * CV.KPH_TO_MS
+            sp_target = min(v_target, v_current + bias)
+
+          setpoint_error = sp_target - CS.out.cruiseState.speed
+          setpoint_deadzone = SETPOINT_DEADZONE * CV.KPH_TO_MS
+
+          # Dropping v_error from the decel gate is part of the new law, not a
+          # tidy-up: it used to block 51% of the a_cmd −0.4..−0.3 band, because
+          # sitting near the plan's target speed is not a reason to ignore a
+          # planner asking for deceleration. The setpoint deadzone replaces it
+          # — it asks the question that actually matters (is a whole step of
+          # setpoint worth moving?) and is what keeps a noisy accel from
+          # churning commands. With the bias off this must reduce to exactly
+          # the pre-2026-09 gate, v_error term included, so that
+          # SetpointBias=0 is a true rollback and not a third behaviour.
+          if self.setpoint_bias_on:
+            decel_gate = setpoint_error < -setpoint_deadzone
+          else:
+            decel_gate = v_error < -V_ERROR_DEADZONE and setpoint_error < 0
 
           if v_error > V_ERROR_DEADZONE and accel > 0 and setpoint_error > 0:
             cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
             interval = self.pin_cadence(HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
             cruise_cmd(cmd, interval)
 
-          elif v_error < -V_ERROR_DEADZONE and accel < 0 and setpoint_error < 0 and CS.out.cruiseState.speed > self.min_cruise_setpoint:
+          elif accel < 0 and decel_gate and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6
             cmd = CruiseStalk.minus5 if -accel >= DECEL_STEP5_THRESHOLD else CruiseStalk.minus1
             interval = self.pin_cadence(HOLD_INTERVAL if -accel >= DECEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
             step = 5 if cmd == CruiseStalk.minus5 else 1
             if headroom_kmh >= step:
               cruise_cmd(cmd, interval)
+
+          # Restore. The bias is a debt: the setpoint is parked below where the
+          # demand now justifies, and every path out of a decel leaves it there
+          # (the plant is symmetric, so a setpoint left low keeps braking).
+          # Walking back with plus1 at SINGLE holds the setpoint <= 1-2 km/h
+          # above vEgo, so the restore transient is <= 0.19 m/s² — imperceptible
+          # — and costs 1.0 s at the p90 debt of 5.2 km/h, 3.2 s at the worst
+          # observed 16 km/h. plus5 would repay it in 0.2 s but park the
+          # setpoint ~12 km/h high on the way, a +1.1 m/s² lurch.
+          #
+          # This is the whole recovery mechanism for the 96% of decel episodes
+          # that end normally: sp_target rises back to v_target on its own as
+          # demand releases, and this branch follows it. Only exits that stop
+          # us commanding entirely (disengage, brake) need the debt ledger.
+          elif self.setpoint_bias_on and setpoint_error > setpoint_deadzone:
+            cruise_cmd(CruiseStalk.plus1, self.pin_cadence(SINGLE_INTERVAL))
 
     # Trailing counter overwrite. If commanding stopped (or is briefly idle in
     # a deadzone) but the burst is still live, keep transmitting at the burst's
