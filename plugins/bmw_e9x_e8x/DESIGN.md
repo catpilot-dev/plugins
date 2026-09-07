@@ -234,6 +234,56 @@ gain in slew; it is taken for robustness of the assertion against dropped
 frames, which the logs cannot settle either way. `DECEL_HOLD_THRESHOLD` and
 `DECEL_STEP5_THRESHOLD` now live only on the `SetpointBias=0` rollback path.
 
+### Concordance gate — two estimates must agree
+
+Route 454 drove the bias off a bare `accel < 0` sign test and it chattered. The
+setpoint changed direction **19.3 times a minute** against the old law's 4.6,
+burned 2.75× the bus (724 vs 263 TX/min), and delivered **less** deceleration —
+50% of demand against the old law's 69% — because minus1 and plus1 bursts
+cancelled each other, 640 against 810 in half an hour. `a_cmd` crosses zero
+22 times a minute, and every crossing swapped the target between `vEgo + bias`
+and `v_target`.
+
+Two estimates of the same intent are available, with largely independent noise:
+
+| signal | what it is | noise vs a 2 s centred mean of `a_cmd` |
+|---|---|---|
+| `accel` | `actuators.accel` — LongControl's output, already filtered | **0.046 m/s²** |
+| `a_dv` | the raw plan's `vTarget` differentiated over `DV_WINDOW` | 0.221 m/s² |
+
+They disagree in sign on **18.8%** of samples yet agree ~100% once
+`accel < −0.3`: they diverge where the noise is and converge where the demand
+is real. The rule needs no thresholds:
+
+```
+both negative  -> brake
+both positive  -> accelerate
+disagreement   -> hold whatever state we are in
+```
+
+The hysteresis falls out of the disagreement region, which is exactly the band
+where the noise lives — so it is self-sizing rather than tuned. Modelled on
+454: flips **18.6 → 8.9/min**, commanding 1658 → 1487 moves/min.
+
+`a_dv` is **only** the concordance check; the bias magnitude stays raw `accel`.
+Using `min(accel, a_dv)` for the magnitude simulates better still (75% of
+demand against 57%) but that is a deliberate brake-to-the-more-pessimistic-
+estimate policy rather than noise rejection, and is deliberately not taken.
+
+Two things that do **not** work, both tried on 454's trace:
+
+- **A `v_error` deadband or concordance.** `v_error = vTarget − vEgo` carries
+  our own braking back through vEgo, so gating decel on it is negative feedback
+  on the quantity being sustained: gain goes to **−83%** even with a zero
+  deadband, and the gap turns positive. It was safe under the old law only
+  because the setpoint tracked `v_target` there, making `v_error` the genuine
+  control error.
+- **Filtering `a_cmd`.** The trouble is not fast noise — `a_cmd`'s residual
+  against a 0.2 s low-pass is sd 0.037. It is the planner's own oscillation at
+  0.1–0.3 m/s² over 0.5–2 s, which sits below any sensible filter corner, so a
+  low-pass removes signal before it removes the wander (tau 1.0 s: flips 8.1
+  but gain down to 49%).
+
 **The debt ledger.** The restore branch only runs while openpilot is driving,
 so every exit that stops us commanding parks the bias in DCC's setpoint memory:
 the driver resumes expecting their set speed and gets one up to 12 km/h low,

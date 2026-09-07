@@ -1,3 +1,5 @@
+from collections import deque
+
 from opendbc.car import Bus, DT_CTRL
 from opendbc.car.lateral import apply_dist_to_meas_limits
 from bmw import bmwcan
@@ -79,6 +81,40 @@ DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint
 K_DCC = 0.1                    # m/s² of DCC response per km/h of setpoint gap
 SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
 SETPOINT_DEADZONE = 1.0        # km/h — one whole step; below this, don't command
+
+# Concordance gate on entering/leaving the braking bias.
+#
+# Route 454 drove the bias off a bare `accel < 0` sign test and it chattered:
+# the setpoint changed direction 19.3 times a minute against the old law's 4.6,
+# burned 2.75x the bus, and delivered *less* deceleration (50% of demand against
+# the old law's 69%) because minus1 and plus1 bursts cancelled — 640 against 810
+# in half an hour. a_cmd crosses zero 22 times a minute, and every crossing
+# swapped the target between `vEgo + bias` and `v_target`.
+#
+# Two independent estimates of the same intent are available:
+#   accel        actuators.accel, LongControl's output and already filtered —
+#                sd 0.046 m/s² against a 2 s centred mean of itself
+#   a_dv         the raw plan's vTarget differentiated over DV_WINDOW —
+#                sd 0.221, noisier, but its noise comes from somewhere else
+# They disagree in sign on 18.8% of samples yet agree ~100% once accel < -0.3:
+# they diverge where the noise is and converge where the demand is real. That
+# is what makes requiring agreement work here, and it is why the earlier
+# attempt with v_error did not — v_error carries our own braking back through
+# vEgo, so gating on it is negative feedback on the thing being sustained.
+#
+# a_dv is ONLY the concordance check. The bias magnitude stays raw accel:
+# taking min(accel, a_dv) simulates better still (75% against 61%) but that is
+# a deliberate brake-to-the-more-pessimistic-estimate policy, not noise
+# rejection, and it is not being smuggled in as a tuning win.
+#
+# The rule needs no thresholds. Both negative -> brake; both positive ->
+# accelerate; disagreement -> hold whatever state we are in. The hysteresis
+# falls out of the disagreement region, which is exactly the band where the
+# noise lives, so it is self-sizing rather than tuned.
+#
+# Modelled on 454: flips 18.6 -> 8.9/min, commanding 1658 -> 1487 moves/min,
+# gain 61% -> 57% of demand, unwanted braking -0.002 m/s².
+DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 
 # Step size keys on the setpoint error, not on accel. Under the old clamped
 # setpoint the two were nearly the same question, because the setpoint could
@@ -183,6 +219,10 @@ class CarController(CarControllerBase):
       self.setpoint_bias_on = True
     if not self.setpoint_bias_on:
       print("[bmw] SetpointBias disabled - setpoint tracks v_target (pre-2026-09 behaviour)")
+
+    # Concordance state: vTarget history for a_dv, and the braking latch.
+    self.v_target_hist = deque(maxlen=int(round(DV_WINDOW / DT_CTRL)) + 1)
+    self.setpoint_braking = False
 
     # Hand-back point — the driver's set speed in km/h, latched while openpilot
     # is driving. Every downward bias is borrowed from it and has to be given
@@ -308,6 +348,23 @@ class CarController(CarControllerBase):
     if not CS.out.cruiseState.enabled:
       self.cruise_cancel = False
 
+    # Concordance gate. Both estimates must agree before the bias is taken on
+    # or given up. Until DV_WINDOW of history exists a_dv is unavailable, so
+    # fall back to accel alone rather than refusing to brake.
+    self.v_target_hist.append(v_target)
+    if len(self.v_target_hist) == self.v_target_hist.maxlen:
+      a_dv = (v_target - self.v_target_hist[0]) / DV_WINDOW
+    else:
+      a_dv = accel
+    if not CC.enabled:
+      self.setpoint_braking = False
+      self.v_target_hist.clear()
+    elif accel < 0 and a_dv < 0:
+      self.setpoint_braking = True
+    elif accel > 0 and a_dv > 0:
+      self.setpoint_braking = False
+    # else: the two estimates disagree — hold the state we are already in.
+
     cruise_stalk_human_pressing = CS.cruise_stalk_resume or CS.cruise_stalk_cancel or CS.cruise_stalk_speed != 0
 
     # Latch the hand-back point while we still have the car. Range-checked the
@@ -357,8 +414,10 @@ class CarController(CarControllerBase):
           #
           # The min_cruise_setpoint floor stays with the branch guard below.
           sp_target = v_target
-          if self.setpoint_bias_on and accel < 0:
-            bias = max(accel / K_DCC, -SETPOINT_BIAS_MAX) * CV.KPH_TO_MS
+          if self.setpoint_bias_on and self.setpoint_braking:
+            # min(accel, 0) so a positive blip while latched holds the bias
+            # rather than releasing it — the latch is what decides to release.
+            bias = max(min(accel, 0.0) / K_DCC, -SETPOINT_BIAS_MAX) * CV.KPH_TO_MS
             sp_target = min(v_target, v_current + bias)
 
           setpoint_error = sp_target - CS.out.cruiseState.speed
@@ -374,7 +433,7 @@ class CarController(CarControllerBase):
           # the pre-2026-09 gate, v_error term included, so that
           # SetpointBias=0 is a true rollback and not a third behaviour.
           if self.setpoint_bias_on:
-            decel_gate = setpoint_error < -setpoint_deadzone
+            decel_gate = self.setpoint_braking and setpoint_error < -setpoint_deadzone
           else:
             decel_gate = v_error < -V_ERROR_DEADZONE and setpoint_error < 0
 

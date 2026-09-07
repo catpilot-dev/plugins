@@ -1,6 +1,7 @@
 """Tests for BMW E9x/E8x plugin — VIN detection, CAN checksums, DBC paths, resume button."""
 import pytest
 from unittest.mock import MagicMock, patch, call
+import importlib
 import sys
 import os
 
@@ -437,13 +438,15 @@ class TestCruiseBurstCounter:
     cc = self._controller()
     events, t, szl = [], 0.0, 0
     for dur, accel, v_target, human in phases:
+      elapsed = 0.0
       for _ in range(int(round(dur / self.STEP))):
         t += self.STEP
+        elapsed += self.STEP
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
           events.append((t, 'SZL', szl))
         CS = make_stalk_carstate(szl, human_pressing=human)
-        CC = make_stalk_carcontrol(accel, v_target)
+        CC = make_stalk_carcontrol(accel, v_target + accel * elapsed)
         _, sends = cc.update(CC, CS, int(round(t * 1e9)))
         for addr, dat, _bus in sends:
           if addr == 404:
@@ -540,11 +543,13 @@ class TestCruiseCadencePin:
     t, szl, sent = 0.0, 0, []
     v_target = 24.0 + (2.0 if accel > 0 else -2.0)
     for dur, a, vt in [(1.0, 0.0, 24.0), (1.2, accel, v_target)]:
+      elapsed = 0.0
       for _ in range(int(round(dur / self.STEP))):
         t += self.STEP
+        elapsed += self.STEP
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
-        _, msgs = cc.update(make_stalk_carcontrol(a, vt),
+        _, msgs = cc.update(make_stalk_carcontrol(a, vt + a * elapsed),
                             make_stalk_carstate(szl, setpoint=23.0 if accel < 0 else 24.5),
                             int(round(t * 1e9)))
         for addr, dat, _bus in msgs:
@@ -621,7 +626,7 @@ class TestSetpointBias:
   ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
 
   def _run(self, accel, v_ego_kmh=86.0, setpoint_kmh=86.0, v_target_kmh=None,
-           bias='', dur=1.2):
+           bias='', dur=1.2, v_target_rate=None):
     """Hold one steady operating point and report what we transmit.
 
     Returns (set of action names emitted, set of counter steps, median TX
@@ -650,9 +655,15 @@ class TestSetpointBias:
     v_target = (v_ego_kmh if v_target_kmh is None else v_target_kmh) * self.KPH
 
     t, szl, sent = 0.0, 0, []
-    for phase_dur, a, vt in [(1.0, 0.0, v_ego), (dur, accel, v_target)]:
+    # v_target ramps at the demanded accel. The concordance gate differentiates
+    # vTarget over DV_WINDOW, so a harness that holds it flat reports a_dv = 0
+    # and the braking latch can never engage — the trace has to be consistent.
+    for phase_dur, a, vt0 in [(1.0, 0.0, v_ego), (dur, accel, v_target)]:
+      elapsed = 0.0
       for _ in range(int(round(phase_dur / self.STEP))):
         t += self.STEP
+        elapsed += self.STEP
+        vt = vt0 + (a if v_target_rate is None else v_target_rate) * elapsed
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
         _, msgs = cc.update(make_stalk_carcontrol(a, vt),
@@ -723,6 +734,56 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-1.5, v_ego_kmh=86.0, setpoint_kmh=76.0)
     assert 'minus1' in acts and 'minus5' not in acts, acts
 
+  def test_concordance_blocks_a_cmd_noise_alone(self):
+    """a_cmd dips negative but vTarget is flat: that is noise, not intent, so
+    the bias must not be taken on. This is what made route 454 chatter — the
+    setpoint changed direction 19.3 times a minute off a bare sign test on
+    a_cmd, against the old law's 4.6, and delivered less decel for it."""
+    acts, _, _ = self._run(accel=-0.6, v_ego_kmh=86.0, setpoint_kmh=86.0,
+                           v_target_rate=0.0)
+    assert 'minus1' not in acts and 'minus5' not in acts, acts
+
+  def test_concordance_allows_a_real_decel(self):
+    """Same demand, but vTarget is falling with it — both agree, so brake."""
+    acts, _, _ = self._run(accel=-0.6, v_ego_kmh=86.0, setpoint_kmh=86.0)
+    assert 'minus1' in acts, acts
+
+  def test_disagreement_holds_state_rather_than_releasing(self):
+    """The rule is three-state: both negative brakes, both positive releases,
+    disagreement holds. A vTarget that stops falling while a_cmd is still
+    negative must not drop a gap that took seconds to build."""
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    CP = MagicMock()
+    CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+    CP.minEnableSpeed = 30 / 3.6
+    cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    t, szl = 0.0, 0
+    v_ego = 86.0 * self.KPH
+    vt = v_ego
+    for phase, (a, rate) in enumerate([(-0.6, -0.6), (0.0, 0.0)]):
+      for _ in range(120):
+        t += self.STEP
+        vt += rate * self.STEP
+        if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+          szl = (szl + 1) % 15
+        cc.update(make_stalk_carcontrol(a, vt),
+                  make_stalk_carstate(szl, v_ego=v_ego, setpoint=86.0 * self.KPH),
+                  int(round(t * 1e9)))
+      if phase == 0:
+        assert cc.setpoint_braking, "should have latched braking"
+    # a_cmd 0.0 and a_dv 0.0 -> neither branch fires -> state held
+    assert cc.setpoint_braking, "disagreement/neutral must hold, not release"
+
+  def test_dv_window_spans_several_model_frames(self):
+    """modelV2 runs at 20 Hz, so 300 ms is 6 predictions — enough to average
+    the plan's per-frame jitter without lagging real intent."""
+    import bmw.carcontroller as mod
+    assert mod.DV_WINDOW >= 0.25
+    assert round(mod.DV_WINDOW * 20) >= 5
+
   def test_rollback_path_keeps_the_accel_keyed_step(self):
     acts, _, _ = self._run(accel=-1.0, v_target_kmh=80.0, setpoint_kmh=86.0, bias='0')
     assert 'minus5' in acts, acts
@@ -770,7 +831,7 @@ class TestSetpointBias:
 
   def test_param_off_restores_old_clamp(self):
     """With the bias off, a zero v_error decel is dropped again."""
-    acts, _, _ = self._run(accel=-0.5, bias='0')
+    acts, _, _ = self._run(accel=-0.5, bias='0', v_target_rate=0.0)
     assert 'minus1' not in acts and 'minus5' not in acts, acts
 
   def test_param_off_sends_no_restore(self):
@@ -804,7 +865,7 @@ class TestSetpointBias:
     with the setpoint above v_target is the case that separates the old gate
     from the new one: the old code blocks on v_error, and off must too."""
     acts, _, _ = self._run(accel=-0.5, v_ego_kmh=86.0, v_target_kmh=85.8,
-                           setpoint_kmh=90.0, bias='0')
+                           setpoint_kmh=90.0, bias='0', v_target_rate=0.0)
     assert 'minus1' not in acts and 'minus5' not in acts, acts
 
   def test_bias_on_commands_that_same_case(self):
@@ -902,8 +963,10 @@ class TestSetpointDebtLedger:
         cc._sim_obs = 0.0
         cc._sim_min_true = cc._sim_true
       acts = set()
+      ph_elapsed = 0.0
       for _ in range(int(round(dur / self.STEP))):
         t += self.STEP
+        ph_elapsed += self.STEP
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
         if t - cc._sim_obs >= OBS_PERIOD:          # 5 Hz observation
@@ -917,7 +980,8 @@ class TestSetpointDebtLedger:
                                  available=kw.get('available', True),
                                  v_cruise=cc._sim_vcruise)
         ccx = make_stalk_carcontrol(kw.get('accel', 0.0),
-                                    kw.get('v_target_kmh', 86.0) * self.KPH,
+                                    (kw.get('v_target_kmh', 86.0) * self.KPH
+                                     + kw.get('accel', 0.0) * ph_elapsed),
                                     enabled=kw.get('enabled', True))
         _, msgs = cc.update(ccx, cs, int(round(t * 1e9)))
         for addr, dat, _bus in msgs:
@@ -1089,10 +1153,12 @@ class TestSetpointDebtLedger:
     runs far past where the law asked it to go."""
     cc, mod = self._cc()
     v_ego = 86.0
-    self._phases(cc, [(1.0, {}), (6.0, {'accel': -3.0, 'v_ego_kmh': v_ego})])
+    # accel and duration chosen so v_target stays above vEgo - SETPOINT_BIAS_MAX
+    # for the whole phase: the cap has to be what governs the floor, not the
+    # ramping v_target, or this measures the harness rather than the law.
+    self._phases(cc, [(1.0, {}), (2.5, {'accel': -1.2, 'v_ego_kmh': v_ego})])
     floor = v_ego - mod.SETPOINT_BIAS_MAX
     overshoot = floor - cc._sim_min_true
     assert overshoot <= 2.0, (
       f"setpoint reached {cc._sim_min_true:.1f}, {overshoot:.1f} km/h past the "
       f"{floor:.1f} floor = {overshoot * 0.0935:.2f} m/s2 of unasked-for braking")
-
