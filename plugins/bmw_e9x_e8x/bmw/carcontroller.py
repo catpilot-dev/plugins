@@ -78,7 +78,7 @@ DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint
 # K_DCC is deliberately 0.1, not the measured 0.0935. That makes every ask ~7%
 # shallow, landing at a flat 92–93% of demand across the whole linear range
 # rather than overshooting wherever the plant is stiffer than measured.
-K_DCC = 0.15                    # m/s² of DCC response per km/h of setpoint gap
+K_DCC = 0.10                   # m/s² of DCC response per km/h of setpoint gap
 SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
 SETPOINT_DEADZONE = 3.0        # km/h — one whole step; below this, don't command
 
@@ -171,7 +171,7 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 # measured on 452/453. The metric to judge it by on the next drive is the
 # driver-brake rate, which is the outcome and which halved on 455 (0.22 -> 0.11
 # per engaged minute), not this regression gain.
-DECEL_STEP5_KMH = 10.0         # km/h of remaining error at or above which minus5 is used
+DECEL_STEP5_KMH = 5.0         # km/h of remaining error at or above which minus5 is used
 MINUS5_YIELD_KMH = 10.0        # measured median setpoint drop from one minus5 burst
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
