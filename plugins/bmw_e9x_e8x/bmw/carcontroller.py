@@ -78,9 +78,9 @@ DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint
 # K_DCC is deliberately 0.1, not the measured 0.0935. That makes every ask ~7%
 # shallow, landing at a flat 92–93% of demand across the whole linear range
 # rather than overshooting wherever the plant is stiffer than measured.
-K_DCC = 0.1                    # m/s² of DCC response per km/h of setpoint gap
+K_DCC = 0.15                    # m/s² of DCC response per km/h of setpoint gap
 SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
-SETPOINT_DEADZONE = 1.0        # km/h — one whole step; below this, don't command
+SETPOINT_DEADZONE = 3.0        # km/h — one whole step; below this, don't command
 
 # Restoring is lazier than braking, deliberately. Route 455 still flipped the
 # setpoint direction 13 times a minute against the old law's 4.5, and it is not
