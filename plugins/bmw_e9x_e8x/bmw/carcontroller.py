@@ -82,6 +82,20 @@ K_DCC = 0.1                    # m/s² of DCC response per km/h of setpoint gap
 SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
 SETPOINT_DEADZONE = 1.0        # km/h — one whole step; below this, don't command
 
+# Restoring is lazier than braking, deliberately. Route 455 still flipped the
+# setpoint direction 13 times a minute against the old law's 4.5, and it is not
+# the concordance latch doing it — a minimum dwell in the braking state changed
+# nothing at all (68% / 7.3 flips at every value from 0.3 to 2.0 s). It is the
+# restore branch chasing v_target back up between braking episodes: 769 plus1
+# bursts against 559 minus1 on that drive.
+#
+# Widening only the upward deadzone cuts it, at no cost in delivered decel
+# (bench: 7.3 -> 4.0 flips/min, gain 68% either way). The asymmetry is the same
+# reasoning as the latch's: coming down should be responsive, going back up is a
+# release and can afford to wait. It costs speed-return tracking — rms speed
+# error 2.75 -> 3.72 — so the car is slower to pick back up to the set speed.
+RESTORE_DEADZONE = 3.0         # km/h — how far below target before we walk it back
+
 # Concordance gate on entering/leaving the braking bias.
 #
 # Route 454 drove the bias off a bare `accel < 0` sign test and it chattered:
@@ -139,13 +153,25 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 #   minus5 at err >= 5      *68%*                             3.5 km/h (0.33)
 #   minus5 at err >= 10      54%                              1.6 km/h (0.15)
 #
-# 5 km/h is chosen knowing it overshoots by construction — minus5's yield is
-# 10 km/h against a 12 km/h total bias budget, so any threshold low enough to be
-# useful overshoots. A threshold of 10 is overshoot-free and recovers almost
-# nothing. The overshoot is in the safe direction, is pulled back by the restore
-# branch, and minus5 fires only about once a minute, so it stays a rare
-# intervention for the hard cases rather than a routine command.
-DECEL_STEP5_KMH = 5.0          # km/h of remaining error at or above which minus5 is used
+# The threshold matches minus5's yield, so it can only fire when there is a
+# whole yield of room: overshoot-free by construction. That is a deliberate
+# trade of authority for smoothness, taken from the seat after route 455.
+#
+# minus5 is measurably the jerkiest thing the controller does. On 455, peak
+# |d a_ego/dt| in the 0.7 s after a burst: minus5 3.49 m/s³ median and 6.55 at
+# p90, against minus1 2.08/3.90, plus1 1.86/3.82 and a 0.71 baseline.
+#
+# It is binary, not a dial: err rarely exceeds 8 km/h once minus1 is keeping up,
+# so 8 and 10 both amount to switching minus5 off (bench 54% and 51% of demand,
+# against 68% at a threshold of 5, and 48% with minus5 removed entirely).
+# Rate-limiting instead was measured and does nothing — minus5 already fires
+# about once a minute, so a minimum gap of up to 3 s never binds.
+#
+# The cost is real: 68% -> 51% of demanded decel, below the 69% the pre-bias law
+# measured on 452/453. The metric to judge it by on the next drive is the
+# driver-brake rate, which is the outcome and which halved on 455 (0.22 -> 0.11
+# per engaged minute), not this regression gain.
+DECEL_STEP5_KMH = 10.0         # km/h of remaining error at or above which minus5 is used
 MINUS5_YIELD_KMH = 10.0        # measured median setpoint drop from one minus5 burst
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
@@ -480,6 +506,8 @@ class CarController(CarControllerBase):
 
           setpoint_error = sp_target - CS.out.cruiseState.speed
           setpoint_deadzone = SETPOINT_DEADZONE * CV.KPH_TO_MS
+          restore_deadzone = (RESTORE_DEADZONE if self.setpoint_bias_on
+                              else SETPOINT_DEADZONE) * CV.KPH_TO_MS
 
           # Dropping v_error from the decel gate is part of the new law, not a
           # tidy-up: it used to block 51% of the a_cmd −0.4..−0.3 band, because
@@ -542,7 +570,7 @@ class CarController(CarControllerBase):
           # that end normally: sp_target rises back to v_target on its own as
           # demand releases, and this branch follows it. Only exits that stop
           # us commanding entirely (disengage, brake) need the debt ledger.
-          elif self.setpoint_bias_on and setpoint_error > setpoint_deadzone:
+          elif self.setpoint_bias_on and setpoint_error > restore_deadzone:
             cruise_cmd(CruiseStalk.plus1, self.pin_cadence(SINGLE_INTERVAL))
 
       # Repay while openpilot is not driving. The branches above only run with

@@ -234,6 +234,18 @@ gain in slew; it is taken for robustness of the assertion against dropped
 frames, which the logs cannot settle either way. `DECEL_HOLD_THRESHOLD` and
 `DECEL_STEP5_THRESHOLD` now live only on the `SetpointBias=0` rollback path.
 
+### Route history
+
+| route | law | gain | flips/min | tx/min | med gap | driver brakes/min |
+|---|---|---|---|---|---|---|
+| 452/453 | pre-bias | 69–71% | 4.3–4.8 | 212–308 | −1.9 | 0.22–0.25 |
+| 454 | bias, bare sign test | **50%** | **19.3** | 724 | −1.9 | 0.20 |
+| 455 | + concordance gate, per-slot selection | 67% | 13.0 | 420 | **−3.5** | **0.11** |
+
+455 is the first drive where the bias actually established itself (median gap
+−3.5 km/h) and the driver-brake rate halved. Flipping remains the open item and
+is what `RESTORE_DEADZONE` targets.
+
 ### Concordance gate — two estimates must agree
 
 Route 454 drove the bias off a bare `accel < 0` sign test and it chattered. The
@@ -322,11 +334,30 @@ measured plant, 5 Hz observation — validated by `minus1`-only reproducing the
 | `minus5` at err ≥ 8 | 58% | 1.7 km/h (0.16) |
 | `minus5` at err ≥ 10 | 54% | 1.6 km/h (0.15) |
 
-`DECEL_STEP5_KMH` = 5 overshoots by construction — a 10 km/h yield against a
-12 km/h bias budget means any useful threshold does. A threshold of 10 is
-overshoot-free and recovers almost nothing. The overshoot is in the safe
-direction, the restore branch pulls it back, and `minus5` fires about once a
-minute, so it stays a rare intervention rather than a routine command.
+`DECEL_STEP5_KMH` = 10 matches minus5's yield, so it fires only with a whole
+yield of room: overshoot-free by construction. That is a deliberate trade of
+authority for smoothness, taken from the seat after route 455, where minus5 was
+measurably the jerkiest thing the controller does — peak |d a_ego/dt| in the
+0.7 s after a burst was **3.49 m/s³** median and **6.55** at p90, against
+minus1's 2.08/3.90, plus1's 1.86/3.82 and a 0.71 baseline.
+
+It is binary rather than a dial: `err` rarely exceeds 8 km/h once minus1 is
+keeping up, so 8 and 10 both amount to switching minus5 off (bench 54% and 51%
+of demand, against 68% at a threshold of 5, and 48% with minus5 gone). Rate
+limiting instead was measured and does nothing — minus5 already fires about once
+a minute, so a minimum gap of up to 3 s never binds. The cost is real: **68% →
+51%**, below the 69% the pre-bias law measured. Judge it on the next drive by
+the driver-brake rate, not this gain.
+
+**Restoring is lazier than braking** (`RESTORE_DEADZONE` = 3 km/h against
+`SETPOINT_DEADZONE` = 1). Route 455 still flipped the setpoint direction 13
+times a minute against the old law's 4.5, and it is *not* the concordance latch
+— a minimum dwell in the braking state changed nothing at all (68% / 7.3 flips
+at every value from 0.3 to 2.0 s). It is the restore branch chasing v_target
+back up between episodes: 769 plus1 bursts against 559 minus1 on that drive.
+Widening only the upward deadzone takes flips 7.3 → 4.0/min at no cost in
+delivered decel. It costs speed-return tracking (rms speed error 2.75 → 3.72),
+so the car is slower to pick back up to the set speed.
 
 Do **not** add lead compensation: `longitudinalActuatorDelay` is 0.7 for this
 car, so the planner already computes vTarget/aTarget at that horizon.

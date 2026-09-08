@@ -777,6 +777,35 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-1.2, v_ego_kmh=86.0, setpoint_kmh=90.0)
     assert 'minus5' in acts, acts
 
+  def test_minus5_needs_a_whole_yield_of_room(self):
+    """DECEL_STEP5_KMH matches minus5's 10 km/h yield, so it can only fire with
+    a full yield of room — overshoot-free by construction. An error of 7 km/h is
+    minus1 territory even though it is large.
+
+    Traded deliberately: minus5 is the jerkiest thing the controller does (peak
+    |d a_ego/dt| after a burst on route 455 was 3.49 m/s3 median, 6.55 at p90,
+    against minus1's 2.08/3.90), and it costs 68% -> 51% of demanded decel on
+    the bench.
+    """
+    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=90.5)
+    assert 'minus1' in acts and 'minus5' not in acts, acts
+
+  def test_restore_waits_for_a_wider_deadzone_than_braking(self):
+    """Restoring is lazier than braking. Route 455 flipped the setpoint 13
+    times a minute and it was the restore branch, not the concordance latch —
+    a minimum dwell in the braking state changed nothing at all."""
+    import bmw.carcontroller as mod
+    assert mod.RESTORE_DEADZONE > mod.SETPOINT_DEADZONE
+    # 2 km/h low: inside the restore deadzone, leave it alone
+    acts, _, _ = self._run(accel=0.0, v_ego_kmh=86.0, setpoint_kmh=84.0,
+                           v_target_kmh=86.0, v_target_rate=0.0)
+    assert 'plus1' not in acts, acts
+    # Well past it: walk it back. Started far enough down that the settling
+    # phase cannot finish the job before the measured phase begins.
+    acts, _, _ = self._run(accel=0.0, v_ego_kmh=86.0, setpoint_kmh=72.0,
+                           v_target_kmh=86.0, v_target_rate=0.0)
+    assert 'plus1' in acts, acts
+
   def test_small_error_picks_minus1(self):
     """Under DECEL_STEP5_KMH a minus5 could only overshoot — its yield is ten
     times minus1's and there is nowhere to put it."""
