@@ -101,6 +101,30 @@ SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s
 # and going back up is a release.
 SETPOINT_DEADZONE = 3.0        # km/h — how far off target before we command
 
+# ...but a band wide enough to stop noise starting a braking episode is also
+# wide enough to abandon one halfway. Walking route 459's mid-episode releases
+# — where |a_ego| had reached 80% of demand and fell back under 50% while the
+# demand was still there — attributes them:
+#
+#   inside the 3 km/h deadzone      51%   (455: 51%, 45a: 50%)
+#   still commanding, DCC lagging   47%   (455: 46%, 45a: 50%)
+#   bias cap reached                 1%
+#   setpoint on the 35 km/h floor    0%   (455: 3%)
+#
+# The lag half is the plant and no constant fixes it. The deadzone half is
+# ours: as the setpoint closes on sp_target the error drops under 3, commanding
+# stops, vEgo keeps falling, the gap shrinks and the decel decays.
+#
+# So make it a Schmitt trigger — the full deadzone to START commanding down,
+# this narrower one to CONTINUE within the same episode. Noise still cannot
+# open an episode, which is the whole anti-flip property; it just cannot close
+# one early either. Bench over 459 + 45a's real episodes: gain 44% -> 59% for
+# +0.3 flips/min, against the 68% / 7.0 flips a flat 1 km/h deadzone would buy.
+#
+# This is the asymmetry the note above kept the door open for — but on the
+# enter-vs-continue axis, not down-vs-up.
+SETPOINT_HOLD_DEADZONE = 1.0   # km/h — once an episode is under way
+
 # Concordance gate on entering/leaving the braking bias.
 #
 # Route 454 drove the bias off a bare `accel < 0` sign test and it chattered:
@@ -326,6 +350,10 @@ class CarController(CarControllerBase):
     # Concordance state: vTarget history for its trend, and the braking latch.
     self.v_target_hist = deque(maxlen=int(round(DV_WINDOW / DT_CTRL)) + 1)
     self.setpoint_braking = False
+    # True once this braking episode has actually sent a down command, which is
+    # what narrows the deadzone to SETPOINT_HOLD_DEADZONE. Cleared whenever the
+    # episode ends, so a new one always has to pay the full entry price.
+    self.setpoint_commanding = False
 
     # Per-slot command selection: what was decided this slot, and how much
     # setpoint we have asked for but not yet seen arrive.
@@ -483,6 +511,8 @@ class CarController(CarControllerBase):
       self.setpoint_braking = True
     elif accel > 0 and dv_target > 0:
       self.setpoint_braking = False
+    if not self.setpoint_braking:
+      self.setpoint_commanding = False
     # else: the two estimates disagree — hold the state we are already in.
 
     # A changed setpoint reading is a fresh 0x193 report, and it already
@@ -552,6 +582,13 @@ class CarController(CarControllerBase):
             sp_target = min(v_target, v_current + bias)
 
           setpoint_error = sp_target - CS.out.cruiseState.speed
+          # Schmitt trigger: the full deadzone opens an episode, the narrow one
+          # keeps it open. Restoring always pays the full width — it is the
+          # release side, and nothing about being mid-episode should make the
+          # setpoint quicker to climb back.
+          active_deadzone_kmh = (SETPOINT_HOLD_DEADZONE if self.setpoint_commanding
+                                 else SETPOINT_DEADZONE)
+          active_deadzone = active_deadzone_kmh * CV.KPH_TO_MS
           setpoint_deadzone = SETPOINT_DEADZONE * CV.KPH_TO_MS
 
           # Dropping v_error from the decel gate is part of the new law, not a
@@ -564,7 +601,7 @@ class CarController(CarControllerBase):
           # the pre-2026-09 gate, v_error term included, so that
           # SetpointBias=0 is a true rollback and not a third behaviour.
           if self.setpoint_bias_on:
-            decel_gate = self.setpoint_braking and setpoint_error < -setpoint_deadzone
+            decel_gate = self.setpoint_braking and setpoint_error < -active_deadzone
           else:
             decel_gate = v_error < -V_ERROR_DEADZONE and setpoint_error < 0
 
@@ -586,10 +623,12 @@ class CarController(CarControllerBase):
                   self.slot_cmd = CruiseStalk.minus5
                   self.setpoint_pending += MINUS5_YIELD_KMH
                   self.setpoint_pending_ns = now_nanos
-                elif err_kmh >= SETPOINT_DEADZONE and headroom_kmh >= 1:
+                  self.setpoint_commanding = True
+                elif err_kmh >= active_deadzone_kmh and headroom_kmh >= 1:
                   self.slot_cmd = CruiseStalk.minus1
                   self.setpoint_pending += MINUS1_YIELD_KMH
                   self.setpoint_pending_ns = now_nanos
+                  self.setpoint_commanding = True
                 else:
                   self.slot_cmd = None
               if self.slot_cmd is not None:

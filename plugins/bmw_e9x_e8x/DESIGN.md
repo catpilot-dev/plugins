@@ -438,6 +438,51 @@ a restore not made. It was briefly asymmetric; symmetric is simpler and better
 measured, so there is one constant. The reason to keep them separable if this
 is revisited: coming down is a response, going back up is a release.
 
+### The command gate is a Schmitt trigger
+
+A band wide enough to stop noise *starting* a braking episode is also wide
+enough to abandon one halfway. Walking route 459's mid-episode releases — where
+`|a_ego|` had reached 80% of demand and fell back under 50% while the demand
+was still there — attributes them, and the split is stable across three drives:
+
+| cause | 455 | 459 | 45a |
+|---|---|---|---|
+| inside the 3 km/h deadzone | 51% | **51%** | 50% |
+| still commanding, DCC lagging | 46% | 47% | 50% |
+| bias cap (12 km/h) reached | — | 1% | — |
+| setpoint on the 35 km/h floor | 3% | — | — |
+
+The lag half is the plant and no constant fixes it. The deadzone half is ours:
+as the setpoint closes on `sp_target` the error drops under 3, commanding
+stops, vEgo keeps falling, the gap shrinks and the decel decays.
+
+So the full deadzone **opens** an episode and `SETPOINT_HOLD_DEADZONE` = 1 km/h
+**keeps it open**. Noise still cannot start an episode, which is the whole
+anti-flip property; it just cannot close one early either. Restoring always
+pays the full width — it is the release side, and being mid-episode is no
+reason for the setpoint to be quicker to climb back. The narrow band belongs to
+one episode: when the braking latch releases, `setpoint_commanding` clears and
+the next episode pays the full entry price again.
+
+Bench over 459 + 45a's real episodes:
+
+| law | gain | flips/min |
+|---|---|---|
+| deadzone 3/3 | 44% | 3.0 |
+| **enter 3 / hold 1** | **59%** | **3.3** |
+| flat deadzone 1 | 68% | 7.0 |
+
+Two-thirds of the decel a flat 1 km/h band would buy, for +0.3 flips/min
+instead of +4.0. This is the asymmetry the deadzone note keeps the door open
+for — but on the **enter-vs-continue** axis, not down-vs-up.
+
+**`SETPOINT_BIAS_MAX` is not the lever here**, and was measured before this was
+built: the cap accounts for 1 of 70 mid-episode releases on 459. It binds on
+0.77% of engaged samples, and within that band the gap actually reaches 12 km/h
+only 2.7% of the time (median achieved 8.4 against 12.0 asked). Raising it to
+15 would be physically tidy — 15 × 0.0935 = −1.40, the plant's saturation
+point — but it addresses ~1% of the symptom.
+
 The debt-repay branch deliberately does **not** use this deadzone — it fires at
 one step's yield. The deadzone exists to stop a noisy `a_cmd` churning
 commands; repaying is a one-shot reconciliation with nothing noisy about it,

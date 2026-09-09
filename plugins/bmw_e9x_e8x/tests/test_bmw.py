@@ -792,6 +792,110 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=89.5)
     assert 'minus5' in acts, acts
 
+  # ---- the Schmitt trigger on the command gate ---------------------------
+
+  def _fresh_cc(self):
+    """A CarController with the bias law on, for tests that drive it directly."""
+    import importlib
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    import config as cfg
+    orig = cfg.read_plugin_param
+    cfg.read_plugin_param = lambda pid, key, default='': ''
+    try:
+      CP = MagicMock()
+      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+      CP.minEnableSpeed = 30 / 3.6
+      return mod.CarController({0: 'bmw_e9x_e8x'}, CP), mod
+    finally:
+      cfg.read_plugin_param = orig
+
+  def _hold(self, cc, accel, setpoint_kmh, t0, n, v_ego_kmh=86.0, vt_slope=-1.0):
+    """Hold one operating point for n frames, pinning the setpoint so the error
+    stays put, and report which actions went out. vTarget slides at vt_slope
+    km/h/s so the concordance gate sees a real trend."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    acts, t = set(), t0
+    vt = v_ego_kmh * self.KPH
+    for i in range(n):
+      t += self.STEP
+      vt += vt_slope * self.STEP * self.KPH
+      _, msgs = cc.update(make_stalk_carcontrol(accel, vt),
+                          make_stalk_carstate(i % 15, v_ego=v_ego_kmh * self.KPH,
+                                              setpoint=setpoint_kmh * self.KPH),
+                          int(round(t * 1e9)))
+      for addr, dat, _bus in msgs:
+        if addr == 404:
+          acts |= {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+    return acts, t
+
+  def test_narrow_band_cannot_open_an_episode(self):
+    """An error of 2 km/h is inside SETPOINT_DEADZONE and outside
+    SETPOINT_HOLD_DEADZONE. From cold that must send nothing — noise being
+    unable to start a braking episode is the whole anti-flip property, and the
+    hold band must not weaken it."""
+    cc, mod = self._fresh_cc()
+    assert mod.SETPOINT_HOLD_DEADZONE < mod.SETPOINT_DEADZONE
+    # accel -0.25 -> bias -2.5 km/h -> sp_target 83.5; setpoint 85.5 -> err 2.0
+    acts, _ = self._hold(cc, -0.25, 85.5, 0.0, 200)
+    assert cc.setpoint_braking, "the latch should be on — this is a real decel"
+    assert not cc.setpoint_commanding
+    assert 'minus1' not in acts and 'minus5' not in acts, acts
+
+  def test_a_started_episode_commands_into_the_narrow_band(self):
+    """Same 2 km/h error, but with the episode already under way: now it
+    commands. This is the mid-episode release — on route 459 the 3 km/h
+    deadzone accounted for 51% of the times |a_ego| fell back under half of
+    demand while the demand was still there."""
+    cc, _ = self._fresh_cc()
+    # Open the episode on a wide error, then step back into the narrow band.
+    opened, t = self._hold(cc, -0.25, 88.0, 0.0, 200)
+    assert 'minus1' in opened and cc.setpoint_commanding, opened
+    acts, _ = self._hold(cc, -0.25, 85.5, t, 200)
+    assert 'minus1' in acts, "abandoned the episode inside the deadzone"
+
+  def test_episode_end_clears_the_hold_band(self):
+    """The narrow band belongs to one episode. When the braking latch releases,
+    the next episode has to pay the full entry price again — otherwise a single
+    episode would permanently widen the law's sensitivity to noise."""
+    import importlib
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    import config as cfg
+    orig = cfg.read_plugin_param
+    cfg.read_plugin_param = lambda pid, key, default='': ''
+    try:
+      CP = MagicMock()
+      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+      CP.minEnableSpeed = 30 / 3.6
+      cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    finally:
+      cfg.read_plugin_param = orig
+
+    v_ego = 86.0 * self.KPH
+    t = 0.0
+    # Falling vTarget with a real decel demand: latch engages and commands.
+    vt = 86.0 * self.KPH
+    for i in range(200):
+      t += self.STEP
+      vt -= 1.0 * self.STEP * self.KPH
+      cc.update(make_stalk_carcontrol(-1.0, vt),
+                make_stalk_carstate(i % 15, v_ego=v_ego, setpoint=90.0 * self.KPH),
+                int(round(t * 1e9)))
+    assert cc.setpoint_braking and cc.setpoint_commanding, "episode never opened"
+    # Demand and plan both turn positive: the latch releases.
+    for i in range(200):
+      t += self.STEP
+      vt += 1.0 * self.STEP * self.KPH
+      cc.update(make_stalk_carcontrol(+1.0, vt),
+                make_stalk_carstate(i % 15, v_ego=v_ego, setpoint=90.0 * self.KPH),
+                int(round(t * 1e9)))
+    assert not cc.setpoint_braking
+    assert not cc.setpoint_commanding, "hold band survived the end of the episode"
+
   def test_restore_uses_the_same_deadzone_as_braking(self):
     """One deadzone gates both directions. It was briefly asymmetric (1 down,
     3 up); 3 both ways measured better on route 459 and is one constant, so
