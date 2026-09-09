@@ -693,7 +693,7 @@ class TestSetpointBias:
 
     t, szl, sent = 0.0, 0, []
     # v_target ramps at the demanded accel. The concordance gate differentiates
-    # vTarget over DV_WINDOW, so a harness that holds it flat reports a_dv = 0
+    # vTarget over DV_WINDOW, so a harness that holds it flat reports no trend
     # and the braking latch can never engage — the trace has to be consistent.
     #
     # The setpoint has to respond too: the law decides once per SZL slot and
@@ -777,26 +777,28 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-1.2, v_ego_kmh=86.0, setpoint_kmh=90.0)
     assert 'minus5' in acts, acts
 
-  def test_minus5_needs_a_whole_yield_of_room(self):
-    """DECEL_STEP5_KMH matches minus5's 10 km/h yield, so it can only fire with
-    a full yield of room — overshoot-free by construction. An error of 7 km/h is
-    minus1 territory even though it is large.
+  def test_step5_boundary_follows_the_error_not_the_demand(self):
+    """DECEL_STEP5_KMH splits the two steps at 5 km/h of remaining error, and
+    the demand does not get a vote: the same shallow -0.25 ask draws minus1 at
+    4 km/h of error and minus5 at 6.
 
-    Traded deliberately: minus5 is the jerkiest thing the controller does (peak
-    |d a_ego/dt| after a burst on route 455 was 3.49 m/s3 median, 6.55 at p90,
-    against minus1's 2.08/3.90), and it costs 68% -> 51% of demanded decel on
-    the bench.
+    Route 459 ran this split (against 455's 10) and the drive came back
+    smoother, not jerkier: regression gain 67% -> 87%, |a_ego| excursions past
+    1.5 m/s2 halved to 0.54/min, jerk rms 3.29 -> 3.04 m/s3. Handing minus5 the
+    band it can actually settle in stops minus1 from grinding at it.
     """
-    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=90.5)
+    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=87.5)
     assert 'minus1' in acts and 'minus5' not in acts, acts
+    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=89.5)
+    assert 'minus5' in acts, acts
 
-  def test_restore_waits_for_a_wider_deadzone_than_braking(self):
-    """Restoring is lazier than braking. Route 455 flipped the setpoint 13
-    times a minute and it was the restore branch, not the concordance latch —
-    a minimum dwell in the braking state changed nothing at all."""
+  def test_restore_uses_the_same_deadzone_as_braking(self):
+    """One deadzone gates both directions. It was briefly asymmetric (1 down,
+    3 up); 3 both ways measured better on route 459 and is one constant, so
+    there is no separate restore threshold to drift out of step."""
     import bmw.carcontroller as mod
-    assert mod.RESTORE_DEADZONE > mod.SETPOINT_DEADZONE
-    # 2 km/h low: inside the restore deadzone, leave it alone
+    assert not hasattr(mod, 'RESTORE_DEADZONE'), "restore threshold split off again"
+    # 2 km/h low: inside the deadzone, leave it alone
     acts, _, _ = self._run(accel=0.0, v_ego_kmh=86.0, setpoint_kmh=84.0,
                            v_target_kmh=86.0, v_target_rate=0.0)
     assert 'plus1' not in acts, acts
@@ -807,9 +809,9 @@ class TestSetpointBias:
     assert 'plus1' in acts, acts
 
   def test_small_error_picks_minus1(self):
-    """Under DECEL_STEP5_KMH a minus5 could only overshoot — its yield is ten
-    times minus1's and there is nowhere to put it."""
-    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=86.0)
+    """Just over the deadzone: a minus5 here could only overshoot, its yield
+    being ten times minus1's with nowhere to put it."""
+    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=87.0)
     assert 'minus1' in acts and 'minus5' not in acts, acts
 
   def test_bias_path_decel_uses_single(self):
@@ -867,7 +869,7 @@ class TestSetpointBias:
                   int(round(t * 1e9)))
       if phase == 0:
         assert cc.setpoint_braking, "should have latched braking"
-    # a_cmd 0.0 and a_dv 0.0 -> neither branch fires -> state held
+    # a_cmd 0.0 and no vTarget trend -> neither branch fires -> state held
     assert cc.setpoint_braking, "disagreement/neutral must hold, not release"
 
   def _drive(self, accel, v_ego_kmh, setpoint_kmh, seconds, respond=True,
@@ -959,6 +961,38 @@ class TestSetpointBias:
                                    seconds=2.5, respond=False)
     late = [t for t, _ in sent if t > 2.0]
     assert late, "went silent for good against an unresponsive DCC"
+
+  def test_partial_window_holds_rather_than_falling_back_to_accel(self):
+    """Before DV_WINDOW of vTarget history exists there is no second estimate,
+    so the gate holds state — it does not degrade to the bare accel sign test
+    route 454 was driven on. The latch and the history are cleared together on
+    disengage, so the state held is always not-braking."""
+    import importlib
+    import bmw.carcontroller as mod
+    importlib.reload(mod)
+    from bmw.values import BmwFlags
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    import config as cfg
+    orig = cfg.read_plugin_param
+    cfg.read_plugin_param = lambda pid, key, default='': ''
+    try:
+      CP = MagicMock()
+      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+      CP.minEnableSpeed = 30 / 3.6
+      cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    finally:
+      cfg.read_plugin_param = orig
+
+    # Hard decel demand from the very first frame, with no history behind it.
+    CS = make_stalk_carstate(0, v_ego=86.0 * self.KPH, setpoint=90.0 * self.KPH)
+    CC = make_stalk_carcontrol(accel=-1.5, v_target=86.0 * self.KPH)
+    n = cc.v_target_hist.maxlen
+    for i in range(n - 1):
+      cc.update(CC, CS, i * mod.DT_CTRL * 1e9)
+      assert not cc.setpoint_braking, f"latched on a partial window at frame {i}"
+    # One more frame fills it; vTarget has been flat, so still no agreement.
+    cc.update(CC, CS, (n - 1) * mod.DT_CTRL * 1e9)
+    assert not cc.setpoint_braking
 
   def test_dv_window_spans_several_model_frames(self):
     """modelV2 runs at 20 Hz, so 300 ms is 6 predictions — enough to average

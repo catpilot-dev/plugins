@@ -80,21 +80,26 @@ DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint
 # rather than overshooting wherever the plant is stiffer than measured.
 K_DCC = 0.10                   # m/s² of DCC response per km/h of setpoint gap
 SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
-SETPOINT_DEADZONE = 3.0        # km/h — one whole step; below this, don't command
-
-# Restoring is lazier than braking, deliberately. Route 455 still flipped the
-# setpoint direction 13 times a minute against the old law's 4.5, and it is not
-# the concordance latch doing it — a minimum dwell in the braking state changed
-# nothing at all (68% / 7.3 flips at every value from 0.3 to 2.0 s). It is the
-# restore branch chasing v_target back up between braking episodes: 769 plus1
-# bursts against 559 minus1 on that drive.
+# One number gates both directions: how far the setpoint has to be from its
+# target before it is worth moving at all. It is the whole answer to setpoint
+# flipping, which is not the concordance latch's doing — a minimum dwell in the
+# braking state changed nothing at all (68% / 7.3 bench flips at every value
+# from 0.3 to 2.0 s). The flipping is sp_target *breathing* inside a stable
+# braking state: sp_target is v_ego + accel/K_DCC, so a_cmd wandering from
+# -0.6 to -0.2 — ordinary noise, no state change — walks the target 4 km/h.
+# A narrow band chases every one of those.
 #
-# Widening only the upward deadzone cuts it, at no cost in delivered decel
-# (bench: 7.3 -> 4.0 flips/min, gain 68% either way). The asymmetry is the same
-# reasoning as the latch's: coming down should be responsive, going back up is a
-# release and can afford to wait. It costs speed-return tracking — rms speed
-# error 2.75 -> 3.72 — so the car is slower to pick back up to the set speed.
-RESTORE_DEADZONE = 3.0         # km/h — how far below target before we walk it back
+# Route 455 ran 1 km/h down / 3 up and flipped 13.0 times a minute against the
+# old clamped law's 4.6. Route 459 runs 3 both ways: 6.9 flips/min, and the
+# regression gain went the *right* way, 67% -> 87%, so the band costs no
+# delivered decel. What it costs is speed-return tracking, since every wander
+# it absorbs is a restore not made.
+#
+# It was briefly asymmetric (1 down / 3 up). Symmetric is both simpler and
+# better measured, so there is one constant again — but the reason to keep
+# them separable, if this is ever revisited, is that coming down is a response
+# and going back up is a release.
+SETPOINT_DEADZONE = 3.0        # km/h — how far off target before we command
 
 # Concordance gate on entering/leaving the braking bias.
 #
@@ -106,9 +111,15 @@ RESTORE_DEADZONE = 3.0         # km/h — how far below target before we walk it
 # swapped the target between `vEgo + bias` and `v_target`.
 #
 # Two independent estimates of the same intent are available:
-#   accel        actuators.accel, LongControl's output and already filtered —
-#                sd 0.046 m/s² against a 2 s centred mean of itself
-#   a_dv         the raw plan's vTarget differentiated over DV_WINDOW —
+#   accel        actuators.accel, which IS longitudinalPlan.aTarget — measured
+#                r = 1.0000, rms difference 0.0024 m/s², LongControl's PID
+#                being pass-through here. Smooth not because anything filters
+#                it but because aTarget is 2*(v_target(0.75 s) - v_now)/0.75
+#                - a_now, a horizon average: sd 0.046 m/s² against a 2 s
+#                centred mean of itself. Note what that formula means — it
+#                subtracts the plan's current accel, so aTarget ~ 0 says "what
+#                the car is doing now is right", NOT "no demand".
+#   dv_target    the raw plan's vTarget over DV_WINDOW — as an acceleration
 #                sd 0.221, noisier, but its noise comes from somewhere else
 # They disagree in sign on 18.8% of samples yet agree ~100% once accel < -0.3:
 # they diverge where the noise is and converge where the demand is real. That
@@ -116,10 +127,16 @@ RESTORE_DEADZONE = 3.0         # km/h — how far below target before we walk it
 # attempt with v_error did not — v_error carries our own braking back through
 # vEgo, so gating on it is negative feedback on the thing being sustained.
 #
-# a_dv is ONLY the concordance check. The bias magnitude stays raw accel:
-# taking min(accel, a_dv) simulates better still (75% against 61%) but that is
-# a deliberate brake-to-the-more-pessimistic-estimate policy, not noise
-# rejection, and it is not being smuggled in as a tuning win.
+# The plan's trend is ONLY the concordance check, and only its SIGN is ever
+# read — so it is carried as the raw vTarget delta rather than divided into an
+# acceleration. DV_WINDOW is a positive constant and divides out of every
+# comparison below; the units were decoration.
+#
+# The bias magnitude stays raw accel: taking min(accel, dv/DV_WINDOW) simulates
+# better still (75% against 61%) but that is a deliberate brake-to-the-more-
+# pessimistic-estimate policy, not noise rejection, and it is not being
+# smuggled in as a tuning win. That is the one thing the division would be
+# needed for, and it is not taken.
 #
 # The rule needs no thresholds. Both negative -> brake; both positive ->
 # accelerate; disagreement -> hold whatever state we are in. The hysteresis
@@ -128,6 +145,27 @@ RESTORE_DEADZONE = 3.0         # km/h — how far below target before we walk it
 #
 # Modelled on 454: flips 18.6 -> 8.9/min, commanding 1658 -> 1487 moves/min,
 # gain 61% -> 57% of demand, unwanted braking -0.002 m/s².
+
+# DV_WINDOW is not a tuning knob — it is the deque length and nothing more.
+# Swept 0.2 to 1.0 s on 459 + 45a: braking-state toggles move 7.8 -> 6.2/min
+# and setpoint flips do not move at all, while p90 latch lag grows 0.15 ->
+# 0.81 s and 45a's restore commands rise 28 -> 76. Longer is not better;
+# don't sweep it again.
+#
+# Windowless alternatives were measured and all lose. vTarget - setpoint and
+# vTarget - vEgo buy their quiet by not braking (19 to 61 of 459's 64 decel
+# episodes unserved), and vTarget - vEgo is v_error, whose defect is already
+# on record. The plan's own forward slope, speeds[k] - speeds[0], is a real
+# signal (corr 0.82 with accel against this one's 0.75, so not collinear) but
+# over 459's full 73 episodes it is worse everywhere that counts: braking
+# commands 551 -> 480..528, restore commands 100 -> 168..208, and 3 to 6
+# episodes missed against zero. Setpoint flips do NOT improve — 1.4 to 1.6/min
+# for every variant including this one; an apparent halving on an 8-segment
+# sample did not survive the full route. Only braking-state toggles fall, and
+# toggles are an intermediate quantity, not an objective.
+#
+# It would also need longitudinalPlan.speeds plumbed through the hook boundary:
+# register.py injects only actuators.speed and .accel.
 DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 
 # Command selection: pick the largest step whose measured yield fits the error
@@ -285,7 +323,7 @@ class CarController(CarControllerBase):
     if not self.setpoint_bias_on:
       print("[bmw] SetpointBias disabled - setpoint tracks v_target (pre-2026-09 behaviour)")
 
-    # Concordance state: vTarget history for a_dv, and the braking latch.
+    # Concordance state: vTarget history for its trend, and the braking latch.
     self.v_target_hist = deque(maxlen=int(round(DV_WINDOW / DT_CTRL)) + 1)
     self.setpoint_braking = False
 
@@ -422,19 +460,28 @@ class CarController(CarControllerBase):
       self.cruise_cancel = False
 
     # Concordance gate. Both estimates must agree before the bias is taken on
-    # or given up. Until DV_WINDOW of history exists a_dv is unavailable, so
-    # fall back to accel alone rather than refusing to brake.
+    # or given up. Sign only, so vTarget's raw delta over the window stands in
+    # for the acceleration it implies.
     self.v_target_hist.append(v_target)
     if len(self.v_target_hist) == self.v_target_hist.maxlen:
-      a_dv = (v_target - self.v_target_hist[0]) / DV_WINDOW
+      dv_target = v_target - self.v_target_hist[0]
     else:
-      a_dv = accel
+      # Not a full window yet — so there is no second estimate, and the gate's
+      # own rule already says what to do with that: no agreement, hold state.
+      # The alternative, falling back to accel alone, is the bare sign test
+      # route 454 was driven on, reintroduced for the first 300 ms of every
+      # engagement. Holding instead costs nothing: the state held is
+      # not-braking (CC.enabled going false clears both the history and the
+      # latch together), so the worst case is 300 ms on the old clamped
+      # behaviour, and a part-window delta would be the noisiest signal
+      # available at exactly the moment this gate exists to be careful.
+      dv_target = 0.0
     if not CC.enabled:
       self.setpoint_braking = False
       self.v_target_hist.clear()
-    elif accel < 0 and a_dv < 0:
+    elif accel < 0 and dv_target < 0:
       self.setpoint_braking = True
-    elif accel > 0 and a_dv > 0:
+    elif accel > 0 and dv_target > 0:
       self.setpoint_braking = False
     # else: the two estimates disagree — hold the state we are already in.
 
@@ -506,8 +553,6 @@ class CarController(CarControllerBase):
 
           setpoint_error = sp_target - CS.out.cruiseState.speed
           setpoint_deadzone = SETPOINT_DEADZONE * CV.KPH_TO_MS
-          restore_deadzone = (RESTORE_DEADZONE if self.setpoint_bias_on
-                              else SETPOINT_DEADZONE) * CV.KPH_TO_MS
 
           # Dropping v_error from the decel gate is part of the new law, not a
           # tidy-up: it used to block 51% of the a_cmd −0.4..−0.3 band, because
@@ -570,7 +615,7 @@ class CarController(CarControllerBase):
           # that end normally: sp_target rises back to v_target on its own as
           # demand releases, and this branch follows it. Only exits that stop
           # us commanding entirely (disengage, brake) need the debt ledger.
-          elif self.setpoint_bias_on and setpoint_error > restore_deadzone:
+          elif self.setpoint_bias_on and setpoint_error > setpoint_deadzone:
             cruise_cmd(CruiseStalk.plus1, self.pin_cadence(SINGLE_INTERVAL))
 
       # Repay while openpilot is not driving. The branches above only run with
@@ -590,7 +635,12 @@ class CarController(CarControllerBase):
       # anything, so the debt waits — it survives standby because only losing
       # cruiseState.available clears it — and is settled when the driver
       # brings DCC back.
-      elif self.setpoint_debt >= SETPOINT_DEADZONE:
+      # Threshold is one step's yield, not SETPOINT_DEADZONE. The deadzone is
+      # there to keep a noisy a_cmd from churning commands; repaying is a
+      # one-shot reconciliation with nothing noisy about it, and borrowing 3
+      # km/h of the driver's set speed and never giving it back is exactly the
+      # failure this ledger exists to prevent.
+      elif self.setpoint_debt >= MINUS1_YIELD_KMH:
         cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL)
 
     # Trailing counter overwrite. If commanding stopped (or is briefly idle in

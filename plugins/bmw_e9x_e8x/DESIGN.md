@@ -241,10 +241,56 @@ frames, which the logs cannot settle either way. `DECEL_HOLD_THRESHOLD` and
 | 452/453 | pre-bias | 69–71% | 4.3–4.8 | 212–308 | −1.9 | 0.22–0.25 |
 | 454 | bias, bare sign test | **50%** | **19.3** | 724 | −1.9 | 0.20 |
 | 455 | + concordance gate, per-slot selection | 67% | 13.0 | 420 | **−3.5** | **0.11** |
+| 459 | deadzone 3 both ways, step5 at 5 | **87%** | 6.9 | 267 | −2.7 | 0.19 |
+| 45a | (same, 7.0 min) | 65% | 7.8 | 212 | −2.7 | 0.43 |
 
 455 is the first drive where the bias actually established itself (median gap
-−3.5 km/h) and the driver-brake rate halved. Flipping remains the open item and
-is what `RESTORE_DEADZONE` targets.
+−3.5 km/h) and the driver-brake rate halved. 459 is the best drive so far on
+every axis the law controls: highest delivered decel, flips halved, bus traffic
+back to the pre-bias law's level, and the tightest a_ego-vs-a_cmd tracking of
+any route (rms 0.32 against 455's 0.39 and the pre-bias law's 0.59).
+
+Comfort improved with the authority rather than against it: |a_ego| excursions
+past 1.5 m/s² halved (1.03 → 0.54/min) and jerk rms fell 3.29 → 3.04 m/s³.
+Giving minus5 the 5 km/h band means fewer, better-placed steps instead of
+minus1 grinding at a large error.
+
+The brake-rate rise, 0.11 → 0.19/min, is not the law — but the reason needs
+care, because `a_cmd` alone does not say what the planner wanted.
+
+`a_cmd` is `actuators.accel`, and with `longActive` it is **exactly**
+`longitudinalPlan.aTarget` (r = 1.0000, rms difference 0.0024 m/s² over four
+segments of 459). LongControl's PID is pass-through here; the feedforward is
+the whole output. So `a_cmd` is the planner's ask, not a filtered version of
+it — but `aTarget` is `2·(v_target(0.75 s) − v_now)/0.75 − a_now`, which
+**subtracts the plan's current acceleration**. `aTarget ≈ 0` therefore means
+"what the car is doing now is right", not "no demand". Reading it as the latter
+under-describes an active acceleration.
+
+Walking 459's five brake events with `hasLead`, `leadsV3` and `vTarget`:
+
+| event | v | what the plan was doing | reading |
+|---|---|---|---|
+| t=152 | 38 | `hasLead` false (lead prob 0.01), vTarget 33 → 41, aEgo +0.82, set speed 105 | e2e accelerating out of a slow zone with nothing ahead; driver disagreed |
+| t=707 | 47 | lead prob 0.82–0.98 at 48–66 m reporting **46–53 km/h**, vTarget 46 → 52 | following a lead the model saw pulling away; range noisy ±8 m |
+| t=902 | 77 | lead prob 0.99 closing **82 → 55 m in 5 s**, aTarget only −0.40 | **planner under-braked** into a slowly closing lead |
+| t=1529 | 37 | aTarget −1.81, a_ego −1.61 | law delivered 89% of demand |
+| t=2148 | 35 | aTarget −1.00, gap +0.2 | 35 km/h setpoint floor |
+
+All three of the first group ran with `longitudinalPlanSource = e2e`, so the e2e
+model's `desiredAcceleration` was binding (`min(e2e, mpc)` under experimental
+mode). Only t=152 is a driver-preference brake; t=707 is lead-tracking noise
+and t=902 is genuine planner under-reaction. **None are command-selection
+failures** — the setpoint law delivered what `aTarget` asked in every case.
+
+The consequence for method: driver-brake rate is an outcome measure for the
+whole stack, not for this law, and it moves with the planner. Judge the law by
+what it controls — delivered decel against `aTarget`, and the brake events
+where `aTarget` was actually deep.
+
+On the same reading, 45a's three brakes were **all** at 36–38 km/h with the
+setpoint already on the floor: that floor is the dominant unhandled case here,
+not command selection.
 
 ### Concordance gate — two estimates must agree
 
@@ -260,8 +306,8 @@ Two estimates of the same intent are available, with largely independent noise:
 
 | signal | what it is | noise vs a 2 s centred mean of `a_cmd` |
 |---|---|---|
-| `accel` | `actuators.accel` — LongControl's output, already filtered | **0.046 m/s²** |
-| `a_dv` | the raw plan's `vTarget` differentiated over `DV_WINDOW` | 0.221 m/s² |
+| `accel` | `actuators.accel`, which *is* `longitudinalPlan.aTarget` | **0.046 m/s²** |
+| `dv_target` | the raw plan's `vTarget` over `DV_WINDOW` | 0.221 m/s² as an accel |
 
 They disagree in sign on **18.8%** of samples yet agree ~100% once
 `accel < −0.3`: they diverge where the noise is and converge where the demand
@@ -277,10 +323,35 @@ The hysteresis falls out of the disagreement region, which is exactly the band
 where the noise lives — so it is self-sizing rather than tuned. Modelled on
 454: flips **18.6 → 8.9/min**, commanding 1658 → 1487 moves/min.
 
-`a_dv` is **only** the concordance check; the bias magnitude stays raw `accel`.
-Using `min(accel, a_dv)` for the magnitude simulates better still (75% of
-demand against 57%) but that is a deliberate brake-to-the-more-pessimistic-
-estimate policy rather than noise rejection, and is deliberately not taken.
+Before a full `DV_WINDOW` of history exists there is no second estimate, and
+the same rule covers it: **hold**. It is tempting to fall back to `accel`
+alone, but that is precisely the bare sign test 454 was driven on, reinstated
+for the first 300 ms of every engagement. Holding costs nothing — the latch and
+the history are cleared together when `CC.enabled` drops, so the state held is
+always not-braking, i.e. 300 ms of the old clamped behaviour.
+
+**The wider deadzone does not make this redundant** — the question was asked
+after route 459 and measured on 459 + 45a. The two act at different points: the
+gate decides *which target* the setpoint chases, the deadzone decides whether
+the current gap is worth a step. Replaying 459's recorded `a_cmd` and `vTarget`
+through the shipped decision rule, deleting the gate takes braking-state
+toggles from 7.4/min to **20.2/min** and, at the slot level, from 679 brake
+commands to 1129 — minus5 alone doubles, 110 → 235. The extra commands come
+from `a_cmd` noise dips that `vTarget`'s own slope contradicts, and the deadzone
+cannot absorb them because they move the target rather than the error. The gate
+stays.
+
+The plan's trend is **only** the concordance check, and only its **sign** is
+ever read, so the code carries the raw `vTarget` delta and does not divide it
+into an acceleration: `DV_WINDOW` is a positive constant and divides out of
+every comparison. The noise figure above is quoted as an accel purely to be
+comparable with `accel`'s.
+
+The bias magnitude stays raw `accel`. Using `min(accel, dv/DV_WINDOW)` for the
+magnitude simulates better still (75% of demand against 57%) but that is a
+deliberate brake-to-the-more-pessimistic-estimate policy rather than noise
+rejection, and is deliberately not taken — it is also the one thing the
+division would be needed for.
 
 Two things that do **not** work, both tried on 454's trace:
 
@@ -349,15 +420,29 @@ a minute, so a minimum gap of up to 3 s never binds. The cost is real: **68% →
 51%**, below the 69% the pre-bias law measured. Judge it on the next drive by
 the driver-brake rate, not this gain.
 
-**Restoring is lazier than braking** (`RESTORE_DEADZONE` = 3 km/h against
-`SETPOINT_DEADZONE` = 1). Route 455 still flipped the setpoint direction 13
-times a minute against the old law's 4.5, and it is *not* the concordance latch
-— a minimum dwell in the braking state changed nothing at all (68% / 7.3 flips
-at every value from 0.3 to 2.0 s). It is the restore branch chasing v_target
-back up between episodes: 769 plus1 bursts against 559 minus1 on that drive.
-Widening only the upward deadzone takes flips 7.3 → 4.0/min at no cost in
-delivered decel. It costs speed-return tracking (rms speed error 2.75 → 3.72),
-so the car is slower to pick back up to the set speed.
+**One deadzone gates both directions** (`SETPOINT_DEADZONE` = 3 km/h). It is
+the whole answer to setpoint flipping, and the flipping is *not* the
+concordance latch's doing — a minimum dwell in the braking state changed
+nothing at all (68% / 7.3 bench flips at every value from 0.3 to 2.0 s).
+
+What flips is `sp_target` **breathing inside a stable braking state**. It is
+`vEgo + accel/K_DCC`, so `a_cmd` wandering from −0.6 to −0.2 — ordinary noise,
+no state change — walks the target 4 km/h. A narrow band chases every one of
+those: route 455 ran 1 km/h down / 3 up and fired 769 plus1 bursts against 559
+minus1.
+
+Route 459 runs 3 both ways: **6.9 flips/min** against 455's 13.0, and the
+regression gain went the *right* way, 67% → 87%, so the band costs no delivered
+decel. What it costs is speed-return tracking, since every wander it absorbs is
+a restore not made. It was briefly asymmetric; symmetric is simpler and better
+measured, so there is one constant. The reason to keep them separable if this
+is revisited: coming down is a response, going back up is a release.
+
+The debt-repay branch deliberately does **not** use this deadzone — it fires at
+one step's yield. The deadzone exists to stop a noisy `a_cmd` churning
+commands; repaying is a one-shot reconciliation with nothing noisy about it,
+and leaving 3 km/h of the driver's set speed permanently borrowed is exactly
+the failure the ledger exists to prevent.
 
 Do **not** add lead compensation: `longitudinalActuatorDelay` is 0.7 for this
 car, so the planner already computes vTarget/aTarget at that horizon.
