@@ -742,7 +742,7 @@ class TestPlannerHook:
 
     return _C()
 
-  def _settle(self, hook, v_cruise, v_ego, sm, clk, ticks=600, dt=0.05):
+  def _settle(self, hook, v_cruise, v_ego, sm, clk, ticks=2000, dt=0.05):
     """Run the hook until the ceiling has finished ramping; return the last
     returned v_cruise. Tests that assert a STEADY-STATE cap use this; tests
     that assert ramp behaviour drive the clock themselves."""

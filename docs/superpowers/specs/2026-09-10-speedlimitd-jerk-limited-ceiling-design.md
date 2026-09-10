@@ -70,7 +70,7 @@ crossing mid-ramp introduces no discontinuity.
 State: `_ceiling_ms` (m/s), `_ceiling_rate` (m/s², signed), `_last_t`.
 
 ```
-CEIL_A_DOWN  = 0.8   # m/s²  peak descent rate — matches speedlimitd's COMFORT_BRAKE
+CEIL_A_DOWN  = 0.5   # m/s²  peak descent rate — kept below COMFORT_BRAKE (0.8)
 CEIL_J_DOWN  = 0.5   # m/s³  jerk limit on the descent; this is the whole point
 CEIL_A_UP    = 1.5   # m/s²  ascent: brisk, per "acceleration is fine"
 CEIL_J_UP    = 1.0   # m/s³
@@ -130,8 +130,10 @@ Pinning the value on overshoot while letting the slope bleed out over the
 following ticks is the same principle applied to the other end: a hard
 `rate = 0` on arrival is a discontinuity even when the value is already correct.
 
-Resulting 80 → 40 km/h (Δv = 11.1 m/s): **~16 s**, ramp-in 1.6 s, hold at
-0.8 m/s², ramp-out 1.6 s. Slower than today's 9 s, but with no spikes — the
+Resulting 80 → 40 km/h (Δv = 11.1 m/s): **~24 s**, ramp-in 1.0 s, hold at
+0.5 m/s², ramp-out 1.0 s. That is ~410 m of road; a 120 → 40 drop is ~49 s /
+~1 km. The descent rate is the comfort knob — it shipped at 0.8 and was
+lowered to 0.5 after route 45f confirmed the ramp binding on real drops. Slower than today's 9 s, but with no spikes — the
 peak demand falls from ~5.3 m/s of instantaneous gap to a steady 0.8 m/s².
 
 ### Why the ascent is brisk

@@ -28,7 +28,10 @@ SOURCE_ROAD_TYPE_INFERENCE = 2  # _sl_data['source'] value for inferred limits
 # Descent is tightly jerk-limited (braking jerk is the complaint); ascent is
 # brisk (acceleration is not). DCC caps real acceleration near +0.5 m/s², so
 # CEIL_A_UP above ~0.6 simply releases the cap as fast as the car can use it.
-CEIL_A_DOWN = 0.8    # m/s²  peak descent rate — matches speedlimitd's COMFORT_BRAKE
+CEIL_A_DOWN = 0.5    # m/s²  peak descent rate — deliberately gentler than
+                     #       speedlimitd's COMFORT_BRAKE (0.8), so the comfort ramp
+                     #       is always the gentler of the two and a safety cap
+                     #       still wins simply by being steeper
 CEIL_J_DOWN = 0.5    # m/s³  jerk limit on the descent
 CEIL_A_UP = 1.5      # m/s²  peak ascent rate
 CEIL_J_UP = 1.0      # m/s³  jerk limit on the ascent

@@ -444,8 +444,8 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
 - **Jerk-limited ceiling.** The enforced target does not jump between limits.
   `_ceiling_ms` slides toward `limit + offset` under a trapezoidal acceleration
   profile (`_advance_ceiling`), so both its value and its slope stay continuous
-  and it arrives with zero slope. Descent `CEIL_A_DOWN = 0.8` m/s² at
-  `CEIL_J_DOWN = 0.5` m/s³ (~16 s for 80 → 40); ascent `CEIL_A_UP = 1.5` m/s²
+  and it arrives with zero slope. Descent `CEIL_A_DOWN = 0.5` m/s² at
+  `CEIL_J_DOWN = 0.5` m/s³ (~24 s for 80 → 40); ascent `CEIL_A_UP = 1.5` m/s²
   at `CEIL_J_UP = 1.0` m/s³. Setpoint *gap* is what drives DCC deceleration on
   this car (corr +0.746), so a step in the target is a brake spike — the old
   3 s ladder produced three of them per drop.
@@ -466,9 +466,16 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   limit is applied immediately rather than ramped from stale state.
 
   **Safety caps bypass the ramp** — `safetyCapped` assigns the target directly.
-  A tightening curve cannot wait out a 16 s ramp. `CEIL_A_DOWN` equals
-  `COMFORT_BRAKE` precisely so a safety cap's own distance-aware profile is
-  never gentler than the comfort ramp, and the two can never fight.
+  A tightening curve cannot wait out a 24 s ramp. `CEIL_A_DOWN` (0.5) is kept
+  strictly below `COMFORT_BRAKE` (0.8) so a safety cap's own distance-aware
+  profile is never gentler than the comfort ramp — a safety cap always wins by
+  simply being steeper, and the two can never fight.
+
+  The descent rate is the comfort knob. It started at 0.8 (= `COMFORT_BRAKE`)
+  and was lowered to 0.5 after route 45f, where the ramp was confirmed binding
+  on real drops. The cost is overspeed distance: 80 → 40 takes ~24 s / ~410 m,
+  and a 120 → 40 drop takes ~49 s / ~1 km. Do not lower it further without
+  weighing that.
 
   **Known trade-off:** because the ceiling ignores vehicle state, it is slower
   to bite on a driver already below the old limit — at 70 in an 80 zone it

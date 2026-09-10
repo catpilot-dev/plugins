@@ -91,9 +91,9 @@ class TestAdvanceCeiling:
     assert min(r for _, _, r in tr) >= -ph.CEIL_A_DOWN - 1e-9
 
   def test_80_to_40_lands_in_the_expected_window(self, ph):
-    """Spec: ~15 s. Ramp-in 1.6 s + 11.1/0.8 hold + ramp-out 1.6 s."""
+    """Spec: ~24 s. Ramp-in 1.0 s + 11.1/0.5 hold + ramp-out 1.0 s."""
     tr = _trace(ph, 88.0, 46.0)
-    assert 13.0 <= tr[-1][0] <= 17.0
+    assert 22.0 <= tr[-1][0] <= 27.0
 
   def test_ascent_is_brisker_than_descent(self, ph):
     """Braking jerk is what annoys; acceleration is fine. A_UP > A_DOWN."""
@@ -115,7 +115,7 @@ class TestAdvanceCeiling:
     target_b = 46.0 / 3.6
     ceiling, rate = 88.0 / 3.6, 0.0
     prev = (ceiling, rate)
-    for i in range(400):
+    for i in range(1200):
       target = target_a if i < 40 else target_b
       ceiling, rate = ph._advance_ceiling(ceiling, rate, target, DT)
       assert abs(rate - prev[1]) <= ph.CEIL_J_DOWN * DT + 1e-9
