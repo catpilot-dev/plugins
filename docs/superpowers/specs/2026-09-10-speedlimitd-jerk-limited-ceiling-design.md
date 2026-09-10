@@ -199,22 +199,43 @@ bleeding speed, so the driver briefly sees themselves over the displayed limit.
 This is accepted — the sign now tells the truth about the road, and the ramp is
 an enforcement concern.
 
-## Accepted trade-off: slower to bite below the limit
+## Descent anchor (added after route 45f)
 
-Because the ceiling ignores vehicle state, it takes longer to affect a driver
-who is *already* below the old limit. Driver at 70 km/h in an 80 zone (ceiling
-88), limit drops to 40:
+Because the ceiling ignored vehicle state entirely, it began every descent at
+the old limit + offset and had to traverse the gap down to the car's actual
+speed before the cap did anything. Measured on route 45f:
 
-- The ceiling spends ~6 s descending 88 → 70 with no effect on the car.
-- It then captures the car and slows it 70 → 46 over ~9 s.
+| drop | vEgo | dead time before biting |
+|------|------|-------------------------|
+| 80 → 40 | 66.0 | 12.8 s |
+| 80 → 40 | 56.3 | 18.1 s |
+| 80 → 40 | 53.7 | 19.6 s |
+| 100 → 40 | 62.1 | 27.1 s |
+| 100 → 30 | 48.3 | 34.8 s |
 
-Today's ladder reaches 69 after 3 s and captures that driver sooner. This is a
-deliberate consequence of the decoupled design.
+On the tick the target drops, the ceiling is therefore clamped:
 
-**Mitigation, if a drive shows the delay is objectionable:** initialise the
-ceiling at `min(_ceiling_ms, v_cruise)` when a descent begins. This *reads*
-`v_cruise` without manipulating it and preserves determinism given the same
-driver setpoint. Not implemented initially — add only on evidence.
+```python
+if target_ms < prev_target_ms:
+    anchored = min(_ceiling_ms, max(v_ego, target_ms))
+    if anchored < _ceiling_ms:
+        _ceiling_ms, _ceiling_rate = anchored, 0.0
+```
+
+**Why this is not a brake spike.** It is a step in the *cap*, not in the
+setpoint *gap*. Clamping 88 → 55 km/h while the car is doing 55 leaves the
+error at zero, and setpoint gap is what drives DCC deceleration. `modelV2`/MPC
+decides `vTarget`; the ceiling only bounds it.
+
+`max(v_ego, target)` stops it dragging a driver already slower than the new
+limit down to their own speed and holding them there. `min(...)` stops it ever
+handing out a higher cap than the ramp already allows.
+
+**One-shot, not continuous.** It fires only on the tick the target drops.
+Re-anchoring every tick would ratchet the cap down with any deceleration. The
+ceiling's pure-function property is surrendered at exactly one instant; from
+there the ramp is a pure function of the limit again. Bite delay across the
+real 45f drops fell from 3.7–22.2 s to a single tick.
 
 ## Structure & Testability
 

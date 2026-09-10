@@ -46,6 +46,7 @@ _road_id = ''         # last non-empty OSM road identity
 _ceiling_ms = None    # jerk-limited allowed-speed ceiling (m/s); None = uninitialised
 _ceiling_rate = 0.0   # its current slope (m/s², signed)
 _last_t = None        # monotonic timestamp of the last ceiling advance
+_prev_target_ms = None  # previous tick's raw target, to detect a fresh drop
 
 
 def _get_sl_data():
@@ -156,15 +157,18 @@ def _reset_all():
   invalid limits). Clearing the ceiling means the next valid limit is applied
   immediately rather than ramped from a stale value."""
   global _baseline_ms, _gas_floor_ms, _ceiling_ms, _ceiling_rate, _last_t
+  global _prev_target_ms
   _baseline_ms = None
   _gas_floor_ms = None
   _ceiling_ms = None
   _ceiling_rate = 0.0
   _last_t = None
+  _prev_target_ms = None
 
 
 def on_v_cruise(v_cruise, v_ego, sm):
   global _baseline_ms, _gas_floor_ms, _road_id, _ceiling_ms, _ceiling_rate, _last_t
+  global _prev_target_ms
   _get_sl_data()  # update from plugin bus
   if _sl_data is None:
     _reset_all()
@@ -200,9 +204,27 @@ def on_v_cruise(v_cruise, v_ego, sm):
   if _ceiling_ms is None or safety_capped:
     _ceiling_ms, _ceiling_rate = target_ms, 0.0
   else:
+    # A FRESH drop anchors the ceiling to where the car actually is. Starting
+    # every descent at the old limit + offset meant the ceiling spent seconds
+    # in dead air above the car before the cap reached it and anything
+    # happened — on 80 -> 40 at 55 km/h, ~20 s and ~300 m into the 40 zone.
+    # This is a step in the CAP, not in the setpoint GAP: clamping 88 -> 55
+    # while the car is doing 55 leaves zero error, so there is nothing for DCC
+    # to react to. Never below the new target (that would drag the driver down
+    # and hold them there) and never upward (min).
+    #
+    # Fires only on the tick the target drops — re-anchoring every tick would
+    # ratchet the cap down with a decelerating car. It costs the ceiling's
+    # pure-function property at exactly one instant; the ramp is a pure
+    # function of the limit from there on.
+    if _prev_target_ms is not None and target_ms < _prev_target_ms - 1e-9:
+      anchored = min(_ceiling_ms, max(v_ego, target_ms))
+      if anchored < _ceiling_ms:
+        _ceiling_ms, _ceiling_rate = anchored, 0.0
     dt = min(max(now - _last_t, 0.0), CEIL_DT_MAX) if _last_t is not None else 0.0
     _ceiling_ms, _ceiling_rate = _advance_ceiling(_ceiling_ms, _ceiling_rate, target_ms, dt)
   _last_t = now
+  _prev_target_ms = target_ms
 
   # Gas pedal: universal suspend (all sources, incl. safety caps). Raise the
   # hold floor to current speed so enforcement resumes from here on release.

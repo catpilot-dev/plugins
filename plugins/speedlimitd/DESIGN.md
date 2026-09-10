@@ -483,11 +483,23 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   and a 120 → 40 drop takes ~49 s / ~1 km. Do not lower it further without
   weighing that.
 
-  **Known trade-off:** because the ceiling ignores vehicle state, it is slower
-  to bite on a driver already below the old limit — at 70 in an 80 zone it
-  spends ~6 s descending 88 → 70 before the car feels anything. Accepted. If a
-  drive shows it matters, initialise the ceiling at `min(_ceiling_ms, v_cruise)`
-  when a descent begins.
+  **Descent anchor.** On the tick the target *drops*, the ceiling is clamped to
+  `min(ceiling, max(v_ego, target))`. Without it every descent began at the old
+  limit + offset, so the ceiling spent seconds in dead air above the car before
+  the cap reached it and anything happened — measured on route 45f, an 80 → 40
+  at 55 km/h gave ~20 s and ~300 m inside the 40 zone with the car untouched,
+  and 100 → 30 at 48 km/h gave ~35 s.
+
+  This is a step in the **cap**, not in the setpoint **gap**: clamping 88 → 55
+  while the car is doing 55 leaves zero error, so there is nothing for DCC to
+  react to. `max(v_ego, target)` keeps it from dragging a slower driver down and
+  holding them there; `min` keeps it from ever handing out a *higher* cap.
+
+  It fires only on the tick the target drops. Re-anchoring every tick would
+  ratchet the cap down with a decelerating car. So the ceiling's pure-function
+  property is given up at exactly one instant, and the ramp is a pure function
+  of the limit from there on. Bite delay across the real route-45f drops went
+  from 3.7–22.2 s to one tick.
 - **Comfort offset** (`_effective_offset_percent`): the enforced target is the
   limit **+15%** below 80 km/h, **+10%** at/above 80 km/h, and **+0%** (exact)
   when `safetyCapped`. *(This corrects the old README's +40/+30/+10 tiers,

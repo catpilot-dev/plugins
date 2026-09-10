@@ -295,3 +295,90 @@ class TestCeilingInOnVCruise:
     clk['t'] += 10.0
     out = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
     assert out > 87 / 3.6, 'a stalled tick integrated the whole gap'
+
+
+class TestDescentAnchor:
+  """A fresh drop anchors the ceiling to current speed.
+
+  The ceiling used to begin every descent at the OLD limit + offset, even when
+  the car was already far below it — on 80 -> 40 at 55 km/h that is ~20 s
+  (~300 m) of dead air before the cap reaches the car and anything happens.
+  Anchoring is a step in the CAP, not in the setpoint GAP: clamping 88 -> 55
+  while the car is doing 55 leaves zero error, so there is nothing for DCC to
+  react to. modelV2/MPC decides vTarget; the ceiling only bounds it.
+  """
+  _sm = TestCeilingInOnVCruise._sm
+  _sl = TestCeilingInOnVCruise._sl
+  _clock = TestCeilingInOnVCruise._clock
+
+  def test_drop_anchors_ceiling_to_current_speed(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    v = 55 / 3.6
+    self._sl(ph, 80, source=1)
+    assert ph.on_v_cruise(120 / 3.6, v, self._sm()) == pytest.approx(88 / 3.6, abs=0.01)
+    self._sl(ph, 40, source=1)
+    clk['t'] += DT
+    out = ph.on_v_cruise(120 / 3.6, v, self._sm())
+    assert out == pytest.approx(v, abs=0.05), 'ceiling did not anchor to v_ego'
+
+  def test_anchor_makes_the_cap_bite_at_once(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    v = 55 / 3.6
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(120 / 3.6, v, self._sm())
+    self._sl(ph, 40, source=1)
+    clk['t'] += DT
+    assert ph.on_v_cruise(120 / 3.6, v, self._sm()) <= v + 1e-9
+
+  def test_anchor_never_goes_below_the_new_target(self, ph, monkeypatch):
+    """Driver already slower than the new limit: the cap must not be dragged
+    down to their speed and hold them there."""
+    clk = self._clock(ph, monkeypatch)
+    v = 30 / 3.6
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(120 / 3.6, v, self._sm())
+    self._sl(ph, 40, source=1)
+    clk['t'] += DT
+    ph.on_v_cruise(120 / 3.6, v, self._sm())
+    assert ph._ceiling_ms == pytest.approx(46 / 3.6, abs=0.01)
+
+  def test_anchor_never_raises_the_ceiling(self, ph, monkeypatch):
+    """Driver above the old limit: anchoring must not hand them a higher cap."""
+    clk = self._clock(ph, monkeypatch)
+    v = 95 / 3.6
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(120 / 3.6, v, self._sm())
+    self._sl(ph, 40, source=1)
+    clk['t'] += DT
+    assert ph._ceiling_ms == pytest.approx(88 / 3.6, abs=0.05)
+
+  def test_ramp_still_governs_after_the_anchor(self, ph, monkeypatch):
+    """Anchoring sets where the descent starts; CEIL_A_DOWN still sets how fast."""
+    clk = self._clock(ph, monkeypatch)
+    v = 55 / 3.6
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(120 / 3.6, v, self._sm())
+    self._sl(ph, 40, source=1)
+    prev = None
+    for _ in range(900):
+      clk['t'] += DT
+      out = ph.on_v_cruise(120 / 3.6, v, self._sm())
+      if prev is not None:
+        assert out <= prev + 1e-9
+        assert abs(out - prev) <= ph.CEIL_A_DOWN * DT + 1e-9, 'anchored ramp broke the rate limit'
+      prev = out
+    assert prev == pytest.approx(46 / 3.6, abs=0.01)
+
+  def test_anchor_only_fires_on_a_fresh_drop(self, ph, monkeypatch):
+    """Mid-ramp ticks must not keep re-anchoring to a decelerating v_ego —
+    that would ratchet the cap down with the car."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(120 / 3.6, 55 / 3.6, self._sm())
+    self._sl(ph, 40, source=1)
+    clk['t'] += DT
+    ph.on_v_cruise(120 / 3.6, 55 / 3.6, self._sm())
+    for _ in range(20):
+      clk['t'] += DT
+      ph.on_v_cruise(120 / 3.6, 20 / 3.6, self._sm())   # car brakes hard on its own
+    assert ph._ceiling_ms > 46 / 3.6, 'ceiling ratcheted down with v_ego'
