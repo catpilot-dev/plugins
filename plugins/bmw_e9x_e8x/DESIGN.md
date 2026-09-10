@@ -458,10 +458,44 @@ tracking, since every wander it absorbs is a restore not made. It was briefly as
 measured, so there is one constant. The reason to keep them separable if this
 is revisited: coming down is a response, going back up is a release.
 
-### minus5's threshold must equal its yield
+### minus1 is a step; minus5 is a ramp
 
-The step is 10 km/h and it is indivisible, so firing it on a smaller error
-overshoots by the difference — all of it inside one 200 ms slot.
+This is the asymmetry that matters, and it is not what the constants used to
+say. Measured over 454/455/459/45b, isolated bursts only, setpoint read off
+0x193:
+
+| | behaviour | yield |
+|---|---|---|
+| minus1 | **step** — 1.0 km/h flat for any burst 60–300 ms (n=104), repeats only past 300 ms | deterministic |
+| minus5 | **ramp** — runs until DCC observes the release | **5–8 km/h**, median 6 |
+
+Why minus5 is not one 5 km/h notch: our SINGLE burst asserts it for 50 ms at
+20 Hz, but **SZL idles at 5 Hz**, so DCC cannot see the release for up to
+200 ms and keeps stepping through that blind window — about 24 steps/s. Three
+isolated bursts:
+
+```
+3 frames / 60 ms   85 → 78    drop 7
+2 frames / 50 ms   83 → 78    drop 5
+2 frames / 50 ms   64 → 58    drop 6
+```
+
+What sets the size is **where the burst lands in the SZL phase**, not how many
+frames we send: identical 2-frame bursts scatter 5–8, longer ones reach 18, and
+the yield grows ~16 km/h per extra second held.
+
+So `MINUS5_YIELD_KMH` is a range, not a number. It is set to **8.0**, the top
+of it. That constant is credited to `setpoint_pending` the moment a minus5 is
+sent and subtracted from the remaining error, so over-crediting produces a
+brief under-command (corrected as soon as the real drop is read back, or by
+`PENDING_TIMEOUT`), while under-crediting would stack a second command on top
+of a yield still in flight. Bias toward the former.
+
+### minus5's threshold must cover its worst case
+
+Because the yield is a range, "threshold equals yield" is unachievable. Firing
+minus5 on a smaller error overshoots by an amount nobody can predict, all
+inside one 200 ms slot.
 
 Route 45b, 10:27:27, a minivan cutting in (the model's lead jumps 67 → 22 m as
 it switches objects):
@@ -472,9 +506,10 @@ it switches objects):
                              sp_target 70.8   -> overshot by 2.8 km/h
 ```
 
-About **0.3 m/s² of deceleration nobody asked for**, arriving as a step on top
-of a −0.6 m/s² demand. A 50% overshoot inside one slot is what a step in brake
-pressure feels — and sounds — like from the seat.
+That 9 km/h is the top of the range — an unlucky SZL phase. About **0.3 m/s²
+of deceleration nobody asked for**, arriving as a step on top of a −0.6 m/s²
+demand. A 50% overshoot inside one slot is what a step in brake pressure feels
+— and sounds — like from the seat.
 
 It was not an outlier. With the threshold at 5:
 
@@ -483,15 +518,19 @@ It was not an outlier. With the threshold at 5:
 | 459 | 56 | **89%** | 3.4 km/h → 0.32 m/s² |
 | 45b | 59 | **73%** | 3.1 km/h → 0.29 m/s² |
 
-At 10 it is overshoot-free *by construction* rather than by tuning, which is
-why it was 10 originally. It was lowered to 5 to stop minus1 grinding at large
+At 10 — above the worst yield ever observed — **undershoot** becomes the
+failure mode instead, and undershoot is safe: minus1 is deterministic and
+finishes the job at 1 km/h per slot. It was lowered to 5 to stop minus1 grinding at large
 errors; the Schmitt trigger on the command gate now covers that case instead,
 so the reason is superseded. Replay over 459 + 45b: +12% minus1 slots, flips
 unchanged at 4.0 and 5.3/min.
 
-Peak `a_ego` at that cut-in was −0.99 m/s² with no brake pedal, so this is a
-harshness finding, not a traction one — and note this car publishes no wheel
-speeds, so slip cannot be confirmed from a log either way.
+Peak `a_ego` at that cut-in was −0.99 m/s² with no brake pedal, and there was
+**no slip**: `carState.wheelSpeeds` is empty on this car, but 0x0CE (DSC)
+carries them — four 16-bit LE signed at 0.0625 kph. Over 93,048 engaged frames
+on 45b the spread across the four wheels is median 0.38, p99.9 1.75, max
+2.31 km/h, and the worst frames are axle or left/right splits from cornering,
+not lockup. So the noise is the DSC actuator, not the tyres.
 
 ### Both signs invert the plant
 

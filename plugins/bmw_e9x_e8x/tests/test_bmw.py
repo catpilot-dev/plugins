@@ -651,6 +651,11 @@ class TestSetpointBias:
   SZL_TICK = 0.2
   STEP = 0.01
   KPH = 1 / 3.6
+  # What DCC actually drops per minus5 burst in these harnesses. Deliberately
+  # the top of the measured 5-8 km/h range (9 was seen on 45b), and above
+  # MINUS5_YIELD_KMH, so the pending ledger is always tested against a yield
+  # larger than it credited.
+  SIM_MINUS5_YIELD = 10.0
 
   @pytest.fixture(autouse=True)
   def _mocks(self, monkeypatch):
@@ -704,7 +709,8 @@ class TestSetpointBias:
     sp_true = setpoint
     sp_obs = sp_true
     slot_acts, tobs = set(), 0.0
-    YIELD = {'minus1': -1.0, 'minus5': -10.0, 'plus1': 1.0, 'plus5': 5.0}
+    YIELD = {'minus1': -1.0, 'minus5': -self.SIM_MINUS5_YIELD,
+             'plus1': 1.0, 'plus5': 5.0}
     settle_vt = v_target if v_target_kmh is not None else v_ego
     for phase_dur, a, vt0 in [(1.0, 0.0, settle_vt), (dur, accel, v_target)]:
       elapsed = 0.0
@@ -777,18 +783,22 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-1.2, v_ego_kmh=86.0, setpoint_kmh=90.0)
     assert 'minus5' in acts, acts
 
-  def test_step5_threshold_matches_the_yield(self):
-    """DECEL_STEP5_KMH must equal MINUS5_YIELD_KMH. The step is indivisible, so
-    firing it on a smaller error overshoots by the difference in one slot —
-    route 45b, 10:27:27: error 5.6 km/h, setpoint 77 -> 68 against a target of
-    70.8, roughly 0.3 m/s2 of decel nobody asked for. At a threshold of 5 that
-    happened on 89% of minus5 bursts (459) and 73% (45b).
+  def test_step5_threshold_covers_the_worst_case_yield(self):
+    """DECEL_STEP5_KMH must be at least MINUS5_YIELD_KMH, because minus5's
+    yield is not a number. minus1 is a step (1.0 km/h flat for any burst from
+    60 to 300 ms); minus5 is a ramp that runs until DCC observes the release,
+    and SZL idles at 5 Hz, so a 50 ms assertion keeps stepping for up to 200 ms
+    more — 5 to 8 km/h from identical 2-frame bursts, 9 at the cut-in on 45b.
+
+    Firing it on a smaller error therefore overshoots by an amount nobody can
+    predict. A threshold above the worst case makes undershoot the failure mode
+    instead, and undershoot is safe: minus1 finishes the job deterministically.
 
     The step choice still follows the error, not the demand: the same shallow
     -0.25 ask draws minus1 at 4 km/h of error and at 9.
     """
     import bmw.carcontroller as mod
-    assert mod.DECEL_STEP5_KMH == mod.MINUS5_YIELD_KMH
+    assert mod.DECEL_STEP5_KMH >= mod.MINUS5_YIELD_KMH
     for setpoint in (87.5, 92.0):
       acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=setpoint)
       assert 'minus1' in acts and 'minus5' not in acts, (setpoint, acts)
@@ -819,7 +829,8 @@ class TestSetpointBias:
     With respond=True the setpoint answers at DCC's one-yield-per-slot rate, so
     the loop can actually converge; otherwise it is pinned."""
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    YIELD = {'minus1': -1.0, 'minus5': -10.0, 'plus1': 1.0, 'plus5': 5.0}
+    YIELD = {'minus1': -1.0, 'minus5': -self.SIM_MINUS5_YIELD,
+             'plus1': 1.0, 'plus5': 5.0}
     acts, t, sp = set(), t0, setpoint_kmh
     vt = v_ego_kmh * self.KPH
     slot, slot_acts, travel = None, set(), 0.0
@@ -1007,7 +1018,8 @@ class TestSetpointBias:
     CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
     CP.minEnableSpeed = 30 / 3.6
     cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
-    YIELD = {'minus1': -1.0, 'minus5': -10.0, 'plus1': 1.0, 'plus5': 5.0}
+    YIELD = {'minus1': -1.0, 'minus5': -self.SIM_MINUS5_YIELD,
+             'plus1': 1.0, 'plus5': 5.0}
     v_ego = v_ego_kmh * self.KPH
     vt0 = (v_target_kmh if v_target_kmh is not None else v_ego_kmh)
     sp_true = setpoint_kmh
@@ -1051,18 +1063,44 @@ class TestSetpointBias:
   def test_pending_stops_a_second_minus5_before_the_first_is_visible(self):
     """The setpoint is only reported back at ~5 Hz. Without discounting what is
     already in flight, a 10 km/h error draws minus5 in two consecutive slots and
-    overshoots by a whole yield — 10 km/h, 0.9 m/s2 of braking nobody asked
-    for."""
+    overshoots by a whole yield.
+
+    The harness drops SIM_MINUS5_YIELD per burst, deliberately MORE than
+    MINUS5_YIELD_KMH credits. That is the dangerous direction — DCC ramping
+    further than the ledger booked — and the discount still has to hold.
+    """
     import bmw.carcontroller as mod
     _, sent, max_pending, _, sp_min = self._drive(accel=-2.0, v_ego_kmh=86.0,
                                                   setpoint_kmh=95.0, seconds=1.5)
     assert any('minus5' in n for _, n in sent), "expected a minus5 for this error"
     floor = 86.0 - mod.SETPOINT_BIAS_MAX
     # without the discount the setpoint runs a second full yield past the floor
-    assert sp_min >= floor - mod.MINUS5_YIELD_KMH - 1.0, (
+    assert sp_min >= floor - self.SIM_MINUS5_YIELD - 1.0, (
       f"setpoint reached {sp_min:.1f}, more than one yield past the {floor:.1f} floor")
     assert max_pending <= 2 * mod.MINUS5_YIELD_KMH + 1.0, (
       f"pending reached {max_pending:.1f}")
+
+  def test_under_delivery_against_the_credit_does_not_stall_the_law(self):
+    """MINUS5_YIELD_KMH is the TOP of the measured 5-8 km/h range, so on a
+    typical burst DCC delivers less than the ledger booked. That must be a
+    brief under-command, not a stall: the readback clears pending as soon as
+    the real drop is visible, and PENDING_TIMEOUT covers the case where it
+    never is.
+
+    Simulated here at the bottom of the range — DCC yields 5 where 8 was
+    credited — which is the largest shortfall the measurements support.
+    """
+    import bmw.carcontroller as mod
+    real = self.SIM_MINUS5_YIELD
+    try:
+      self.SIM_MINUS5_YIELD = 5.0
+      _, sent, _, _, _ = self._drive(accel=-2.0, v_ego_kmh=86.0,
+                                     setpoint_kmh=95.0, seconds=2.5)
+    finally:
+      self.SIM_MINUS5_YIELD = real
+    assert sent, "went silent entirely"
+    late = [t for t, _ in sent if t > 1.2]
+    assert late, "stopped commanding after the first burst was over-credited"
 
   def test_at_most_one_command_decision_per_slot(self):
     """Deciding every 10 ms cycle instead of once per SZL slot books a yield per
@@ -1297,6 +1335,11 @@ class TestSetpointDebtLedger:
   SZL_TICK = 0.2
   STEP = 0.01
   KPH = 1 / 3.6
+  # What DCC actually drops per minus5 burst in these harnesses. Deliberately
+  # the top of the measured 5-8 km/h range (9 was seen on 45b), and above
+  # MINUS5_YIELD_KMH, so the pending ledger is always tested against a yield
+  # larger than it credited.
+  SIM_MINUS5_YIELD = 10.0
 
   @pytest.fixture(autouse=True)
   def _mocks(self, monkeypatch):

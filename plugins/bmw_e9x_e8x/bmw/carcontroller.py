@@ -221,19 +221,31 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 # whole yield of room: overshoot-free by construction. That is a deliberate
 # trade of authority for smoothness, taken from the seat after route 455.
 #
-# This MUST match minus5's yield. The step is 10 km/h and it is indivisible, so
-# firing it on a smaller error overshoots by the difference, in one 200 ms slot.
+# This must be at least minus5's WORST-CASE yield, because that yield is not a
+# number. minus1 is a step: 1.0 km/h flat for any burst from 60 to 300 ms
+# (n=104 isolated bursts). minus5 is a RAMP. Our SINGLE burst asserts it for
+# 50 ms at 20 Hz, but SZL idles at 5 Hz, so DCC cannot see the release for up
+# to 200 ms and keeps stepping the setpoint through that blind window —
+# measured 5 to 8 km/h from identical 2-frame bursts (median 6, ~24 steps/s),
+# up to 18 on longer ones, growing ~16 km/h per extra second held. What sets
+# the size is where the burst lands in the SZL phase, not how many frames we
+# send.
+#
+# So "threshold equals yield" is unachievable and firing it on a smaller error
+# overshoots by an amount we cannot predict, all inside one slot.
 #
 # Route 45b at 10:27:27, a minivan cutting in: error 5.6 km/h, minus5 fired,
-# setpoint went 77 -> 68 against a target of 70.8. That is 2.8 km/h of setpoint
-# the planner never asked for, about 0.3 m/s² of extra decel arriving as a step
-# on top of a -0.6 m/s² demand — a 50% overshoot inside one slot, which is what
-# a step in brake pressure feels and sounds like from the seat.
+# setpoint went 77 -> 68 against a target of 70.8 — a 9 km/h yield, the top of
+# the range. That is 3.4 km/h of setpoint the planner never asked for, about
+# 0.3 m/s² of extra decel arriving as a step on top of a -0.6 m/s² demand, and
+# it is what a step in brake pressure sounds like from the seat. (Wheel speeds
+# off 0x0CE show no slip anywhere on that route: spread across the four wheels
+# p99.9 = 1.75 km/h. carState.wheelSpeeds is empty on this car; decode 0x0CE.)
 #
-# It was not an outlier. At a threshold of 5, minus5 fired with the error in
-# [5, 10) on 89% of bursts on 459 and 73% on 45b, median overshoot 3.4 and
-# 3.1 km/h. At 10 it is overshoot-free by construction rather than by tuning,
-# which is why it was 10 originally.
+# At a threshold of 5, minus5 fired with the error under 10 km/h on 89% of
+# bursts on 459 and 73% on 45b. Setting the threshold above the worst observed
+# yield makes UNDERSHOOT the failure mode instead, which is safe: minus1 is
+# deterministic and finishes the job at 1 km/h per slot.
 #
 # It was lowered to 5 to stop minus1 grinding at large errors. The Schmitt
 # trigger on the command gate now covers that case instead — the narrow hold
@@ -245,7 +257,13 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 # Ignore both. Neither metric resolves differences of that size — see the
 # route-table warning in DESIGN.md.)
 DECEL_STEP5_KMH = 10.0         # km/h of remaining error at or above which minus5 is used
-MINUS5_YIELD_KMH = 10.0        # measured median setpoint drop from one minus5 burst
+# Not a median — the high end of the measured 5-8 km/h range, deliberately.
+# This is credited to setpoint_pending the moment a minus5 is sent, and pending
+# is subtracted from the remaining error. Over-crediting makes the next slot
+# ask for less than it might need (a brief under-command, corrected as soon as
+# the real drop is read back); under-crediting would stack a second command on
+# top of a yield still in flight. Bias toward the former.
+MINUS5_YIELD_KMH = 8.0         # km/h — worst-case drop from one minus5 burst
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
                                # Without it, a DCC that stops acting on us never
