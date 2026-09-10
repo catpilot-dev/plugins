@@ -95,19 +95,18 @@ class TestAdvanceCeiling:
     tr = _trace(ph, 88.0, 46.0)
     assert 22.0 <= tr[-1][0] <= 27.0
 
-  def test_ascent_is_brisker_than_descent(self, ph):
-    """Braking jerk is what annoys; acceleration is fine. A_UP > A_DOWN."""
-    down = _trace(ph, 88.0, 46.0)[-1][0]
-    up = _trace(ph, 46.0, 88.0)[-1][0]
-    assert up < down
+  def test_rising_limit_is_applied_immediately(self, ph):
+    """A rising limit is a release, not a manoeuvre. The hook only ever lowers
+    v_cruise, so raising the ceiling merely stops capping — DCC's own
+    acceleration envelope shapes what follows. Ramping it only delayed it."""
+    c, r = ph._advance_ceiling(46.0 / 3.6, 0.0, 88.0 / 3.6, DT)
+    assert c == pytest.approx(88.0 / 3.6, abs=1e-9)
+    assert r == 0.0
 
-  def test_ascent_respects_its_own_limits(self, ph):
-    tr = _trace(ph, 46.0, 88.0)
-    for (_, c0, r0), (_, c1, r1) in zip(tr, tr[1:]):
-      assert abs(r1 - r0) <= ph.CEIL_J_UP * DT + 1e-9
-      assert c1 >= c0 - 1e-9
-    assert max(r for _, _, r in tr) <= ph.CEIL_A_UP + 1e-9
-    assert tr[-1][1] == pytest.approx(88.0 / 3.6, abs=1e-9)
+  def test_rising_limit_is_immediate_even_from_a_standstill_ceiling(self, ph):
+    c, r = ph._advance_ceiling(30.0 / 3.6, 0.0, 120.0 / 3.6, DT)
+    assert c == pytest.approx(120.0 / 3.6, abs=1e-9)
+    assert r == 0.0
 
   def test_retarget_mid_ramp_stays_continuous(self, ph):
     """80 -> 60, then 40 arrives while still ramping. No step in value or slope."""
@@ -124,19 +123,16 @@ class TestAdvanceCeiling:
     assert ceiling == pytest.approx(target_b, abs=1e-9)
     assert rate == 0.0
 
-  def test_reversal_mid_descent_is_continuous(self, ph):
-    """The limit rises while the ceiling is still falling. The rate must pass
-    through zero under the jerk limit, not flip sign."""
+  def test_reversal_mid_descent_releases_at_once(self, ph):
+    """The limit rises while the ceiling is still falling. The release wins
+    immediately and the descent slope is dropped with it."""
     ceiling, rate = 88.0 / 3.6, 0.0
     for _ in range(40):
       ceiling, rate = ph._advance_ceiling(ceiling, rate, 46.0 / 3.6, DT)
     assert rate < 0.0, 'precondition: still descending'
-    prev_rate = rate
-    for _ in range(400):
-      ceiling, rate = ph._advance_ceiling(ceiling, rate, 100.0 / 3.6, DT)
-      assert abs(rate - prev_rate) <= ph.CEIL_J_UP * DT + 1e-9
-      prev_rate = rate
+    ceiling, rate = ph._advance_ceiling(ceiling, rate, 100.0 / 3.6, DT)
     assert ceiling == pytest.approx(100.0 / 3.6, abs=1e-9)
+    assert rate == 0.0
 
   def test_already_at_target_is_a_no_op(self, ph):
     target = 46.0 / 3.6
@@ -237,15 +233,16 @@ class TestCeilingInOnVCruise:
     # safetyCapped => no offset, exact limit, immediately
     assert ph.on_v_cruise(100 / 3.6, 25.0, self._sm()) == pytest.approx(40 / 3.6, abs=0.01)
 
-  def test_ramp_resumes_cleanly_after_a_safety_cap_releases(self, ph, monkeypatch):
+  def test_safety_cap_release_is_immediate(self, ph, monkeypatch):
+    """Curve ends, limit goes back up: the cap lifts on the next tick rather
+    than holding the car down while a ramp catches up."""
     clk = self._clock(ph, monkeypatch)
     self._sl(ph, 40, source=4, safety=True)
     ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
     self._sl(ph, 80, source=1)
     clk['t'] += DT
     out = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
-    assert out < 88 / 3.6, 'release teleported instead of ramping up'
-    assert out > 40 / 3.6
+    assert out == pytest.approx(88 / 3.6, abs=0.01)
 
   # --- gas -------------------------------------------------------------
 

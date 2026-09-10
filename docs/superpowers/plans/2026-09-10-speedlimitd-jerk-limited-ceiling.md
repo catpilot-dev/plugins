@@ -10,6 +10,12 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-10-speedlimitd-jerk-limited-ceiling-design.md`
 
+> **Historical record — executed 2026-09-10.** Constants and the profile maths
+> below are as-planned, not as-shipped: the stop budget gained a one-tick
+> look-ahead, `CEIL_A_DOWN` was lowered 0.8 → 0.5, and the ascent ramp
+> (`CEIL_A_UP`/`CEIL_J_UP`) was removed in favour of an immediate release.
+> The spec above is the design of record.
+
 ## Global Constraints
 
 - Repo: `/home/oxygen/catpilot-dev/plugins`, branch `dev`.

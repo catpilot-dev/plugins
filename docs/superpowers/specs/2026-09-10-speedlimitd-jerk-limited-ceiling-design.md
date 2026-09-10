@@ -72,8 +72,6 @@ State: `_ceiling_ms` (m/s), `_ceiling_rate` (m/s², signed), `_last_t`.
 ```
 CEIL_A_DOWN  = 0.5   # m/s²  peak descent rate — kept below COMFORT_BRAKE (0.8)
 CEIL_J_DOWN  = 0.5   # m/s³  jerk limit on the descent; this is the whole point
-CEIL_A_UP    = 1.5   # m/s²  ascent: brisk, per "acceleration is fine"
-CEIL_J_UP    = 1.0   # m/s³
 CEIL_DT_MAX  = 0.2   # s     dt clamp (plannerd runs at DT_MDL = 0.05)
 ```
 
@@ -91,20 +89,20 @@ and `_advance_ceiling` is:
 
 ```python
 err = target_ms - ceiling_ms
-descending = err < 0.0
-a_max, j_max = (CEIL_A_DOWN, CEIL_J_DOWN) if descending else (CEIL_A_UP, CEIL_J_UP)
-dj = j_max * dt
+if err >= 0.0:
+    return target_ms, 0.0            # a rising limit is a release — immediate
 
-reach = sqrt(2 * j_max * max(0.0, abs(err) - abs(rate) * dt))
-want  = -min(a_max, reach) if descending else min(a_max, reach)
+dj = CEIL_J_DOWN * dt
+reach = sqrt(2 * CEIL_J_DOWN * max(0.0, -err - abs(rate) * dt))
+want  = -min(CEIL_A_DOWN, reach)
 
 rate    += clamp(want - rate, -dj, +dj)
 ceiling += rate * dt
 
-if ceiling passed target:            # discrete integration overshoot
+if ceiling <= target_ms:             # discrete integration overshoot
     ceiling = target_ms              # pin the value…
-if ceiling == target_ms and abs(rate) <= dj:
-    rate = 0.0                       # …and only zero the slope once it is within one jerk step
+    if abs(rate) <= dj:
+        rate = 0.0                   # …and only zero the slope once it is within one jerk step
 ```
 
 ### Why the stop budget looks one tick ahead
@@ -136,13 +134,19 @@ Resulting 80 → 40 km/h (Δv = 11.1 m/s): **~24 s**, ramp-in 1.0 s, hold at
 lowered to 0.5 after route 45f confirmed the ramp binding on real drops. Slower than today's 9 s, but with no spikes — the
 peak demand falls from ~5.3 m/s of instantaneous gap to a steady 0.8 m/s².
 
-### Why the ascent is brisk
+### The ascent is not shaped at all
 
-DCC caps real acceleration at roughly +0.5 m/s², so any `CEIL_A_UP` above ~0.6
-means the ceiling outruns the car and the release is effectively "as fast as the
-car can use". 1.5 m/s² is chosen deliberately: it removes the cap promptly
-without a step change in the setpoint. This replaces today's
-`_STEP_UP_INTERVAL = 2 s` ladder, which served the same purpose discretely.
+A rising limit is a **release**, not a manoeuvre. The hook only ever lowers
+`v_cruise`, so handing the ceiling straight to a higher target merely stops
+capping — DCC's own ~+0.5 m/s² envelope shapes the acceleration from there.
+
+This was initially built as a brisk ramp (`CEIL_A_UP = 1.5`, `CEIL_J_UP = 1.0`)
+on the reasoning that a step change in the setpoint should be avoided in both
+directions. That was wrong: since DCC caps real acceleration near +0.5 m/s²,
+any ascent rate above ~0.6 produces identical car behaviour, so the ramp bought
+nothing and only postponed the release — most visibly when a safety cap lifts
+at the end of a curve and the car stays held down while the ramp catches up.
+Braking jerk is the complaint; acceleration is not.
 
 ## Interaction with existing enforcement
 

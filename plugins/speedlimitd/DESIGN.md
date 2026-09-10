@@ -445,10 +445,16 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   `_ceiling_ms` slides toward `limit + offset` under a trapezoidal acceleration
   profile (`_advance_ceiling`), so both its value and its slope stay continuous
   and it arrives with zero slope. Descent `CEIL_A_DOWN = 0.5` m/s² at
-  `CEIL_J_DOWN = 0.5` m/s³ (~24 s for 80 → 40); ascent `CEIL_A_UP = 1.5` m/s²
-  at `CEIL_J_UP = 1.0` m/s³. Setpoint *gap* is what drives DCC deceleration on
-  this car (corr +0.746), so a step in the target is a brake spike — the old
-  3 s ladder produced three of them per drop.
+  `CEIL_J_DOWN = 0.5` m/s³ (~24 s for 80 → 40). Setpoint *gap* is what drives
+  DCC deceleration on this car (corr +0.746), so a step in the target is a
+  brake spike — the old 3 s ladder produced three of them per drop.
+
+  **Only the descent is shaped.** A rising limit is applied at once. The hook
+  only ever lowers `v_cruise`, so raising the ceiling merely stops capping —
+  DCC's own ~+0.5 m/s² envelope shapes the acceleration from there, and
+  ramping the release only delayed it. This also means a safety cap lifts on
+  the tick the curve ends, instead of holding the car down while a ramp
+  catches up.
 
   The stop budget is measured against the error remaining **after** the tick's
   travel (`|err| - |rate|·dt`). The textbook `sqrt(2·j·|err|)` is optimistic by
