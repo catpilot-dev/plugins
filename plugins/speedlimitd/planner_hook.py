@@ -1,4 +1,5 @@
 import math
+import time
 
 from openpilot.common.constants import CV
 
@@ -40,6 +41,9 @@ _sl_data = None
 _baseline_ms = None   # inferred running-max target on the current road (floor)
 _gas_floor_ms = None  # driver-override hold floor (all sources), set post gas
 _road_id = ''         # last non-empty OSM road identity
+_ceiling_ms = None    # jerk-limited allowed-speed ceiling (m/s); None = uninitialised
+_ceiling_rate = 0.0   # its current slope (m/s², signed)
+_last_t = None        # monotonic timestamp of the last ceiling advance
 
 
 def _get_sl_data():
@@ -148,14 +152,19 @@ def _gas_pressed(sm) -> bool:
 
 
 def _reset_all():
-  """Clear the floors (road identity is kept across brief invalid limits)."""
-  global _baseline_ms, _gas_floor_ms
+  """Clear the floors and the ceiling (road identity is kept across brief
+  invalid limits). Clearing the ceiling means the next valid limit is applied
+  immediately rather than ramped from a stale value."""
+  global _baseline_ms, _gas_floor_ms, _ceiling_ms, _ceiling_rate, _last_t
   _baseline_ms = None
   _gas_floor_ms = None
+  _ceiling_ms = None
+  _ceiling_rate = 0.0
+  _last_t = None
 
 
 def on_v_cruise(v_cruise, v_ego, sm):
-  global _baseline_ms, _gas_floor_ms, _road_id
+  global _baseline_ms, _gas_floor_ms, _road_id, _ceiling_ms, _ceiling_rate, _last_t
   _get_sl_data()  # update from plugin bus
   if _sl_data is None:
     _reset_all()
@@ -182,6 +191,19 @@ def on_v_cruise(v_cruise, v_ego, sm):
     _baseline_ms = None
     _gas_floor_ms = None
 
+  # Advance the jerk-limited ceiling toward the target. This runs before the
+  # gas early-return on purpose: the ceiling is a pure function of the limit,
+  # so a gas hold must not freeze it — the gas FLOOR is what suspends
+  # enforcement. Safety caps assign the target directly; a tightening curve
+  # cannot wait out a 16 s ramp.
+  now = time.monotonic()
+  if _ceiling_ms is None or safety_capped:
+    _ceiling_ms, _ceiling_rate = target_ms, 0.0
+  else:
+    dt = min(max(now - _last_t, 0.0), CEIL_DT_MAX) if _last_t is not None else 0.0
+    _ceiling_ms, _ceiling_rate = _advance_ceiling(_ceiling_ms, _ceiling_rate, target_ms, dt)
+  _last_t = now
+
   # Gas pedal: universal suspend (all sources, incl. safety caps). Raise the
   # hold floor to current speed so enforcement resumes from here on release.
   if _gas_pressed(sm):
@@ -205,9 +227,12 @@ def on_v_cruise(v_cruise, v_ego, sm):
   else:
     _baseline_ms = None
 
+  # The ramped ceiling — not the raw target — is what gets enforced. The floors
+  # above still track the RAW target: they are statements about the limit
+  # ("highest seen on this road", "driver's held speed"), not about the ramp.
   floors = [f for f in (baseline_floor, _gas_floor_ms) if f is not None]
   effective_floor = max(floors) if floors else None
-  floored_target = target_ms if effective_floor is None else max(target_ms, effective_floor)
+  floored_target = _ceiling_ms if effective_floor is None else max(_ceiling_ms, effective_floor)
 
   # Fast lead suggests a non-safety confirmed limit is wrong — skip. Not for
   # inferred limits (the baseline floor handles those), safety caps (a fast lead

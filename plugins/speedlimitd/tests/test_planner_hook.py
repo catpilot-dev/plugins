@@ -146,3 +146,155 @@ class TestAdvanceCeiling:
     c, r = ph._advance_ceiling(88.0 / 3.6, 0.0, 46.0 / 3.6, 0.0)
     assert c == pytest.approx(88.0 / 3.6)
     assert r == 0.0
+
+
+class TestCeilingInOnVCruise:
+  """The ceiling as on_v_cruise actually drives it, with a fake clock."""
+
+  def _sm(self, gas=False, lead_status=False, lead_vLead=0.0):
+    cs = MagicMock()
+    cs.gasPressed = gas
+    lead = MagicMock()
+    lead.status = lead_status
+    lead.vLead = lead_vLead
+    radar = MagicMock()
+    radar.leadOne = lead
+    sm = MagicMock()
+
+    def getitem(key):
+      if key == 'carState':
+        return cs
+      if key == 'radarState':
+        return radar
+      return MagicMock()
+
+    sm.__getitem__ = MagicMock(side_effect=getitem)
+    return sm
+
+  def _sl(self, ph, speed_limit, source=1, safety=False, confirmed=True, road='A'):
+    ph._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit,
+                   'safetyCapped': safety, 'source': source,
+                   'roadName': road, 'wayRef': ''}
+
+  def _clock(self, ph, monkeypatch, t0=1000.0):
+    """Fake monotonic clock. `clk['t'] += DT` advances one planner tick."""
+    clk = {'t': t0}
+    monkeypatch.setattr(ph.time, 'monotonic', lambda: clk['t'])
+    return clk
+
+  # --- first reading is immediate, not ramped -------------------------
+
+  def test_first_reading_applies_immediately(self, ph, monkeypatch):
+    """No ramp from a null ceiling — there is nothing to ramp from."""
+    self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    assert ph.on_v_cruise(100 / 3.6, 25.0, self._sm()) == pytest.approx(88 / 3.6, abs=0.01)
+
+  # --- a drop ramps ---------------------------------------------------
+
+  def test_drop_does_not_jump(self, ph, monkeypatch):
+    """80 -> 40 must not land on 46 km/h the very next tick."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 40, source=1)
+    clk['t'] += DT
+    out = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    assert out > 80 / 3.6, 'ceiling teleported to the new limit'
+
+  def test_drop_reaches_the_target(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 40, source=1)
+    out = None
+    for _ in range(600):
+      clk['t'] += DT
+      out = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    assert out == pytest.approx(46 / 3.6, abs=0.01)
+
+  def test_drop_is_monotonic_and_never_speeds_up(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    prev = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 40, source=1)
+    for _ in range(600):
+      clk['t'] += DT
+      out = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+      assert out <= prev + 1e-9
+      assert out <= 100 / 3.6 + 1e-9, 'returned above the incoming v_cruise'
+      prev = out
+
+  # --- safety caps bypass the ramp ------------------------------------
+
+  def test_safety_cap_bypasses_the_ramp(self, ph, monkeypatch):
+    """A tightening curve must bite now, not in 16 s."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 40, source=4, safety=True)
+    clk['t'] += DT
+    # safetyCapped => no offset, exact limit, immediately
+    assert ph.on_v_cruise(100 / 3.6, 25.0, self._sm()) == pytest.approx(40 / 3.6, abs=0.01)
+
+  def test_ramp_resumes_cleanly_after_a_safety_cap_releases(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 40, source=4, safety=True)
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 80, source=1)
+    clk['t'] += DT
+    out = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    assert out < 88 / 3.6, 'release teleported instead of ramping up'
+    assert out > 40 / 3.6
+
+  # --- gas -------------------------------------------------------------
+
+  def test_ceiling_keeps_ramping_while_gas_is_pressed(self, ph, monkeypatch):
+    """The ceiling is a function of the limit, not of the driver. On release
+    the limit must already be where it belongs, not 16 s behind."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 40, source=1)
+    for _ in range(600):
+      clk['t'] += DT
+      ph.on_v_cruise(100 / 3.6, 25.0, self._sm(gas=True))
+    assert ph._ceiling_ms == pytest.approx(46 / 3.6, abs=0.01)
+
+  # --- reset -----------------------------------------------------------
+
+  def test_invalid_limit_clears_the_ceiling(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 80, source=1, confirmed=False)
+    clk['t'] += DT
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    assert ph._ceiling_ms is None
+    # …and the next valid limit is applied immediately, not ramped from stale state
+    self._sl(ph, 40, source=1)
+    clk['t'] += DT
+    assert ph.on_v_cruise(100 / 3.6, 25.0, self._sm()) == pytest.approx(46 / 3.6, abs=0.01)
+
+  def test_road_change_does_not_reset_the_ceiling(self, ph, monkeypatch):
+    """Resetting on a road change would reintroduce exactly the jump we removed."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1, road='A')
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 40, source=1, road='B')
+    clk['t'] += DT
+    out = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    assert out > 80 / 3.6, 'ceiling was reset by the road change'
+
+  # --- dt hygiene -------------------------------------------------------
+
+  def test_long_stall_does_not_lurch(self, ph, monkeypatch):
+    """A 10 s gap between ticks (process stall) must be clamped to CEIL_DT_MAX,
+    not integrated as a 10 s step."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    self._sl(ph, 40, source=1)
+    clk['t'] += 10.0
+    out = ph.on_v_cruise(100 / 3.6, 25.0, self._sm())
+    assert out > 87 / 3.6, 'a stalled tick integrated the whole gap'
