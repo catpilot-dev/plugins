@@ -246,6 +246,17 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 STEP5_GRID_KMH = 10.0         # DCC snaps to this grid on plus5 and minus5
 STEP5_MIN_USEFUL_KMH = 2.0    # below this it is the +-1 command's job anyway
 
+# Where the grid sits in cruiseState.speed's own units: every measured landing
+# has (speed + STEP5_GRID_PHASE) % STEP5_GRID_KMH == 0, i.e. speed ≡ 8 mod 10.
+# 54 of 54 minus5 and 32 of 32 plus5 landings.
+#
+# This is NOT CruiseSettings.CLUSTER_OFFSET, even though both are 2 today. That
+# one is cosmetic — it shifts vEgoCluster and speedCluster for the display.
+# This one is load-bearing: it decides where the landing points are, and the
+# overshoot guard is built on them. Tuning the display must not silently move
+# the control grid, so they are separate constants that happen to agree.
+STEP5_GRID_PHASE = 2.0        # km/h — measured, not derived from the display
+
 # ...and one press is all minus5 needs, so do not hold it for the rest of the
 # slot the way minus1 is held. Route 45c: 7 of 38 minus5 bursts took TWO grid
 # steps, overshooting sp_target by a median 7.5 km/h — about 0.7 m/s2 of decel
@@ -319,21 +330,21 @@ def minus5_landing_kmh(setpoint_kmh):
   CS.out.cruiseState.speed (km/h).
 
   DCC snaps down to the next multiple of STEP5_GRID_KMH strictly below the
-  current value, and it does so on the CLUSTER value, so the offset has to be
-  taken off and put back. Exact on 54 of 54 measured landings.
+  current value. STEP5_GRID_PHASE places that grid in these units. Exact on 54
+  of 54 measured landings.
   """
-  raw = round(setpoint_kmh + CruiseSettings.CLUSTER_OFFSET)
+  raw = round(setpoint_kmh + STEP5_GRID_PHASE)
   land = STEP5_GRID_KMH * ((raw - 1) // STEP5_GRID_KMH)
-  return land - CruiseSettings.CLUSTER_OFFSET
+  return land - STEP5_GRID_PHASE
 
 
 def plus5_landing_kmh(setpoint_kmh):
   """The mirror: plus5 snaps UP to the next multiple of STEP5_GRID_KMH strictly
   above. Exact on 32 of 32 measured landings, gain 1-10 km/h — from 49 you get
   1, from 50 you get 10, same command."""
-  raw = round(setpoint_kmh + CruiseSettings.CLUSTER_OFFSET)
+  raw = round(setpoint_kmh + STEP5_GRID_PHASE)
   land = STEP5_GRID_KMH * ((raw // STEP5_GRID_KMH) + 1)
-  return land - CruiseSettings.CLUSTER_OFFSET
+  return land - STEP5_GRID_PHASE
 
 
 class CarController(CarControllerBase):

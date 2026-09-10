@@ -793,13 +793,31 @@ class TestSetpointBias:
     the next multiple of 10 strictly below, on the CLUSTER value. These pairs
     are measured landings from routes 454/455/459/45b (54 of 54 exact)."""
     import bmw.carcontroller as mod
-    from bmw.values import CruiseSettings
-    off = CruiseSettings.CLUSTER_OFFSET
+    off = mod.STEP5_GRID_PHASE
     for before_cluster, after_cluster in [(70, 60), (71, 70), (77, 70), (55, 50),
                                           (65, 60), (101, 100), (94, 90),
                                           (68, 60), (54, 50), (60, 50)]:
       got = mod.minus5_landing_kmh(before_cluster - off)
       assert got == after_cluster - off, (before_cluster, after_cluster, got + off)
+
+  def test_grid_phase_is_independent_of_the_display_offset(self):
+    """STEP5_GRID_PHASE and CruiseSettings.CLUSTER_OFFSET are both 2 today and
+    must stay separate. The first decides where minus5/plus5 actually land and
+    the overshoot guard is built on it; the second only shifts vEgoCluster and
+    speedCluster for the display. Retuning the display must not silently move
+    the control grid."""
+    import bmw.carcontroller as mod
+    from bmw.values import CruiseSettings
+    before = [mod.minus5_landing_kmh(v) for v in range(60, 100)]
+    before += [mod.plus5_landing_kmh(v) for v in range(60, 100)]
+    real = CruiseSettings.CLUSTER_OFFSET
+    try:
+      CruiseSettings.CLUSTER_OFFSET = real + 5
+      after = [mod.minus5_landing_kmh(v) for v in range(60, 100)]
+      after += [mod.plus5_landing_kmh(v) for v in range(60, 100)]
+    finally:
+      CruiseSettings.CLUSTER_OFFSET = real
+    assert before == after, "the display offset moved the landing grid"
 
   def test_minus5_only_fires_when_it_lands_at_or_above_the_target(self):
     """The overshoot guard is exact, not a threshold: minus5 is used precisely
@@ -1263,8 +1281,7 @@ class TestSetpointBias:
     strictly above. These pairs are measured landings from routes 452-45b
     (32 of 32 exact)."""
     import bmw.carcontroller as mod
-    from bmw.values import CruiseSettings
-    off = CruiseSettings.CLUSTER_OFFSET
+    off = mod.STEP5_GRID_PHASE
     for before_cluster, after_cluster in [(35, 40), (41, 50), (49, 50), (50, 60),
                                           (58, 60), (59, 60), (60, 70), (67, 70),
                                           (70, 80), (43, 50)]:

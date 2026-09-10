@@ -476,9 +476,16 @@ Measured over 454/455/459/45b, isolated bursts only, setpoint read off 0x193:
 | plus5 | **snap** — the same rule mirrored, next multiple of 10 strictly above | deterministic, **1–10 km/h** |
 
 ```
-minus5:  land = 10 * floor((setpoint - 1) / 10)      [cluster units]
-plus5:   land = 10 * (floor(setpoint / 10) + 1)
+minus5:  land = 10 * floor((setpoint + PHASE - 1) / 10) - PHASE
+plus5:   land = 10 * (floor((setpoint + PHASE) / 10) + 1) - PHASE
 ```
+
+`STEP5_GRID_PHASE` = 2 km/h places the grid in `cruiseState.speed`'s own units:
+every measured landing sits at `speed ≡ 8 (mod 10)`. It is **not**
+`CruiseSettings.CLUSTER_OFFSET`, even though both are 2 today — that one is
+cosmetic (`vEgoCluster`, `speedCluster`, the disengage guard), while this one
+decides where the landings are and carries the overshoot guard. Retuning the
+display must not silently move the control grid, so a test pins them apart.
 
 Exact on **54 of 54** minus5 landings and **32 of 32** plus5 landings. Some
 measured pairs:
