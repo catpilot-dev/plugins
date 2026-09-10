@@ -48,6 +48,33 @@ _ceiling_rate = 0.0   # its current slope (m/s², signed)
 _last_t = None        # monotonic timestamp of the last ceiling advance
 _prev_target_ms = None  # previous tick's raw target, to detect a fresh drop
 
+# Enforcement telemetry. The daemon publishes what the LIMIT is; without this
+# the enforcement side — ceiling, anchor, floors, whether the cap even bound —
+# is invisible in the rlog, and a drive can only be analysed by inferring from
+# longitudinalPlan.aTarget, which is the MPC output with lead-following mixed
+# in. bus_logger auto-discovers topics from /tmp/plugin_bus/, so this needs no
+# registration; entries land in pluginBusLog.
+_pub = None
+_pub_ok = True
+
+
+def _publish(telem):
+  """Best-effort telemetry. Never raises into the planner's hot path."""
+  global _pub, _pub_ok
+  if not _pub_ok:
+    return
+  if _pub is None:
+    try:
+      from openpilot.selfdrive.plugins.plugin_bus import PluginPub
+      _pub = PluginPub('speedLimitEnforce')
+    except Exception:
+      _pub_ok = False   # no bus here (tests, bench) — stop trying
+      return
+  try:
+    _pub.send(telem)
+  except Exception:
+    pass              # a dropped sample must never disturb enforcement
+
 
 def _get_sl_data():
   """Update _sl_data from plugin bus if available."""
@@ -169,16 +196,37 @@ def _reset_all():
 def on_v_cruise(v_cruise, v_ego, sm):
   global _baseline_ms, _gas_floor_ms, _road_id, _ceiling_ms, _ceiling_rate, _last_t
   global _prev_target_ms
+
+  KPH = CV.MS_TO_KPH
+  tl = {'state': 'no_data', 'vEgo': round(v_ego * KPH, 1),
+        'vCruiseIn': round(v_cruise * KPH, 1), 'vCruiseOut': round(v_cruise * KPH, 1),
+        'limit': 0, 'target': 0.0, 'ceiling': 0.0, 'ceilingRate': 0.0,
+        'source': None, 'safetyCapped': False, 'anchored': False,
+        'anchorFrom': 0.0, 'anchorTo': 0.0,
+        'baselineFloor': 0.0, 'gasFloor': 0.0, 'capActive': False}
+
+  def _emit(out, state):
+    tl['state'] = state
+    tl['vCruiseOut'] = round(out * KPH, 1)
+    tl['capActive'] = out < v_cruise - 1e-9
+    if _ceiling_ms is not None:
+      tl['ceiling'] = round(_ceiling_ms * KPH, 2)
+      tl['ceilingRate'] = round(_ceiling_rate, 3)
+    tl['baselineFloor'] = round(_baseline_ms * KPH, 1) if _baseline_ms is not None else 0.0
+    tl['gasFloor'] = round(_gas_floor_ms * KPH, 1) if _gas_floor_ms is not None else 0.0
+    _publish(tl)
+    return out
+
   _get_sl_data()  # update from plugin bus
   if _sl_data is None:
     _reset_all()
-    return v_cruise
+    return _emit(v_cruise, 'no_data')
 
   confirmed = _sl_data.get('confirmed', False)
   speed_limit = _sl_data.get('speedLimit', 0)
   if not (confirmed and speed_limit > 0):
     _reset_all()
-    return v_cruise
+    return _emit(v_cruise, 'unconfirmed' if not confirmed else 'no_limit')
 
   safety_capped = _sl_data.get('safetyCapped', True)
   source = _sl_data.get('source')
@@ -187,6 +235,8 @@ def on_v_cruise(v_cruise, v_ego, sm):
 
   offset_pct = 0 if safety_capped else _effective_offset_percent(speed_limit)
   target_ms = speed_limit * (1 + offset_pct / 100.0) * CV.KPH_TO_MS
+  tl.update(limit=speed_limit, source=source, safetyCapped=bool(safety_capped),
+            target=round(target_ms * KPH, 2))
 
   # New (non-empty) road: drop carried floors. A transient empty road_id (OSM
   # tile gap on the same road) is NOT a change.
@@ -199,7 +249,7 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # gas early-return on purpose: the ceiling is a pure function of the limit,
   # so a gas hold must not freeze it — the gas FLOOR is what suspends
   # enforcement. Safety caps assign the target directly; a tightening curve
-  # cannot wait out a 16 s ramp.
+  # cannot wait out a 24 s ramp.
   now = time.monotonic()
   if _ceiling_ms is None or safety_capped:
     _ceiling_ms, _ceiling_rate = target_ms, 0.0
@@ -220,6 +270,8 @@ def on_v_cruise(v_cruise, v_ego, sm):
     if _prev_target_ms is not None and target_ms < _prev_target_ms - 1e-9:
       anchored = min(_ceiling_ms, max(v_ego, target_ms))
       if anchored < _ceiling_ms:
+        tl.update(anchored=True, anchorFrom=round(_ceiling_ms * KPH, 2),
+                  anchorTo=round(anchored * KPH, 2))
         _ceiling_ms, _ceiling_rate = anchored, 0.0
     dt = min(max(now - _last_t, 0.0), CEIL_DT_MAX) if _last_t is not None else 0.0
     _ceiling_ms, _ceiling_rate = _advance_ceiling(_ceiling_ms, _ceiling_rate, target_ms, dt)
@@ -230,7 +282,7 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # hold floor to current speed so enforcement resumes from here on release.
   if _gas_pressed(sm):
     _gas_floor_ms = v_ego
-    return v_cruise
+    return _emit(v_cruise, 'gas')
 
   # Ratchet the gas floor down with the driver; clear once eased to the limit.
   if _gas_floor_ms is not None:
@@ -261,13 +313,13 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # doesn't make a curve less tight — route 2fd), or when a gas hold is active.
   if not inferred and not safety_capped and _gas_floor_ms is None \
       and _lead_overrides_limit(sm, speed_limit):
-    return v_cruise
+    return _emit(v_cruise, 'lead_override')
 
   # Enforce the cap directly; DCC comfort-limits the deceleration. floored_target
   # is <= v_ego whenever the limit dropped, so the cap never commands accel.
   if floored_target < v_cruise:
-    return floored_target
-  return v_cruise
+    return _emit(floored_target, 'capped')
+  return _emit(v_cruise, 'not_binding')
 
 
 def _pid_alive(name: str) -> bool:

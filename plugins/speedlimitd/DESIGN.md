@@ -522,6 +522,30 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   steering-wheel command → `speedlimit_cmd_car`), 1 s debounced. It never
   auto-resets on limit change, disengage, or process restart.
 
+### Enforcement telemetry (`speedLimitEnforce` topic)
+
+`speedLimitState` describes what the **limit** is. The enforcement side — the
+ceiling, the anchor, the floors, whether the cap even bound — used to be
+invisible, so a drive could only be analysed by inferring the cap from
+`longitudinalPlan.aTarget`, which is the MPC output with lead-following mixed
+in. `on_v_cruise` therefore publishes one sample per tick on **every** path
+(no gaps in the series), best-effort — a publish failure can never disturb
+enforcement.
+
+| field | meaning |
+|-------|---------|
+| `state` | `no_data` / `unconfirmed` / `no_limit` / `gas` / `lead_override` / `capped` / `not_binding` |
+| `vEgo`, `vCruiseIn`, `vCruiseOut` | km/h; `capActive` = did the hook actually lower it |
+| `limit`, `source`, `safetyCapped` | echo of the driving `speedLimitState` sample, so the series is self-contained |
+| `target` | limit + offset, km/h — the ramp's destination |
+| `ceiling`, `ceilingRate` | the ramped cap (km/h) and its slope (m/s²) — jerk compliance is directly measurable |
+| `anchored`, `anchorFrom`, `anchorTo` | one-tick anchor event; invisible otherwise |
+| `baselineFloor`, `gasFloor` | km/h, 0 = inactive |
+
+`bus_logger` discovers topics by scanning `/tmp/plugin_bus/` and re-scans
+periodically, so this needs no registration — samples land in `pluginBusLog`
+in the rlog.
+
 ## Hooks (from `plugin.json`)
 
 | Hook | Module.function | Role |

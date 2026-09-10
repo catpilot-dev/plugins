@@ -382,3 +382,113 @@ class TestDescentAnchor:
       clk['t'] += DT
       ph.on_v_cruise(120 / 3.6, 20 / 3.6, self._sm())   # car brakes hard on its own
     assert ph._ceiling_ms > 46 / 3.6, 'ceiling ratcheted down with v_ego'
+
+
+class TestEnforcementTelemetry:
+  """The payload published to /tmp/plugin_bus/speedLimitEnforce.
+
+  bus_logger auto-discovers topics, so these dicts land in pluginBusLog in the
+  rlog. Without them a drive can only be analysed by inferring the cap from
+  longitudinalPlan.aTarget — the MPC output, with lead-following mixed in.
+  """
+  _sm = TestCeilingInOnVCruise._sm
+  _sl = TestCeilingInOnVCruise._sl
+  _clock = TestCeilingInOnVCruise._clock
+
+  @pytest.fixture
+  def bus(self, ph, monkeypatch):
+    """Capture published telemetry instead of binding a real socket."""
+    sent = []
+    ph._pub = type("P", (), {"send": staticmethod(lambda d: sent.append(dict(d)))})()
+    ph._pub_ok = True
+    return sent
+
+  def test_publishes_every_tick_on_every_path(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    ph._sl_data = None
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm())          # no_data
+    self._sl(ph, 80, source=1, confirmed=False)
+    clk['t'] += DT; ph.on_v_cruise(100 / 3.6, 25.0, self._sm())   # unconfirmed
+    self._sl(ph, 80, source=1)
+    clk['t'] += DT; ph.on_v_cruise(100 / 3.6, 25.0, self._sm())   # capped
+    clk['t'] += DT; ph.on_v_cruise(100 / 3.6, 25.0, self._sm(gas=True))  # gas
+    states = [m['state'] for m in bus]
+    assert states == ['no_data', 'unconfirmed', 'capped', 'gas']
+    assert len(bus) == 4, 'one sample per tick, no gaps in the series'
+
+  def test_capped_sample_carries_the_ceiling_and_the_cap(self, ph, bus, monkeypatch):
+    self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    out = ph.on_v_cruise(100 / 3.6, 20.0, self._sm())
+    m = bus[-1]
+    assert m['state'] == 'capped'
+    assert m['capActive'] is True
+    assert m['limit'] == 80
+    assert m['target'] == pytest.approx(88.0, abs=0.05)
+    assert m['ceiling'] == pytest.approx(88.0, abs=0.05)
+    assert m['vCruiseOut'] == pytest.approx(out * 3.6, abs=0.05)
+    assert m['vCruiseIn'] == pytest.approx(100.0, abs=0.05)
+    assert m['vEgo'] == pytest.approx(72.0, abs=0.05)
+
+  def test_not_binding_is_distinguishable_from_capped(self, ph, bus, monkeypatch):
+    self._clock(ph, monkeypatch)
+    self._sl(ph, 120, source=1)
+    ph.on_v_cruise(40 / 3.6, 11.0, self._sm())
+    assert bus[-1]['state'] == 'not_binding'
+    assert bus[-1]['capActive'] is False
+
+  def test_anchor_event_is_recorded_with_from_and_to(self, ph, bus, monkeypatch):
+    """The anchor is a one-tick event — if it is not logged it is invisible."""
+    clk = self._clock(ph, monkeypatch)
+    v = 55 / 3.6
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(120 / 3.6, v, self._sm())
+    assert bus[-1]['anchored'] is False
+    self._sl(ph, 40, source=1)
+    clk['t'] += DT
+    ph.on_v_cruise(120 / 3.6, v, self._sm())
+    m = bus[-1]
+    assert m['anchored'] is True
+    assert m['anchorFrom'] == pytest.approx(88.0, abs=0.1)
+    assert m['anchorTo'] == pytest.approx(55.0, abs=0.1)
+    clk['t'] += DT
+    ph.on_v_cruise(120 / 3.6, v, self._sm())
+    assert bus[-1]['anchored'] is False, 'anchor flag must not stick across ticks'
+
+  def test_ceiling_rate_is_published_so_jerk_is_measurable(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(120 / 3.6, 25.0, self._sm())
+    self._sl(ph, 40, source=1)
+    for _ in range(60):
+      clk['t'] += DT
+      ph.on_v_cruise(120 / 3.6, 25.0, self._sm())
+    rates = [m['ceilingRate'] for m in bus if m['state'] == 'capped']
+    assert min(rates) < -0.3, 'descent slope never showed up in telemetry'
+    for a, b in zip(rates, rates[1:]):
+      assert abs(b - a) <= ph.CEIL_J_DOWN * DT + 1e-6
+
+  def test_floors_are_visible(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 60, source=2, road='A')
+    ph.on_v_cruise(120 / 3.6, 25.0, self._sm())
+    assert bus[-1]['baselineFloor'] > 0.0
+    clk['t'] += DT
+    ph.on_v_cruise(120 / 3.6, 25.0, self._sm(gas=True))
+    assert bus[-1]['gasFloor'] == pytest.approx(90.0, abs=0.1)
+
+  def test_lead_override_is_visible(self, ph, bus, monkeypatch):
+    self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1)
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm(lead_status=True, lead_vLead=100 / 3.6))
+    assert bus[-1]['state'] == 'lead_override'
+    assert bus[-1]['capActive'] is False
+
+  def test_a_broken_bus_never_reaches_the_planner(self, ph, monkeypatch):
+    """Telemetry is best-effort. A publish failure must not change the cap."""
+    self._clock(ph, monkeypatch)
+    def boom(_): raise RuntimeError('bus gone')
+    ph._pub = type("P", (), {"send": staticmethod(boom)})()
+    ph._pub_ok = True
+    self._sl(ph, 80, source=1)
+    assert ph.on_v_cruise(100 / 3.6, 20.0, self._sm()) == pytest.approx(88 / 3.6, abs=0.01)
