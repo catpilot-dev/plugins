@@ -1115,9 +1115,9 @@ class TestSetpointBias:
                                                   setpoint_kmh=95.0, seconds=1.5)
     assert any('minus5' in n for _, n in sent), "expected a minus5 for this error"
     floor = 86.0 - mod.SETPOINT_BIAS_MAX
-    assert sp_min >= floor - mod.MINUS5_GRID_KMH - 1.0, (
+    assert sp_min >= floor - mod.STEP5_GRID_KMH - 1.0, (
       f"setpoint reached {sp_min:.1f}, more than one grid step past {floor:.1f}")
-    assert max_pending <= 2 * mod.MINUS5_GRID_KMH + 1.0, (
+    assert max_pending <= 2 * mod.STEP5_GRID_KMH + 1.0, (
       f"pending reached {max_pending:.1f}")
 
   def test_at_most_one_command_decision_per_slot(self):
@@ -1212,17 +1212,64 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=0.0, setpoint_kmh=86.0, v_target_kmh=86.0)
     assert 'plus1' not in acts and 'plus5' not in acts, acts
 
-  # ---- the accel branch is untouched -------------------------------------
+  # ---- the accel branch ---------------------------------------------------
 
-  @pytest.mark.parametrize('accel', [0.2, 0.5, 0.8])
-  def test_accel_branch_picks_the_same_command_with_and_without_bias(self, accel):
-    """The bias caps how far the accel branch reaches, not which step it uses
-    or how fast it sends. At these demands v_target is still the binding term,
-    so the emitted commands and cadence match the rollback path exactly."""
+  @pytest.mark.parametrize('accel', [0.2, 0.5])
+  def test_accel_branch_picks_the_same_command_below_the_step5_threshold(self, accel):
+    """Under ACCEL_STEP5_THRESHOLD only plus1 is on the table, so the bias
+    changes how far the branch reaches but not which step it uses or how fast
+    it sends — identical to the rollback path."""
     on = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0, bias='')
     off = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0, bias='0')
     assert on[0] == off[0], (on[0], off[0])
     assert on[2] == pytest.approx(off[2], abs=1e-6)
+
+  def test_plus5_landing_is_the_next_multiple_of_ten_above(self):
+    """plus5 is minus5 mirrored: it snaps UP to the next multiple of 10
+    strictly above. These pairs are measured landings from routes 452-45b
+    (32 of 32 exact)."""
+    import bmw.carcontroller as mod
+    from bmw.values import CruiseSettings
+    off = CruiseSettings.CLUSTER_OFFSET
+    for before_cluster, after_cluster in [(35, 40), (41, 50), (49, 50), (50, 60),
+                                          (58, 60), (59, 60), (60, 70), (67, 70),
+                                          (70, 80), (43, 50)]:
+      got = mod.plus5_landing_kmh(before_cluster - off)
+      assert got == after_cluster - off, (before_cluster, after_cluster, got + off)
+
+  def test_plus5_only_fires_when_it_lands_at_or_below_the_target(self):
+    """The accel-side twin of the minus5 guard. A plus5 just under a grid line
+    jumps up to 10 km/h; it is only the right tool when that lands at or below
+    the target. Demand is the same in both cases — only grid position differs.
+    """
+    # accel +1.0 -> ask 10 km/h, v_target 100 -> sp_target 96 from vEgo 86.
+    # Setpoint 86 (cluster 88) lands on cluster 90, i.e. 88: a 2 km/h gain
+    # inside the 10 km/h error, so plus5 fits.
+    acts, _, _ = self._run(accel=1.0, v_ego_kmh=86.0, setpoint_kmh=86.0,
+                           v_target_kmh=100.0)
+    assert 'plus5' in acts, acts
+    # Setpoint 94 (cluster 96) lands on cluster 100, i.e. 98 — past the 96
+    # target, so plus1 must be used instead.
+    acts, _, _ = self._run(accel=1.0, v_ego_kmh=86.0, setpoint_kmh=94.0,
+                           v_target_kmh=100.0)
+    assert 'plus5' not in acts, acts
+
+  def test_plus5_never_overshoots_whatever_the_grid_position(self):
+    """Sweep the setpoint across a whole grid period: whenever plus5 is used,
+    its landing point must be at or below the target."""
+    import bmw.carcontroller as mod
+    for setpoint in [86.0 + d for d in range(0, 10)]:
+      acts, _, _ = self._run(accel=1.0, v_ego_kmh=86.0, setpoint_kmh=setpoint,
+                             v_target_kmh=100.0)
+      if 'plus5' in acts:
+        land = mod.plus5_landing_kmh(setpoint)
+        assert land <= 96.0 + 0.01, (setpoint, land)
+
+  def test_plus5_rollback_path_is_unchanged(self):
+    """With the bias off, plus5 is still chosen on demand alone."""
+    acts, _, _ = self._run(accel=0.8, v_target_kmh=92.0, setpoint_kmh=86.0,
+                           bias='0')
+    assert 'plus5' in acts, acts
 
   def test_accel_target_is_capped_by_the_ask(self):
     """A near-zero positive demand must not buy the whole v_target gap.

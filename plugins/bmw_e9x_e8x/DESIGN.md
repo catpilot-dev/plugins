@@ -458,7 +458,7 @@ tracking, since every wander it absorbs is a restore not made. It was briefly as
 measured, so there is one constant. The reason to keep them separable if this
 is revisited: coming down is a response, going back up is a release.
 
-### minus1 is a step; minus5 snaps to a grid
+### ±1 is a step; ±5 snaps to a grid
 
 Measured over 454/455/459/45b, isolated bursts only, setpoint read off 0x193:
 
@@ -466,17 +466,26 @@ Measured over 454/455/459/45b, isolated bursts only, setpoint read off 0x193:
 |---|---|---|
 | minus1 | **step** — 1.0 km/h flat for any burst 60–300 ms (n=104), repeats only past 300 ms | deterministic, 1 km/h |
 | minus5 | **snap** — setpoint jumps to the next multiple of 10 strictly below | deterministic, **1–10 km/h** |
+| plus5 | **snap** — the same rule mirrored, next multiple of 10 strictly above | deterministic, **1–10 km/h** |
 
 ```
-land = 10 * floor((setpoint - 1) / 10)        [cluster units]
+minus5:  land = 10 * floor((setpoint - 1) / 10)      [cluster units]
+plus5:   land = 10 * (floor(setpoint / 10) + 1)
 ```
 
-Exact on **54 of 54** isolated landings. Some measured pairs:
+Exact on **54 of 54** minus5 landings and **32 of 32** plus5 landings. Some
+measured pairs:
 
 ```
-71 → 70    77 → 70    55 → 50    101 → 100
-70 → 60    68 → 60    94 →  90    60 →  50
+minus5   71 → 70    77 → 70    55 → 50    101 → 100
+         70 → 60    68 → 60    94 → 90     60 →  50
+
+plus5    49 → 50    59 → 60    67 → 70     35 →  40
+         50 → 60    60 → 70    70 → 80     41 →  50
 ```
+
+Note 49 → 50 against 50 → 60: one km/h of starting position changes the gain by
+a factor of ten, from the same command.
 
 So the drop is decided entirely by where the setpoint already sits: from 71 you
 get 1 km/h, from 70 you get 10, from the same command. Observed drops were
@@ -486,7 +495,7 @@ median of 6. **There was never a constant to find.** An earlier note here
 explained the scatter as a ramp running until DCC observed the release, timed
 by SZL phase; that was wrong.
 
-### minus5 needs no threshold
+### ±5 needs no threshold
 
 Because the landing point is computable, the overshoot guard is exact rather
 than statistical:
@@ -510,6 +519,14 @@ burst too early).
 
 The floor guard is now the landing point rather than a headroom margin: minus5
 is used only if `land` is at or above `min_cruise_setpoint`.
+
+**plus5 gets the identical guard, mirrored.** It is used only when its landing
+point is at or below `sp_target`, so a plus5 sitting just under a grid line can
+no longer jump up to 10 km/h past the target — the accel-side twin of the
+route-45b cut-in. The step is still offered only above
+`ACCEL_STEP5_THRESHOLD`; the landing test decides whether it is taken. With
+`SetpointBias=0` the old demand-only choice is unchanged, so the rollback stays
+a true rollback.
 
 ### Both signs invert the plant
 

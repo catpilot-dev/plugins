@@ -222,7 +222,7 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 # trade of authority for smoothness, taken from the seat after route 455.
 #
 # minus5 does not subtract a fixed amount. It SNAPS the setpoint down to the
-# next multiple of MINUS5_GRID_KMH strictly below where it is:
+# next multiple of STEP5_GRID_KMH strictly below where it is:
 #
 #     land = 10 * floor((setpoint - 1) / 10)          [cluster units]
 #
@@ -241,8 +241,10 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 # by construction — and the pending ledger is credited the real drop instead of
 # an estimate. That also makes it usable in cases a threshold rejected: 6 km/h
 # of error from a setpoint of 76 lands precisely on 70.
-MINUS5_GRID_KMH = 10.0         # DCC snaps to this grid on minus5
-MINUS5_MIN_USEFUL_KMH = 2.0    # below this the drop is minus1's job anyway
+# plus5 is the same rule mirrored — it snaps UP to the next multiple of 10
+# strictly above, exact on 32 of 32 measured landings, gain likewise 1-10 km/h.
+STEP5_GRID_KMH = 10.0         # DCC snaps to this grid on plus5 and minus5
+STEP5_MIN_USEFUL_KMH = 2.0    # below this it is the +-1 command's job anyway
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
                                # Without it, a DCC that stops acting on us never
@@ -293,12 +295,21 @@ def minus5_landing_kmh(setpoint_kmh):
   """Where a minus5 will actually put the setpoint, in the same units as
   CS.out.cruiseState.speed (km/h).
 
-  DCC snaps down to the next multiple of MINUS5_GRID_KMH strictly below the
+  DCC snaps down to the next multiple of STEP5_GRID_KMH strictly below the
   current value, and it does so on the CLUSTER value, so the offset has to be
   taken off and put back. Exact on 54 of 54 measured landings.
   """
   raw = round(setpoint_kmh + CruiseSettings.CLUSTER_OFFSET)
-  land = MINUS5_GRID_KMH * ((raw - 1) // MINUS5_GRID_KMH)
+  land = STEP5_GRID_KMH * ((raw - 1) // STEP5_GRID_KMH)
+  return land - CruiseSettings.CLUSTER_OFFSET
+
+
+def plus5_landing_kmh(setpoint_kmh):
+  """The mirror: plus5 snaps UP to the next multiple of STEP5_GRID_KMH strictly
+  above. Exact on 32 of 32 measured landings, gain 1-10 km/h — from 49 you get
+  1, from 50 you get 10, same command."""
+  raw = round(setpoint_kmh + CruiseSettings.CLUSTER_OFFSET)
+  land = STEP5_GRID_KMH * ((raw // STEP5_GRID_KMH) + 1)
   return land - CruiseSettings.CLUSTER_OFFSET
 
 
@@ -649,7 +660,20 @@ class CarController(CarControllerBase):
             decel_gate = v_error < -V_ERROR_DEADZONE and setpoint_error < 0
 
           if v_error > V_ERROR_DEADZONE and accel > 0 and setpoint_error > 0:
-            cmd = CruiseStalk.plus5 if accel >= ACCEL_STEP5_THRESHOLD else CruiseStalk.plus1
+            cmd = CruiseStalk.plus1
+            if accel >= ACCEL_STEP5_THRESHOLD:
+              if self.setpoint_bias_on:
+                # Same landing test as minus5, mirrored: plus5 jumps to the
+                # next multiple of 10 above, so it is only the right tool when
+                # that lands at or below the target. Without this a plus5 at a
+                # setpoint just under the grid line overshoots by up to 10 km/h
+                # — the accel-side twin of the route-45b cut-in.
+                sp_now_kmh = CS.out.cruiseState.speed * 3.6
+                gain_kmh = plus5_landing_kmh(sp_now_kmh) - sp_now_kmh
+                if STEP5_MIN_USEFUL_KMH <= gain_kmh <= setpoint_error * 3.6:
+                  cmd = CruiseStalk.plus5
+              else:
+                cmd = CruiseStalk.plus5
             interval = self.pin_cadence(HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL)
             cruise_cmd(cmd, interval)
 
@@ -670,9 +694,9 @@ class CarController(CarControllerBase):
                 # Use it only when it lands at or above the target. That is the
                 # whole overshoot guard, and it is exact rather than a
                 # threshold: no drop larger than the error can ever be sent.
-                # Below MINUS5_MIN_USEFUL_KMH it would only be doing minus1's
+                # Below STEP5_MIN_USEFUL_KMH it would only be doing minus1's
                 # job with the jerkier command.
-                if (MINUS5_MIN_USEFUL_KMH <= m5_drop_kmh <= err_kmh
+                if (STEP5_MIN_USEFUL_KMH <= m5_drop_kmh <= err_kmh
                     and m5_land_kmh >= self.min_cruise_setpoint * 3.6):
                   self.slot_cmd = CruiseStalk.minus5
                   self.setpoint_pending += m5_drop_kmh
