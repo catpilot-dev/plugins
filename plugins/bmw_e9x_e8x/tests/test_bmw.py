@@ -1263,7 +1263,7 @@ class TestSetpointBias:
                              v_target_kmh=100.0)
       if 'plus5' in acts:
         land = mod.plus5_landing_kmh(setpoint)
-        assert land <= 96.0 + 0.01, (setpoint, land)
+        assert land <= 100.0 + 0.01, (setpoint, land)
 
   def test_plus5_rollback_path_is_unchanged(self):
     """With the bias off, plus5 is still chosen on demand alone."""
@@ -1271,18 +1271,20 @@ class TestSetpointBias:
                            bias='0')
     assert 'plus5' in acts, acts
 
-  def test_accel_target_is_capped_by_the_ask(self):
-    """A near-zero positive demand must not buy the whole v_target gap.
-
-    accel +0.1 asks for 1 km/h; v_target sits 6 km/h above vEgo. Capping at the
-    ask means the setpoint, already 1 km/h up, is where it should be and
-    nothing is sent. Uncapped — the pre-45b behaviour — this asked for the full
-    6 km/h and delivered 408% of the demand in this band on routes 459 + 45b.
+  def test_accel_target_is_v_target_not_the_ask(self):
+    """The accel side must chase the full v_target gap. Capping it at the
+    instantaneous ask (tried in 3acdc35) starves acceleration: on route 45c the
+    cap bound 88% of accel samples and cut the chasable gap from a median
+    6.2 km/h to 0.9 — implied steady accel 0.57 -> 0.08 m/s². Braking, the gap
+    IS the effort; accelerating, the setpoint is the destination, and the car
+    cannot reach v_target unless the setpoint does.
     """
+    # A small ask with a large speed gap: 0.1 m/s2 would cap the target at
+    # vEgo + 1 km/h, which must NOT happen — v_target is 6 km/h up.
     acts, _, _ = self._run(accel=0.1, v_ego_kmh=86.0, setpoint_kmh=87.0,
                            v_target_kmh=92.0)
-    assert 'plus1' not in acts and 'plus5' not in acts, acts
-    # Same geometry with the bias off still walks up: this is the difference.
+    assert 'plus1' in acts, ("capped at the ask instead of chasing v_target", acts)
+    # And with the bias off it behaves the same, since this is the shared path.
     roll, _, _ = self._run(accel=0.1, v_ego_kmh=86.0, setpoint_kmh=87.0,
                            v_target_kmh=92.0, bias='0')
     assert 'plus1' in roll, roll
@@ -1295,42 +1297,6 @@ class TestSetpointBias:
       acts, _, _ = self._run(accel=a, v_ego_kmh=86.0, setpoint_kmh=86.0,
                              v_target_kmh=92.0)
       assert acts & {'plus1', 'plus5'}, (a, acts)
-
-  def test_latch_release_is_not_a_step(self):
-    """The flipping mechanism itself (route 45b, 10:08:43). With both sides
-    inverting the plant, a_cmd near zero gives sp_target ~ vEgo either way, so
-    the braking latch changing state moves the target by ~nothing instead of
-    stepping it 5 km/h and firing a three-second plus1 walk."""
-    def walk(bias_on):
-      import importlib
-      import bmw.carcontroller as mod
-      importlib.reload(mod)
-      from bmw.values import BmwFlags
-      import config as cfg
-      orig = cfg.read_plugin_param
-      cfg.read_plugin_param = lambda pid, key, default='': ('' if bias_on else '0')
-      try:
-        CP = MagicMock()
-        CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-        CP.minEnableSpeed = 30 / 3.6
-        cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
-      finally:
-        cfg.read_plugin_param = orig
-      # Settle into a shallow braking episode, then let both signals tip
-      # barely positive so the latch releases — the 45b geometry, with
-      # vTarget climbing well above vEgo.
-      _, t, sp, _ = self._hold(cc, -0.10, 86.0, 0.0, 200, respond=True)
-      _, _, sp2, travel = self._hold(cc, +0.10, sp, t, 400, vt_slope=+3.0,
-                                     respond=True)
-      return sp2 - sp, travel
-
-    capped, _ = walk(True)
-    raw, _ = walk(False)
-    # The ask at +0.10 is 1 km/h. Capped, the setpoint may take that and stop;
-    # uncapped it chases vTarget, which is climbing away.
-    assert capped <= 1.5, f"capped walk ran to {capped:+.1f} km/h"
-    assert raw > capped + 1.0, (
-      f"expected the uncapped walk to run further: {raw:+.1f} vs {capped:+.1f}")
 
   # ---- the param ---------------------------------------------------------
 

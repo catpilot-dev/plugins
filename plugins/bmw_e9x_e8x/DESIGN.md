@@ -535,50 +535,41 @@ route-45b cut-in. The step is still offered only above
 `SetpointBias=0` the old demand-only choice is unchanged, so the rollback stays
 a true rollback.
 
-### Both signs invert the plant
+### Only the decel side inverts the plant
 
-The accel side used to take `v_target` raw while the decel side used
-`v_ego + accel/K_DCC`, and that asymmetry was a flipping mechanism in its own
-right. What it costs, measured over 459 + 45b:
+`min(v_target, v_ego + ask)` looks symmetric and is not. Braking, the ask is
+*deeper* than `v_target`, so the min picks it and **adds** authority.
+Accelerating, the ask is *shallower*, so the same min picks it and **removes**
+authority.
 
-| a_cmd | raw `v_target` asks | delivers | capped at the ask |
-|---|---|---|---|
-| 0.0 – 0.1 | +1.9 km/h | **408%** of demand | 77% |
-| 0.1 – 0.3 | +2.2 | 117% | 75% |
-| 0.3 – 0.6 | +2.5 | 62% | **62%** (identical) |
-| 0.6 – 1.0 | +2.7 | 35% | **35%** (identical) |
+The setpoint's job also differs between the two. Braking, the gap **is** the
+effort — DCC's deceleration is proportional to it. Accelerating, the setpoint
+is the **destination**, and the car cannot reach `v_target` unless the setpoint
+does.
 
-A near-zero positive demand bought the whole `v_target` gap. Route 45b at
-10:08:43 is the mechanism in one window:
+It was tried symmetric anyway (3acdc35) and route 45c measured the cost:
 
-```
-405.50  a_cmd +0.14  dv −0.01   latch ON    sp_target 75.4  setpt 76   err +0.6
-405.60  a_cmd +0.10  dv +0.03   latch OFF   sp_target 80.8  setpt 76   err −4.8  ← 5.4 km/h step
-405.6 … 408.7                   plus1 every slot, setpoint 76 → 81
-408.80  a_cmd −0.01  dv −0.10   latch ON    sp_target 77.8  setpt 81   err +3.2
-408.8 … 412.6                   minus1 every slot, setpoint 81 → 71
-```
+| | 45b (asymmetric) | 45c (symmetric) |
+|---|---|---|
+| accel cap is the binding term | 70% of samples | **88%** |
+| gap the setpoint may chase (median) | 2.6 → 0.7 km/h | **6.2 → 0.9 km/h** |
+| implied steady accel | 0.23 → 0.07 m/s² | **0.57 → 0.08 m/s²** |
+| vTarget − vEgo, 50–80 km/h | med +1.5, p90 +5.2 | **med +5.1, p90 +11.8** |
+| plus5 bursts in ~26 min | 7 | **0** |
 
-The latch released on a marginal positive and `sp_target` **stepped 5.4 km/h in
-one frame**, purely because the two sides used different formulas.
+The car ran a median 5 km/h under the plan and plus5 never fired once. It
+bought a quieter bus — flips 9.6 → 6.0/min, TX 380 → 251 — **by not
+accelerating**, which is the same trap that disqualified `vTarget − setpoint`
+and the plan-slope gate earlier in this document.
 
-Capping it at the ask removes the step: near zero demand both formulas give
-`sp_target ≈ v_ego`, so the latch changing state moves the target by nothing.
-Above +0.3 m/s² nothing changes at all — `v_target` is the binding term there
-and the `min()` keeps it as the ceiling, so staying under the driver's set
-speed is still the planner's job. Replay over 459 + 45b: **up-commands −67% and
-−70%, braking commands bit-identical**, flips 5.3 → 4.0 and 6.0 → 5.3.
+So the accel side takes `v_target` raw, as it always did. What the symmetric
+version was fixing — `sp_target` stepping several km/h when the braking latch
+releases on a marginal positive, route 45b at 10:08:43 — is a **latch-flap**
+problem. It belongs at the latch, or at a rate limit on the climb, not at the
+destination. Unfixed for now; the lag it caused was worse than the flapping it
+cured.
 
-The zeroing is what the latch is for. Latched braking, a positive blip gives
-bias 0 rather than lifting the target — the latch decides when to release, not
-one frame of `a_cmd`. Unlatched, a negative blip likewise cannot push the
-target down.
-
-This ends the earlier invariant that the accel branch is untouched by the bias
-law. `SetpointBias=0` is still a true rollback — the change is gated on it —
-but "the accel branch is bit-identical" is no longer one of the law's
-properties, and the test that asserted it now asserts the narrower true thing:
-the same command and cadence are chosen, only the reach is capped.
+The plus5 landing guard is independent of all this and stays.
 
 ### The command gate is a Schmitt trigger
 

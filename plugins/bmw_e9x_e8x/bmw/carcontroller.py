@@ -606,33 +606,35 @@ class CarController(CarControllerBase):
           # planner's job, exactly as before: it caps v_target at v_cruise.
           #
           # The min_cruise_setpoint floor stays with the branch guard below.
-          # Both signs invert the plant. The accel side used to take v_target
-          # raw, and that asymmetry was the flipping mechanism: at a_cmd
-          # +0.10 the decel formula would ask for 1 km/h of gap while
-          # v_target sat 5.4 km/h above vEgo, so releasing the braking latch
-          # stepped sp_target 5 km/h in one frame. Route 45b, 10:08:43 —
-          # a_cmd +0.10 with dv +0.03 dropped the latch, plus1 walked the
-          # setpoint 76 -> 81 over three seconds, the latch re-engaged and
-          # minus1 walked it 81 -> 71. Measured over 459 + 45b, that raw
-          # v_target delivered 408% of the ask in the 0.0-0.1 m/s2 band and
-          # 117% in 0.1-0.3.
+          # The DECEL side inverts the plant: ask for the gap the demanded
+          # accel needs. The ACCEL side does not, and the asymmetry is real
+          # rather than an oversight.
           #
-          # Capping it at the ask removes the step: near zero demand both
-          # formulas give sp_target ~ vEgo, so the latch changing state does
-          # nothing at all. Above +0.3 m/s2 nothing changes either, because
-          # v_target is the binding term there and the min() keeps it as the
-          # ceiling — the driver's set speed is still the planner's job.
-          # Replay: up-commands -67%/-70%, braking commands bit-identical.
+          # min(v_target, v_ego + ask) looks symmetric but is not. Braking, the
+          # ask is deeper than v_target, so the min picks it and ADDS
+          # authority. Accelerating, the ask is shallower, so the same min
+          # picks it and REMOVES authority — and the setpoint's job differs
+          # between the two. Braking, the gap IS the effort. Accelerating, the
+          # setpoint is the destination, and the car cannot reach v_target
+          # unless the setpoint does.
           #
-          # The zeroing is what the latch is for. Latched braking, a positive
-          # blip gives bias 0 rather than lifting the target — the latch
-          # decides when to release, not a single frame of a_cmd; unlatched,
-          # a negative blip likewise cannot push the target down.
+          # This was tried symmetric (3acdc35) and route 45c measured the cost:
+          # the cap was the binding term on 88% of accel samples and cut the
+          # gap the setpoint could chase from a median 6.2 km/h to 0.9 —
+          # implied steady accel 0.57 -> 0.08 m/s². The car ran a median
+          # 5.1 km/h under the plan in the 50-80 km/h band, p90 11.8, and plus5
+          # never fired once in 26 minutes. It bought a quieter bus (flips
+          # 9.6 -> 6.0/min, TX 380 -> 251) by not accelerating.
+          #
+          # What the symmetric version was fixing — sp_target stepping several
+          # km/h when the braking latch releases on a marginal positive — is a
+          # latch-flap problem and belongs at the latch or at a rate limit on
+          # the climb, not at the destination.
           sp_target = v_target
-          if self.setpoint_bias_on:
-            ask = min(accel, 0.0) if self.setpoint_braking else max(accel, 0.0)
-            bias = min(max(ask / K_DCC, -SETPOINT_BIAS_MAX),
-                       SETPOINT_BIAS_MAX) * CV.KPH_TO_MS
+          if self.setpoint_bias_on and self.setpoint_braking:
+            # min(accel, 0) so a positive blip while latched holds the bias
+            # rather than releasing it — the latch is what decides to release.
+            bias = max(min(accel, 0.0) / K_DCC, -SETPOINT_BIAS_MAX) * CV.KPH_TO_MS
             sp_target = min(v_target, v_current + bias)
 
           setpoint_error = sp_target - CS.out.cruiseState.speed
