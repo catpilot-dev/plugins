@@ -698,6 +698,9 @@ class TestPlannerHook:
     mod._baseline_ms = None
     mod._gas_floor_ms = None
     mod._road_id = ''
+    mod._ceiling_ms = None
+    mod._ceiling_rate = 0.0
+    mod._last_t = None
     return mod
 
   # helpers -------------------------------------------------
@@ -729,12 +732,25 @@ class TestPlannerHook:
                      'roadName': road, 'wayRef': ''}
 
   def _clock(self, monkeypatch, hook, t0=1000.0):
-    # planner_hook no longer uses a clock (enforcement is immediate — DCC shapes
-    # the decel, no ramp). Kept as a no-op so existing tests still read cleanly.
+    """Fake monotonic clock for the ceiling ramp. `.tick(dt)` advances it."""
+    clk = {'t': t0}
+    monkeypatch.setattr(hook.time, 'monotonic', lambda: clk['t'])
+
     class _C:
       def tick(self, dt):
-        pass
+        clk['t'] += dt
+
     return _C()
+
+  def _settle(self, hook, v_cruise, v_ego, sm, clk, ticks=600, dt=0.05):
+    """Run the hook until the ceiling has finished ramping; return the last
+    returned v_cruise. Tests that assert a STEADY-STATE cap use this; tests
+    that assert ramp behaviour drive the clock themselves."""
+    out = None
+    for _ in range(ticks):
+      clk.tick(dt)
+      out = hook.on_v_cruise(v_cruise, v_ego, sm)
+    return out
 
   # basic enforcement (non-inferred, no gas) ----------------
 
@@ -828,15 +844,16 @@ class TestPlannerHook:
     assert r >= 100 / 3.6 - 0.2       # held at current speed
     assert r > 75 / 3.6               # definitely NOT braked toward 60
 
-  def test_inferred_real_drop_new_road_slows(self, hook):
-    """road_id change → baseline resets → new lower limit enforced immediately
-    (DCC shapes the deceleration, no artificial ramp)."""
+  def test_inferred_real_drop_new_road_slows(self, hook, monkeypatch):
+    """road_id change → baseline resets → new lower limit enforced. The cap is
+    now reached by the jerk-limited ramp rather than in one tick, so settle it."""
+    clk = self._clock(monkeypatch, hook)
     self._sl(hook, 100, source=2, road='A')
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     self._sl(hook, 40, source=2, road='B')  # new road, real lower limit
-    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    r = self._settle(hook, 120 / 3.6, 100 / 3.6, self._sm(), clk)
     assert hook._baseline_ms == pytest.approx(40 * 1.15 / 3.6, abs=0.1)  # baseline reset
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # cap enforced immediately
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # cap enforced
 
   def test_inferred_recovery_allows_accel(self, hook, monkeypatch):
     """Inferred limit rises again → cap restores up, acceleration allowed."""
@@ -849,14 +866,26 @@ class TestPlannerHook:
     assert r > 60 / 3.6
 
   def test_never_speed_up_on_drop(self, hook, monkeypatch):
-    """Cap never rises above the new (lower) limit when it drops."""
+    """A drop may only lower the cap.
+
+    This used to assert the cap is never above the new target, which was the
+    same statement as "never rises" only while enforcement was instant. The
+    ceiling now ramps, so it legitimately sits above the new target for the
+    length of the ramp. What must still hold on every tick: the cap never
+    RISES, and it never exceeds the incoming v_cruise — then it settles on
+    the new target."""
     clk = self._clock(monkeypatch, hook)
     self._sl(hook, 100, source=2, road='A')
-    hook.on_v_cruise(120 / 3.6, 50 / 3.6, self._sm())
-    clk.tick(0.1)
+    prev = hook.on_v_cruise(120 / 3.6, 50 / 3.6, self._sm())
     self._sl(hook, 60, source=2, road='A')
-    r = hook.on_v_cruise(120 / 3.6, 50 / 3.6, self._sm())
-    assert r <= 60 * 1.15 / 3.6 + 0.1   # never above the dropped limit's target
+    r = prev
+    for _ in range(600):
+      clk.tick(0.05)
+      r = hook.on_v_cruise(120 / 3.6, 50 / 3.6, self._sm())
+      assert r <= prev + 1e-9, 'cap rose during a drop'
+      assert r <= 120 / 3.6 + 1e-9, 'returned above the incoming v_cruise'
+      prev = r
+    assert r <= 60 * 1.15 / 3.6 + 0.1   # settles at the dropped limit's target
 
   def test_inferred_gas_release_holds_speed(self, hook, monkeypatch):
     """Ramp 40, gas to 60, release → hold 60, no brake-back."""
@@ -933,15 +962,30 @@ class TestPlannerHook:
 
   # baseline floor requires a road identity ------------------
 
-  def test_empty_road_id_disables_baseline_hold(self, hook):
+  def test_empty_road_id_disables_baseline_hold(self, hook, monkeypatch):
     """No OSM identity (road_id='') → baseline hold invalid → the inferred/vision
-    cap is enforced immediately (route 3a1 unnamed motorway_link ramp)."""
+    cap is enforced, not held off (route 3a1 unnamed motorway_link ramp). The
+    cap arrives by ramp now, so settle it before asserting."""
+    clk = self._clock(monkeypatch, hook)
     self._sl(hook, 100, source=2, road='')          # unnamed way
     hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
     self._sl(hook, 40, source=2, road='')           # vision cap → 40, still unnamed
-    r = hook.on_v_cruise(120 / 3.6, 100 / 3.6, self._sm())
+    r = self._settle(hook, 120 / 3.6, 100 / 3.6, self._sm(), clk)
     assert hook._baseline_ms is None                # baseline not built without identity
-    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # enforced immediately, not held
+    assert r == pytest.approx(40 * 1.15 / 3.6, abs=0.1)   # enforced, not held
+
+  def test_floors_track_the_raw_limit_not_the_ramped_ceiling(self, hook, monkeypatch):
+    """The baseline floor means "highest limit seen on this road". If it
+    tracked the ceiling instead, a mid-ramp reading would bake the ramp's
+    transient into the floor and the hold would drift."""
+    clk = self._clock(monkeypatch, hook)
+    self._sl(hook, 100, source=2, road='A')
+    hook.on_v_cruise(40.0, 30.0, self._sm())
+    assert hook._baseline_ms == pytest.approx(100 * 1.10 / 3.6, abs=0.01)
+    self._sl(hook, 60, source=2, road='A')     # spurious drop, same road
+    clk.tick(0.05)
+    hook.on_v_cruise(40.0, 30.0, self._sm())
+    assert hook._baseline_ms == pytest.approx(100 * 1.10 / 3.6, abs=0.01)
 
   def test_named_road_id_keeps_baseline_hold(self, hook, monkeypatch):
     """With a road identity, spurious same-road drops are still held (unchanged)."""
