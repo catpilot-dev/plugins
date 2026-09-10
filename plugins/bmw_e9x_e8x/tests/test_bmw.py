@@ -651,11 +651,14 @@ class TestSetpointBias:
   SZL_TICK = 0.2
   STEP = 0.01
   KPH = 1 / 3.6
-  # What DCC actually drops per minus5 burst in these harnesses. Deliberately
-  # the top of the measured 5-8 km/h range (9 was seen on 45b), and above
-  # MINUS5_YIELD_KMH, so the pending ledger is always tested against a yield
-  # larger than it credited.
-  SIM_MINUS5_YIELD = 10.0
+  @staticmethod
+  def _sim_minus5(sp_kmh):
+    """What DCC really does on minus5: snap down to the next multiple of 10
+    strictly below, on the CLUSTER value. Exact on 54 of 54 measured landings.
+    The harnesses model this rather than a fixed drop, because the drop is
+    1-10 km/h depending only on where the setpoint already sits."""
+    raw = round(sp_kmh + 2)
+    return 10 * ((raw - 1) // 10) - 2
 
   @pytest.fixture(autouse=True)
   def _mocks(self, monkeypatch):
@@ -709,8 +712,7 @@ class TestSetpointBias:
     sp_true = setpoint
     sp_obs = sp_true
     slot_acts, tobs = set(), 0.0
-    YIELD = {'minus1': -1.0, 'minus5': -self.SIM_MINUS5_YIELD,
-             'plus1': 1.0, 'plus5': 5.0}
+    YIELD = {'minus1': -1.0, 'plus1': 1.0, 'plus5': 5.0}
     settle_vt = v_target if v_target_kmh is not None else v_ego
     for phase_dur, a, vt0 in [(1.0, 0.0, settle_vt), (dur, accel, v_target)]:
       elapsed = 0.0
@@ -722,7 +724,10 @@ class TestSetpointBias:
           szl = (szl + 1) % 15
           for name in ('minus5', 'minus1', 'plus5', 'plus1'):
             if name in slot_acts:
-              sp_true = max(0.0, sp_true + YIELD[name] * self.KPH)
+              if name == 'minus5':
+                sp_true = max(0.0, self._sim_minus5(sp_true / self.KPH) * self.KPH)
+              else:
+                sp_true = max(0.0, sp_true + YIELD[name] * self.KPH)
               break
           slot_acts = set()
         if t - tobs >= 0.20:
@@ -783,27 +788,63 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-1.2, v_ego_kmh=86.0, setpoint_kmh=90.0)
     assert 'minus5' in acts, acts
 
-  def test_step5_threshold_covers_the_worst_case_yield(self):
-    """DECEL_STEP5_KMH must be at least MINUS5_YIELD_KMH, because minus5's
-    yield is not a number. minus1 is a step (1.0 km/h flat for any burst from
-    60 to 300 ms); minus5 is a ramp that runs until DCC observes the release,
-    and SZL idles at 5 Hz, so a 50 ms assertion keeps stepping for up to 200 ms
-    more — 5 to 8 km/h from identical 2-frame bursts, 9 at the cut-in on 45b.
-
-    Firing it on a smaller error therefore overshoots by an amount nobody can
-    predict. A threshold above the worst case makes undershoot the failure mode
-    instead, and undershoot is safe: minus1 finishes the job deterministically.
-
-    The step choice still follows the error, not the demand: the same shallow
-    -0.25 ask draws minus1 at 4 km/h of error and at 9.
-    """
+  def test_minus5_landing_is_the_next_multiple_of_ten_below(self):
+    """minus5 does not subtract a fixed amount — it snaps the setpoint down to
+    the next multiple of 10 strictly below, on the CLUSTER value. These pairs
+    are measured landings from routes 454/455/459/45b (54 of 54 exact)."""
     import bmw.carcontroller as mod
-    assert mod.DECEL_STEP5_KMH >= mod.MINUS5_YIELD_KMH
-    for setpoint in (87.5, 92.0):
-      acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=setpoint)
-      assert 'minus1' in acts and 'minus5' not in acts, (setpoint, acts)
+    from bmw.values import CruiseSettings
+    off = CruiseSettings.CLUSTER_OFFSET
+    for before_cluster, after_cluster in [(70, 60), (71, 70), (77, 70), (55, 50),
+                                          (65, 60), (101, 100), (94, 90),
+                                          (68, 60), (54, 50), (60, 50)]:
+      got = mod.minus5_landing_kmh(before_cluster - off)
+      assert got == after_cluster - off, (before_cluster, after_cluster, got + off)
 
-  # ---- the Schmitt trigger on the command gate ---------------------------
+  def test_minus5_only_fires_when_it_lands_at_or_above_the_target(self):
+    """The overshoot guard is exact, not a threshold: minus5 is used precisely
+    when its landing point does not go past the target. Same demand, same error
+    size — only the grid position differs.
+
+    accel -0.25 -> bias 2.5 km/h -> sp_target = vEgo - 2.5.
+    """
+    # vEgo 86 -> target 83.5. Setpoint 88 (cluster 90) lands on cluster 80,
+    # i.e. 78 — well past the target, so minus5 must NOT be used.
+    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=88.0)
+    assert 'minus5' not in acts, acts
+    # vEgo 86 -> target 83.5. Setpoint 92 (cluster 94) lands on cluster 90,
+    # i.e. 88 — still above the target, so minus5 fits and should be used.
+    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=92.0)
+    assert 'minus5' in acts, acts
+
+  def test_pending_is_credited_the_real_drop_not_a_constant(self):
+    """The ledger books what minus5 will actually take, which is the distance
+    to the landing point and varies 1-10 km/h with the grid position. Booking a
+    constant would understate the remaining error on a small drop (a silent
+    law) and overstate it on a large one (a second burst too early)."""
+    import bmw.carcontroller as mod
+    cc, _ = self._fresh_cc()
+    # setpoint 92 -> cluster 94 -> lands on cluster 90, i.e. 88. Drop is 4.
+    land = mod.minus5_landing_kmh(92.0)
+    assert land == 88.0, land
+    # Stop after exactly one booked decision. The concordance latch needs
+    # DV_WINDOW of vTarget history first, so the first decel decision lands at
+    # t = 0.4 s and the next at 0.6; 45 frames sits between them. Run longer
+    # and the next slot correctly adds a minus1 on top of the remaining error.
+    acts, _, _, _ = self._hold(cc, -0.25, 92.0, 0.0, 45, v_ego_kmh=86.0)
+    assert 'minus5' in acts, acts
+    assert cc.setpoint_pending == pytest.approx(92.0 - land, abs=0.01), (
+      f"credited {cc.setpoint_pending:.1f}, real drop {92.0 - land:.1f}")
+
+  def test_minus5_never_overshoots_whatever_the_grid_position(self):
+    """Sweep the setpoint across a whole grid period. Whenever minus5 is used,
+    its landing point must be at or above the target — for every phase."""
+    import bmw.carcontroller as mod
+    for setpoint in [86.0 + d for d in range(0, 10)]:
+      acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=setpoint)
+      if 'minus5' in acts:
+        land = mod.minus5_landing_kmh(setpoint)
+        assert land >= 86.0 - 2.5 - 0.01, (setpoint, land)
 
   def _fresh_cc(self):
     """A CarController with the bias law on, for tests that drive it directly."""
@@ -829,8 +870,7 @@ class TestSetpointBias:
     With respond=True the setpoint answers at DCC's one-yield-per-slot rate, so
     the loop can actually converge; otherwise it is pinned."""
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    YIELD = {'minus1': -1.0, 'minus5': -self.SIM_MINUS5_YIELD,
-             'plus1': 1.0, 'plus5': 5.0}
+    YIELD = {'minus1': -1.0, 'plus1': 1.0, 'plus5': 5.0}
     acts, t, sp = set(), t0, setpoint_kmh
     vt = v_ego_kmh * self.KPH
     slot, slot_acts, travel = None, set(), 0.0
@@ -841,8 +881,9 @@ class TestSetpointBias:
       if slot is not None and k != slot and respond:
         for name in ('minus5', 'minus1', 'plus5', 'plus1'):
           if name in slot_acts:
-            sp += YIELD[name]
-            travel += abs(YIELD[name])
+            new = self._sim_minus5(sp) if name == 'minus5' else sp + YIELD[name]
+            travel += abs(new - sp)
+            sp = new
             break
         slot_acts = set()
       slot = k
@@ -1018,8 +1059,7 @@ class TestSetpointBias:
     CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
     CP.minEnableSpeed = 30 / 3.6
     cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
-    YIELD = {'minus1': -1.0, 'minus5': -self.SIM_MINUS5_YIELD,
-             'plus1': 1.0, 'plus5': 5.0}
+    YIELD = {'minus1': -1.0, 'plus1': 1.0, 'plus5': 5.0}
     v_ego = v_ego_kmh * self.KPH
     vt0 = (v_target_kmh if v_target_kmh is not None else v_ego_kmh)
     sp_true = setpoint_kmh
@@ -1041,10 +1081,14 @@ class TestSetpointBias:
           if respond:
             for n in ('minus5', 'minus1', 'plus5', 'plus1'):
               if n in slot_acts:
-                queued.append((t + STEP_LATENCY, YIELD[n])); break
+                queued.append((t + STEP_LATENCY, n)); break
           slot_acts = set()
         while queued and queued[0][0] <= t:
-          sp_true = max(0.0, sp_true + queued.pop(0)[1])
+          n = queued.pop(0)[1]
+          # minus5 snaps to the grid, so the drop depends on where the setpoint
+          # is when it lands, not on when it was queued.
+          sp_true = max(0.0, self._sim_minus5(sp_true) if n == 'minus5'
+                        else sp_true + YIELD[n])
         if t - tobs >= 0.20:
           tobs, sp_obs = t, sp_true
         _, msgs = cc.update(make_stalk_carcontrol(a, vt),
@@ -1062,45 +1106,19 @@ class TestSetpointBias:
 
   def test_pending_stops_a_second_minus5_before_the_first_is_visible(self):
     """The setpoint is only reported back at ~5 Hz. Without discounting what is
-    already in flight, a 10 km/h error draws minus5 in two consecutive slots and
-    overshoots by a whole yield.
-
-    The harness drops SIM_MINUS5_YIELD per burst, deliberately MORE than
-    MINUS5_YIELD_KMH credits. That is the dangerous direction — DCC ramping
-    further than the ledger booked — and the discount still has to hold.
+    already in flight, a large error draws minus5 in consecutive slots and
+    overshoots by a whole grid step. The credit is now the REAL drop — the
+    distance to the landing point — not an estimate, so the discount is exact.
     """
     import bmw.carcontroller as mod
     _, sent, max_pending, _, sp_min = self._drive(accel=-2.0, v_ego_kmh=86.0,
                                                   setpoint_kmh=95.0, seconds=1.5)
     assert any('minus5' in n for _, n in sent), "expected a minus5 for this error"
     floor = 86.0 - mod.SETPOINT_BIAS_MAX
-    # without the discount the setpoint runs a second full yield past the floor
-    assert sp_min >= floor - self.SIM_MINUS5_YIELD - 1.0, (
-      f"setpoint reached {sp_min:.1f}, more than one yield past the {floor:.1f} floor")
-    assert max_pending <= 2 * mod.MINUS5_YIELD_KMH + 1.0, (
+    assert sp_min >= floor - mod.MINUS5_GRID_KMH - 1.0, (
+      f"setpoint reached {sp_min:.1f}, more than one grid step past {floor:.1f}")
+    assert max_pending <= 2 * mod.MINUS5_GRID_KMH + 1.0, (
       f"pending reached {max_pending:.1f}")
-
-  def test_under_delivery_against_the_credit_does_not_stall_the_law(self):
-    """MINUS5_YIELD_KMH is the TOP of the measured 5-8 km/h range, so on a
-    typical burst DCC delivers less than the ledger booked. That must be a
-    brief under-command, not a stall: the readback clears pending as soon as
-    the real drop is visible, and PENDING_TIMEOUT covers the case where it
-    never is.
-
-    Simulated here at the bottom of the range — DCC yields 5 where 8 was
-    credited — which is the largest shortfall the measurements support.
-    """
-    import bmw.carcontroller as mod
-    real = self.SIM_MINUS5_YIELD
-    try:
-      self.SIM_MINUS5_YIELD = 5.0
-      _, sent, _, _, _ = self._drive(accel=-2.0, v_ego_kmh=86.0,
-                                     setpoint_kmh=95.0, seconds=2.5)
-    finally:
-      self.SIM_MINUS5_YIELD = real
-    assert sent, "went silent entirely"
-    late = [t for t, _ in sent if t > 1.2]
-    assert late, "stopped commanding after the first burst was over-credited"
 
   def test_at_most_one_command_decision_per_slot(self):
     """Deciding every 10 ms cycle instead of once per SZL slot books a yield per
@@ -1335,11 +1353,14 @@ class TestSetpointDebtLedger:
   SZL_TICK = 0.2
   STEP = 0.01
   KPH = 1 / 3.6
-  # What DCC actually drops per minus5 burst in these harnesses. Deliberately
-  # the top of the measured 5-8 km/h range (9 was seen on 45b), and above
-  # MINUS5_YIELD_KMH, so the pending ledger is always tested against a yield
-  # larger than it credited.
-  SIM_MINUS5_YIELD = 10.0
+  @staticmethod
+  def _sim_minus5(sp_kmh):
+    """What DCC really does on minus5: snap down to the next multiple of 10
+    strictly below, on the CLUSTER value. Exact on 54 of 54 measured landings.
+    The harnesses model this rather than a fixed drop, because the drop is
+    1-10 km/h depending only on where the setpoint already sits."""
+    raw = round(sp_kmh + 2)
+    return 10 * ((raw - 1) // 10) - 2
 
   @pytest.fixture(autouse=True)
   def _mocks(self, monkeypatch):

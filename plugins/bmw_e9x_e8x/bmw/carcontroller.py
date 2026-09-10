@@ -221,49 +221,28 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 # whole yield of room: overshoot-free by construction. That is a deliberate
 # trade of authority for smoothness, taken from the seat after route 455.
 #
-# This must be at least minus5's WORST-CASE yield, because that yield is not a
-# number. minus1 is a step: 1.0 km/h flat for any burst from 60 to 300 ms
-# (n=104 isolated bursts). minus5 is a RAMP. Our SINGLE burst asserts it for
-# 50 ms at 20 Hz, but SZL idles at 5 Hz, so DCC cannot see the release for up
-# to 200 ms and keeps stepping the setpoint through that blind window —
-# measured 5 to 8 km/h from identical 2-frame bursts (median 6, ~24 steps/s),
-# up to 18 on longer ones, growing ~16 km/h per extra second held. What sets
-# the size is where the burst lands in the SZL phase, not how many frames we
-# send.
+# minus5 does not subtract a fixed amount. It SNAPS the setpoint down to the
+# next multiple of MINUS5_GRID_KMH strictly below where it is:
 #
-# So "threshold equals yield" is unachievable and firing it on a smaller error
-# overshoots by an amount we cannot predict, all inside one slot.
+#     land = 10 * floor((setpoint - 1) / 10)          [cluster units]
 #
-# Route 45b at 10:27:27, a minivan cutting in: error 5.6 km/h, minus5 fired,
-# setpoint went 77 -> 68 against a target of 70.8 — a 9 km/h yield, the top of
-# the range. That is 3.4 km/h of setpoint the planner never asked for, about
-# 0.3 m/s² of extra decel arriving as a step on top of a -0.6 m/s² demand, and
-# it is what a step in brake pressure sounds like from the seat. (Wheel speeds
-# off 0x0CE show no slip anywhere on that route: spread across the four wheels
-# p99.9 = 1.75 km/h. carState.wheelSpeeds is empty on this car; decode 0x0CE.)
+# Measured exact on 54 of 54 isolated landings across 454/455/459/45b. So the
+# drop is 1 to 10 km/h and is decided entirely by where the setpoint already
+# sits — from 71 you get 1 km/h, from 70 you get 10, same command. Observed
+# drops were near-uniform over that range, which is why every attempt to
+# calibrate a single MINUS5_YIELD_KMH kept landing on a different number (10,
+# then 8, then a measured median of 6): there was never a constant to find.
 #
-# At a threshold of 5, minus5 fired with the error under 10 km/h on 89% of
-# bursts on 459 and 73% on 45b. Setting the threshold above the worst observed
-# yield makes UNDERSHOOT the failure mode instead, which is safe: minus1 is
-# deterministic and finishes the job at 1 km/h per slot.
+# minus1, by contrast, is a true step: 1.0 km/h flat for any burst from 60 to
+# 300 ms (n=104 isolated bursts), repeating only past 300 ms.
 #
-# It was lowered to 5 to stop minus1 grinding at large errors. The Schmitt
-# trigger on the command gate now covers that case instead — the narrow hold
-# band works an error down rather than abandoning it — so the reason is
-# superseded. Replay over 459 + 45b: +12% minus1 slots, flips unchanged.
-#
-# (An earlier note here argued from bench gain, 68% at a threshold of 5 against
-# 51% at 10, and told the reader to judge the next drive by driver-brake rate.
-# Ignore both. Neither metric resolves differences of that size — see the
-# route-table warning in DESIGN.md.)
-DECEL_STEP5_KMH = 10.0         # km/h of remaining error at or above which minus5 is used
-# Not a median — the high end of the measured 5-8 km/h range, deliberately.
-# This is credited to setpoint_pending the moment a minus5 is sent, and pending
-# is subtracted from the remaining error. Over-crediting makes the next slot
-# ask for less than it might need (a brief under-command, corrected as soon as
-# the real drop is read back); under-crediting would stack a second command on
-# top of a yield still in flight. Bias toward the former.
-MINUS5_YIELD_KMH = 8.0         # km/h — worst-case drop from one minus5 burst
+# Because the landing point is computable, minus5 no longer needs a threshold.
+# It is used exactly when it lands at or above the target — never overshooting
+# by construction — and the pending ledger is credited the real drop instead of
+# an estimate. That also makes it usable in cases a threshold rejected: 6 km/h
+# of error from a setpoint of 76 lands precisely on 70.
+MINUS5_GRID_KMH = 10.0         # DCC snaps to this grid on minus5
+MINUS5_MIN_USEFUL_KMH = 2.0    # below this the drop is minus1's job anyway
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
                                # Without it, a DCC that stops acting on us never
@@ -309,6 +288,19 @@ PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
 # on the 0x194 counter-overwrite axis for no measured gain in slew; it is taken
 # for robustness of the assertion against dropped frames, which is not
 # something the logs can settle either way.
+
+def minus5_landing_kmh(setpoint_kmh):
+  """Where a minus5 will actually put the setpoint, in the same units as
+  CS.out.cruiseState.speed (km/h).
+
+  DCC snaps down to the next multiple of MINUS5_GRID_KMH strictly below the
+  current value, and it does so on the CLUSTER value, so the offset has to be
+  taken off and put back. Exact on 54 of 54 measured landings.
+  """
+  raw = round(setpoint_kmh + CruiseSettings.CLUSTER_OFFSET)
+  land = MINUS5_GRID_KMH * ((raw - 1) // MINUS5_GRID_KMH)
+  return land - CruiseSettings.CLUSTER_OFFSET
+
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
@@ -670,9 +662,20 @@ class CarController(CarControllerBase):
               if (now_nanos - self.slot_decided_ns) / 1e9 >= CRUISE_STALK_IDLE_TICK_STOCK:
                 self.slot_decided_ns = now_nanos
                 err_kmh = -setpoint_error * 3.6 - self.setpoint_pending
-                if err_kmh >= DECEL_STEP5_KMH and headroom_kmh >= 5:
+                # Where minus5 would land, measured from the setpoint we expect
+                # once what is already in flight has arrived.
+                sp_eff_kmh = CS.out.cruiseState.speed * 3.6 - self.setpoint_pending
+                m5_land_kmh = minus5_landing_kmh(sp_eff_kmh)
+                m5_drop_kmh = sp_eff_kmh - m5_land_kmh
+                # Use it only when it lands at or above the target. That is the
+                # whole overshoot guard, and it is exact rather than a
+                # threshold: no drop larger than the error can ever be sent.
+                # Below MINUS5_MIN_USEFUL_KMH it would only be doing minus1's
+                # job with the jerkier command.
+                if (MINUS5_MIN_USEFUL_KMH <= m5_drop_kmh <= err_kmh
+                    and m5_land_kmh >= self.min_cruise_setpoint * 3.6):
                   self.slot_cmd = CruiseStalk.minus5
-                  self.setpoint_pending += MINUS5_YIELD_KMH
+                  self.setpoint_pending += m5_drop_kmh
                   self.setpoint_pending_ns = now_nanos
                   self.setpoint_commanding = True
                 elif err_kmh >= active_deadzone_kmh and headroom_kmh >= 1:

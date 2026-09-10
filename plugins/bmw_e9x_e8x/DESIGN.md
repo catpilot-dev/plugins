@@ -458,79 +458,58 @@ tracking, since every wander it absorbs is a restore not made. It was briefly as
 measured, so there is one constant. The reason to keep them separable if this
 is revisited: coming down is a response, going back up is a release.
 
-### minus1 is a step; minus5 is a ramp
+### minus1 is a step; minus5 snaps to a grid
 
-This is the asymmetry that matters, and it is not what the constants used to
-say. Measured over 454/455/459/45b, isolated bursts only, setpoint read off
-0x193:
+Measured over 454/455/459/45b, isolated bursts only, setpoint read off 0x193:
 
 | | behaviour | yield |
 |---|---|---|
-| minus1 | **step** — 1.0 km/h flat for any burst 60–300 ms (n=104), repeats only past 300 ms | deterministic |
-| minus5 | **ramp** — runs until DCC observes the release | **5–8 km/h**, median 6 |
-
-Why minus5 is not one 5 km/h notch: our SINGLE burst asserts it for 50 ms at
-20 Hz, but **SZL idles at 5 Hz**, so DCC cannot see the release for up to
-200 ms and keeps stepping through that blind window — about 24 steps/s. Three
-isolated bursts:
+| minus1 | **step** — 1.0 km/h flat for any burst 60–300 ms (n=104), repeats only past 300 ms | deterministic, 1 km/h |
+| minus5 | **snap** — setpoint jumps to the next multiple of 10 strictly below | deterministic, **1–10 km/h** |
 
 ```
-3 frames / 60 ms   85 → 78    drop 7
-2 frames / 50 ms   83 → 78    drop 5
-2 frames / 50 ms   64 → 58    drop 6
+land = 10 * floor((setpoint - 1) / 10)        [cluster units]
 ```
 
-What sets the size is **where the burst lands in the SZL phase**, not how many
-frames we send: identical 2-frame bursts scatter 5–8, longer ones reach 18, and
-the yield grows ~16 km/h per extra second held.
-
-So `MINUS5_YIELD_KMH` is a range, not a number. It is set to **8.0**, the top
-of it. That constant is credited to `setpoint_pending` the moment a minus5 is
-sent and subtracted from the remaining error, so over-crediting produces a
-brief under-command (corrected as soon as the real drop is read back, or by
-`PENDING_TIMEOUT`), while under-crediting would stack a second command on top
-of a yield still in flight. Bias toward the former.
-
-### minus5's threshold must cover its worst case
-
-Because the yield is a range, "threshold equals yield" is unachievable. Firing
-minus5 on a smaller error overshoots by an amount nobody can predict, all
-inside one 200 ms slot.
-
-Route 45b, 10:27:27, a minivan cutting in (the model's lead jumps 67 → 22 m as
-it switches objects):
+Exact on **54 of 54** isolated landings. Some measured pairs:
 
 ```
-1530.80   err +5.6 km/h  ->  minus5 fires    setpt 77
-1531.00                      setpt 68         yield 10 km/h
-                             sp_target 70.8   -> overshot by 2.8 km/h
+71 → 70    77 → 70    55 → 50    101 → 100
+70 → 60    68 → 60    94 →  90    60 →  50
 ```
 
-That 9 km/h is the top of the range — an unlucky SZL phase. About **0.3 m/s²
-of deceleration nobody asked for**, arriving as a step on top of a −0.6 m/s²
-demand. A 50% overshoot inside one slot is what a step in brake pressure feels
-— and sounds — like from the seat.
+So the drop is decided entirely by where the setpoint already sits: from 71 you
+get 1 km/h, from 70 you get 10, from the same command. Observed drops were
+near-uniform across 1–10, which is why every attempt to calibrate a single
+`MINUS5_YIELD_KMH` landed on a different number — 10, then 8, then a measured
+median of 6. **There was never a constant to find.** An earlier note here
+explained the scatter as a ramp running until DCC observed the release, timed
+by SZL phase; that was wrong.
 
-It was not an outlier. With the threshold at 5:
+### minus5 needs no threshold
 
-| | minus5 bursts | fired with 5 ≤ err < 10 | median overshoot |
-|---|---|---|---|
-| 459 | 56 | **89%** | 3.4 km/h → 0.32 m/s² |
-| 45b | 59 | **73%** | 3.1 km/h → 0.29 m/s² |
+Because the landing point is computable, the overshoot guard is exact rather
+than statistical:
 
-At 10 — above the worst yield ever observed — **undershoot** becomes the
-failure mode instead, and undershoot is safe: minus1 is deterministic and
-finishes the job at 1 km/h per slot. It was lowered to 5 to stop minus1 grinding at large
-errors; the Schmitt trigger on the command gate now covers that case instead,
-so the reason is superseded. Replay over 459 + 45b: +12% minus1 slots, flips
-unchanged at 4.0 and 5.3/min.
+```python
+land = minus5_landing_kmh(setpoint - pending)
+if MINUS5_MIN_USEFUL_KMH <= (setpoint - pending) - land <= err:
+    use minus5          # lands at or above the target, by construction
+```
 
-Peak `a_ego` at that cut-in was −0.99 m/s² with no brake pedal, and there was
-**no slip**: `carState.wheelSpeeds` is empty on this car, but 0x0CE (DSC)
-carries them — four 16-bit LE signed at 0.0625 kph. Over 93,048 engaged frames
-on 45b the spread across the four wheels is median 0.38, p99.9 1.75, max
-2.31 km/h, and the worst frames are axle or left/right splits from cornering,
-not lockup. So the noise is the DSC actuator, not the tyres.
+`DECEL_STEP5_KMH` and `MINUS5_YIELD_KMH` are both gone. A drop larger than the
+remaining error can no longer be sent at all, so the route-45b cut-in — error
+5.6 km/h, setpoint 77 → 68 against a target of 70.8 — is unreachable. And
+minus5 becomes usable in cases a threshold rejected: 6 km/h of error from a
+setpoint of 76 lands precisely on 70.
+
+`setpoint_pending` is credited the real drop, so the discount for what is in
+flight is exact too. Booking a constant would understate the remaining error on
+a small drop (silencing the law) and overstate it on a large one (a second
+burst too early).
+
+The floor guard is now the landing point rather than a headroom margin: minus5
+is used only if `land` is at or above `min_cruise_setpoint`.
 
 ### Both signs invert the plant
 
