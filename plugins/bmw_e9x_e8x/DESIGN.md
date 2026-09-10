@@ -388,16 +388,19 @@ Two things that do **not** work, both tried on 454's trace:
 
 ### Command selection — one decision per SZL slot
 
-What a burst is worth was measured **per burst**: neither cadence nor hold
-length moves it. Over four routes a `minus1` burst drops the setpoint 1 km/h and
-a `minus5` burst **10 km/h** (median; 2- and 3-frame bursts both land there, and
-a 1-frame burst has n=1, so the 10 is not dialable down by shortening it).
+What a burst is worth is set **per burst**: neither cadence nor hold length
+moves it. A `minus1` burst drops the setpoint exactly 1 km/h. A `minus5` burst
+snaps it to the grid — see "±1 is a step; ±5 snaps to a grid" below, which
+supersedes the fixed-yield model this section originally described.
 
 ```
-err = (setpoint_observed - sp_target) - setpoint_pending      [km/h]
-if   err >= DECEL_STEP5_KMH:   minus5
-elif err >= SETPOINT_DEADZONE: minus1
-else (err <= -deadzone):       plus1 via the restore branch
+err  = (setpoint_observed - sp_target) - setpoint_pending      [km/h]
+land = minus5_landing_kmh(setpoint_observed - setpoint_pending)
+drop = (setpoint_observed - setpoint_pending) - land
+
+if   STEP5_MIN_USEFUL_KMH <= drop <= err:  minus5    # lands at/above target
+elif err >= active_deadzone:               minus1    # deadzone is the Schmitt band
+else (err <= -SETPOINT_DEADZONE):          plus1 via the restore branch
 ```
 
 decided once per 200 ms slot and held for the rest of it, because an assertion
@@ -424,12 +427,16 @@ measured plant, 5 Hz observation — validated by `minus1`-only reproducing the
 | `minus5` at err ≥ 8 | 58% | 1.7 km/h (0.16) |
 | `minus5` at err ≥ 10 | 54% | 1.6 km/h (0.15) |
 
-`DECEL_STEP5_KMH` = 10 matches minus5's yield, so it fires only with a whole
-yield of room: overshoot-free by construction. That is a deliberate trade of
-authority for smoothness, taken from the seat after route 455, where minus5 was
-measurably the jerkiest thing the controller does — peak |d a_ego/dt| in the
-0.7 s after a burst was **3.49 m/s³** median and **6.55** at p90, against
-minus1's 2.08/3.90, plus1's 1.86/3.82 and a 0.71 baseline.
+That table is **superseded**. It swept a threshold against an assumed fixed
+yield, and there is no fixed yield: the landing test replaced the threshold
+entirely, so minus5 is overshoot-free without trading away the authority the
+`err ≥ 10` row was paying. Kept only to record that the sweep was done.
+
+minus5 does remain the jerkiest thing the controller does — peak |d a_ego/dt|
+in the 0.7 s after a burst was **3.49 m/s³** median and **6.55** at p90 on
+route 455, against minus1's 2.08/3.90, plus1's 1.86/3.82 and a 0.71 baseline.
+(Treat those as indicative: on 100 Hz `a_ego` a peak-of-window statistic is
+noise-dominated — the quiet baseline measures 8 m/s³ on the same routes.)
 
 It is binary rather than a dial: `err` rarely exceeds 8 km/h once minus1 is
 keeping up, so 8 and 10 both amount to switching minus5 off (bench 54% and 51%
