@@ -1,3 +1,5 @@
+import math
+
 from openpilot.common.constants import CV
 
 # Lead vehicle override: if lead is traveling above the speed limit,
@@ -15,6 +17,21 @@ LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
 # (no artificial ramp). See
 # docs/superpowers/specs/2026-07-10-speedlimitd-driver-intent-enforcement-design.md
 SOURCE_ROAD_TYPE_INFERENCE = 2  # _sl_data['source'] value for inferred limits
+
+# --- Jerk-limited allowed-speed ceiling ---
+# The enforced target does not jump between limits; it slides under a
+# trapezoidal acceleration profile so both its value and its slope are
+# continuous. Setpoint GAP is what drives DCC deceleration on this car
+# (corr +0.746), so a step change in the target is a brake spike — three of
+# them for an 80 -> 40 drop under the old fixed-time ladder.
+# Descent is tightly jerk-limited (braking jerk is the complaint); ascent is
+# brisk (acceleration is not). DCC caps real acceleration near +0.5 m/s², so
+# CEIL_A_UP above ~0.6 simply releases the cap as fast as the car can use it.
+CEIL_A_DOWN = 0.8    # m/s²  peak descent rate — matches speedlimitd's COMFORT_BRAKE
+CEIL_J_DOWN = 0.5    # m/s³  jerk limit on the descent
+CEIL_A_UP = 1.5      # m/s²  peak ascent rate
+CEIL_J_UP = 1.0      # m/s³  jerk limit on the ascent
+CEIL_DT_MAX = 0.2    # s     dt clamp (plannerd ticks at DT_MDL = 0.05)
 
 _sl_sub = None
 _sl_data = None
@@ -61,6 +78,53 @@ def _effective_offset_percent(speed_limit_kph):
     return 15
   else:
     return 10
+
+
+def _advance_ceiling(ceiling_ms, rate_ms2, target_ms, dt):
+  """Advance the allowed-speed ceiling one tick toward target_ms.
+
+  Returns (ceiling_ms, rate_ms2). A pure function of its arguments and the
+  CEIL_* constants — no vehicle state, no clock — so the trajectory for a
+  given limit change is always the same.
+
+  The profile is trapezoidal in acceleration: the slope ramps in at the jerk
+  limit, holds at the peak, then ramps back out so the ceiling arrives at the
+  target with zero slope. Every tick changes the slope by at most j_max·dt,
+  including the last one — an arrival that zeroes a leftover slope is itself
+  the brake spike this profile exists to remove.
+  """
+  if dt <= 0.0:
+    return ceiling_ms, rate_ms2
+
+  err = target_ms - ceiling_ms
+  if err == 0.0 and rate_ms2 == 0.0:
+    return ceiling_ms, rate_ms2
+
+  descending = err < 0.0
+  a_max, j_max = (CEIL_A_DOWN, CEIL_J_DOWN) if descending else (CEIL_A_UP, CEIL_J_UP)
+  dj = j_max * dt
+
+  # The fastest slope we may still carry and bleed to zero inside the error
+  # that will remain AFTER this tick's travel. Budgeting against the error we
+  # have *now* is optimistic by one tick, and the shortfall compounds: the
+  # bleed starts late, and the ceiling lands on the target with slope still on
+  # it (measured: −0.15 m/s² left at arrival, 6× the jerk step).
+  reach = math.sqrt(2.0 * j_max * max(0.0, abs(err) - abs(rate_ms2) * dt))
+  want = min(a_max, reach)
+  if descending:
+    want = -want
+
+  rate_ms2 += max(-dj, min(dj, want - rate_ms2))
+  ceiling_ms += rate_ms2 * dt
+
+  # Discrete integration can still step past the target. Pin the value there
+  # and let the slope bleed out over the following ticks rather than zeroing
+  # it outright.
+  if (target_ms - ceiling_ms < 0.0) != descending:
+    ceiling_ms = target_ms
+  if ceiling_ms == target_ms and abs(rate_ms2) <= dj:
+    rate_ms2 = 0.0
+  return ceiling_ms, rate_ms2
 
 
 def _lead_overrides_limit(sm, speed_limit_kph):

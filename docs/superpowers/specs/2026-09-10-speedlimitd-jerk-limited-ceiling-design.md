@@ -74,7 +74,6 @@ CEIL_A_DOWN  = 0.8   # m/s²  peak descent rate — matches speedlimitd's COMFOR
 CEIL_J_DOWN  = 0.5   # m/s³  jerk limit on the descent; this is the whole point
 CEIL_A_UP    = 1.5   # m/s²  ascent: brisk, per "acceleration is fine"
 CEIL_J_UP    = 1.0   # m/s³
-CEIL_SNAP_MS = 0.05  # m/s   close-enough epsilon
 CEIL_DT_MAX  = 0.2   # s     dt clamp (plannerd runs at DT_MDL = 0.05)
 ```
 
@@ -84,23 +83,54 @@ Per tick, after `target_ms` is computed and **before** the hold floors:
 if _ceiling_ms is None or safety_capped:
     _ceiling_ms, _ceiling_rate = target_ms, 0.0     # immediate — safety bypasses the ramp
 else:
-    dt   = clamp(now - _last_t, 0.0, CEIL_DT_MAX)
-    err  = target_ms - _ceiling_ms
-    a, j = (CEIL_A_DOWN, CEIL_J_DOWN) if err < 0 else (CEIL_A_UP, CEIL_J_UP)
-    stop = _ceiling_rate ** 2 / (2 * j)             # Δv needed to bleed rate to 0 at j
-    want = 0.0 if abs(err) <= stop else copysign(a, err)
-    _ceiling_rate += clamp(want - _ceiling_rate, -j * dt, j * dt)
-    _ceiling_ms   += _ceiling_rate * dt
-    if abs(target_ms - _ceiling_ms) < CEIL_SNAP_MS and abs(_ceiling_rate) < 0.1:
-        _ceiling_ms, _ceiling_rate = target_ms, 0.0
+    dt = clamp(now - _last_t, 0.0, CEIL_DT_MAX)
+    _ceiling_ms, _ceiling_rate = _advance_ceiling(_ceiling_ms, _ceiling_rate, target_ms, dt)
 ```
 
-The `stop` term is the braking-distance test in velocity space: it starts
-bleeding the rate toward zero early enough that the ceiling arrives at the
-target with zero slope, so there is no overshoot and no discontinuity at
-arrival.
+and `_advance_ceiling` is:
 
-Resulting 80 → 40 km/h (Δv = 11.1 m/s): **~15 s**, ramp-in 1.6 s, hold at
+```python
+err = target_ms - ceiling_ms
+descending = err < 0.0
+a_max, j_max = (CEIL_A_DOWN, CEIL_J_DOWN) if descending else (CEIL_A_UP, CEIL_J_UP)
+dj = j_max * dt
+
+reach = sqrt(2 * j_max * max(0.0, abs(err) - abs(rate) * dt))
+want  = -min(a_max, reach) if descending else min(a_max, reach)
+
+rate    += clamp(want - rate, -dj, +dj)
+ceiling += rate * dt
+
+if ceiling passed target:            # discrete integration overshoot
+    ceiling = target_ms              # pin the value…
+if ceiling == target_ms and abs(rate) <= dj:
+    rate = 0.0                       # …and only zero the slope once it is within one jerk step
+```
+
+### Why the stop budget looks one tick ahead
+
+`reach` is the fastest slope we may still carry and bleed to zero inside the
+error that will remain **after** this tick's travel — note the
+`abs(err) - abs(rate)*dt`.
+
+The textbook form, `sqrt(2·j·|err|)`, budgets against the error we have *now*.
+That is optimistic by exactly one tick, and the shortfall compounds: the bleed
+starts late, the ceiling reaches the target with slope still on it, and the
+arrival has to zero that slope in a single step. Measured on an 88 → 46 km/h
+descent at dt = 0.05: the ceiling landed carrying −0.15 m/s², a **6×** jerk-limit
+violation on the final tick — the exact discontinuity this whole design exists
+to remove, relocated to the end of the ramp. A half-jerk-step correction
+(`sqrt(2j|err| + (j·dt)²/4) − j·dt/2`) narrows it to 1.7× but does not close it.
+
+The look-ahead form is jerk-compliant on every tick, verified across 80→40,
+40→80, 80→60, 90→40 and a 1 km/h nudge, at both dt = 0.05 and the dt = 0.2
+clamp. It costs ~0.2 s of ramp length.
+
+Pinning the value on overshoot while letting the slope bleed out over the
+following ticks is the same principle applied to the other end: a hard
+`rate = 0` on arrival is a discontinuity even when the value is already correct.
+
+Resulting 80 → 40 km/h (Δv = 11.1 m/s): **~16 s**, ramp-in 1.6 s, hold at
 0.8 m/s², ramp-out 1.6 s. Slower than today's 9 s, but with no spikes — the
 peak demand falls from ~5.3 m/s of instantaneous gap to a steady 0.8 m/s².
 
