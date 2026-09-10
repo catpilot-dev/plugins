@@ -110,30 +110,6 @@ def snap_to_standard_speed(speed: int) -> int:
   return min(_STANDARD_SPEEDS, key=lambda s: abs(s - speed))
 
 
-# Gradual transition timing (seconds per step)
-_STEP_DOWN_INTERVAL = 3.0  # downgrade: 80 → 60 → 50 → 40 (3s per step)
-_STEP_UP_INTERVAL = 2.0    # upgrade:   40 → 50 → 60 → 80 (2s per step)
-
-
-def _step_speed_limit(current: int, target: int) -> int:
-  """Move current one step toward target in _STANDARD_SPEEDS.
-
-  Returns the next standard speed in the direction of target,
-  or target itself if already adjacent or equal.
-  """
-  if current == target or current == 0:
-    return target
-
-  if target < current:
-    # Step down: find the next lower standard speed
-    lower = [s for s in _STANDARD_SPEEDS if s < current]
-    return max(lower) if lower else target
-  else:
-    # Step up: find the next higher standard speed
-    higher = [s for s in _STANDARD_SPEEDS if s > current]
-    return min(higher) if higher else target
-
-
 def _near_road_edge(model_msg) -> tuple[bool, bool]:
   """Check if the car is near the left or right road edge.
 
@@ -893,10 +869,9 @@ class SpeedLimitMiddleware:
     self._react_last_t: float = 0.0       # monotonic time of last reactive tick
     self._react_livepose_last_t: float = 0.0  # monotonic time livePose last updated
 
-    # Gradual speed limit transition — step through standard speeds one level
-    # at a time instead of jumping directly (e.g. 80 → 60 → 50 → 40).
+    # The published limit. Transitions are NOT shaped here — planner_hook ramps
+    # the enforced ceiling. This is the sign value: what the road says, now.
     self._displayed_speed_limit: int = 0
-    self._last_step_time: float = 0.0
 
     # GPS state
     self._gps_lat: float = 0.0
@@ -1634,31 +1609,18 @@ class SpeedLimitMiddleware:
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
 
-    # --- Gradual speed limit transition ---
-    # Curvature cap bypasses gradual transition — it's safety-critical and must
-    # apply immediately. The gradual ramp only applies to road-type / YOLO changes.
+    # --- Publish the fused limit directly ---
+    # No transition shaping here. The daemon answers "what is the limit";
+    # planner_hook owns "how we get there" and ramps the enforced ceiling under
+    # a jerk limit. The ladder that used to live here set both, which meant the
+    # sign's step interval was also the brake schedule.
     # OSM-sourced base carries the exact posted value — the CN ladder would
-    # round a US 45 mph (72 km/h) limit UP to 80. Round to 5 km/h and step
-    # ±10 toward it; all other sources keep the CN-ladder snap/step.
+    # round a US 45 mph (72 km/h) limit UP to 80, so round to 5 km/h instead.
     osm_display = osm_base and source == 2
     if osm_display:
-      target = int(round(speed_limit / 5.0) * 5)
+      self._displayed_speed_limit = int(round(speed_limit / 5.0) * 5)
     else:
-      target = snap_to_standard_speed(int(speed_limit))
-    if self._displayed_speed_limit == 0:
-      # First reading — set immediately
-      self._displayed_speed_limit = target
-      self._last_step_time = now
-    elif target != self._displayed_speed_limit:
-      interval = _STEP_DOWN_INTERVAL if target < self._displayed_speed_limit else _STEP_UP_INTERVAL
-      if now - self._last_step_time >= interval:
-        if osm_display:
-          step = 10 if target > self._displayed_speed_limit else -10
-          nxt = self._displayed_speed_limit + step
-          self._displayed_speed_limit = min(nxt, target) if step > 0 else max(nxt, target)
-        else:
-          self._displayed_speed_limit = _step_speed_limit(self._displayed_speed_limit, target)
-        self._last_step_time = now
+      self._displayed_speed_limit = snap_to_standard_speed(int(speed_limit))
 
     # Safety cap override — clamp displayed limit immediately (bypass gradual
     # transition) so a tightening curve cap takes effect without lag. Both the

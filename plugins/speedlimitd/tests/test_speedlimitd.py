@@ -2632,33 +2632,29 @@ class TestGsDistanceGuardedRelease:
 
   # ================= F6 — kept-code robustness (review) ====================
 
-  def test_oscillation_ladder_damps_displayed_limit(self, sld, monkeypatch):
+  def test_gs_oscillation_does_not_corrupt_release_state(self, sld, monkeypatch):
     """Release → genuine G/S re-match (re-promote, margin count reset) → fresh
-    divergence → re-release, repeated. The inferenceMode flag may oscillate, but
-    _displayed_speed_limit only ever moves ONE standard-ladder rung per step
-    interval (3 s down / 2 s up) — it never teleports 100→60 and back (review
-    F3, the ladder damping)."""
+    divergence → re-release, repeated. inferenceMode may oscillate; the release
+    bookkeeping must stay coherent through it.
+
+    This test used to also assert two things about _displayed_speed_limit: that
+    it never moved more than one standard rung per step interval, and that it
+    never cliffed to the released 60. Both were measuring the display ladder,
+    which is gone — the daemon now publishes the fused limit directly, so it
+    does show 60 on a release. The car not cliffing is the enforced ceiling's
+    job now; that is covered in tests/test_planner_hook.py
+    (test_drop_does_not_jump, test_drop_is_monotonic_and_never_speeds_up)."""
     mw = self._mw(sld)
     mw.lane_count_stable = 3
     clock = {'t': 20000.0}
     monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
-    STD = sld._STANDARD_SPEEDS
-    displayed = []
     self._hold_s1(mw)
-    displayed.append(mw._displayed_speed_limit)
     for _ in range(3):
       self._diverge(mw, clock, held_dist=13.5, matched_dist=0.6)
-      displayed.append(mw._displayed_speed_limit)
       self._diverge(mw, clock, held_dist=17.0, matched_dist=0.6)
-      displayed.append(mw._displayed_speed_limit)
       assert mw._gs_force_release is True
       self._hold_s1(mw)                          # genuine re-match re-promotes
-      displayed.append(mw._displayed_speed_limit)
       assert mw._gs_margin_since is None            # reset on the re-match
-    # No teleport: consecutive displayed limits are equal or exactly one rung apart.
-    for a, b in zip(displayed, displayed[1:]):
-      assert abs(STD.index(a) - STD.index(b)) <= 1, f'displayed teleported {a}->{b}'
-    assert min(displayed) >= 80                  # never cliffed to the released 60
 
   def test_held_ref_transitions_s1_to_s20(self, sld, monkeypatch):
     """Held on S1, then S20 (a different expressway) matches → _gs_held_ref
@@ -3018,14 +3014,16 @@ class TestOsmBaseSelection:
     assert pub['inferenceMode'] == 'osm'
     assert pub['speedLimit'] == 100
 
-  def test_osm_step_is_plus_minus_10(self, sld):
+  def test_osm_rounds_to_5_not_the_cn_ladder(self, sld):
+    """OSM carries the exact posted value, so it rounds to 5 km/h — the CN
+    ladder would round a US 45 mph (72 km/h) limit UP to 80. The transition
+    itself is no longer shaped here; planner_hook ramps the enforced ceiling."""
     mw = self._mw_for_update(sld)
-    self._arm(mw, 65.0)
-    mw._displayed_speed_limit = 105   # previously showing 105
-    mw._last_step_time = 0.0          # step interval elapsed
+    self._arm(mw, 72.0)
+    mw._displayed_speed_limit = 105   # a previous, unrelated reading
     mw.update()
     pub = mw._sl_pub.send.call_args[0][0]
-    assert pub['speedLimit'] == 95    # one −10 step toward 65, not a ladder jump
+    assert pub['speedLimit'] == 70    # applied at once, rounded to 5
 
   def test_publish_carries_osm_fields(self, sld):
     mw = self._mw_for_update(sld)
