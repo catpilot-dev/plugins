@@ -502,6 +502,48 @@ median of 6. **There was never a constant to find.** An earlier note here
 explained the scatter as a ramp running until DCC observed the release, timed
 by SZL phase; that was wrong.
 
+### minus5 is released after two frames
+
+One press is all minus5 needs, and holding it longer makes DCC auto-repeat into
+a **second** grid step. Route 45c, first drive with the landing logic:
+
+| outcome of a minus5 burst | n |
+|---|---|
+| settled on one grid step, as designed | 23 |
+| ran **two** grid steps | **7** |
+| settle window contaminated by following minus1s | 8 |
+
+The two-step cases are confirmed from the raw stream, not inferred:
+
+```
+83 → 82 → 80 → 70    minus5 ×4 over 150 ms, our plus1 only from +200 ms
+84 → 83 → 80 → 70    minus5 ×5 over 149 ms, our plus1 only from +199 ms
+```
+
+The setpoint reaches the predicted grid point and keeps going, before anything
+else we send. Against `sp_target` of 75.7 and 77.9, landing on 70 overshoots by
+5.7 and 7.9 km/h — a median 7.5 across the seven, about **0.7 m/s² of
+deceleration nobody asked for**. Note the setpoint also steps *through*
+intermediate values rather than jumping, so a single 5 Hz sample taken just
+after the burst reads a transient, not the landing. Measuring this needs the
+settled value.
+
+By burst length on that route:
+
+| frames asserted | one step | two steps |
+|---|---|---|
+| 1–2 | **8** | **0** |
+| 3 | 4 | 1 |
+| 4 | 4 | **4** |
+| 5 | 11 | 2 |
+| ≥6 | 3 | 0 |
+
+So minus5 is asserted for `MINUS5_ASSERT_S` (two frames at SINGLE cadence) and
+released, instead of holding the rest of the slot. **minus1 still holds its
+slot**: it steps by 1 and has nowhere to run to, and the reason for holding —
+a sub-0.06 s assertion produced no step 80% of the time — was measured for
+minus1 under the old law.
+
 ### ±5 needs no threshold
 
 Because the landing point is computable, the overshoot guard is exact rather

@@ -245,6 +245,29 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 # strictly above, exact on 32 of 32 measured landings, gain likewise 1-10 km/h.
 STEP5_GRID_KMH = 10.0         # DCC snaps to this grid on plus5 and minus5
 STEP5_MIN_USEFUL_KMH = 2.0    # below this it is the +-1 command's job anyway
+
+# ...and one press is all minus5 needs, so do not hold it for the rest of the
+# slot the way minus1 is held. Route 45c: 7 of 38 minus5 bursts took TWO grid
+# steps, overshooting sp_target by a median 7.5 km/h — about 0.7 m/s2 of decel
+# nobody asked for. The setpoint reached the predicted grid point and then kept
+# going, before anything else we sent:
+#
+#   83 -> 82 -> 80 -> 70    minus5 x4 over 150 ms, our plus1 only from +200 ms
+#   84 -> 83 -> 80 -> 70    minus5 x5 over 149 ms, our plus1 only from +199 ms
+#
+# DCC auto-repeats while it still sees the press, and 200 ms of assertion is
+# long enough. By burst length on that route:
+#
+#   1-2 frames   8 single steps, 0 double
+#   3 frames     4 single,       1 double
+#   4 frames     4 single,       4 double
+#   5 frames    11 single,       2 double
+#
+# No short burst ever double-stepped, so assert minus5 for two frames at
+# SINGLE cadence and stop. minus1 keeps holding its slot: it steps by 1 and has
+# nowhere to run to, and the reason for holding — a sub-0.06 s assertion
+# produced no step 80% of the time — was measured for minus1 under the old law.
+MINUS5_ASSERT_S = 0.06        # s — two frames at SINGLE_INTERVAL, then release
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
                                # Without it, a DCC that stops acting on us never
@@ -712,7 +735,11 @@ class CarController(CarControllerBase):
                 else:
                   self.slot_cmd = None
               if self.slot_cmd is not None:
-                cruise_cmd(self.slot_cmd, self.pin_cadence(SINGLE_INTERVAL))
+                # minus5 is released early; everything else holds the slot.
+                held_s = (now_nanos - self.slot_decided_ns) / 1e9
+                if (self.slot_cmd is not CruiseStalk.minus5
+                    or held_s < MINUS5_ASSERT_S):
+                  cruise_cmd(self.slot_cmd, self.pin_cadence(SINGLE_INTERVAL))
             else:
               use_step5 = -accel >= DECEL_STEP5_THRESHOLD
               cmd = CruiseStalk.minus5 if use_step5 else CruiseStalk.minus1

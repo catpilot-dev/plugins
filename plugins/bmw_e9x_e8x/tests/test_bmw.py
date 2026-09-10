@@ -1104,7 +1104,41 @@ class TestSetpointBias:
         sp_min = min(sp_min, sp_true)
     return cc, sent, max_pending, sp_true, sp_min
 
-  def test_pending_stops_a_second_minus5_before_the_first_is_visible(self):
+  def test_minus5_is_released_after_two_frames(self):
+    """One press is all minus5 needs, and holding it longer makes DCC
+    auto-repeat into a second grid step. Route 45c: 7 of 38 bursts took two
+    steps, overshooting sp_target by a median 7.5 km/h — the setpoint reached
+    the predicted grid point and kept going, before anything else we sent. No
+    burst of 1-2 frames ever double-stepped; 4-frame bursts did so half the
+    time.
+
+    minus1 is unaffected and still holds its slot: it steps by 1 and has
+    nowhere to run to.
+    """
+    _, sent, _, _, _ = self._drive(accel=-2.0, v_ego_kmh=86.0,
+                                   setpoint_kmh=95.0, seconds=2.5)
+
+    def runs(action):
+      """Frame counts of each contiguous burst of `action`."""
+      out, last = [], None
+      for t, names in sent:
+        if action not in names:
+          continue
+        if last is None or t - last > 0.12:
+          out.append(1)
+        else:
+          out[-1] += 1
+        last = t
+      return out
+
+    m5 = runs('minus5')
+    assert m5, "expected minus5 to fire for this error"
+    assert max(m5) <= 2, f"minus5 asserted for {max(m5)} frames; runs={m5}"
+    m1 = runs('minus1')
+    if m1:
+      assert max(m1) >= 3, f"minus1 should still hold its slot; runs={m1}"
+
+
     """The setpoint is only reported back at ~5 Hz. Without discounting what is
     already in flight, a large error draws minus5 in consecutive slots and
     overshoots by a whole grid step. The credit is now the REAL drop — the
