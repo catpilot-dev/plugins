@@ -811,24 +811,39 @@ class TestSetpointBias:
     finally:
       cfg.read_plugin_param = orig
 
-  def _hold(self, cc, accel, setpoint_kmh, t0, n, v_ego_kmh=86.0, vt_slope=-1.0):
-    """Hold one operating point for n frames, pinning the setpoint so the error
-    stays put, and report which actions went out. vTarget slides at vt_slope
-    km/h/s so the concordance gate sees a real trend."""
+  def _hold(self, cc, accel, setpoint_kmh, t0, n, v_ego_kmh=86.0, vt_slope=-1.0,
+            respond=False):
+    """Hold one operating point for n frames and report which actions went out.
+    vTarget slides at vt_slope km/h/s so the concordance gate sees a real trend.
+    With respond=True the setpoint answers at DCC's one-yield-per-slot rate, so
+    the loop can actually converge; otherwise it is pinned."""
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    acts, t = set(), t0
+    YIELD = {'minus1': -1.0, 'minus5': -10.0, 'plus1': 1.0, 'plus5': 5.0}
+    acts, t, sp = set(), t0, setpoint_kmh
     vt = v_ego_kmh * self.KPH
+    slot, slot_acts, travel = None, set(), 0.0
     for i in range(n):
       t += self.STEP
       vt += vt_slope * self.STEP * self.KPH
+      k = round(t / self.SZL_TICK)
+      if slot is not None and k != slot and respond:
+        for name in ('minus5', 'minus1', 'plus5', 'plus1'):
+          if name in slot_acts:
+            sp += YIELD[name]
+            travel += abs(YIELD[name])
+            break
+        slot_acts = set()
+      slot = k
       _, msgs = cc.update(make_stalk_carcontrol(accel, vt),
                           make_stalk_carstate(i % 15, v_ego=v_ego_kmh * self.KPH,
-                                              setpoint=setpoint_kmh * self.KPH),
+                                              setpoint=sp * self.KPH),
                           int(round(t * 1e9)))
       for addr, dat, _bus in msgs:
         if addr == 404:
-          acts |= {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
-    return acts, t
+          got = {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+          acts |= got
+          slot_acts |= got
+    return acts, t, sp, travel
 
   def test_narrow_band_cannot_open_an_episode(self):
     """An error of 2 km/h is inside SETPOINT_DEADZONE and outside
@@ -838,7 +853,7 @@ class TestSetpointBias:
     cc, mod = self._fresh_cc()
     assert mod.SETPOINT_HOLD_DEADZONE < mod.SETPOINT_DEADZONE
     # accel -0.25 -> bias -2.5 km/h -> sp_target 83.5; setpoint 85.5 -> err 2.0
-    acts, _ = self._hold(cc, -0.25, 85.5, 0.0, 200)
+    acts, _, _, _ = self._hold(cc, -0.25, 85.5, 0.0, 200)
     assert cc.setpoint_braking, "the latch should be on — this is a real decel"
     assert not cc.setpoint_commanding
     assert 'minus1' not in acts and 'minus5' not in acts, acts
@@ -850,9 +865,9 @@ class TestSetpointBias:
     demand while the demand was still there."""
     cc, _ = self._fresh_cc()
     # Open the episode on a wide error, then step back into the narrow band.
-    opened, t = self._hold(cc, -0.25, 88.0, 0.0, 200)
+    opened, t, _, _ = self._hold(cc, -0.25, 88.0, 0.0, 200)
     assert 'minus1' in opened and cc.setpoint_commanding, opened
-    acts, _ = self._hold(cc, -0.25, 85.5, t, 200)
+    acts, _, _, _ = self._hold(cc, -0.25, 85.5, t, 200)
     assert 'minus1' in acts, "abandoned the episode inside the deadzone"
 
   def test_episode_end_clears_the_hold_band(self):
@@ -1143,11 +1158,75 @@ class TestSetpointBias:
   # ---- the accel branch is untouched -------------------------------------
 
   @pytest.mark.parametrize('accel', [0.2, 0.5, 0.8])
-  def test_accel_branch_identical_with_and_without_bias(self, accel):
+  def test_accel_branch_picks_the_same_command_with_and_without_bias(self, accel):
+    """The bias caps how far the accel branch reaches, not which step it uses
+    or how fast it sends. At these demands v_target is still the binding term,
+    so the emitted commands and cadence match the rollback path exactly."""
     on = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0, bias='')
     off = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0, bias='0')
     assert on[0] == off[0], (on[0], off[0])
     assert on[2] == pytest.approx(off[2], abs=1e-6)
+
+  def test_accel_target_is_capped_by_the_ask(self):
+    """A near-zero positive demand must not buy the whole v_target gap.
+
+    accel +0.1 asks for 1 km/h; v_target sits 6 km/h above vEgo. Capping at the
+    ask means the setpoint, already 1 km/h up, is where it should be and
+    nothing is sent. Uncapped — the pre-45b behaviour — this asked for the full
+    6 km/h and delivered 408% of the demand in this band on routes 459 + 45b.
+    """
+    acts, _, _ = self._run(accel=0.1, v_ego_kmh=86.0, setpoint_kmh=87.0,
+                           v_target_kmh=92.0)
+    assert 'plus1' not in acts and 'plus5' not in acts, acts
+    # Same geometry with the bias off still walks up: this is the difference.
+    roll, _, _ = self._run(accel=0.1, v_ego_kmh=86.0, setpoint_kmh=87.0,
+                           v_target_kmh=92.0, bias='0')
+    assert 'plus1' in roll, roll
+
+  def test_real_accel_demand_is_untouched(self):
+    """Above ~+0.3 m/s2 the ask exceeds v_target's own lead, so the min() keeps
+    v_target as the ceiling and nothing about the accel branch changes. The cap
+    can only ever bite where the demand is small."""
+    for a in (0.4, 0.8):
+      acts, _, _ = self._run(accel=a, v_ego_kmh=86.0, setpoint_kmh=86.0,
+                             v_target_kmh=92.0)
+      assert acts & {'plus1', 'plus5'}, (a, acts)
+
+  def test_latch_release_is_not_a_step(self):
+    """The flipping mechanism itself (route 45b, 10:08:43). With both sides
+    inverting the plant, a_cmd near zero gives sp_target ~ vEgo either way, so
+    the braking latch changing state moves the target by ~nothing instead of
+    stepping it 5 km/h and firing a three-second plus1 walk."""
+    def walk(bias_on):
+      import importlib
+      import bmw.carcontroller as mod
+      importlib.reload(mod)
+      from bmw.values import BmwFlags
+      import config as cfg
+      orig = cfg.read_plugin_param
+      cfg.read_plugin_param = lambda pid, key, default='': ('' if bias_on else '0')
+      try:
+        CP = MagicMock()
+        CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
+        CP.minEnableSpeed = 30 / 3.6
+        cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+      finally:
+        cfg.read_plugin_param = orig
+      # Settle into a shallow braking episode, then let both signals tip
+      # barely positive so the latch releases — the 45b geometry, with
+      # vTarget climbing well above vEgo.
+      _, t, sp, _ = self._hold(cc, -0.10, 86.0, 0.0, 200, respond=True)
+      _, _, sp2, travel = self._hold(cc, +0.10, sp, t, 400, vt_slope=+3.0,
+                                     respond=True)
+      return sp2 - sp, travel
+
+    capped, _ = walk(True)
+    raw, _ = walk(False)
+    # The ask at +0.10 is 1 km/h. Capped, the setpoint may take that and stop;
+    # uncapped it chases vTarget, which is climbing away.
+    assert capped <= 1.5, f"capped walk ran to {capped:+.1f} km/h"
+    assert raw > capped + 1.0, (
+      f"expected the uncapped walk to run further: {raw:+.1f} vs {capped:+.1f}")
 
   # ---- the param ---------------------------------------------------------
 
