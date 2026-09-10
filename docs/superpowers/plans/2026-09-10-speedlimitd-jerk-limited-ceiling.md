@@ -595,7 +595,7 @@ cd /home/oxygen/catpilot-dev/plugins
 PYTHONPATH= uv run pytest plugins/speedlimitd/tests/test_planner_hook.py -q
 ```
 
-Expected: PASS, 23 tests.
+Expected: PASS, 22 tests.
 
 - [ ] **Step 8: Commit**
 
