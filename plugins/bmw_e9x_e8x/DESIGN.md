@@ -241,22 +241,41 @@ frames, which the logs cannot settle either way. `DECEL_HOLD_THRESHOLD` and
 | 452/453 | pre-bias | 69–71% | 4.3–4.8 | 212–308 | −1.9 | 0.22–0.25 |
 | 454 | bias, bare sign test | **50%** | **19.3** | 724 | −1.9 | 0.20 |
 | 455 | + concordance gate, per-slot selection | 67% | 13.0 | 420 | **−3.5** | **0.11** |
-| 459 | deadzone 3 both ways, step5 at 5 | **87%** | 6.9 | 267 | −2.7 | 0.19 |
+| 459 | deadzone 3 both ways, step5 at 5 | 87% | 6.9 | 267 | −2.7 | 0.19 |
 | 45a | (same, 7.0 min) | 65% | 7.8 | 212 | −2.7 | 0.43 |
+| 45b | + Schmitt trigger, floor 35→31 | 66% | 9.6 | 380 | −3.2 | 0.23 |
 
-455 is the first drive where the bias actually established itself (median gap
-−3.5 km/h) and the driver-brake rate halved. 459 is the best drive so far on
-every axis the law controls: highest delivered decel, flips halved, bus traffic
-back to the pre-bias law's level, and the tightest a_ego-vs-a_cmd tracking of
-any route (rms 0.32 against 455's 0.39 and the pre-bias law's 0.59).
+### ⚠ This table cannot resolve differences between drives
 
-Comfort improved with the authority rather than against it: |a_ego| excursions
-past 1.5 m/s² halved (1.03 → 0.54/min) and jerk rms fell 3.29 → 3.04 m/s³.
-Giving minus5 the 5 km/h band means fewer, better-placed steps instead of
-minus1 grinding at a large error.
+Measured on 455/459/45b by splitting each drive into sixths, with the law
+constant by construction inside each drive:
 
-The brake-rate rise, 0.11 → 0.19/min, is not the law — but the reason needs
-care, because `a_cmd` alone does not say what the planner wanted.
+| column | within-drive spread | largest between-drive difference |
+|---|---|---|
+| gain | **50–107%** (45b alone) | 21 pts |
+| flips/min | 4.4 – 7.4 | 2.7 |
+| tx/min | 97 – 195 | 113 |
+| driver brakes/min | 0.5 – 0.9 | 0.2 |
+
+**Every column's noise exceeds the effect being read off it.** These are
+whole-drive aggregates over different roads and traffic, and the decel-episode
+mix dominates them. 459's 87% is not the law being better than 455's 67% or
+45b's 66% — it is one drive. In the 50–80 km/h band, where the setpoint floor
+cannot matter, the three read 66 / 92 / 64%: 459 is simply the outlier.
+
+This was over-read once already: 459's 87% was cited as evidence that the 3
+km/h deadzone "costs no delivered decel". That conclusion was unfounded. The
+deadzone consolidation may still be right, but this table is not what shows it.
+
+**Use conditioned counts instead** — a fraction measured only where the
+mechanism can act, on a large sample. Those do resolve, e.g. the hold-band
+commanding fraction and the release attribution below. To compare two laws on
+delivered decel, they need to run on the *same* road: an A/B param toggled
+within one drive, not two drives compared.
+
+The brake-rate difference between these drives is not resolvable either (see above), but
+the events are still worth walking one by one, because `a_cmd` alone does not
+say what the planner wanted.
 
 `a_cmd` is `actuators.accel`, and with `longActive` it is **exactly**
 `longitudinalPlan.aTarget` (r = 1.0000, rms difference 0.0024 m/s² over four
@@ -431,10 +450,11 @@ no state change — walks the target 4 km/h. A narrow band chases every one of
 those: route 455 ran 1 km/h down / 3 up and fired 769 plus1 bursts against 559
 minus1.
 
-Route 459 runs 3 both ways: **6.9 flips/min** against 455's 13.0, and the
-regression gain went the *right* way, 67% → 87%, so the band costs no delivered
-decel. What it costs is speed-return tracking, since every wander it absorbs is
-a restore not made. It was briefly asymmetric; symmetric is simpler and better
+Route 459 runs 3 both ways and reads **6.9 flips/min** against 455's 13.0 —
+but see the route-table warning: flips/min varies by 4.4–7.4 *within* a single
+drive, so that difference is not resolved, and the 67% → 87% gain originally
+cited beside it is drive-to-drive noise. What the band costs is speed-return
+tracking, since every wander it absorbs is a restore not made. It was briefly asymmetric; symmetric is simpler and better
 measured, so there is one constant. The reason to keep them separable if this
 is revisited: coming down is a response, going back up is a release.
 
@@ -445,7 +465,30 @@ enough to abandon one halfway. Walking route 459's mid-episode releases — wher
 `|a_ego|` had reached 80% of demand and fell back under 50% while the demand
 was still there — attributes them, and the split is stable across three drives:
 
-| cause | 455 | 459 | 45a |
+**Route 45b measured it, and the targeted category is gone.** Attributing
+releases from the TX stream instead of a re-derived model — was a minus1/minus5
+actually going out within 200 ms of the release?
+
+| attribution | 455 | 459 | **45b** |
+|---|---|---|---|
+| still commanding, DCC lagging | 93% | 77% | **95%** |
+| error 1–3 km/h, **not** commanding | 0% | **19%** | **0%** |
+| error under 1 km/h (nothing left to ask) | 4% | 3% | 5% |
+| on the min-setpoint floor / bias cap | 3% | 1% | 0% |
+| releases per engaged minute | 2.7 | 2.7 | **1.5** |
+
+459's 13-of-70 deadzone abandonments become 0 of 40 on 45b (Fisher exact,
+p = 0.004). What remains is DCC's own lag, which is the plant. Confirming the
+band was live: commanding happens on **38.6%** of samples with the error
+between 1 and 3 km/h on 45b, against 8.3% on 459 — n > 30k both.
+
+Nothing else about 45b is interpretable. Its gain (66%), flips (9.6/min) and
+TX rate (380/min) all sit inside the within-drive spread, and it carried a
+second change — `MIN_SPEED_BUFFER` 5.0 → 1.0, taking the setpoint floor from 35
+to 31 km/h. That floor change did take effect: time pinned to the floor fell
+2.09% → 0.78% of engaged samples.
+
+| cause (route 459, model-derived) | 455 | 459 | 45a |
 |---|---|---|---|
 | inside the 3 km/h deadzone | 51% | **51%** | 50% |
 | still commanding, DCC lagging | 46% | 47% | 50% |

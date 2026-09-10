@@ -89,11 +89,13 @@ SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s
 # -0.6 to -0.2 — ordinary noise, no state change — walks the target 4 km/h.
 # A narrow band chases every one of those.
 #
-# Route 455 ran 1 km/h down / 3 up and flipped 13.0 times a minute against the
-# old clamped law's 4.6. Route 459 runs 3 both ways: 6.9 flips/min, and the
-# regression gain went the *right* way, 67% -> 87%, so the band costs no
-# delivered decel. What it costs is speed-return tracking, since every wander
-# it absorbs is a restore not made.
+# Route 455 ran 1 km/h down / 3 up and reads 13.0 flips/min against the old
+# clamped law's 4.6; route 459 runs 3 both ways and reads 6.9. Treat both as
+# weak evidence: flips/min varies by 4.4 to 7.4 WITHIN a single drive, and the
+# "67% -> 87% gain" originally cited next to them is drive-to-drive noise (the
+# same metric spans 50-107% inside route 45b alone). See the route-table
+# warning in DESIGN.md. What the band costs is speed-return tracking, since
+# every wander it absorbs is a restore not made.
 #
 # It was briefly asymmetric (1 down / 3 up). Symmetric is both simpler and
 # better measured, so there is one constant again — but the reason to keep
