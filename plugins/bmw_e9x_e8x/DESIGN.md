@@ -545,11 +545,21 @@ By burst length on that route:
 | 5 | 11 | 2 |
 | ≥6 | 3 | 0 |
 
-So minus5 is asserted for `MINUS5_ASSERT_S` (two frames at SINGLE cadence) and
-released, instead of holding the rest of the slot. **minus1 still holds its
-slot**: it steps by 1 and has nowhere to run to, and the reason for holding —
-a sub-0.06 s assertion produced no step 80% of the time — was measured for
-minus1 under the old law.
+So minus5 is asserted for `MINUS5_ASSERT_FRAMES` = 2 and released, instead of
+holding the rest of the slot. **minus1 still holds its slot**: it steps by 1
+and has nowhere to run to, and the reason for holding — a sub-0.06 s assertion
+produced no step 80% of the time — was measured for minus1 under the old law.
+
+Route 45f confirmed it: **0 of 54** bursts double-stepped, against 7 of 38, and
+no landing overshot `sp_target` (min −0.4, median +1.9 km/h).
+
+**Count frames, not seconds.** A 0.06 s window was tried first and 45f showed
+why it is the wrong unit: the cadence pin only transmits once the interval has
+elapsed, so a slot decision landing just after a transmission got a single
+frame out of that window. 24 of 54 bursts came out at 1 frame, and the share
+that moved the setpoint *not at all* rose 5% → 11%. Two frames is what was
+measured never to double-step, so ask for exactly that and let the cadence take
+as long as it needs.
 
 ### ±5 needs no threshold
 

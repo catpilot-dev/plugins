@@ -1152,6 +1152,13 @@ class TestSetpointBias:
     m5 = runs('minus5')
     assert m5, "expected minus5 to fire for this error"
     assert max(m5) <= 2, f"minus5 asserted for {max(m5)} frames; runs={m5}"
+    # Counted in frames, not seconds: a wall-clock window let the cadence pin
+    # emit a single frame when the slot decision landed just after a
+    # transmission, and route 45f showed 24 of 54 bursts coming out at 1 frame
+    # with 11% of them moving the setpoint not at all. Every burst but a
+    # truncated last one should get its full two frames.
+    assert sorted(m5)[:-1].count(2) == len(m5) - 1 or all(f == 2 for f in m5), (
+      f"short bursts emitted; runs={m5}")
     m1 = runs('minus1')
     if m1:
       assert max(m1) >= 3, f"minus1 should still hold its slot; runs={m1}"

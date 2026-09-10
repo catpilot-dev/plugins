@@ -274,11 +274,19 @@ STEP5_GRID_PHASE = 2.0        # km/h — measured, not derived from the display
 #   4 frames     4 single,       4 double
 #   5 frames    11 single,       2 double
 #
-# No short burst ever double-stepped, so assert minus5 for two frames at
-# SINGLE cadence and stop. minus1 keeps holding its slot: it steps by 1 and has
-# nowhere to run to, and the reason for holding — a sub-0.06 s assertion
-# produced no step 80% of the time — was measured for minus1 under the old law.
-MINUS5_ASSERT_S = 0.06        # s — two frames at SINGLE_INTERVAL, then release
+# No short burst ever double-stepped, so assert minus5 briefly and stop. minus1
+# keeps holding its slot: it steps by 1 and has nowhere to run to, and the
+# reason for holding — a sub-0.06 s assertion produced no step 80% of the time
+# — was measured for minus1 under the old law.
+#
+# Counted in FRAMES, not seconds. A 0.06 s window was tried first and route 45f
+# showed why it is the wrong unit: the cadence pin only transmits when the
+# interval has elapsed, so a slot decision landing just after a transmission
+# got a single frame out of that window. 24 of 54 bursts were 1 frame, and
+# 11% of bursts moved the setpoint not at all (against 5% when the command was
+# held for the whole slot). Two frames is what was measured never to
+# double-step; ask for exactly that.
+MINUS5_ASSERT_FRAMES = 2      # transmitted frames, then release
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.
                                # Without it, a DCC that stops acting on us never
@@ -420,6 +428,9 @@ class CarController(CarControllerBase):
     # what narrows the deadzone to SETPOINT_HOLD_DEADZONE. Cleared whenever the
     # episode ends, so a new one always has to pay the full entry price.
     self.setpoint_commanding = False
+    # Frames actually transmitted for the current slot's command, so minus5 can
+    # be released after a counted number rather than a wall-clock window.
+    self.slot_cmd_frames = 0
 
     # Per-slot command selection: what was decided this slot, and how much
     # setpoint we have asked for but not yet seen arrive.
@@ -721,6 +732,7 @@ class CarController(CarControllerBase):
               # assertion produced nothing 80% of the time).
               if (now_nanos - self.slot_decided_ns) / 1e9 >= CRUISE_STALK_IDLE_TICK_STOCK:
                 self.slot_decided_ns = now_nanos
+                self.slot_cmd_frames = 0
                 err_kmh = -setpoint_error * 3.6 - self.setpoint_pending
                 # Where minus5 would land, measured from the setpoint we expect
                 # once what is already in flight has arrived.
@@ -746,11 +758,12 @@ class CarController(CarControllerBase):
                 else:
                   self.slot_cmd = None
               if self.slot_cmd is not None:
-                # minus5 is released early; everything else holds the slot.
-                held_s = (now_nanos - self.slot_decided_ns) / 1e9
+                # minus5 is released after MINUS5_ASSERT_FRAMES have actually
+                # gone out; everything else holds the slot.
                 if (self.slot_cmd is not CruiseStalk.minus5
-                    or held_s < MINUS5_ASSERT_S):
-                  cruise_cmd(self.slot_cmd, self.pin_cadence(SINGLE_INTERVAL))
+                    or self.slot_cmd_frames < MINUS5_ASSERT_FRAMES):
+                  if cruise_cmd(self.slot_cmd, self.pin_cadence(SINGLE_INTERVAL)):
+                    self.slot_cmd_frames += 1
             else:
               use_step5 = -accel >= DECEL_STEP5_THRESHOLD
               cmd = CruiseStalk.minus5 if use_step5 else CruiseStalk.minus1
