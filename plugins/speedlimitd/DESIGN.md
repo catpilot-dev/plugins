@@ -288,14 +288,11 @@ limit (72 km/h) the nearest rung is **up**, to 80: speedlimitd would display
 and enforce a higher number than what's actually posted. When the active base
 is OSM (`osm_display = osm_base and source == 2`):
 
-- **Target** is the OSM speed rounded to the nearest 5 km/h
+- **Published value** is the OSM speed rounded to the nearest 5 km/h
   (`round(speed_limit / 5.0) * 5`), not snapped to the ladder.
-- **Gradual transition** steps **±10 km/h** toward that target, clamped so it
-  never overshoots, at the same cadence as every other source
-  (`_STEP_DOWN_INTERVAL = 3 s`, `_STEP_UP_INTERVAL = 2 s`) — instead of
-  walking `_step_speed_limit`'s ladder.
-- Every other source (lane-count, G-S, YOLO) keeps the existing CN-ladder
-  snap/step unchanged.
+- Every other source (lane-count, G-S, YOLO) keeps the CN-ladder snap.
+- Neither path shapes the *transition* any more — the value is published at
+  once and `planner_hook` ramps the enforced ceiling. See §Enforcement.
 
 ### Safety caps unchanged and always winning
 
@@ -410,7 +407,7 @@ Both curve caps enter the same `min()` as **safety-class** (source 4) sources:
 they inherit the planner hook's gas-suspend and are in the lead-override-
 protected class — a faster lead never lifts a curve cap (route 2fd).
 
-## Temporal accumulators & the display ladder
+## Temporal accumulators
 
 Vision is noisy, so nearly every input is debounced before it moves the limit:
 
@@ -431,18 +428,53 @@ Vision is noisy, so nearly every input is debounced before it moves the limit:
   immediately and refreshes a 3 s hold; when the hold expires and raw is looser,
   the cap **step-relaxes up the standard ladder** `[30,40,50,60,80,100,120]` at
   2 s per rung (releasing to off above 80) rather than snapping to 0.
-- **Display step ladder.** The published limit changes one standard step at a
-  time — `_STEP_DOWN_INTERVAL = 3 s`, `_STEP_UP_INTERVAL = 2 s` per rung — via
-  `_step_speed_limit`. **Safety caps bypass this**: a tightening curve or
-  reactive cap clamps the displayed limit down immediately.
+- **No display ladder.** The published limit is the fused value, applied at
+  once (CN-ladder snapped, or rounded to 5 km/h under an OSM base). Transition
+  shaping lives in `planner_hook`, which ramps the *enforced* ceiling — see
+  below. The ladder that used to live here set the sign's step interval and the
+  brake schedule with one number; splitting them is what removed the brake
+  spikes. Safety caps still clamp the published limit down immediately.
 
 ## Enforcement & gas override (`planner_hook.on_v_cruise`)
 
 The hook drains `speedLimitState` from the bus and returns a possibly-reduced
 `v_cruise`. It **only ever lowers or holds** — `floored_target < v_cruise`
-returns the target, otherwise `v_cruise` is unchanged; DCC comfort-shapes the
-deceleration (no artificial ramp). Key rules:
+returns the target, otherwise `v_cruise` is unchanged. Key rules:
 
+- **Jerk-limited ceiling.** The enforced target does not jump between limits.
+  `_ceiling_ms` slides toward `limit + offset` under a trapezoidal acceleration
+  profile (`_advance_ceiling`), so both its value and its slope stay continuous
+  and it arrives with zero slope. Descent `CEIL_A_DOWN = 0.8` m/s² at
+  `CEIL_J_DOWN = 0.5` m/s³ (~16 s for 80 → 40); ascent `CEIL_A_UP = 1.5` m/s²
+  at `CEIL_J_UP = 1.0` m/s³. Setpoint *gap* is what drives DCC deceleration on
+  this car (corr +0.746), so a step in the target is a brake spike — the old
+  3 s ladder produced three of them per drop.
+
+  The stop budget is measured against the error remaining **after** the tick's
+  travel (`|err| - |rate|·dt`). The textbook `sqrt(2·j·|err|)` is optimistic by
+  one tick and the shortfall compounds: measured on 88 → 46, the ceiling landed
+  still carrying −0.15 m/s², a 6× jerk violation on the final tick — the same
+  spike, relocated to the end of the ramp. On overshoot the value is pinned to
+  the target and the slope bleeds out over the following ticks rather than
+  being zeroed outright, for the same reason.
+
+  The ceiling is a **pure function of the limit history**: it never reads
+  `v_ego` or `v_cruise`, so a given limit change always produces the same
+  trajectory. It keeps advancing while the gas is pressed (the gas *floor* is
+  what suspends enforcement), and it survives a `road_id` change — resetting it
+  there would reintroduce the jump. `_reset_all()` clears it, so the next valid
+  limit is applied immediately rather than ramped from stale state.
+
+  **Safety caps bypass the ramp** — `safetyCapped` assigns the target directly.
+  A tightening curve cannot wait out a 16 s ramp. `CEIL_A_DOWN` equals
+  `COMFORT_BRAKE` precisely so a safety cap's own distance-aware profile is
+  never gentler than the comfort ramp, and the two can never fight.
+
+  **Known trade-off:** because the ceiling ignores vehicle state, it is slower
+  to bite on a driver already below the old limit — at 70 in an 80 zone it
+  spends ~6 s descending 88 → 70 before the car feels anything. Accepted. If a
+  drive shows it matters, initialise the ceiling at `min(_ceiling_ms, v_cruise)`
+  when a descent begins.
 - **Comfort offset** (`_effective_offset_percent`): the enforced target is the
   limit **+15%** below 80 km/h, **+10%** at/above 80 km/h, and **+0%** (exact)
   when `safetyCapped`. *(This corrects the old README's +40/+30/+10 tiers,
