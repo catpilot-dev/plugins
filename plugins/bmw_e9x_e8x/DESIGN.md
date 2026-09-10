@@ -458,6 +458,41 @@ tracking, since every wander it absorbs is a restore not made. It was briefly as
 measured, so there is one constant. The reason to keep them separable if this
 is revisited: coming down is a response, going back up is a release.
 
+### minus5's threshold must equal its yield
+
+The step is 10 km/h and it is indivisible, so firing it on a smaller error
+overshoots by the difference — all of it inside one 200 ms slot.
+
+Route 45b, 10:27:27, a minivan cutting in (the model's lead jumps 67 → 22 m as
+it switches objects):
+
+```
+1530.80   err +5.6 km/h  ->  minus5 fires    setpt 77
+1531.00                      setpt 68         yield 10 km/h
+                             sp_target 70.8   -> overshot by 2.8 km/h
+```
+
+About **0.3 m/s² of deceleration nobody asked for**, arriving as a step on top
+of a −0.6 m/s² demand. A 50% overshoot inside one slot is what a step in brake
+pressure feels — and sounds — like from the seat.
+
+It was not an outlier. With the threshold at 5:
+
+| | minus5 bursts | fired with 5 ≤ err < 10 | median overshoot |
+|---|---|---|---|
+| 459 | 56 | **89%** | 3.4 km/h → 0.32 m/s² |
+| 45b | 59 | **73%** | 3.1 km/h → 0.29 m/s² |
+
+At 10 it is overshoot-free *by construction* rather than by tuning, which is
+why it was 10 originally. It was lowered to 5 to stop minus1 grinding at large
+errors; the Schmitt trigger on the command gate now covers that case instead,
+so the reason is superseded. Replay over 459 + 45b: +12% minus1 slots, flips
+unchanged at 4.0 and 5.3/min.
+
+Peak `a_ego` at that cut-in was −0.99 m/s² with no brake pedal, so this is a
+harshness finding, not a traction one — and note this car publishes no wheel
+speeds, so slip cannot be confirmed from a log either way.
+
 ### Both signs invert the plant
 
 The accel side used to take `v_target` raw while the decel side used

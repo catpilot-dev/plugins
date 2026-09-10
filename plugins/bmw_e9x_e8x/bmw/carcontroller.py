@@ -221,21 +221,30 @@ DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
 # whole yield of room: overshoot-free by construction. That is a deliberate
 # trade of authority for smoothness, taken from the seat after route 455.
 #
-# minus5 is measurably the jerkiest thing the controller does. On 455, peak
-# |d a_ego/dt| in the 0.7 s after a burst: minus5 3.49 m/s³ median and 6.55 at
-# p90, against minus1 2.08/3.90, plus1 1.86/3.82 and a 0.71 baseline.
+# This MUST match minus5's yield. The step is 10 km/h and it is indivisible, so
+# firing it on a smaller error overshoots by the difference, in one 200 ms slot.
 #
-# It is binary, not a dial: err rarely exceeds 8 km/h once minus1 is keeping up,
-# so 8 and 10 both amount to switching minus5 off (bench 54% and 51% of demand,
-# against 68% at a threshold of 5, and 48% with minus5 removed entirely).
-# Rate-limiting instead was measured and does nothing — minus5 already fires
-# about once a minute, so a minimum gap of up to 3 s never binds.
+# Route 45b at 10:27:27, a minivan cutting in: error 5.6 km/h, minus5 fired,
+# setpoint went 77 -> 68 against a target of 70.8. That is 2.8 km/h of setpoint
+# the planner never asked for, about 0.3 m/s² of extra decel arriving as a step
+# on top of a -0.6 m/s² demand — a 50% overshoot inside one slot, which is what
+# a step in brake pressure feels and sounds like from the seat.
 #
-# The cost is real: 68% -> 51% of demanded decel, below the 69% the pre-bias law
-# measured on 452/453. The metric to judge it by on the next drive is the
-# driver-brake rate, which is the outcome and which halved on 455 (0.22 -> 0.11
-# per engaged minute), not this regression gain.
-DECEL_STEP5_KMH = 5.0         # km/h of remaining error at or above which minus5 is used
+# It was not an outlier. At a threshold of 5, minus5 fired with the error in
+# [5, 10) on 89% of bursts on 459 and 73% on 45b, median overshoot 3.4 and
+# 3.1 km/h. At 10 it is overshoot-free by construction rather than by tuning,
+# which is why it was 10 originally.
+#
+# It was lowered to 5 to stop minus1 grinding at large errors. The Schmitt
+# trigger on the command gate now covers that case instead — the narrow hold
+# band works an error down rather than abandoning it — so the reason is
+# superseded. Replay over 459 + 45b: +12% minus1 slots, flips unchanged.
+#
+# (An earlier note here argued from bench gain, 68% at a threshold of 5 against
+# 51% at 10, and told the reader to judge the next drive by driver-brake rate.
+# Ignore both. Neither metric resolves differences of that size — see the
+# route-table warning in DESIGN.md.)
+DECEL_STEP5_KMH = 10.0         # km/h of remaining error at or above which minus5 is used
 MINUS5_YIELD_KMH = 10.0        # measured median setpoint drop from one minus5 burst
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5          # s — give up on what was sent and re-command.

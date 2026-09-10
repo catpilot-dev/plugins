@@ -777,20 +777,21 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=-1.2, v_ego_kmh=86.0, setpoint_kmh=90.0)
     assert 'minus5' in acts, acts
 
-  def test_step5_boundary_follows_the_error_not_the_demand(self):
-    """DECEL_STEP5_KMH splits the two steps at 5 km/h of remaining error, and
-    the demand does not get a vote: the same shallow -0.25 ask draws minus1 at
-    4 km/h of error and minus5 at 6.
+  def test_step5_threshold_matches_the_yield(self):
+    """DECEL_STEP5_KMH must equal MINUS5_YIELD_KMH. The step is indivisible, so
+    firing it on a smaller error overshoots by the difference in one slot —
+    route 45b, 10:27:27: error 5.6 km/h, setpoint 77 -> 68 against a target of
+    70.8, roughly 0.3 m/s2 of decel nobody asked for. At a threshold of 5 that
+    happened on 89% of minus5 bursts (459) and 73% (45b).
 
-    Route 459 ran this split (against 455's 10) and the drive came back
-    smoother, not jerkier: regression gain 67% -> 87%, |a_ego| excursions past
-    1.5 m/s2 halved to 0.54/min, jerk rms 3.29 -> 3.04 m/s3. Handing minus5 the
-    band it can actually settle in stops minus1 from grinding at it.
+    The step choice still follows the error, not the demand: the same shallow
+    -0.25 ask draws minus1 at 4 km/h of error and at 9.
     """
-    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=87.5)
-    assert 'minus1' in acts and 'minus5' not in acts, acts
-    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=89.5)
-    assert 'minus5' in acts, acts
+    import bmw.carcontroller as mod
+    assert mod.DECEL_STEP5_KMH == mod.MINUS5_YIELD_KMH
+    for setpoint in (87.5, 92.0):
+      acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=setpoint)
+      assert 'minus1' in acts and 'minus5' not in acts, (setpoint, acts)
 
   # ---- the Schmitt trigger on the command gate ---------------------------
 
