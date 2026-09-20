@@ -78,7 +78,7 @@ DECEL_STEP5_THRESHOLD = 0.9    # m/s² — use -5 above this, -1 below (midpoint
 # K_DCC is deliberately 0.1, not the measured 0.0935. That makes every ask ~7%
 # shallow, landing at a flat 92–93% of demand across the whole linear range
 # rather than overshooting wherever the plant is stiffer than measured.
-K_DCC = 0.10                   # m/s² of DCC response per km/h of setpoint gap
+K_DCC = 0.12                   # m/s² of DCC response per km/h of setpoint gap
 SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
 # One number gates both directions: how far the setpoint has to be from its
 # target before it is worth moving at all. It is the whole answer to setpoint
