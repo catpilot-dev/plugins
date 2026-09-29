@@ -82,6 +82,22 @@ def _register_interfaces():
   except (ImportError, AttributeError):
     pass
 
+  # Persistent fingerprint cache — DESIGN.md: "Fingerprint cache". get_car()
+  # looks fingerprint up as a module global, so it is wrapped in place; a
+  # plugin reload re-wraps the original instead of stacking wrappers.
+  try:
+    import importlib
+    from opendbc.car.structs import CarParams
+    from bmw import fp_cache
+    car_helpers = importlib.import_module('opendbc.car.car_helpers')
+    orig = getattr(car_helpers.fingerprint, '__wrapped__', car_helpers.fingerprint)
+    wrapped = fp_cache.wrap_fingerprint(orig, car_helpers.can_fingerprint, car_helpers.is_valid_vin,
+                                        CarParams.FingerprintSource.fw, {str(CAR.BMW_E82), str(CAR.BMW_E90)})
+    wrapped.__wrapped__ = orig
+    car_helpers.fingerprint = wrapped
+  except (ImportError, AttributeError):
+    pass
+
 
 # Run at module load time — triggered by registry.load_plugin() -> exec_module()
 _register_interfaces()

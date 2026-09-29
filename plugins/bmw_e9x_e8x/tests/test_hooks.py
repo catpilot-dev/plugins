@@ -66,6 +66,22 @@ class TestRegisterInterfaces:
     bmw_keys = [k for k in patched_params if 'BMW' in k.upper()]
     assert len(bmw_keys) >= 1
 
+  def test_wraps_fingerprint_with_the_cache_once(self, mock_deps):
+    """card calls car_helpers.fingerprint by module-global lookup, so the
+    persistent cache has to be patched in there. Reloading register (plugin
+    reload) must re-wrap the original, not stack wrappers."""
+    import importlib
+    car_helpers = sys.modules['opendbc.car.car_helpers']
+    def stock_fingerprint(*a): return 'stock'
+    car_helpers.fingerprint = stock_fingerprint
+    import register
+    importlib.reload(register)
+    first = car_helpers.fingerprint
+    assert first is not stock_fingerprint
+    assert first.__wrapped__ is stock_fingerprint
+    importlib.reload(register)
+    assert car_helpers.fingerprint.__wrapped__ is stock_fingerprint
+
   def test_torque_params_toml_exists(self):
     """torque_params.toml exists and is parseable."""
     import tomllib

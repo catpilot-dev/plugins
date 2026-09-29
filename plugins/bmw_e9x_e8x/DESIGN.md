@@ -53,6 +53,43 @@ fingerprint to detect **which cruise ECU** is present and set feature flags
 Transmission type (auto vs manual) and a couple of steer-ratio tweaks are also
 inferred from message presence. DCC and NCC both set `minEnableSpeed = 30 km/h`.
 
+### Fingerprint cache
+
+openpilot's own fingerprint cache never applies to this car. BMW defines no FW
+queries, so `carFw` is always empty and `car_helpers.fingerprint`'s cache
+condition (`len(cached_params.carFw) > 0`) is never met — and `CarParamsCache`
+is cleared on every manager start anyway. So every boot, including every
+morning cold start, ran the full sweep: the VIN request to every 11-bit
+0x700–0x7FF and 29-bit 0x18DAxxF1 address on buses 0 and 1, then FW queries
+for all 14 brands, with OBD multiplexing toggled.
+
+Measured on the car (2026-09-29): the VIN comes from the DME on **PT-CAN**
+(0x7DF → 0x7E8). The OBD-multiplexing half of the sweep never reaches F-CAN —
+on the F4 `dos` panda it disables the F-CAN transceiver and routes CAN2 to the
+unconnected OBD pins for ~0.5 s (bus-1 RX drops to 0), which is where the ~46
+startup errors on `canState1` are counted. The gateway also copies the PT-CAN
+diagnostic frames onto K-CAN.
+
+`bmw/fp_cache.py` keeps `{vin, fingerprint}` in the plugin data dir
+(`FingerprintCache`), and `register.py` wraps `car_helpers.fingerprint`
+(looked up as a module global by `get_car`, so wrapped in place; a plugin
+reload re-wraps the original):
+
+- **Hit** — returns exactly what a live fingerprint of this car returns (the
+  VIN-derived model, no FW, source `fw`, fuzzy) after only the passive CAN
+  fingerprint. Nothing is transmitted and OBD multiplexing is never enabled.
+- **Miss** — runs the stock query; a result that identified a BMW model with a
+  valid VIN (source `fw`) is cached.
+- `FINGERPRINT` / `SKIP_FW_QUERY` keep their stock meaning and bypass the cache.
+
+A cached boot arms `bmw/vin_check.py`: 30 s after the controller starts, one
+OBD mode-09 VIN request to the DME on PT-CAN (0x7DF, ISO-TP flow control on
+0x7E0, reply on 0x7E8 — all on the panda's TX allow-list, no ELM327 mode). A
+matching VIN confirms. Another VIN, a negative response, or silence after 3
+attempts (1 s timeout, 10 s apart) deletes the cache, so the next boot
+fingerprints live. The raw reply is read in `CarInterface.update`, since no
+CAN parser subscribes to 0x7E8.
+
 ## Data flow
 
 ```
@@ -955,6 +992,7 @@ Params are **files in the plugin's `data/` dir** (runtime:
 |---|---|---|---|
 | `TemperatureOverlay` | on | yes (read each frame) | coolant/oil temps on the HUD; Driving-panel toggle |
 | `CruiseCeilingMemory` | on | yes (read on engage) | restore last set-speed ceiling on re-engage within a drive |
+| `FingerprintCache` | — | no (read at fingerprint) | `{vin, fingerprint}` written by a live BMW fingerprint, deleted by a failed VIN check; see *Fingerprint cache*. Not a user-facing toggle |
 | `SteerAngleOffset` | 0.0 | yes (1 Hz) | persisted steering-angle zero offset; updated from the `steer_angle_offset` plugin-bus topic, **not** a user-facing toggle |
 
 `torque_params.toml` (LAT_ACCEL_FACTOR / MAX_LAT_ACCEL_MEASURED / FRICTION per
@@ -990,6 +1028,8 @@ bmw_e9x_e8x/
     values.py           # platforms, VIN detection, flags, CAN bus map, DBC map
     fingerprints.py     # empty fingerprints + dummy FW (forces VIN fuzzy match)
     interface.py        # CarInterface._get_params — flags, cruise type, delays
+    fp_cache.py         # persistent fingerprint cache + fingerprint() wrapper
+    vin_check.py        # deferred OBD VIN check confirming a cached fingerprint
     carstate.py         # CAN parsing, resume-button SM, temps, offset
     carcontroller.py    # DCC 0x194 stalk emulation + Ocelot steering
     bmwcan.py           # CAN message builders + checksums
