@@ -410,6 +410,18 @@ def _steps_within_bursts(sent, gap=0.12):
       out.add((sent[i + 1][1] - sent[i][1]) % 15)
   return out
 
+def _make_cc():
+  """A DCC-on-F-CAN CarController with the servo path off, freshly reloaded so
+  module constants are pristine. Returns (controller, module)."""
+  import bmw.carcontroller as mod
+  importlib.reload(mod)
+  from bmw.values import BmwFlags
+  CP = MagicMock()
+  CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL   # cruise on F-CAN, servo path off
+  CP.minEnableSpeed = 30 / 3.6
+  return mod.CarController({0: 'bmw_e9x_e8x'}, CP), mod
+
+
 class TestCruiseBurstCounter:
   """DCC accepts a 0x194 frame only if its counter is a forward step —
   (counter - accepted) mod 15 in [1, 7]. Anything else is dropped as stale,
@@ -437,38 +449,17 @@ class TestCruiseBurstCounter:
     for mod_name, mod_mock in make_cereal_mocks().items():
       monkeypatch.setitem(sys.modules, mod_name, mod_mock)
 
-  def _controller(self):
-    """Built with SetpointBias=0 on purpose.
-
-    The counter-overwrite machinery is shared by both paths and is what these
-    tests are about. The bias path decides once per SZL slot and discounts what
-    it has already asked for against the setpoint it reads back, so a harness
-    that pins cruiseState.speed to a constant makes it fall silent — an
-    artefact of the fixture, not of the burst logic. TestSetpointBias and
-    TestSetpointDebtLedger cover the counter invariant on the bias path with a
-    setpoint that actually responds.
-    """
-    import importlib
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
-    import config as cfg
-    orig = cfg.read_plugin_param
-    cfg.read_plugin_param = lambda pid, key, default='': '0' if key == 'SetpointBias' else default
-    try:
-      CP = MagicMock()
-      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL   # cruise on F-CAN, servo path off
-      CP.minEnableSpeed = 30 / 3.6
-      return mod.CarController({0: 'bmw_e9x_e8x'}, CP)
-    finally:
-      cfg.read_plugin_param = orig
-
   def _replay(self, phases):
     """phases: list of (duration_s, accel, v_target, human_pressing).
-    Returns the interleaved bus as [(t, 'SZL'|'OP', counter), ...]."""
+    Returns the interleaved bus as [(t, 'SZL'|'OP', counter), ...].
+
+    The setpoint responds — one step per SZL slot, read back at the slot — since
+    the law decides once per slot and discounts what it has already asked for
+    against the reading; a pinned setpoint makes it fall silent."""
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    cc = self._controller()
+    cc, mod = _make_cc()
     events, t, szl = [], 0.0, 0
+    sp_kmh, slot_acts = 24.5 * 3.6, set()
     for dur, accel, v_target, human in phases:
       elapsed = 0.0
       for _ in range(int(round(dur / self.STEP))):
@@ -477,158 +468,76 @@ class TestCruiseBurstCounter:
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
           events.append((t, 'SZL', szl))
-        CS = make_stalk_carstate(szl, human_pressing=human)
+          if 'minus5' in slot_acts:
+            sp_kmh = mod.minus5_landing_kmh(sp_kmh)
+          elif 'minus1' in slot_acts:
+            sp_kmh -= 1.0
+          elif 'plus1' in slot_acts:
+            sp_kmh += 1.0
+          slot_acts = set()
+        CS = make_stalk_carstate(szl, setpoint=sp_kmh / 3.6, human_pressing=human)
         CC = make_stalk_carcontrol(accel, v_target + accel * elapsed)
         _, sends = cc.update(CC, CS, int(round(t * 1e9)))
         for addr, dat, _bus in sends:
           if addr == 404:
             events.append((t, 'OP', dat[1] & 0xF))
+            slot_acts |= {n for b, n in enumerate(('plus1', 'plus5', 'minus1', 'minus5'))
+                          if dat[2] & (1 << b)}
     return events
 
   def _resume_delta(self, pause_s, human=False):
     """Burst, then pause, then command again. Returns the first resumed frame's
-    counter delta from the newest SZL counter (which is DCC's accepted value
-    once the handoff has happened)."""
+    counter delta from the last frame DCC actually took.
+
+    DCC suppresses an SZL frame by TIMING when one of ours lands just ahead of
+    it, and the surviving stream must step exactly +1. So an SZL frame survives
+    only if we sent nothing in the PRE_TICK_LEAD before it. If the pause is
+    shorter than the trailing overwrite, we never fall silent and the resume
+    simply continues our own sequence; if it is longer, SZL takes the counter
+    back and the resume has to resync to it."""
     idle    = (1.0,  0.0, 24.0, False)    # anchor SZL phase, nothing commanded
     burst   = (0.25, -0.8, 22.0, False)   # decel burst
-    pause   = (pause_s, 0.0, 24.0, human) # deadzone / driver on the stalk
+    # v_target held at the burst's level: back up at 24 the restore branch
+    # would walk the lowered setpoint back with plus1 and there is no pause.
+    pause   = (pause_s, 0.0, 22.0, human) # deadzone / driver on the stalk
     resume  = (0.20, -0.8, 22.0, False)
     events = self._replay([idle, burst, pause, resume])
-    # first OP frame emitted after the pause began
-    t_pause_start = 1.25 + self.STEP / 2
-    first = next(e for e in events if e[1] == 'OP' and e[0] > t_pause_start + pause_s)
-    szl_now = [c for (t, w, c) in events if w == 'SZL' and t <= first[0]][-1]
-    return (first[2] - szl_now) % 15
+    lead = 0.015 + self.STEP / 2
+    surviving = [e for i, e in enumerate(events)
+                 if e[1] == 'OP' or not any(o[1] == 'OP' and 0 <= e[0] - o[0] <= lead
+                                            for o in events[max(0, i - 4):i])]
+    t_resume = 1.25 + pause_s + self.STEP / 2
+    i = next(i for i, e in enumerate(surviving) if e[1] == 'OP' and e[0] > t_resume)
+    return (surviving[i][2] - surviving[i - 1][2]) % 15
 
   @pytest.mark.parametrize('pause_ms', [210, 250, 280, 300, 350, 400, 450])
   def test_resume_within_burst_live_window_is_forward(self, pause_ms):
     """The regression: pauses shorter than BURST_LIVE_WINDOW but longer than
     SZL's idle slot must still resync, not resume the stale sequence."""
     delta = self._resume_delta(pause_ms / 1000.0)
-    assert 1 <= delta <= 7, f"rollback after {pause_ms} ms pause: delta={delta}"
+    assert delta == 1, f"counter broke +1 after {pause_ms} ms pause: delta={delta}"
 
   def test_resume_after_long_pause_is_forward(self):
     """The path BURST_LIVE_WINDOW already covered stays correct."""
-    assert 1 <= self._resume_delta(0.60) <= 7
+    assert self._resume_delta(0.60) == 1
 
   def test_resume_after_driver_stalk_press_is_forward(self):
     """We yield the bus to the driver, so DCC follows SZL — resync on resume."""
-    assert 1 <= self._resume_delta(0.30, human=True) <= 7
+    assert self._resume_delta(0.30, human=True) == 1
 
   def test_counter_advances_by_one_within_a_burst(self):
     """The handoff latch must not fire during a live burst: our frames still
     have to be a contiguous +1 sequence, or the overwrite stops outrunning SZL."""
-    # accel chosen so the setpoint error stays under one whole step: that keeps
-    # this on minus1 at HOLD, the sustained command. minus5 deliberately
-    # transmits at only 10 Hz now, so it is no longer a burst at all.
-    events = self._replay([(1.0, 0.0, 24.0, False), (0.60, -0.3, 23.0, False)])
+    # accel chosen so the setpoint error stays under one minus5 landing: that
+    # keeps this on minus1, the sustained command. minus5 releases after two
+    # frames, so it is no longer a burst at all.
+    events = self._replay([(1.0, 0.0, 24.0, False), (1.00, -0.3, 23.0, False)])
     ours = [(t, c) for (t, w, c) in events if w == 'OP']
     assert len(ours) > 15, f"expected a sustained burst, got {len(ours)} frames"
     for (t0, prev), (t1, nxt) in zip(ours, ours[1:]):
       if t1 - t0 > 0.12:
         continue            # a new burst resyncs from RX, by design
       assert (nxt - prev) % 15 == 1, f"burst counter jumped {prev} -> {nxt}"
-
-
-class TestCruiseCadencePin:
-  """CruiseCadence debug param — pins the stalk cadence so a HOLD-vs-SINGLE A/B
-  can be driven without openpilot's demand choosing the cadence for us.
-
-  openpilot picks the command and the cadence from the same demanded accel, so
-  observationally the two cells are never matched: 46 decel bursts over 25
-  segments left the question open (gap bin [0.5,2) showed HOLD at -0.284 vs
-  SINGLE at -0.075, but two other bins were a tie or a slight reversal, and the
-  cells differed in speed by 24 km/h). Pinning breaks the entanglement.
-
-  Safety: this must change frame SPACING only. Counter steps stay +1 — that is
-  what the 16-per-slot counter law violated, setting 5ECE + CD95 on-car.
-  """
-
-  SZL_TICK = 0.2
-  STEP = 0.01
-
-  @pytest.fixture(autouse=True)
-  def _mocks(self, monkeypatch):
-    from test_helpers import make_carcontroller_mocks
-    for mod_name, mod_mock in make_carcontroller_mocks().items():
-      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
-    for mod_name, mod_mock in make_cereal_mocks().items():
-      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
-
-  def _run(self, pin, accel):
-    """Drive one burst at `accel`, with CruiseCadence set to `pin`.
-    Returns (median TX interval in ms, counter steps seen)."""
-    import importlib
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
-    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    # SetpointBias=0 for the same reason as TestCruiseBurstCounter._controller:
-    # the bias path's per-slot accounting needs a setpoint that responds, and
-    # pin_cadence is exercised on both paths.
-    monkey = {'bmw_e9x_e8x': {'CruiseCadence': pin, 'SetpointBias': '0'}}
-    import config as cfg
-    orig = cfg.read_plugin_param
-    cfg.read_plugin_param = lambda pid, key, default='': monkey.get(pid, {}).get(key, default)
-    try:
-      CP = MagicMock()
-      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-      CP.minEnableSpeed = 30 / 3.6
-      cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
-    finally:
-      cfg.read_plugin_param = orig
-    t, szl, sent = 0.0, 0, []
-    v_target = 24.0 + (2.0 if accel > 0 else -2.0)
-    for dur, a, vt in [(1.0, 0.0, 24.0), (1.2, accel, v_target)]:
-      elapsed = 0.0
-      for _ in range(int(round(dur / self.STEP))):
-        t += self.STEP
-        elapsed += self.STEP
-        if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
-          szl = (szl + 1) % 15
-        _, msgs = cc.update(make_stalk_carcontrol(a, vt + a * elapsed),
-                            make_stalk_carstate(szl, setpoint=23.0 if accel < 0 else 24.5),
-                            int(round(t * 1e9)))
-        for addr, dat, _bus in msgs:
-          if addr == 404 and dat[2]:
-            sent.append((t, dat[1] & 0xF))
-    assert len(sent) > 8, f"expected a burst, got {len(sent)} frames"
-    import statistics
-    iv = statistics.median((sent[i + 1][0] - sent[i][0]) * 1000 for i in range(len(sent) - 1))
-    steps = _steps_within_bursts(sent)
-    return iv, steps
-
-  def test_default_follows_demand(self):
-    """Unset: gentle demand picks SINGLE (50 ms), firm demand picks HOLD.
-
-    Exercised on the accel side. The decel path is minus1 pinned to HOLD since
-    DCC's minus1 step rate was measured independent of our frame rate, so
-    demand no longer chooses the cadence there."""
-    slow, _ = self._run('', 0.15)
-    fast, _ = self._run('', 0.80)
-    assert slow > fast, f"gentle {slow:.0f} ms should be slower than firm {fast:.0f} ms"
-    assert slow > 35, f"gentle decel should use SINGLE cadence, got {slow:.0f} ms"
-    assert fast < 35, f"firm decel should use HOLD cadence, got {fast:.0f} ms"
-
-  def test_pin_hold_forces_fast_cadence_on_gentle_decel(self):
-    iv, _ = self._run('hold', -0.15)
-    assert iv < 35, f"pinned HOLD should transmit fast, got {iv:.0f} ms"
-
-  def test_pin_single_forces_slow_cadence_on_firm_decel(self):
-    iv, _ = self._run('single', -0.80)
-    assert iv > 35, f"pinned SINGLE should transmit slowly, got {iv:.0f} ms"
-
-  def test_unknown_value_falls_back_to_demand(self):
-    """A typo must not silently pin anything."""
-    assert self._run('HOLDD', 0.80)[0] < 35
-    assert self._run('yes', 0.15)[0] > 35
-
-  @pytest.mark.parametrize('pin', ['', 'hold', 'single'])
-  @pytest.mark.parametrize('accel', [-0.15, -0.80])
-  def test_counter_always_steps_by_one(self, pin, accel):
-    """The safety invariant. Pinning must never touch counter values."""
-    _, steps = self._run(pin, accel)
-    assert steps == {1}, f"pin={pin!r} accel={accel} produced counter steps {steps}"
 
 
 class TestSetpointBias:
@@ -671,29 +580,15 @@ class TestSetpointBias:
   ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
 
   def _run(self, accel, v_ego_kmh=86.0, setpoint_kmh=86.0, v_target_kmh=None,
-           bias='', dur=1.2, v_target_rate=None):
+           dur=1.2, v_target_rate=None):
     """Hold one steady operating point and report what we transmit.
 
     Returns (set of action names emitted, set of counter steps, median TX
     interval in ms). v_target defaults to v_ego so v_error sits at zero — the
     case the old v_error gate silently dropped.
     """
-    import importlib
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    monkey = {'bmw_e9x_e8x': {'SetpointBias': bias}}
-    import config as cfg
-    orig = cfg.read_plugin_param
-    cfg.read_plugin_param = lambda pid, key, default='': monkey.get(pid, {}).get(key, default)
-    try:
-      CP = MagicMock()
-      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-      CP.minEnableSpeed = 30 / 3.6
-      cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
-    finally:
-      cfg.read_plugin_param = orig
+    cc, _ = _make_cc()
 
     v_ego = v_ego_kmh * self.KPH
     setpoint = setpoint_kmh * self.KPH
@@ -750,9 +645,10 @@ class TestSetpointBias:
   # ---- the target itself -------------------------------------------------
 
   def test_sp_target_is_vego_plus_bias_on_decel(self):
-    """a_cmd -0.8 wants an 8 km/h gap, so a setpoint 8 km/h under vEgo."""
+    """a_cmd -0.6 at K_DCC 0.12 wants a 5 km/h gap, so a setpoint 5 km/h under
+    vEgo."""
     import bmw.carcontroller as mod
-    assert -0.8 / mod.K_DCC == pytest.approx(-8.0)
+    assert -0.6 / mod.K_DCC == pytest.approx(-5.0)
 
   def test_bias_is_capped(self):
     import bmw.carcontroller as mod
@@ -760,9 +656,10 @@ class TestSetpointBias:
     assert mod.SETPOINT_BIAS_MAX == 12.0
 
   def test_k_dcc_is_conservative_vs_measured_plant(self):
-    """0.1 rather than the measured 0.0935 — every ask lands ~7% shallow."""
+    """Stiffer than the measured 0.0935, so every ask lands shallow of the plant
+    and never overshoots it. 0.12 (~22% shallow) is the comfort setting."""
     import bmw.carcontroller as mod
-    assert 0.9 < 0.0935 / mod.K_DCC < 1.0
+    assert 0.75 < 0.0935 / mod.K_DCC < 1.0
 
   # ---- decel side --------------------------------------------------------
 
@@ -865,21 +762,7 @@ class TestSetpointBias:
         assert land >= 86.0 - 2.5 - 0.01, (setpoint, land)
 
   def _fresh_cc(self):
-    """A CarController with the bias law on, for tests that drive it directly."""
-    import importlib
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
-    import config as cfg
-    orig = cfg.read_plugin_param
-    cfg.read_plugin_param = lambda pid, key, default='': ''
-    try:
-      CP = MagicMock()
-      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-      CP.minEnableSpeed = 30 / 3.6
-      return mod.CarController({0: 'bmw_e9x_e8x'}, CP), mod
-    finally:
-      cfg.read_plugin_param = orig
+    return _make_cc()
 
   def _hold(self, cc, accel, setpoint_kmh, t0, n, v_ego_kmh=86.0, vt_slope=-1.0,
             respond=False):
@@ -945,21 +828,8 @@ class TestSetpointBias:
     """The narrow band belongs to one episode. When the braking latch releases,
     the next episode has to pay the full entry price again — otherwise a single
     episode would permanently widen the law's sensitivity to noise."""
-    import importlib
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    import config as cfg
-    orig = cfg.read_plugin_param
-    cfg.read_plugin_param = lambda pid, key, default='': ''
-    try:
-      CP = MagicMock()
-      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-      CP.minEnableSpeed = 30 / 3.6
-      cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
-    finally:
-      cfg.read_plugin_param = orig
+    cc, mod = _make_cc()
 
     v_ego = 86.0 * self.KPH
     t = 0.0
@@ -1037,14 +907,8 @@ class TestSetpointBias:
     """The rule is three-state: both negative brakes, both positive releases,
     disagreement holds. A vTarget that stops falling while a_cmd is still
     negative must not drop a gap that took seconds to build."""
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    CP = MagicMock()
-    CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-    CP.minEnableSpeed = 30 / 3.6
-    cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    cc, mod = _make_cc()
     t, szl = 0.0, 0
     v_ego = 86.0 * self.KPH
     vt = v_ego
@@ -1069,14 +933,8 @@ class TestSetpointBias:
     respond=False pins the setpoint, which is what a DCC that has stopped
     acting on us looks like.
     """
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    CP = MagicMock()
-    CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-    CP.minEnableSpeed = 30 / 3.6
-    cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
+    cc, mod = _make_cc()
     YIELD = {'minus1': -1.0, 'plus1': 1.0, 'plus5': 5.0}
     v_ego = v_ego_kmh * self.KPH
     vt0 = (v_target_kmh if v_target_kmh is not None else v_ego_kmh)
@@ -1163,7 +1021,7 @@ class TestSetpointBias:
     if m1:
       assert max(m1) >= 3, f"minus1 should still hold its slot; runs={m1}"
 
-
+  def test_pending_prevents_a_second_minus5_before_the_first_is_seen(self):
     """The setpoint is only reported back at ~5 Hz. Without discounting what is
     already in flight, a large error draws minus5 in consecutive slots and
     overshoots by a whole grid step. The credit is now the REAL drop — the
@@ -1202,21 +1060,8 @@ class TestSetpointBias:
     so the gate holds state — it does not degrade to the bare accel sign test
     route 454 was driven on. The latch and the history are cleared together on
     disengage, so the state held is always not-braking."""
-    import importlib
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
-    import config as cfg
-    orig = cfg.read_plugin_param
-    cfg.read_plugin_param = lambda pid, key, default='': ''
-    try:
-      CP = MagicMock()
-      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-      CP.minEnableSpeed = 30 / 3.6
-      cc = mod.CarController({0: 'bmw_e9x_e8x'}, CP)
-    finally:
-      cfg.read_plugin_param = orig
+    cc, mod = _make_cc()
 
     # Hard decel demand from the very first frame, with no history behind it.
     CS = make_stalk_carstate(0, v_ego=86.0 * self.KPH, setpoint=90.0 * self.KPH)
@@ -1235,12 +1080,6 @@ class TestSetpointBias:
     import bmw.carcontroller as mod
     assert mod.DV_WINDOW >= 0.25
     assert round(mod.DV_WINDOW * 20) >= 5
-
-  def test_rollback_path_keeps_the_accel_keyed_step(self):
-    acts, _, _ = self._run(accel=-1.0, v_target_kmh=80.0, setpoint_kmh=86.0, bias='0')
-    assert 'minus5' in acts, acts
-    acts, _, _ = self._run(accel=-0.4, v_target_kmh=80.0, setpoint_kmh=86.0, bias='0')
-    assert 'minus1' in acts and 'minus5' not in acts, acts
 
   def test_floor_still_blocks(self):
     """min_cruise_setpoint is 35 km/h and the branch guard still owns it."""
@@ -1274,14 +1113,18 @@ class TestSetpointBias:
   # ---- the accel branch ---------------------------------------------------
 
   @pytest.mark.parametrize('accel', [0.2, 0.5])
-  def test_accel_branch_picks_the_same_command_below_the_step5_threshold(self, accel):
-    """Under ACCEL_STEP5_THRESHOLD only plus1 is on the table, so the bias
-    changes how far the branch reaches but not which step it uses or how fast
-    it sends — identical to the rollback path."""
-    on = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0, bias='')
-    off = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0, bias='0')
-    assert on[0] == off[0], (on[0], off[0])
-    assert on[2] == pytest.approx(off[2], abs=1e-6)
+  def test_accel_branch_uses_plus1_below_the_step5_threshold(self, accel):
+    """Under ACCEL_STEP5_THRESHOLD only plus1 is on the table."""
+    acts, _, _ = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0)
+    assert acts == {'plus1'}, acts
+
+  def test_accel_cadence_follows_demand(self):
+    """DCC reads accel magnitude from press rate: gentle demand goes out at
+    SINGLE (50 ms), firm demand at HOLD."""
+    _, _, slow = self._run(accel=0.15, v_target_kmh=92.0, setpoint_kmh=86.0)
+    _, _, fast = self._run(accel=0.80, v_target_kmh=92.0, setpoint_kmh=86.0)
+    assert slow > 35, f"gentle accel should use SINGLE cadence, got {slow:.0f} ms"
+    assert fast < 35, f"firm accel should use HOLD cadence, got {fast:.0f} ms"
 
   def test_plus5_landing_is_the_next_multiple_of_ten_above(self):
     """plus5 is minus5 mirrored: it snaps UP to the next multiple of 10
@@ -1323,12 +1166,6 @@ class TestSetpointBias:
         land = mod.plus5_landing_kmh(setpoint)
         assert land <= 100.0 + 0.01, (setpoint, land)
 
-  def test_plus5_rollback_path_is_unchanged(self):
-    """With the bias off, plus5 is still chosen on demand alone."""
-    acts, _, _ = self._run(accel=0.8, v_target_kmh=92.0, setpoint_kmh=86.0,
-                           bias='0')
-    assert 'plus5' in acts, acts
-
   def test_accel_target_is_v_target_not_the_ask(self):
     """The accel side must chase the full v_target gap. Capping it at the
     instantaneous ask (tried in 3acdc35) starves acceleration: on route 45c the
@@ -1342,10 +1179,6 @@ class TestSetpointBias:
     acts, _, _ = self._run(accel=0.1, v_ego_kmh=86.0, setpoint_kmh=87.0,
                            v_target_kmh=92.0)
     assert 'plus1' in acts, ("capped at the ask instead of chasing v_target", acts)
-    # And with the bias off it behaves the same, since this is the shared path.
-    roll, _, _ = self._run(accel=0.1, v_ego_kmh=86.0, setpoint_kmh=87.0,
-                           v_target_kmh=92.0, bias='0')
-    assert 'plus1' in roll, roll
 
   def test_real_accel_demand_is_untouched(self):
     """Above ~+0.3 m/s2 the ask exceeds v_target's own lead, so the min() keeps
@@ -1356,28 +1189,17 @@ class TestSetpointBias:
                              v_target_kmh=92.0)
       assert acts & {'plus1', 'plus5'}, (a, acts)
 
-  # ---- the param ---------------------------------------------------------
-
-  def test_param_off_restores_old_clamp(self):
-    """With the bias off, a zero v_error decel is dropped again."""
-    acts, _, _ = self._run(accel=-0.5, bias='0', v_target_rate=0.0)
-    assert 'minus1' not in acts and 'minus5' not in acts, acts
-
-  def test_param_off_sends_no_restore(self):
-    acts, _, _ = self._run(accel=0.0, setpoint_kmh=76.0, bias='0')
-    assert 'plus1' not in acts, acts
-
   # ---- the safety invariant ----------------------------------------------
 
-  @pytest.mark.parametrize('bias', ['', '0'])
   @pytest.mark.parametrize('accel,setpoint_kmh', [
     (-0.5, 86.0), (-1.0, 86.0), (-2.5, 86.0), (0.0, 76.0), (-0.2, 76.0), (0.5, 86.0),
+    (0.8, 86.0),
   ])
-  def test_counter_always_steps_by_one(self, bias, accel, setpoint_kmh):
+  def test_counter_always_steps_by_one(self, accel, setpoint_kmh):
     """The 5ECE/CD95 axis. Nothing here may emit a step other than +1."""
     _, steps, _ = self._run(accel=accel, setpoint_kmh=setpoint_kmh,
-                            v_target_kmh=92.0 if accel > 0 else None, bias=bias)
-    assert steps <= {1}, f"bias={bias!r} accel={accel} produced counter steps {steps}"
+                            v_target_kmh=92.0 if accel > 0 else None)
+    assert steps <= {1}, f"accel={accel} produced counter steps {steps}"
 
   def test_never_asks_shallower_than_the_old_law(self):
     """Monotonicity: sp_target is min'd against v_target, the old target, so
@@ -1389,17 +1211,11 @@ class TestSetpointBias:
         bias = max(accel / mod.K_DCC, -mod.SETPOINT_BIAS_MAX) / 3.6
         assert min(v_target, v_ego + bias) <= v_target
 
-  def test_param_off_keeps_the_v_error_gate(self):
-    """SetpointBias=0 must be a true rollback. A v_error inside the deadzone
-    with the setpoint above v_target is the case that separates the old gate
-    from the new one: the old code blocks on v_error, and off must too."""
+  def test_decel_is_not_gated_on_v_error(self):
+    """v_error inside the old deadzone with the setpoint above v_target: the
+    pre-2026-09 gate blocked this on v_error, the setpoint law commands it."""
     acts, _, _ = self._run(accel=-0.5, v_ego_kmh=86.0, v_target_kmh=85.8,
-                           setpoint_kmh=90.0, bias='0', v_target_rate=0.0)
-    assert 'minus1' not in acts and 'minus5' not in acts, acts
-
-  def test_bias_on_commands_that_same_case(self):
-    acts, _, _ = self._run(accel=-0.5, v_ego_kmh=86.0, v_target_kmh=85.8,
-                           setpoint_kmh=90.0, bias='')
+                           setpoint_kmh=90.0)
     assert acts & {'minus1', 'minus5'}, acts
 
 
@@ -1443,22 +1259,8 @@ class TestSetpointDebtLedger:
 
   ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
 
-  def _cc(self, bias=''):
-    import importlib
-    import bmw.carcontroller as mod
-    importlib.reload(mod)
-    from bmw.values import BmwFlags
-    monkey = {'bmw_e9x_e8x': {'SetpointBias': bias}}
-    import config as cfg
-    orig = cfg.read_plugin_param
-    cfg.read_plugin_param = lambda pid, key, default='': monkey.get(pid, {}).get(key, default)
-    try:
-      CP = MagicMock()
-      CP.flags = BmwFlags.DYNAMIC_CRUISE_CONTROL
-      CP.minEnableSpeed = 30 / 3.6
-      return mod.CarController({0: 'bmw_e9x_e8x'}, CP), mod
-    finally:
-      cfg.read_plugin_param = orig
+  def _cc(self):
+    return _make_cc()
 
   def _phases(self, cc, phases):
     """phases: list of (seconds, dict of update kwargs). Returns actions seen
@@ -1609,13 +1411,6 @@ class TestSetpointDebtLedger:
   def test_no_repay_below_the_deadzone(self):
     cc, _ = self._cc()
     acts, = self._phases(cc, [(2.0, {'enabled': False, 'setpoint_kmh': 86.0})])
-    assert 'plus1' not in acts, acts
-
-  def test_param_off_keeps_no_ledger(self):
-    cc, _ = self._cc(bias='0')
-    self._phases(cc, [(1.0, {}), (2.0, {'accel': -0.8, 'v_target_kmh': 80.0}),
-                      (1.0, {'enabled': False, 'dcc': False})])
-    acts, = self._phases(cc, [(2.0, {'enabled': False, 'setpoint_kmh': 76.0})])
     assert 'plus1' not in acts, acts
 
   def test_counter_steps_by_one_through_a_repay(self):

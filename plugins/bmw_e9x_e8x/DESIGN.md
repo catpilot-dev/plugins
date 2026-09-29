@@ -114,8 +114,10 @@ control is done by **emulating cruise-stalk (0x194) presses** — `plus1`,
 `actuators.speed` (= planner `vTarget`, injected by `post_actuators`) against
 current speed and the DCC set-speed, and issues stalk pulses:
 
-- **Command selection** — `plus5/minus5` vs `plus1/minus1` chosen by accel
-  magnitude thresholds; decel is blocked below the cruise minimum + buffer.
+- **Command selection** — accel side: `plus5` vs `plus1` offered by accel
+  magnitude, `plus5` taken only when its grid landing fits; decel side: by the
+  setpoint error left (see below); decel is blocked below the cruise minimum +
+  buffer.
   The **accel** side is gated by `V_ERROR_DEADZONE` (~0.5 km/h) plus accel sign
   and set-speed headroom. The **decel** side is gated by the setpoint deadzone
   instead — see *The setpoint is a torque request* below.
@@ -127,7 +129,8 @@ current speed and the DCC set-speed, and issues stalk pulses:
   not the 40 Hz the constant implies**. SINGLE is unaffected and measures
   20.1 Hz. The calibration table (PLUS1+HOLD ≈ +0.4 m/s², PLUS5+HOLD ≈ +1.2,
   MINUS1 ≈ −0.6, MINUS5 ≈ −1.2 m/s²) was measured against the real 48 Hz
-  behaviour, so do not "correct" the cadence without re-measuring it.
+  behaviour, so do not "correct" the cadence without re-measuring it. Stock's
+  own stalk does the same thing: 5 Hz idle, 20 Hz single, 40 Hz hold.
 
 ### The setpoint is a torque request, not a speed
 
@@ -168,9 +171,10 @@ So the decel setpoint inverts the plant instead:
 sp_target = min(v_target, vEgo + max(accel / K_DCC, -SETPOINT_BIAS_MAX))
 ```
 
-`K_DCC = 0.1` is deliberately shallower than the measured 0.0935: it makes
-every ask ~7% conservative, landing at a flat **92–93% of demand** rather than
-overshooting wherever the plant is stiffer than measured. `SETPOINT_BIAS_MAX`
+`K_DCC` is deliberately stiffer than the measured 0.0935, so every ask is
+shallow of the plant and never overshoots where it is stiffer than measured.
+The first cut was 0.1 (~7% shallow); **0.12** (~22% shallow) rode more
+comfortably from the seat and is the setting (e0d2f2c). `SETPOINT_BIAS_MAX`
 = 12 km/h caps the ask at −1.12 m/s²; above that the car under-brakes on
 purpose and the driver finishes the stop.
 
@@ -183,8 +187,15 @@ Three things to keep straight:
   `v_target` at `v_cruise` — exactly as before.
 - **The new target is min'd against the old one**, so this law can only ever
   ask for a *deeper* setpoint than the pre-2026-09 code, never a shallower one.
-- **The accel side is untouched.** `sp_target == v_target` whenever
-  `accel >= 0`, so that branch is bit-identical.
+- **The accel side is untouched.** Outside a braking episode
+  `sp_target == v_target`. Inside one the bias uses `min(accel, 0)`, so a
+  positive blip while latched holds the bias rather than releasing it — the
+  concordance latch is what decides to release.
+- **The decel gate has no `v_error` term.** It used to block 51% of the
+  `a_cmd` −0.4..−0.3 band, because sitting near the plan's target speed is not
+  a reason to ignore a planner asking for deceleration. The setpoint deadzone
+  replaces it: it asks whether a whole step of setpoint is worth moving, and
+  is what keeps a noisy `accel` from churning commands.
 
 **Restore.** The bias is a debt — a setpoint left low keeps braking, because
 the plant is symmetric. As demand releases, `sp_target` rises back to
@@ -196,7 +207,7 @@ park the setpoint ~12 km/h high on the way — a +1.1 m/s² lurch. This covers
 the 96% of decel episodes that end normally; exits that stop us commanding
 entirely (disengage, brake) are the debt ledger's job.
 
-### The loop is blind for 200 ms — the decel bias is minus1 only
+### The loop is blind for 200 ms
 
 `0x193` reports the setpoint back at only **~5 Hz** (measured median gap
 0.199 s / 0.131 s). That is the observation quantum: we command blind for up to
@@ -223,16 +234,14 @@ So **the binding constraint is now setpoint slew, not the clamp.** Removing the
 clamp moves 61% → 68%, not to the ~93% the static gain suggests; that figure
 assumed the setpoint could *reach* `sp_target`, and it cannot.
 
-`minus5` is parked, not deleted. It buys transient response, not ceiling —
-minus1 alone already sustains 1.28 m/s², above `SETPOINT_BIAS_MAX`'s 1.12 — and
-it costs 7× the blind-window exposure plus model risk on that 67% acceptance
-figure. The table above is what to weigh if it is brought back.
+`minus5` buys transient response, not ceiling — minus1 alone already sustains
+1.28 m/s², above `SETPOINT_BIAS_MAX`'s 1.12. It was parked here for its
+blind-window exposure and came back once its landing point was found to be
+computable (see *±1 is a step; ±5 snaps to a grid* below), which removes the overshoot.
 
-Cadence is `HOLD`. DCC's minus1 step rate does not track our frame rate, so
-HOLD costs ~2× the frames on the 0x194 counter-overwrite axis for no measured
-gain in slew; it is taken for robustness of the assertion against dropped
-frames, which the logs cannot settle either way. `DECEL_HOLD_THRESHOLD` and
-`DECEL_STEP5_THRESHOLD` now live only on the `SetpointBias=0` rollback path.
+Decel cadence is `SINGLE`. DCC's minus1 step rate does not track our frame
+rate and yield is per burst, so HOLD would only double the frames on the 0x194
+counter-overwrite axis.
 
 ### Route history
 
@@ -340,7 +349,8 @@ disagreement   -> hold whatever state we are in
 
 The hysteresis falls out of the disagreement region, which is exactly the band
 where the noise lives — so it is self-sizing rather than tuned. Modelled on
-454: flips **18.6 → 8.9/min**, commanding 1658 → 1487 moves/min.
+454: flips **18.6 → 8.9/min**, commanding 1658 → 1487 moves/min, gain 61% →
+57% of demand, unwanted braking −0.002 m/s².
 
 Before a full `DV_WINDOW` of history exists there is no second estimate, and
 the same rule covers it: **hold**. It is tempting to fall back to `accel`
@@ -365,6 +375,28 @@ ever read, so the code carries the raw `vTarget` delta and does not divide it
 into an acceleration: `DV_WINDOW` is a positive constant and divides out of
 every comparison. The noise figure above is quoted as an accel purely to be
 comparable with `accel`'s.
+
+**`DV_WINDOW` (0.30 s, 6 modelV2 frames) is not a tuning knob** — it is the
+deque length and nothing more. Swept 0.2 → 1.0 s on 459 + 45a: braking-state
+toggles move 7.8 → 6.2/min and setpoint flips do not move at all, while p90
+latch lag grows 0.15 → 0.81 s and 45a's restore commands rise 28 → 76. Longer
+is not better; don't sweep it again.
+
+Windowless alternatives were measured and all lose:
+
+- `vTarget − setpoint` and `vTarget − vEgo` buy their quiet by not braking —
+  19 to 61 of 459's 64 decel episodes unserved. `vTarget − vEgo` is also
+  `v_error`, whose defect is below.
+- The plan's own forward slope, `speeds[k] − speeds[0]`, is a real signal
+  (corr 0.82 with `accel` against `dv_target`'s 0.75, so not collinear), but
+  over 459's full 73 episodes it is worse everywhere that counts: braking
+  commands 551 → 480..528, restore commands 100 → 168..208, and 3 to 6
+  episodes missed against zero. Setpoint flips do **not** improve (1.4–1.6/min
+  for every variant); an apparent halving on an 8-segment sample did not
+  survive the full route. Only braking-state toggles fall, and toggles are an
+  intermediate quantity, not an objective. It would also need
+  `longitudinalPlan.speeds` plumbed through the hook boundary — `register.py`
+  injects only `actuators.speed` and `.accel`.
 
 The bias magnitude stays raw `accel`. Using `min(accel, dv/DV_WINDOW)` for the
 magnitude simulates better still (75% of demand against 57%) but that is a
@@ -407,6 +439,16 @@ decided once per 200 ms slot and held for the rest of it, because an assertion
 under 0.06 s produced no step 80% of the time while 0.10–0.15 s produced one
 99% of the time.
 
+**The step keys on the setpoint error, not on `accel`.** Under the old clamped
+setpoint the two were nearly the same question, because the setpoint could
+never get further from `v_target` than the plan already was. This law breaks
+that: the setpoint can already be deep (nothing to do) while demand is large,
+or sitting high (10 km/h to go) while demand is mild. Measured against what the
+setpoint actually had to move, the accel-keyed rule agreed only 35.7% of the
+time and was too timid in 64.1% of cases — minus1 where ≥ 3 km/h was needed —
+against 0.2% the other way. It also costs duty, which is the counter-overwrite
+exposure: 7.88 presses to close the gap accel-keyed against 2.41 error-keyed.
+
 **`setpoint_pending` is load-bearing.** 0x193 reports the setpoint back at ~5 Hz
 and DCC's first step lands ~0.13 s after a burst starts, so without discounting
 what is already asked for, a 10 km/h error draws `minus5` in two consecutive
@@ -414,7 +456,8 @@ slots and overshoots by a whole yield — measured in the bench as the setpoint
 running to 54 km/h instead of 64 against a 74 km/h floor. `PENDING_TIMEOUT`
 clears it after 0.5 s regardless: a DCC that has stopped acting on us never
 changes the reading, so pending would never clear and the law would fall silent
-for good.
+for good. 0.5 s is 2–3 report periods — anything sent has either landed or
+been lost by then.
 
 Closed-loop bench over 53 real episodes from 452/453/454 — planner surrogate,
 measured plant, 5 Hz observation — validated by `minus1`-only reproducing the
@@ -590,9 +633,7 @@ is used only if `land` is at or above `min_cruise_setpoint`.
 point is at or below `sp_target`, so a plus5 sitting just under a grid line can
 no longer jump up to 10 km/h past the target — the accel-side twin of the
 route-45b cut-in. The step is still offered only above
-`ACCEL_STEP5_THRESHOLD`; the landing test decides whether it is taken. With
-`SetpointBias=0` the old demand-only choice is unchanged, so the rollback stays
-a true rollback.
+`ACCEL_STEP5_THRESHOLD`; the landing test decides whether it is taken.
 
 ### Only the decel side inverts the plant
 
@@ -739,6 +780,11 @@ settled when the driver brings DCC back — `CC.enabled` is still false at that
 point, which is the state the repay branch is written for. It repays with
 `plus1` at `SINGLE` for the same reason the restore branch does.
 
+Repaying is not a new action, it is undoing one of ours, so it is not the kind
+of button use the HMI rule (buttons are for deliberate actions only) forbids.
+It is bounded by the ledger, gentle (≤ 0.19 m/s²), and yields immediately: the
+enclosing guard drops it the moment the driver touches the stalk.
+
 **Duty cycle is the risk to watch.** This raises decel commanding from 6.7% to
 ~47% of engaged time — 7× the 0x194 counter-overwrite exposure — while
 direction flips stay flat (~4/min), so it is sustained commanding, not chatter
@@ -746,32 +792,7 @@ direction flips stay flat (~4/min), so it is sustained commanding, not chatter
 slot is still overwritten, but sustained holds of this length are beyond
 anything driven so far; the longest healthy hold on record is 6.28 s on route
 44b. **Check the merged +1 rate on the first drive** — it should stay in the
-94% band, not the 55% that flagged the slot law. `SetpointBias=0` rolls the
-whole thing back on the car without a redeploy.
-
-### `CruiseCadence` — debug A/B param (default off)
-
-Pins the stalk cadence regardless of demanded accel, so a HOLD-vs-SINGLE
-comparison can be driven. Read once at `CarController.__init__`, so it applies
-from the next drive start.
-
-```sh
-ssh c3 'echo hold   > /data/plugins-runtime/bmw_e9x_e8x/data/CruiseCadence'  # pin 48 Hz
-ssh c3 'echo single > /data/plugins-runtime/bmw_e9x_e8x/data/CruiseCadence'  # pin 20 Hz
-ssh c3 'rm -f        /data/plugins-runtime/bmw_e9x_e8x/data/CruiseCadence'   # back to normal
-```
-
-It exists because openpilot picks the command **and** the cadence from the same
-demanded accel, so the two cells can never be matched observationally — 46 decel
-bursts over 25 segments left the question open (gap bin [0.5, 2) showed HOLD at
-−0.284 m/s² vs SINGLE at −0.075, but two other bins were a tie or a slight
-reversal, and the cells differed in speed by 24 km/h). Drive the same road once
-pinned `hold` and once pinned `single`, then compare decel at matched setpoint
-gaps.
-
-Changes frame **spacing only** — counter steps stay +1, so it carries none of
-the 5ECE exposure described below. Any unrecognised value falls back to normal
-demand-driven behaviour.
+94% band, not the 55% that flagged the slot law.
 
 ### How DCC accepts 0x194 — read this before touching the counter
 
@@ -792,7 +813,7 @@ Because SZL's frames are only *sometimes* overwritten, our counter has to stay
 +1 relative to whatever DCC last processed — which may be an SZL frame that got
 through. That is what `cruise_burst_released` handles: after a pause long
 enough for SZL to slip through, the next command resyncs from RX rather than
-resuming our own sequence (see `carcontroller.py`).
+resuming our own sequence (see *The counter machinery* below).
 
 **Correction, 2026-09-06.** This section previously stated that DCC accepts a
 frame iff `(1 + M − K) mod 15 ∈ [1, 7]`, and that the counter-overwrite works by
@@ -816,6 +837,47 @@ Evidence — merged 0x194 stream after timing suppression, fraction of +1 steps:
 | 44b | resume fix | 93.9% | no DTC, 11 segments |
 | 44c | 16-per-slot counter | 55.9% | **5ECE + CD95** |
 | 450 | 16-per-slot counter | 54.8% | **5ECE + CD95** |
+
+#### The counter machinery in `carcontroller.py`
+
+Everything below is field-proven and is the part of the file that still needs
+on-car verification before any change (`cruise_cmd`, `cruise_burst_release_safe`,
+the trailing block, the handoff latch, `PRE_TICK_LEAD`, `BURST_LIVE_WINDOW`).
+
+- **Phase anchor.** `last_cruise_rx_timestamp` is refreshed when the RX counter
+  advances *and* nothing was sent in the last two control cycles, so it locks to
+  SZL's own 5 Hz idle clock rather than to our echo. The slot position is taken
+  modulo 200 ms, which covers long bursts where the anchor is not refreshed.
+- **Lead window.** `PRE_TICK_LEAD` = 15 ms before SZL's predicted tick — wide
+  enough to catch at least one 10 ms control cycle with phase jitter. A frame is
+  forced there whatever the cadence, so ours lands first and SZL's falls into
+  the suppression shadow. Outside it, frames are throttled to the chosen
+  cadence.
+- **Counter.** A burst starts resynced to the RX counter; within it the counter
+  steps +1 per transmitted frame on our own sequence. `M` counts overwritten
+  slots (one per lead-window entry edge, tracked before any early return so
+  throttled cycles still count) and `K` counts frames. SZL keeps emitting +1 per
+  slot regardless, so our sequence drifts ahead of it by `frames_per_slot − 1`
+  per slot — every in-burst slot must be overwritten; DCC cannot be relied on to
+  catch up.
+- **Trailing overwrite.** When commanding stops (or idles inside a deadzone)
+  with the burst still live, neutral `act=0` frames continue at the burst's
+  cadence until `cruise_burst_release_safe()` says SZL may take over. That gate
+  still uses the retracted `(1 + M − K) mod 15 ∈ [1, 7]` test (see above), and
+  it is what produced the protective `K ≥ 10` burst floor on the field-clean
+  routes. A consequence: a short SINGLE burst can take longer than a 200–300 ms
+  deadzone pause to become release-safe, so the pause is filled with trailing
+  frames and the resume simply continues our +1 sequence.
+- **Handoff latch.** Once we fall silent with release safe — or yield the bus
+  to the driver — SZL's next tick is the frame DCC takes, and our private
+  sequence is left behind it. Resuming on it breaks +1: route 444 measured 14 of
+  these in 4 minutes (e.g. a 280 ms pause where SZL had reached 9 and we resumed
+  at 3). `BURST_LIVE_WINDOW` (0.5 s) cannot catch it, because it outlives SZL's
+  200 ms slot. So `cruise_burst_released` is a two-step latch: arm on the first
+  silent cycle, fire once SZL's counter actually moves while we are still
+  silent. Any transmission disarms it, so the gaps between our own 20–48 Hz
+  frames never trip it — only a real silence spanning an SZL tick does. When it
+  has fired, the next command starts a fresh burst resynced from RX.
 
 ## Steering command (`carcontroller.py` + `bmwcan.py`)
 
@@ -894,8 +956,6 @@ Params are **files in the plugin's `data/` dir** (runtime:
 | `TemperatureOverlay` | on | yes (read each frame) | coolant/oil temps on the HUD; Driving-panel toggle |
 | `CruiseCeilingMemory` | on | yes (read on engage) | restore last set-speed ceiling on re-engage within a drive |
 | `SteerAngleOffset` | 0.0 | yes (1 Hz) | persisted steering-angle zero offset; updated from the `steer_angle_offset` plugin-bus topic, **not** a user-facing toggle |
-| `SetpointBias` | on | no (read at init) | accel-derived decel setpoint. `0` reverts to the pre-2026-09 `v_target` setpoint, v_error gate included — a true rollback, not a third behaviour |
-| `CruiseCadence` | off | no (read at init) | debug A/B: `hold` / `single` pins the stalk cadence. Not for normal driving |
 
 `torque_params.toml` (LAT_ACCEL_FACTOR / MAX_LAT_ACCEL_MEASURED / FRICTION per
 platform) is folded into opendbc's torque params at load time. Lateral-timing
