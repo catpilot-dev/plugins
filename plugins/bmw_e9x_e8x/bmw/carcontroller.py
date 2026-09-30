@@ -2,10 +2,9 @@ from collections import deque
 
 from opendbc.car import Bus, DT_CTRL
 from opendbc.car.lateral import apply_dist_to_meas_limits
-from bmw import bmwcan, fp_cache
+from bmw import bmwcan
 from bmw.bmwcan import SteeringModes, CruiseStalk
 from bmw.values import CarControllerParams, CanBus, BmwFlags, CruiseSettings
-from bmw.vin_check import VinCheck
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.can import CANPacker
 from opendbc.car.common.conversions import Conversions as CV
@@ -143,12 +142,6 @@ class CarController(CarControllerBase):
       self.cruise_bus = CanBus.F_CAN
 
     self.packer = CANPacker(dbc_name[Bus.pt])
-
-    # Confirm a cached fingerprint once the drive is under way.
-    # DESIGN.md: "Fingerprint cache".
-    self.vin_check = None
-    if fp_cache.cached_vin:
-      self.vin_check = VinCheck(fp_cache.cached_vin, CanBus.PT_CAN, on_fail=fp_cache.clear)
 
   def update(self, CC, CS, now_nanos):
 
@@ -396,13 +389,6 @@ class CarController(CarControllerBase):
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.Off))
 
     self.cruise_enabled_prev = CC.enabled
-
-    if self.vin_check is not None:
-      try:
-        can_sends += self.vin_check.tx(now_nanos)
-      except Exception as e:
-        print(f"[bmw] VIN check disabled: {type(e).__name__}: {e}")
-        self.vin_check = None
 
     new_actuators = actuators.as_builder()
     new_actuators.torque = self.apply_torque_last / CarControllerParams.STEER_MAX

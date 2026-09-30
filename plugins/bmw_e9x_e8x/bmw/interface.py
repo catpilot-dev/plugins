@@ -32,19 +32,6 @@ class CarInterface(CarInterfaceBase):
   def __init__(self, CP, *args, **kwargs):
     super().__init__(CP, *args, **kwargs)
 
-  def update(self, can_packets):
-    ret = super().update(can_packets)
-    # The deferred VIN check needs the raw 0x7E8 reply, which no parser sees.
-    # It is optional; a failure inside it switches it off rather than taking
-    # card down with it (card does not restart).
-    if self.CC.vin_check is not None:
-      try:
-        self.CC.vin_check.rx(can_packets)
-      except Exception as e:
-        print(f"[bmw] VIN check disabled: {type(e).__name__}: {e}")
-        self.CC.vin_check = None
-    return ret
-
   @staticmethod
   def _get_params(ret, candidate, fingerprint, car_fw, alpha_long, is_release, docs):
     ret.brand = "bmw"
