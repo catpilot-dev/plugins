@@ -944,7 +944,15 @@ defines an `AngleControl` mode, but only torque control is used.
 Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
 `cereal.safety_models`. Enforced independently on the Panda:
 
-- **TX allow-list**: only `CruiseControlStalk` (0x194, PT-CAN and F-CAN) and
+- **safetyParam `BMW_PARAM_STEPPER_SERVO` (bit 0)**: set by `interface.py` when
+  the fingerprint sees the servo (0x22F on F-CAN or AUX-CAN). With it, the servo
+  status is RX-checked and steering commands are allowed. Without it, neither:
+  a car with no servo engages longitudinal-only instead of the panda holding
+  `controls_allowed` false on a missing 0x22F, which selfdrived reports as
+  `controlsMismatch` (route 4a7, servo unplugged). Firmware before this change
+  ignores the param, so update the plugin first and flash second.
+- **TX allow-list**: `CruiseControlStalk` (0x194, PT-CAN and F-CAN), UDS to the
+  DME on PT-CAN (0x7E0 / 0x7DF), and — servo param only —
   `STEPPER_STEERING_COMMAND` (F-CAN / AUX-CAN).
 - **Torque limits**: `TorqueMotorLimited`, max 12 Nm, **speed-scaled** down to
   8 Nm at 80 km/h and 4 Nm at 100 km/h; rate up ≤ 0.125 Nm/10 ms, rate down
@@ -960,8 +968,8 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
   note the device lib's `Panda.flash()` hangs on F4 re-enumeration and
   hardcodes H7 sector layout — call `Panda.flash_static(handle, code,
   mcu_type=McuType.F4)` with the panda already in bootstub instead.
-- **RX checks** on brake, gas, speed and either cruise-status message, plus
-  the stepper status.
+- **RX checks** on brake, gas, speed, either cruise-status message and the
+  stalk, plus the stepper status when the servo param is set.
 - `disable_forwarding = true`; cruise-engaged state is taken from the DCC/NCC
   status messages.
 - **LKA mode** (2026-08-14): DCC engaging latches `controls_allowed`; DCC

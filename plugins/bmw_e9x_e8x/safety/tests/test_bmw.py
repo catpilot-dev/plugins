@@ -68,6 +68,9 @@ BMW_TRANSMISSION_DATA_DISPLAY = 0x1D2
 STEPPER_SERVO_STATUS = 0x22F
 STEPPER_SERVO_COMMAND = 0x22E
 
+# safetyParam bits (bmw.h)
+BMW_PARAM_STEPPER_SERVO = 1   # Ocelot servo present: RX-check 0x22F, allow 0x22E
+
 # CAN bus assignments
 BMW_PT_CAN = 0
 BMW_F_CAN = 1
@@ -141,7 +144,7 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
     self.packer = CANPackerPanda("bmw_e9x_e8x")
     self.stepper_packer = CANPackerPanda("ocelot_controls")
     self.safety = libsafety_py.libsafety
-    self.safety.set_safety_hooks(CarParams.SafetyModel.bmw, 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.bmw, BMW_PARAM_STEPPER_SERVO)
     self.safety.init_tests()
 
     # CRITICAL: Send all BMW RX_CHECKS messages by default to prevent frequency validation failures
@@ -761,6 +764,82 @@ class TestBmwSafety(common.PandaCarSafetyTest, common.MotorTorqueSteeringSafetyT
     self._send_all_bmw_rx_checks()
     self.safety.safety_rx_hook(self._dynamic_cruise_msg(engaged=True))
     self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_missing_servo_status_drops_controls(self):
+    """With the servo declared, its status stays RX-checked: a servo that stops
+    reporting must take controls away, since torque_meas comes from it."""
+    self.safety.set_timer(int(1.9e6))
+    for msg in _rx_msgs_without_servo(self):
+      self.safety.safety_rx_hook(msg)
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(int(2e6))
+    self.safety.safety_tick_current_safety_config()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+
+def _rx_msgs_without_servo(t):
+  """Every RX-checked message except the servo status (0x22F)."""
+  return [t._engine_brake_msg(brake_pressed=False), t._acc_pedal_msg(gas_pressed=False),
+          t._speed_msg(0), t._transmission_msg(8), t._dynamic_cruise_msg(engaged=False),
+          t._cruise_stalk_msg(bus=BMW_F_CAN)]
+
+
+class TestBmwSafetyNoServo(unittest.TestCase):
+  """safetyParam without BMW_PARAM_STEPPER_SERVO: a car with no Ocelot servo.
+
+  The servo status is not RX-checked, so its absence cannot hold
+  controls_allowed false — route 4a7 (servo unplugged) raised controlsMismatch
+  on every engage attempt, even for DCC-only longitudinal. Steering commands
+  are off the TX list instead.
+  """
+  _engine_brake_msg = TestBmwSafety._engine_brake_msg
+  _acc_pedal_msg = TestBmwSafety._acc_pedal_msg
+  _speed_msg = TestBmwSafety._speed_msg
+  _transmission_msg = TestBmwSafety._transmission_msg
+  _dynamic_cruise_msg = TestBmwSafety._dynamic_cruise_msg
+  _cruise_stalk_msg = TestBmwSafety._cruise_stalk_msg
+  _stepper_command_msg = TestBmwSafety._stepper_command_msg
+  STANDSTILL_THRESHOLD = TestBmwSafety.STANDSTILL_THRESHOLD
+
+  def setUp(self):
+    self.packer = CANPackerPanda("bmw_e9x_e8x")
+    self.stepper_packer = CANPackerPanda("ocelot_controls")
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(CarParams.SafetyModel.bmw, 0)
+    self.safety.init_tests()
+
+  def _rx_all(self):
+    for msg in _rx_msgs_without_servo(self):
+      self.safety.safety_rx_hook(msg)
+
+  def test_rx_checks_valid_without_servo_status(self):
+    self._rx_all()
+    self.assertTrue(self.safety.safety_config_valid())
+
+  def test_missing_servo_does_not_drop_controls(self):
+    self.safety.set_timer(int(1.9e6))
+    self._rx_all()
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(int(2e6))
+    self.safety.safety_tick_current_safety_config()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_dcc_engages(self):
+    self._rx_all()
+    self.safety.safety_rx_hook(self._dynamic_cruise_msg(engaged=True))
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_steering_commands_are_blocked(self):
+    self._rx_all()
+    self.safety.set_controls_allowed(True)
+    for steer_req, torque in ((0, 0), (1, 0), (1, 1)):
+      msg = self._stepper_command_msg(torque, steer_req=steer_req)
+      self.assertFalse(self.safety.safety_tx_hook(msg), (steer_req, torque))
+
+  def test_cruise_stalk_still_transmits(self):
+    self._rx_all()
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self.safety.safety_tx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN)))
 
 
 if __name__ == "__main__":

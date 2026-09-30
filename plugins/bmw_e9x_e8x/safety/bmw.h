@@ -41,6 +41,11 @@
 #define BMW_F_CAN 1U
 #define BMW_AUX_CAN 2U
 
+// safetyParam: set by the plugin when the Ocelot servo is detected at
+// fingerprint. Without it the servo status is not RX-checked (a missing servo
+// must not block longitudinal-only engagement) and steering TX is not allowed.
+#define BMW_PARAM_STEPPER_SERVO 1U
+
 #define CAN_BMW_SPEED_FAC 0.1
 #define CAN_BMW_ACC_FAC 0.025
 #define CAN_ACTUATOR_TQ_FAC 0.125
@@ -212,27 +217,39 @@ static bool bmw_tx_hook(const CANPacket_t *msg) {
   return tx;
 }
 
-static safety_config bmw_init(uint16_t param) {
-  SAFETY_UNUSED(param);
+// Common RX checks: brake, gas, speed and cruise status on PT-CAN, stalk on F- or PT-CAN.
+#define BMW_COMMON_RX_CHECKS \
+  {.msg = {{BMW_EngineAndBrake, BMW_PT_CAN, 8, .frequency = 100U, \
+            .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{BMW_AccPedal, BMW_PT_CAN, 8, .frequency = 100U, \
+            .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{BMW_Speed, BMW_PT_CAN, 8, .frequency = 50U, \
+            .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{BMW_DynamicCruiseControlStatus, BMW_PT_CAN, 8, .frequency = 5U, \
+            .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, \
+           {BMW_CruiseControlStatus, BMW_PT_CAN, 8, .frequency = 5U, \
+            .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, \
+           { 0 }}}, \
+  {.msg = {{BMW_CruiseControlStalk, BMW_F_CAN, 4, .frequency = 5U, \
+            .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, \
+           {BMW_CruiseControlStalk, BMW_PT_CAN, 4, .frequency = 5U, \
+            .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, \
+           { 0 }}}
 
+#define BMW_COMMON_TX_MSGS \
+  {BMW_CruiseControlStalk, BMW_PT_CAN, 4, .check_relay = false}, /* Normal cruise control send status on PT-CAN */ \
+  {BMW_CruiseControlStalk, BMW_F_CAN, 4, .check_relay = false},  /* Dynamic cruise control send status on F-CAN */ \
+  {BMW_UDS_REQUEST_DME, BMW_PT_CAN, 8, .check_relay = false},    /* UDS diagnostic requests to DME */ \
+  {BMW_UDS_FUNCTIONAL_REQUEST, BMW_PT_CAN, 8, .check_relay = false}  /* UDS functional requests */
+
+static safety_config bmw_init(uint16_t param) {
   static RxCheck bmw_rx_checks[] = {
-    // Core safety: brake, gas, speed on Bus 0, steering torque on Bus 1 (same pattern as Toyota 0xaa, 0x260, 0x1D2, 0x226)
-    {.msg = {{BMW_EngineAndBrake, BMW_PT_CAN, 8, .frequency = 100U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{BMW_AccPedal, BMW_PT_CAN, 8, .frequency = 100U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{BMW_Speed, BMW_PT_CAN, 8, .frequency = 50U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{BMW_DynamicCruiseControlStatus, BMW_PT_CAN, 8, .frequency = 5U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-             {BMW_CruiseControlStatus, BMW_PT_CAN, 8, .frequency = 5U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-             { 0 }}},
-    {.msg = {{BMW_CruiseControlStalk, BMW_F_CAN, 4, .frequency = 5U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-             {BMW_CruiseControlStalk, BMW_PT_CAN, 4, .frequency = 5U,
-              .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-             { 0 }}},
+    BMW_COMMON_RX_CHECKS,
+  };
+
+  // With the servo: its status (torque_meas source) is RX-checked, on F-CAN or a standalone bus.
+  static RxCheck bmw_servo_rx_checks[] = {
+    BMW_COMMON_RX_CHECKS,
     {.msg = {{STEPPER_STEERING_STATUS,  BMW_F_CAN, 8, .ignore_counter = true, .frequency = 100U,
               .ignore_quality_flag = true, .ignore_checksum = true},
              {STEPPER_STEERING_STATUS,  BMW_AUX_CAN, 8, .ignore_counter = true, .frequency = 100U,
@@ -240,21 +257,26 @@ static safety_config bmw_init(uint16_t param) {
              { 0 }}},
   };
 
-  // TX_MSGS configuration - allowed outgoing CAN messages
   static const CanMsg BMW_TX_MSGS[] = {
-    {BMW_CruiseControlStalk, BMW_PT_CAN, 4, .check_relay = false}, // Normal cruise control send status on PT-CAN
-    {BMW_CruiseControlStalk, BMW_F_CAN, 4, .check_relay = false}, // Dynamic cruise control send status on F-CAN
-    {STEPPER_STEERING_COMMAND, BMW_F_CAN, 5, .check_relay = false}, // STEPPER_SERVO_CAN is allowed on F-CAN network
+    BMW_COMMON_TX_MSGS,
+  };
+
+  static const CanMsg BMW_SERVO_TX_MSGS[] = {
+    BMW_COMMON_TX_MSGS,
+    {STEPPER_STEERING_COMMAND, BMW_F_CAN, 5, .check_relay = false},    // STEPPER_SERVO_CAN is allowed on F-CAN network
     {STEPPER_STEERING_COMMAND, BMW_AUX_CAN, 5, .check_relay = false},  // or an standalone network
-    {BMW_UDS_REQUEST_DME, BMW_PT_CAN, 8, .check_relay = false}, // UDS diagnostic requests to DME
-    {BMW_UDS_FUNCTIONAL_REQUEST, BMW_PT_CAN, 8, .check_relay = false}, // UDS functional requests
   };
 
   bmw_speed = 0.0f;
   cruise_engaged_prev = false;
   bmw_stalk_set_prev = false;
 
-  safety_config ret = BUILD_SAFETY_CFG(bmw_rx_checks, BMW_TX_MSGS);
+  safety_config ret;
+  if (GET_FLAG(param, BMW_PARAM_STEPPER_SERVO)) {
+    ret = BUILD_SAFETY_CFG(bmw_servo_rx_checks, BMW_SERVO_TX_MSGS);
+  } else {
+    ret = BUILD_SAFETY_CFG(bmw_rx_checks, BMW_TX_MSGS);
+  }
   ret.disable_forwarding = true;
 
   return ret;

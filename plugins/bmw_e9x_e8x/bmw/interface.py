@@ -2,7 +2,7 @@
 from opendbc.car import structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car import get_safety_config
-from bmw.values import CanBus, BmwFlags, CruiseSettings
+from bmw.values import CanBus, BmwFlags, BmwSafetyFlags, CruiseSettings
 from opendbc.car.interfaces import CarInterfaceBase
 from bmw.carcontroller import CarController
 from bmw.carstate import CarState
@@ -88,7 +88,11 @@ class CarInterface(CarInterfaceBase):
       ret.minEnableSpeed = CruiseSettings.MIN_ENABLE_SPEED_KPH * CV.KPH_TO_MS
 
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.bmw)]
+    # Without a servo the panda neither RX-checks its status nor allows steering
+    # commands, so longitudinal-only engagement still works.
     ret.safetyConfigs[0].safetyParam = 0
+    if ret.flags & BmwFlags.STEPPER_SERVO_CAN:
+      ret.safetyConfigs[0].safetyParam |= BmwSafetyFlags.STEPPER_SERVO.value
 
     ret.steerControlType = structs.CarParams.SteerControlType.torque
     # BMW-specific: lagd never converges for our curvature/front-wheel-angle

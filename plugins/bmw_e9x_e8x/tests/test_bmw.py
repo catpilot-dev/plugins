@@ -1493,3 +1493,50 @@ class TestSetpointDebtLedger:
     assert overshoot <= 2.0, (
       f"setpoint reached {cc._sim_min_true:.1f}, {overshoot:.1f} km/h past the "
       f"{floor:.1f} floor = {overshoot * 0.0935:.2f} m/s2 of unasked-for braking")
+
+
+class TestSafetyParam:
+  """safetyParam tells the panda whether the Ocelot servo is fitted. With
+  BMW_PARAM_STEPPER_SERVO the firmware RX-checks the servo status (0x22F) and
+  allows steering commands (0x22E); without it, neither — so a car with no
+  servo can still engage longitudinal-only instead of raising controlsMismatch
+  (route 4a7, servo unplugged)."""
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mods in (make_carcontroller_mocks(), make_cereal_mocks()):
+      for name, mod in mods.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    class Base:
+      def __init__(self, *a, **kw): pass
+      @staticmethod
+      def configure_torque_tune(*a, **kw): pass
+    monkeypatch.setattr(sys.modules['opendbc.car.interfaces'], 'CarInterfaceBase', Base)
+
+  def _safety_param(self, fingerprint):
+    from types import SimpleNamespace
+    import bmw.interface as mod
+    importlib.reload(mod)
+    ret = SimpleNamespace(flags=0, wheelbase=2.76, lateralTuning=None)
+    mod.CarInterface._get_params(ret, 'BMW_E90', fingerprint, [], False, False, False)
+    return ret.safetyConfigs[0].safetyParam
+
+  def test_servo_on_f_can_sets_the_bit(self):
+    from bmw.values import BmwSafetyFlags
+    assert self._safety_param({1: {0x22F: 8}}) == BmwSafetyFlags.STEPPER_SERVO
+
+  def test_servo_on_aux_can_sets_the_bit(self):
+    from bmw.values import BmwSafetyFlags
+    assert self._safety_param({2: {0x22F: 8}}) == BmwSafetyFlags.STEPPER_SERVO
+
+  def test_no_servo_leaves_it_clear(self):
+    assert self._safety_param({0: {0x1A0: 8}, 1: {0x0C9: 8}}) == 0
+
+  def test_flag_matches_the_firmware_define(self):
+    import re
+    from bmw.values import BmwSafetyFlags
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'safety', 'bmw.h')).read()
+    m = re.search(r'#define BMW_PARAM_STEPPER_SERVO (\d+)U', src)
+    assert m and int(m.group(1)) == BmwSafetyFlags.STEPPER_SERVO

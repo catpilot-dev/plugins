@@ -34,6 +34,11 @@ class CarControllerParams: #controls running @ 100hz
     pass
 
 
+class BmwSafetyFlags(IntFlag):
+  # safetyParam bits — must match safety/bmw.h
+  STEPPER_SERVO = 1  # BMW_PARAM_STEPPER_SERVO: RX-check 0x22F, allow 0x22E
+
+
 class BmwFlags(IntFlag):
   # Detected Flags
   STEPPER_SERVO_CAN = 2 ** 0
