@@ -54,13 +54,17 @@ class VinCheck:
     return []
 
   def rx(self, can_packets):
-    """Feed raw CAN packets, [(nanos, [CanData(address, dat, src)])]."""
+    """Feed raw CAN packets, [(nanos, [(address, dat, src), ...])].
+
+    Frames are unpacked by position: card passes plain tuples
+    (can_capnp_to_list), other callers opendbc's CanData namedtuple.
+    """
     if self.state != 'pending' or self.deadline_ns is None:
       return
     for _, frames in can_packets:
-      for f in frames:
-        if f.address == RESPONSE_ADDR and f.src == self.bus:
-          self._frame(bytes(f.dat))
+      for address, dat, src in frames:
+        if address == RESPONSE_ADDR and src == self.bus:
+          self._frame(bytes(dat))
 
   def _frame(self, dat):
     kind = dat[0] >> 4

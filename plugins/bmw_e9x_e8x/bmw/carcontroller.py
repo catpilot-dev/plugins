@@ -398,7 +398,11 @@ class CarController(CarControllerBase):
     self.cruise_enabled_prev = CC.enabled
 
     if self.vin_check is not None:
-      can_sends += self.vin_check.tx(now_nanos)
+      try:
+        can_sends += self.vin_check.tx(now_nanos)
+      except Exception as e:
+        print(f"[bmw] VIN check disabled: {type(e).__name__}: {e}")
+        self.vin_check = None
 
     new_actuators = actuators.as_builder()
     new_actuators.torque = self.apply_torque_last / CarControllerParams.STEER_MAX

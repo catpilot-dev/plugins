@@ -198,9 +198,10 @@ def _vin_frames(vin, src=PT):
 
 
 def _pkt(frames, t=0):
-  from collections import namedtuple
-  CanData = namedtuple('CanData', 'address dat src')
-  return [(t, [CanData(*f) for f in frames])]
+  """What card really passes CarInterface.update: can_capnp_to_list gives
+  [(nanos, [(address, dat, src), ...])] -- plain tuples, not CanData. Route
+  4a8/4a9: rx read f.address and crashed card 30 s into every cached boot."""
+  return [(t, [tuple(f) for f in frames])]
 
 
 class TestVinCheck:
@@ -255,6 +256,16 @@ class TestVinCheck:
     chk.rx(_pkt(_vin_frames(VIN, src=128)))   # TX echo of bus 0
     chk.rx(_pkt(_vin_frames(VIN, src=2)))     # gateway copy on K-CAN
     assert chk.state == 'pending'
+
+  def test_accepts_candata_as_well(self):
+    """opendbc's CanData namedtuple is the other shape frames arrive in."""
+    from collections import namedtuple
+    CanData = namedtuple('CanData', 'address dat src')
+    chk, fails = _check(delay=0.0)
+    chk.tx(0)
+    chk.tx(1)
+    chk.rx([(0, [CanData(*f) for f in _vin_frames(VIN)])])
+    assert chk.state == 'confirmed'
 
   def test_negative_response_counts_as_no_answer(self):
     chk, fails = _check(delay=0.0, attempts=1)
@@ -313,3 +324,25 @@ class TestWiring:
     packets = _pkt(_vin_frames(VIN))
     assert ci.update(packets) == 'carstate'
     ci.CC.vin_check.rx.assert_called_once_with(packets)
+
+  def test_a_failing_check_disables_itself_instead_of_killing_card(self, monkeypatch):
+    """The check is a nicety; card is not. Whatever goes wrong inside it must
+    switch it off, never propagate out of CarInterface.update or the
+    controller -- card does not restart (route 4a8)."""
+    class Base:
+      def __init__(self, *a, **kw): pass
+      def update(self, can_packets): return 'carstate'
+    monkeypatch.setattr(sys.modules['opendbc.car.interfaces'], 'CarInterfaceBase', Base)
+    import bmw.interface as mod
+    importlib.reload(mod)
+    ci = mod.CarInterface.__new__(mod.CarInterface)
+    ci.CC = MagicMock()
+    ci.CC.vin_check.rx.side_effect = AttributeError('boom')
+    assert ci.update(_pkt(_vin_frames(VIN))) == 'carstate'
+    assert ci.CC.vin_check is None
+
+    _fp_cache().cached_vin = VIN
+    cc = _controller()
+    cc.vin_check.tx = MagicMock(side_effect=ValueError('boom'))
+    _drive(cc, 0.05)
+    assert cc.vin_check is None
