@@ -67,8 +67,9 @@ Measured on the car (2026-09-29): the VIN comes from the DME on **PT-CAN**
 (0x7DF → 0x7E8). The OBD-multiplexing half of the sweep never reaches F-CAN —
 on the F4 `dos` panda it disables the F-CAN transceiver and routes CAN2 to the
 unconnected OBD pins for ~0.5 s (bus-1 RX drops to 0), which is where the ~46
-startup errors on `canState1` are counted. The gateway also copies the PT-CAN
-diagnostic frames onto K-CAN.
+startup errors on `canState1` are counted. Bus 2 also shows the PT-CAN
+queries, only because the harness relay mirrors PT-CAN onto it during boot
+(see *CAN bus layout*).
 
 `bmw/fp_cache.py` keeps `{vin, fingerprint}` in the plugin data dir
 (`FingerprintCache`), and `register.py` wraps `car_helpers.fingerprint`
@@ -94,7 +95,7 @@ CAN parser subscribes to 0x7E8.
 
 ```
 Panda ──CAN──► carstate.py (CarState.update)
-                 parses PT-CAN / F-CAN / AUX-CAN → structs.CarState
+                 parses PT-CAN / F-CAN (incl. servo status) → structs.CarState
                  publishes bmw_temps (0.2 Hz) on the plugin bus
                  resume-button state machine → ButtonEvents / speedlimit toggle
                         │
@@ -117,9 +118,21 @@ Panda ──CAN──► carstate.py (CarState.update)
 
 | Bus | Names in `values.py::CanBus` | Traffic |
 |---|---|---|
-| 0 | `PT_CAN` | engine, brakes, speed, yaw, transmission, cruise status/stalk, temps |
-| 1 | `SERVO_CAN` / `F_CAN` | Ocelot stepper servo (steering); DCC cruise stalk when DCC is present |
-| 2 | `AUX_CAN` / `K_CAN` | alternative servo bus; logging |
+| 0 | `PT_CAN` | harness CAN0: engine, brakes, speed, yaw, transmission, cruise status/stalk, temps |
+| 1 | `SERVO_CAN` / `F_CAN` | harness CAN1: Ocelot stepper servo (steering); DCC cruise stalk when DCC is present |
+| 2 | `AUX_CAN` | harness CAN2, the relay's camera-side pair — **unconnected on this car** |
+
+Measured 2026-09-30 (routes 4a0, 48c). There is no K-CAN tap on this harness. Bus 2
+is the harness relay's camera-side pair, joined to CAN0 while the relay is at
+rest. It carries an exact copy of PT-CAN during boot (ELM327 / no-output safety),
+our own bus-0 TX included, and goes silent the moment `bmw` safety switches the
+relay to intercept. CAN1 (F-CAN) passes straight through the harness box with no
+relay and no termination.
+
+`AUX_CAN` stays supported (servo detection, panda safety) for a standalone servo
+network. On this harness it is not one: anything wired to CAN2 is bridged onto
+PT-CAN at every boot and whenever the panda is unpowered, unless the relay path
+is removed first.
 
 `get_can_parsers` deliberately subscribes to **both** DCC and NCC cruise
 messages (with a `nan` timeout) so a slow-to-wake ECU can't cause `canValid`

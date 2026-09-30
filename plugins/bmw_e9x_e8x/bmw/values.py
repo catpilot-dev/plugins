@@ -53,11 +53,14 @@ class CruiseSettings:
   MIN_ENABLE_SPEED_KPH = 30.  # CC and DCC both refuse to engage below this
 
 class CanBus:
+  # Panda bus = harness CAN pair: CAN0 PT-CAN, CAN1 F-CAN. DESIGN.md: "CAN bus layout".
   PT_CAN = 0
   SERVO_CAN = 1  # required for steering (STEPPER_SERVO can be on this bus)
   F_CAN = 1  # required for DYNAMIC_CRUISE_CONTROL or optional for logging
-  AUX_CAN = 2  # alternative bus for STEPPER_SERVO messages (matches BMW_AUX_CAN in bmw.h)
-  K_CAN = 2  # not used - only logging
+  # Alternative bus for STEPPER_SERVO messages (matches BMW_AUX_CAN in bmw.h).
+  # CAN2 is the harness relay's camera-side pair: it mirrors PT-CAN whenever the
+  # relay is at rest, so it is a standalone servo bus only with that path removed.
+  AUX_CAN = 2
 
 
 class Footnote(Enum):
