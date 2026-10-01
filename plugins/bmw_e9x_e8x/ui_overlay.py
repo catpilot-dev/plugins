@@ -107,11 +107,16 @@ def on_ui_state_tick(default, sm):
   return default
 
 
+# bmw.values.BmwFlags.STEPPER_SERVO_CAN — the UI stays clear of the car interface.
+STEPPER_SERVO_CAN = 1
+
+
 def lka_active(ui_state):
   """LKA mode: openpilot engaged (lateral steering) while DCC is off — the
-  driver owns gas/brake. See lka_mode.py for the mode machine."""
+  driver owns gas/brake. Never without a servo. See lka_mode.py."""
   try:
-    return bool(ui_state.engaged and not ui_state.sm['carState'].cruiseState.enabled)
+    return bool(ui_state.engaged and not ui_state.sm['carState'].cruiseState.enabled
+                and ui_state.CP is not None and ui_state.CP.flags & STEPPER_SERVO_CAN)
   except Exception:
     return False
 

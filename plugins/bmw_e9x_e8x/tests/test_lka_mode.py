@@ -91,7 +91,14 @@ def make_cs(dcc_on=False, cancel_press=None, gear=GearShifter.drive,
 @pytest.fixture
 def filt():
   import lka_mode
-  return lka_mode.LkaModeFilter()
+  return lka_mode.LkaModeFilter(servo=True)
+
+
+@pytest.fixture
+def filt_ns():
+  """No stepper servo fitted: LKA has nothing to steer with."""
+  import lka_mode
+  return lka_mode.LkaModeFilter(servo=False)
 
 
 class TestNotEngaged:
@@ -175,7 +182,8 @@ class TestFreshStartEngageMirrorsThePort:
     # Source 2 only: DCC is off on both edges, so the DCC-rising-edge branch
     # cannot fire and the port gate reduces to the stalk gesture.
     engages = port_gate(btns, dcc_engaged=dcc_on, dcc_engaged_prev=dcc_on,
-                        v_ego=v_ego, min_enable_speed=lka_mode.MIN_ENABLE_SPEED)
+                        v_ego=v_ego, min_enable_speed=lka_mode.MIN_ENABLE_SPEED,
+                        lka_available=True)
     evs = FakeEvents([EventName.resumeBlocked])
     cs = make_cs(dcc_on=dcc_on, v_ego=v_ego, buttons=[(btn, pressed)])
     filt.filter(evs, cs, make_cs(dcc_on=dcc_on), op_enabled=False)
@@ -336,6 +344,7 @@ class TestLkaUiStatus:
       engaged=True,
       status=self.ui_status.ENGAGED,
       sm={'carState': SimpleNamespace(cruiseState=SimpleNamespace(enabled=False))},
+      CP=SimpleNamespace(flags=1),
     )
     mod = MagicMock()
     mod.ui_state = self.ui_state
@@ -362,6 +371,12 @@ class TestLkaUiStatus:
     self.overlay.on_ui_state_tick(None, self.ui_state.sm)
     assert self.ui_state.status == self.ui_status.DISENGAGED
 
+  def test_no_servo_keeps_engaged_status(self):
+    """Route 4ac: no servo, so there is no LKA to show."""
+    self.ui_state.CP = SimpleNamespace(flags=4)
+    self.overlay.on_ui_state_tick(None, self.ui_state.sm)
+    assert self.ui_state.status == self.ui_status.ENGAGED
+
 
 class TestLkaBadgePredicate:
   @pytest.fixture(autouse=True)
@@ -379,10 +394,11 @@ class TestLkaBadgePredicate:
     return module
 
   @staticmethod
-  def make_ui_state(engaged, dcc_on):
+  def make_ui_state(engaged, dcc_on, flags=1):
     return SimpleNamespace(
       engaged=engaged,
       sm={'carState': SimpleNamespace(cruiseState=SimpleNamespace(enabled=dcc_on))},
+      CP=SimpleNamespace(flags=flags),
     )
 
   def test_active_when_engaged_without_dcc(self, bmw_ui_overlay):
@@ -397,10 +413,110 @@ class TestLkaBadgePredicate:
   def test_inactive_on_error(self, bmw_ui_overlay):
     assert bmw_ui_overlay.lka_active(SimpleNamespace(engaged=True, sm={})) is False
 
+  def test_inactive_without_servo(self, bmw_ui_overlay):
+    assert bmw_ui_overlay.lka_active(self.make_ui_state(True, False, flags=4)) is False
+
+  def test_inactive_before_car_params(self, bmw_ui_overlay):
+    state = self.make_ui_state(True, False)
+    state.CP = None
+    assert bmw_ui_overlay.lka_active(state) is False
+
+  def test_servo_flag_matches_the_car_interface(self, bmw_ui_overlay):
+    from bmw.values import BmwFlags
+    assert bmw_ui_overlay.STEPPER_SERVO_CAN == BmwFlags.STEPPER_SERVO_CAN
+
+
+class TestNoServo:
+  """Route 4ac (2026-10-01, servo unplugged): every DCC drop left openpilot
+  in LKA — enabled, grey border, nothing steering. Without a servo, LKA is
+  bypassed completely: openpilot follows DCC and disengages the way stock does."""
+
+  def test_dcc_drop_disengages(self, filt_ns):
+    events = FakeEvents([])
+    filt_ns.filter(events, make_cs(dcc_on=False), make_cs(dcc_on=True), op_enabled=True)
+    assert EventName.pcmDisable in events.events
+
+  def test_full_mode_untouched(self, filt_ns):
+    events = FakeEvents([EventName.doorOpen])
+    filt_ns.filter(events, make_cs(dcc_on=True), make_cs(dcc_on=True), op_enabled=True)
+    assert events.events == [EventName.doorOpen]
+
+  def test_brake_disengages(self, filt_ns):
+    events = FakeEvents([EventName.pedalPressed])
+    filt_ns.filter(events, make_cs(dcc_on=True), make_cs(dcc_on=True), op_enabled=True)
+    assert EventName.pedalPressed in events.events
+
+  @pytest.mark.parametrize("pressed", [True, False])
+  def test_first_cancel_disengages(self, filt_ns, pressed):
+    events = FakeEvents([EventName.buttonCancel])
+    filt_ns.filter(events, make_cs(dcc_on=True, cancel_press=pressed),
+                   make_cs(dcc_on=True), op_enabled=True)
+    assert EventName.buttonCancel in events.events
+
+  def test_no_longitudinal_override(self, filt_ns):
+    events = FakeEvents([])
+    filt_ns.filter(events, make_cs(dcc_on=False), make_cs(dcc_on=True), op_enabled=True)
+    assert EventName.gasPressedOverride not in events.events
+
+  def test_sub30_engage_block_kept(self, filt_ns):
+    """No sub-30 stalk engage without a servo, so nothing to unblock."""
+    events = FakeEvents([EventName.resumeBlocked])
+    cs = make_cs(dcc_on=False, v_ego=5.0, buttons=[(ButtonType.accelCruise, False)])
+    filt_ns.filter(events, cs, make_cs(), op_enabled=False)
+    assert events.events == [EventName.resumeBlocked]
+
+  def test_non_drive_gear_still_disengages_quietly(self, filt_ns):
+    events = FakeEvents([EventName.wrongGear])
+    filt_ns.filter(events, make_cs(dcc_on=True, gear=GearShifter.neutral),
+                   make_cs(dcc_on=True), op_enabled=True)
+    assert EventName.pcmDisable in events.events
+    assert EventName.wrongGear not in events.events
+
+
+class TestServoDetection:
+  """selfdrived's hook passes no CarParams; the filter reads them once."""
+
+  @pytest.fixture
+  def read(self, monkeypatch):
+    import lka_mode
+    def _read(flags=None, exc=None):
+      def load():
+        if exc:
+          raise exc
+        return SimpleNamespace(flags=flags)
+      monkeypatch.setattr(lka_mode, '_load_car_params', load)
+      return lka_mode._servo_from_car_params()
+    return _read
+
+  def test_servo_flag_set(self, read):
+    assert read(flags=1 | 4) is True
+
+  def test_servo_flag_clear(self, read):
+    assert read(flags=4) is False
+
+  def test_unreadable_params_mean_no_lka(self, read):
+    """Fail toward stock disengagement, never toward a phantom LKA."""
+    assert read(exc=RuntimeError('no CarParams')) is False
+
+  def test_servo_flag_matches_the_car_interface(self):
+    import lka_mode
+    from bmw.values import BmwFlags
+    assert lka_mode.STEPPER_SERVO_CAN == BmwFlags.STEPPER_SERVO_CAN
+
+  def test_hook_builds_the_filter_from_car_params(self, monkeypatch):
+    import lka_mode
+    monkeypatch.setattr(lka_mode, '_filter', None)
+    monkeypatch.setattr(lka_mode, '_servo_from_car_params', lambda: False)
+    events = FakeEvents([])
+    lka_mode.on_events_filter(None, events, make_cs(dcc_on=False), make_cs(dcc_on=True), True)
+    assert EventName.pcmDisable in events.events
+
 
 class TestHookCallback:
-  def test_on_events_filter_returns_default(self):
+  def test_on_events_filter_returns_default(self, monkeypatch):
     import lka_mode
+    monkeypatch.setattr(lka_mode, '_filter', None)
+    monkeypatch.setattr(lka_mode, '_servo_from_car_params', lambda: True)
     events = FakeEvents([EventName.pedalPressed])
     result = lka_mode.on_events_filter(None, events, make_cs(dcc_on=True), make_cs(), True)
     assert result is None

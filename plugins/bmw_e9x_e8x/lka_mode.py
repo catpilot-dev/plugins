@@ -23,6 +23,11 @@ Everything else (DM escalation, doors, seatbelt, steering faults, soft
 disables) passes through untouched and still fully disengages. Stripping
 pedalPressed while engaged also neutralizes DisengageOnAccelerator on this car.
 
+Without a stepper servo there is nothing for LKA to steer with, so the mode is
+bypassed completely: openpilot follows DCC — any DCC drop disengages, brake and
+cancel disengage as stock — and the sub-30 stalk engage is off (carstate). Route
+4ac (2026-10-01, servo unplugged) sat in LKA for 14 s with nothing steering.
+
 Brief: .superpowers/sdd/2026-08-14-bmw-lka-mode/lka-mode-brief.md
 """
 
@@ -33,9 +38,30 @@ Brief: .superpowers/sdd/2026-08-14-bmw-lka-mode/lka-mode-brief.md
 # tests/test_lka_mode.py guards the two against drift.
 MIN_ENABLE_SPEED = 30. / 3.6
 
+# bmw.values.BmwFlags.STEPPER_SERVO_CAN, duplicated for the same reason.
+STEPPER_SERVO_CAN = 1
+
+
+def _load_car_params():
+  import cereal.messaging as messaging
+  from cereal import car
+  from openpilot.common.params import Params
+  return messaging.log_from_bytes(Params().get("CarParams"), car.CarParams)
+
+
+def _servo_from_car_params():
+  """Is a stepper servo fitted? Unreadable CarParams count as no: that fails
+  toward stock disengagement, never toward a phantom LKA."""
+  try:
+    return bool(_load_car_params().flags & STEPPER_SERVO_CAN)
+  except Exception:
+    return False
+
 
 class LkaModeFilter:
-  def __init__(self):
+  def __init__(self, servo):
+    # LKA exists only with a servo to steer with.
+    self.servo = servo
     # True iff the most recent cancel rising edge occurred while already in
     # LKA (openpilot enabled, DCC off) — only such a press may disengage.
     self.cancel_press_in_lka = False
@@ -43,9 +69,16 @@ class LkaModeFilter:
   def filter(self, events, CS, CS_prev, op_enabled):
     from cereal import car, log
     EventName = log.OnroadEvent.EventName
-    ButtonType = car.CarState.ButtonEvent.Type
-    GearShifter = car.CarState.GearShifter
 
+    if not self.servo:
+      # No LKA: openpilot follows DCC. Brake and cancel already disengage as
+      # stock; a DCC drop on its own (min-speed cutout, DSC) needs pcmDisable.
+      if op_enabled and not CS.cruiseState.enabled:
+        events.add(EventName.pcmDisable)
+      self._gear_disengage(events, CS, op_enabled)
+      return
+
+    ButtonType = car.CarState.ButtonEvent.Type
     dcc_on = CS.cruiseState.enabled
     for be in CS.buttonEvents:
       if be.type == ButtonType.cancel and be.pressed:
@@ -91,6 +124,11 @@ class LkaModeFilter:
       # yields to USER_DISABLE, so stage-2 cancel is unaffected.
       events.add(EventName.gasPressedOverride)
 
+    events.events[:] = [e for e in events.events if e not in strip]
+    self._gear_disengage(events, CS, op_enabled)
+
+  @staticmethod
+  def _gear_disengage(events, CS, op_enabled):
     # Only Drive permits engagement (route 3fb seg 2, user ruling 2026-08-16):
     # any other definite gear — FULL or LKA — disengages directly instead of
     # wrongGear's soft-disable "Gear not D" countdown. pcmDisable =
@@ -98,17 +136,23 @@ class LkaModeFilter:
     # on this car (pcmCruise=False). `unknown` (transient CAN glitch) is left
     # to the stock soft-disable so a one-frame dropout can't instantly
     # disengage. Entry-side gating is stock wrongGear NO_ENTRY, untouched.
-    if CS.gearShifter not in (GearShifter.drive, GearShifter.unknown):
-      strip.add(EventName.wrongGear)
+    from cereal import car, log
+    EventName = log.OnroadEvent.EventName
+    GearShifter = car.CarState.GearShifter
+    if op_enabled and CS.gearShifter not in (GearShifter.drive, GearShifter.unknown):
+      events.events[:] = [e for e in events.events if e != EventName.wrongGear]
       events.add(EventName.pcmDisable)
 
-    events.events[:] = [e for e in events.events if e not in strip]
 
-
-_filter = LkaModeFilter()
+# Built on the first hook call: selfdrived's hook passes no CarParams, and
+# selfdrived blocks on the CarParams param before its first update.
+_filter = None
 
 
 def on_events_filter(default, events, CS, CS_prev, op_enabled):
   """Hook callback: selfdrived.events_filter (end of SelfdriveD.update_events)."""
+  global _filter
+  if _filter is None:
+    _filter = LkaModeFilter(servo=_servo_from_car_params())
   _filter.filter(events, CS, CS_prev, op_enabled)
   return default

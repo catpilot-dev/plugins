@@ -29,7 +29,7 @@ def toggle_speed_limit_confirm():
 
 
 def should_button_enable(buttonEvents, *, dcc_engaged, dcc_engaged_prev,
-                        v_ego, min_enable_speed):
+                        v_ego, min_enable_speed, lka_available):
   """Should openpilot engage this frame?  (CarStateBase.update_button_enable)
 
   Two sources, because this car has two engagement regimes:
@@ -49,13 +49,14 @@ def should_button_enable(buttonEvents, *, dcc_engaged, dcc_engaged_prev,
      resumeCruise).
 
   Source 2 is gated on v_ego AND on DCC being off, so a setpoint adjustment
-  never reads as an engage request. Kept as a free function so it is testable
+  never reads as an engage request, and on lka_available: without a stepper
+  servo there is no LKA to engage into (lka_mode.py). Kept as a free function so it is testable
   without constructing a CarState (CarStateBase is mocked in the plugin suite).
   """
   if dcc_engaged and not dcc_engaged_prev:
     return True
 
-  if not dcc_engaged and v_ego < min_enable_speed:
+  if lka_available and not dcc_engaged and v_ego < min_enable_speed:
     for b in buttonEvents:
       if b.type in (ButtonType.accelCruise, ButtonType.decelCruise) and not b.pressed:
         return True
@@ -283,7 +284,8 @@ class CarState(CarStateBase):
                                 dcc_engaged=self.cruise_state_enabled,
                                 dcc_engaged_prev=self.out.cruiseState.enabled,
                                 v_ego=self.out.vEgo,
-                                min_enable_speed=self.CP.minEnableSpeed)
+                                min_enable_speed=self.CP.minEnableSpeed,
+                                lka_available=bool(self.CP.flags & BmwFlags.STEPPER_SERVO_CAN))
 
   @staticmethod
   def _load_steer_angle_offset():

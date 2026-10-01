@@ -962,6 +962,13 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
   firmware heartbeat (`controls_allowed && !heartbeat_engaged` for 3 s clears
   `controls_allowed`; lost heartbeat → SILENT) and enforces the torque limits.
   See `.superpowers/sdd/2026-08-14-bmw-lka-mode/lka-mode-brief.md`.
+- **No servo, no LKA** (route 4ac, 2026-10-01): without `STEPPER_SERVO_CAN`
+  the mode is bypassed in openpilot alone — `lka_mode` adds `pcmDisable` on any
+  DCC drop and leaves brake/cancel to stock, `should_button_enable` drops the
+  sub-30 stalk engage, and the UI shows no LKA badge or grey border. The
+  firmware needs no change: the stalk latch still sets `controls_allowed`, but
+  with openpilot disengaged the heartbeat clears it within 3 s, the servo param
+  blocks 0x22E, and carcontroller sends no 0x194 while DCC is off.
 
 ## Hooks
 
@@ -975,8 +982,8 @@ From `plugin.json` — **eight** hooks:
 | `ui.vehicle_settings` | `on_vehicle_settings` (`register`) | append the Temperature-Overlay toggle + Resume-Button note to the Driving panel's vehicle section (only when `CP.brand == 'bmw'`) |
 | `ui.render_overlay` | `on_render_overlay` (`ui_overlay`) | draw coolant/oil temperature on the driving HUD |
 | `device.health_check` | `on_health_check` (`register`) | report whether the BMW interface registered into opendbc |
-| `selfdrived.events_filter` | `on_events_filter` (`lka_mode`) | LKA two-stage disengagement: strip brake/first-cancel disengage events so lateral survives DCC dropping; a cancel press that starts in LKA fully disengages; any definite gear other than Drive disengages directly (stock soft-disable only for `unknown` glitches) |
-| `ui.state_tick` | `on_ui_state_tick` (`ui_overlay`) | LKA border shows the override grey (UIStatus.OVERRIDE, same as gasPressed while engaged) |
+| `selfdrived.events_filter` | `on_events_filter` (`lka_mode`) | LKA two-stage disengagement: strip brake/first-cancel disengage events so lateral survives DCC dropping; a cancel press that starts in LKA fully disengages; any definite gear other than Drive disengages directly (stock soft-disable only for `unknown` glitches). Without a servo: no LKA — a DCC drop disengages, brake/cancel are stock |
+| `ui.state_tick` | `on_ui_state_tick` (`ui_overlay`) | LKA border shows the override grey (UIStatus.OVERRIDE, same as gasPressed while engaged); never without a servo |
 
 The `ui.vehicle_settings` hook is **dispatched by** the `ui_mod` plugin from
 inside its Driving panel: when a car is detected, ui_mod draws a vehicle

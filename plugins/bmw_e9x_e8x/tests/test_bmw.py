@@ -339,11 +339,11 @@ class TestButtonEnable:
     for mod_name, mod_mock in make_cereal_mocks().items():
       monkeypatch.setitem(sys.modules, mod_name, mod_mock)
 
-  def _call(self, events=(), *, dcc_now=False, dcc_prev=False, v_ego=0.0):
+  def _call(self, events=(), *, dcc_now=False, dcc_prev=False, v_ego=0.0, lka=True):
     from bmw.carstate import should_button_enable
     return should_button_enable(list(events), dcc_engaged=dcc_now,
                                 dcc_engaged_prev=dcc_prev, v_ego=v_ego,
-                                min_enable_speed=self.MIN_ENABLE)
+                                min_enable_speed=self.MIN_ENABLE, lka_available=lka)
 
   def _btn(self, btype, pressed):
     from types import SimpleNamespace
@@ -383,6 +383,15 @@ class TestButtonEnable:
 
   def test_no_stalk_events_does_not_engage(self):
     assert self._call(v_ego=5.5) is False
+
+  # --- no servo: no LKA, so no sub-30 engage ----------------------------
+  def test_stalk_does_not_engage_without_servo(self):
+    """Route 4ac: without a servo there is no LKA to engage into."""
+    for kind in ('accelCruise', 'decelCruise'):
+      assert self._call(self._stalk(kind=kind), v_ego=5.5, lka=False) is False, kind
+
+  def test_dcc_rising_edge_engages_without_servo(self):
+    assert self._call(dcc_now=True, dcc_prev=False, v_ego=15.0, lka=False) is True
 
   def test_stalk_ignored_below_min_speed_while_dcc_already_on(self):
     """Setpoint adjustment with DCC somehow live below the floor is not an
