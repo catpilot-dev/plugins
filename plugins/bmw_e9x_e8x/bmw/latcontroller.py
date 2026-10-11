@@ -229,20 +229,6 @@ UNWIND_CADENCE_TQ = 0.10   # frac (1.2 Nm): standing torque past which a
                            # lot in a single step whenever it lands, so
                            # rescheduling buys nothing. See the cancel_tol block.
 
-# Straight-line step cap (routes 4d3-4d5, 2026-10-11): sudden corrections
-# on straights; the user held the wheel with some friction and never
-# trusted hands-off. Median straight decisions step ~0.3 Nm, but ~10% hit
-# the speed cap (0.9-1.0 Nm per 300 ms, 3-4x as often as route 4a0), and
-# the torque slope into wheel jumps we drive ran 2-3.4 Nm/s vs 1.3 in 4a0.
-# With no rate damping here, a capped step lets the wheel speed up until the
-# yaw-based error catches up. On a straight the step is capped at
-# STEP_MAX_STRAIGHT (0.48 Nm, ~1.6 Nm/s at the 300 ms cadence), blending
-# back to the speed schedule across STEP_MAX_STRAIGHT_K of |kappa_des|.
-# Linear blend, not a gate: a curvature cliff failed before (033df35).
-# It only ever tightens the speed schedule; curve entries are untouched.
-STEP_MAX_STRAIGHT = 0.04              # frac (0.48 Nm)
-STEP_MAX_STRAIGHT_K = [0.002, 0.005]  # |kappa_des| blend edges (1/m)
-
 
 def gain_reference_speed(v_true):
   """Speed the TORQUE PARAMETERS reference (gains and caps), not the plant.
@@ -1305,9 +1291,6 @@ def on_lat_controller_init(result, lac, CP):
           # slew is now ~0.33 frac/s (~4 Nm/s); the P-law reverses on
           # overshoot, speedlimitd handles curve-entry speed (a_y bound).
           step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
-          # Straight-line cap, blended out by |kappa_des| (see STEP_MAX_STRAIGHT).
-          step_max = float(np.interp(abs(state['desired']), STEP_MAX_STRAIGHT_K,
-                                     [min(STEP_MAX_STRAIGHT, step_max), step_max]))
           # Fast unwind in the LKA regime (route 417, 2026-08-21). STEP_MAX
           # exists to stop abrupt APPLICATION — seg 27's single decisions
           # swinging 0.69 frac drove 150 deg/s wheel bursts. RELEASING torque
