@@ -244,6 +244,15 @@ OV_PUSH_MEM_S = 0.3        # cancel_tol yields ~0.3 s after the driver wins and
                            # fires/3.2 h at curve entries, measured)
 OV_RATE_TICKS = 20         # 0.2 s signed-rate window over the shared sb_ring
 
+# Controller timing horizon, DECOUPLED from lat_delay (2026-10-12). It used to
+# follow model_action_t = lat_delay + DT_MDL (0.65 s at steerActuatorDelay 0.4).
+# SAD went to 0.7 so modeld plans for the measured straight-line loop delay
+# (target -> yaw 0.90-1.0 s, routes 4d4/4d5), but this controller's cadence,
+# ramp spread and hold-cap lookahead were all field-tuned at 0.65 s and must
+# not move with it: a 0.95 s horizon stretches the cadence to ~500 ms (added
+# lag - route 4d8) and shrinks hold_cap to 47%, below steady SAT.
+CONTROL_HORIZON_S = 0.65
+
 
 def on_lat_controller_init(result, lac, CP):
   """Plant-inversion at 500 ms horizon in front-wheel-angle space.
@@ -934,14 +943,14 @@ def on_lat_controller_init(result, lac, CP):
       # MODEL_ACTION_T_FALLBACK block above.
       model_action_t = (lat_delay + DT_MDL) if lat_delay and lat_delay > 0 else MODEL_ACTION_T_FALLBACK
 
-      # Decision cadence and CAN ramp length — both equal half of the model
-      # action horizon (see constants block). 2 decision-and-ramp cycles fit
-      # per horizon; the controller's correction bandwidth tracks the model's.
+      # Decision cadence and CAN ramp length — both equal half of the
+      # controller horizon, CONTROL_HORIZON_S (fixed 0.65 s since 2026-10-12;
+      # it used to track model_action_t, see that constant).
       # spread_frames derived from action_cadence_ticks (× 5 CAN ticks per
       # livePose tick) so ramp duration matches cadence period exactly — no
       # rounding mismatch between the two units (e.g. at model_action_t=0.65,
       # half=0.325s → cadence=6 ticks=300ms → spread=30 frames=300ms, equal).
-      half_horizon = 0.5 * model_action_t
+      half_horizon = 0.5 * CONTROL_HORIZON_S
       action_cadence_ticks = max(1, round(half_horizon / DT_LIVEPOSE))
       spread_frames = action_cadence_ticks * int(DT_LIVEPOSE / DT_CAN_TICK)
 
@@ -1005,8 +1014,9 @@ def on_lat_controller_init(result, lac, CP):
       # Slow-error EMA for the persistent-lean escape (see HOLD_EMA_TAU).
       state['derr_ema'] += (DT_LIVEPOSE / HOLD_EMA_TAU) * (delta_err - state['derr_ema'])
 
-      # Lookahead is still needed for the hold cap below.
-      lookahead_m = v * model_action_t
+      # Lookahead is still needed for the hold cap below. Fixed horizon, not
+      # model_action_t - see CONTROL_HORIZON_S.
+      lookahead_m = v * CONTROL_HORIZON_S
 
       # Curvature scale for the P-term and caps (computed per tick since the
       # hold cap below needs it too; keyed on raw |κ_des|, see T_CAP_SCALE

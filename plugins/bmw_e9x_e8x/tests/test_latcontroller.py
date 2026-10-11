@@ -239,7 +239,9 @@ class TestCancelTolStillFires:
     v = 20.0
     kappa = 0.006          # δ_des = δ_meas -> δ_err ≈ 0, inside 1.2·HOLD_BAND
     _set_measured(fake_sm, v, kappa)
-    state['torque'] = 0.4          # -> held = hold_f(=1.0)·0.4 = 0.4, under hold_cap
+    # held = hold_f(=1.0)·0.15 = 0.15, under the production hold_cap (0.192 at
+    # v=20, κ=0.006 on the fixed 0.65 s CONTROL_HORIZON_S)
+    state['torque'] = 0.15
     state['target_frac'] = 0.6     # stale in-flight push target (!= held, arms re-drain)
     state['ramp_frames'] = 5       # a ramp still in flight
     state['action'] = 'ramp'
@@ -248,7 +250,7 @@ class TestCancelTolStillFires:
     _call_update(lac, kappa, v_ego=v)
 
     assert state['action'] == 'cancel_tol'
-    assert state['target_frac'] == pytest.approx(0.4)   # drained to the hold, not 0.6, not 0
+    assert state['target_frac'] == pytest.approx(0.15)  # drained to the hold, not 0.6, not 0
     assert state['ramp_frames'] > 0
 
   def test_cancel_tol_does_not_fire_off_target(self, monkeypatch):
@@ -309,14 +311,14 @@ class TestNonCancelPaths:
     v = 20.0
     kappa = 0.006
     _set_measured(fake_sm, v, kappa)
-    state['torque'] = 0.3
-    state['target_frac'] = 0.3
+    state['torque'] = 0.15           # under the production hold_cap (0.192 here)
+    state['target_frac'] = 0.15
     state['ramp_frames'] = 0
     state['action'] = 'hold_curve'   # NOT 'ramp' -> cancel_tol gate stays shut
     state['tick_count'] = 999
     _call_update(lac, kappa, v_ego=v)
     assert state['action'] == 'hold_curve'
-    assert state['target_frac'] == pytest.approx(0.3)
+    assert state['target_frac'] == pytest.approx(0.15)
 
   def test_counter_turn_torque_runs_normal_decision(self, monkeypatch):
     """Deep in a measured curve with torque already opposing the turn (an
@@ -1115,10 +1117,10 @@ class TestStepMaxSpeedSchedule:
   on 15 and 28 alone.
 
   One CAN tick of ramp is then applied before update() returns:
-  spread_frames = action_cadence_ticks * 5, and with the harness's default
-  lat_delay = 0.2 -> model_action_t = 0.25 -> half = 0.125 s ->
-  action_cadence_ticks = round(2.5) = 2 (banker's rounding) -> 10 frames.
-  So state['torque'] lands on -step_max / 10.
+  spread_frames = action_cadence_ticks * 5, from the fixed CONTROL_HORIZON_S
+  = 0.65 s (independent of lat_delay since 2026-10-12) -> half = 0.325 s ->
+  action_cadence_ticks = round(6.5) = 6 (banker's rounding) -> 30 frames.
+  So state['torque'] lands on -step_max / 30.
   """
 
   DESIRED = -0.02      # deep target: P saturates, so the step cap is what binds
@@ -1128,14 +1130,14 @@ class TestStepMaxSpeedSchedule:
     _decide_from_zero(lac, sm, state, v=15.0, desired=self.DESIRED)
     assert state['action'] == 'ramp'
     assert state['target_frac'] == pytest.approx(-0.10, abs=1e-9)
-    assert state['torque'] == pytest.approx(-0.010, abs=1e-9)
+    assert state['torque'] == pytest.approx(-0.10 / 30, abs=1e-9)
 
   def test_half_step_at_and_above_the_second_breakpoint(self, monkeypatch):
     lac, sm, mod, state = _make_controller(monkeypatch)
     _decide_from_zero(lac, sm, state, v=28.0, desired=self.DESIRED)
     assert state['action'] == 'ramp'
     assert state['target_frac'] == pytest.approx(-0.05, abs=1e-9)
-    assert state['torque'] == pytest.approx(-0.005, abs=1e-9)
+    assert state['torque'] == pytest.approx(-0.05 / 30, abs=1e-9)
 
   def test_interpolated_step_between_the_breakpoints(self, monkeypatch):
     """20 m/s sits strictly inside the ramp: 0.10 - 5/13*0.05 = 0.0807692.
@@ -1144,7 +1146,7 @@ class TestStepMaxSpeedSchedule:
     _decide_from_zero(lac, sm, state, v=20.0, desired=self.DESIRED)
     assert state['action'] == 'ramp'
     assert state['target_frac'] == pytest.approx(-0.0807692307, abs=1e-9)
-    assert state['torque'] == pytest.approx(-0.00807692307, abs=1e-9)
+    assert state['torque'] == pytest.approx(-0.0807692307 / 30, abs=1e-9)
 
   def test_step_cap_shrinks_monotonically_with_speed(self, monkeypatch):
     """The safety property in one assertion, independent of exact values: a
@@ -1155,6 +1157,51 @@ class TestStepMaxSpeedSchedule:
       _decide_from_zero(lac, sm, state, v=v, desired=self.DESIRED)
       steps.append(abs(state['target_frac']))
     assert steps[0] > steps[1] > steps[2]
+
+
+class TestControllerHorizonDecoupled:
+  """2026-10-12: CP.steerActuatorDelay 0.4 -> 0.7 so modeld plans for the
+  measured straight-line loop delay (target -> yaw 0.90-1.0 s on routes
+  4d4/4d5 vs the 0.65 s action point). The controller's own timing must NOT
+  follow: its cadence/ramp spread and the hold-cap lookahead stay on the
+  field-tuned 0.65 s horizon. A 0.95 s horizon would stretch the cadence to
+  ~500 ms (more lag - the 4d8 lesson) and shrink hold_cap to (0.65/0.95)^2 =
+  47%, below steady SAT, breaking hold_curve."""
+
+  def _decision(self, monkeypatch, lat_delay):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    state['torque'] = 0.0
+    state['target_frac'] = 0.0
+    state['ramp_frames'] = 0
+    state['action'] = 'idle'
+    state['tick_count'] = 999
+    _set_measured(sm, 20.0, 0.0)
+    _call_update(lac, -0.004, v_ego=20.0, lat_delay=lat_delay)
+    return state, mod
+
+  def test_ramp_spread_ignores_lat_delay(self, monkeypatch):
+    a, _ = self._decision(monkeypatch, 0.6)
+    b, _ = self._decision(monkeypatch, 0.9)
+    assert a['action'] == b['action'] == 'ramp'
+    assert a['ramp_frames'] == b['ramp_frames']
+    assert a['torque'] == pytest.approx(b['torque'], abs=1e-12)
+
+  def test_spread_is_the_field_tuned_300ms(self, monkeypatch):
+    """0.65 s horizon -> half 0.325 s -> 6 livePose ticks -> 30 CAN frames;
+    one frame is applied inside the decision tick."""
+    a, _ = self._decision(monkeypatch, 0.9)
+    assert a['ramp_frames'] == 30 - 1
+
+  def test_hold_cap_ignores_lat_delay(self, monkeypatch):
+    a, _ = self._decision(monkeypatch, 0.6)
+    b, _ = self._decision(monkeypatch, 0.9)
+    assert a['hold_cap'] == pytest.approx(b['hold_cap'], rel=1e-12)
+
+  def test_horizon_constant_is_the_old_production_value(self, monkeypatch):
+    """0.4 + 0.2 (lagd initial_lag) + DT_MDL: the horizon every controller
+    constant was tuned at."""
+    _, mod = self._decision(monkeypatch, 0.6)
+    assert mod.CONTROL_HORIZON_S == pytest.approx(0.65)
 
 
 class TestSteeringAngleGuard:

@@ -196,6 +196,20 @@ This document is the canonical reference for the lateral controller registered b
 > since STEP_MAX: commanded pushes can only produce ~0.7 m/s³ at highway —
 > revisit the guard's role if it misfires again.
 
+> **2026-10-12 — model timing matched to the measured loop delay; controller
+> timing decoupled.** Stage delays on straights (routes 4d4/4d5, 0.1–1 Hz
+> band): target → torque 0.05–0.10 s, torque → wheel angle 0.30–0.52 s
+> (servo + hydraulic rack), angle → yaw 0.33–0.37 s, total 0.90–1.0 s — but
+> modeld planned for 0.65 s (`steerActuatorDelay` 0.4 + lagd's 0.2 + DT_MDL),
+> so the model's corrections landed ~0.3 s late and drove the sub-Hz in-lane
+> sway. `steerActuatorDelay` → 0.7 (lat_action_t 0.95 s). The controller's
+> cadence/ramp spread and hold-cap lookahead no longer follow lat_delay: they
+> stay on `CONTROL_HORIZON_S = 0.65`, the horizon they were tuned at (a 0.95 s
+> horizon would mean a ~500 ms cadence and a hold cap at 47%, below steady
+> SAT). Curves measured shorter (~0.25–0.6 s, little data), so expect slightly
+> earlier turn-in; 0.6 is the fallback compromise. lane_keeping's gap
+> prediction (1.5 × lat_delay) still follows lat_delay by design.
+
 > **2026-07-12 — relax-dwell (route 3a0 seg 8: "gives up mid-turn").**
 > modelV2's κ_des dips 40–50% for ~1 s mid-hairpin and recovers (3× in one
 > turn) while κ_meas stays steady. The controller faithfully followed each

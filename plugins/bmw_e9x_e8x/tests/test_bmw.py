@@ -1504,6 +1504,34 @@ class TestSetpointDebtLedger:
       f"{floor:.1f} floor = {overshoot * 0.0935:.2f} m/s2 of unasked-for braking")
 
 
+class TestLateralTiming:
+  """steerActuatorDelay is the only input to lagd's initial_lag, which this car
+  never moves off (lagd does not converge here): liveDelay = SAD + 0.2. Routes
+  4d4/4d5 measured target -> yaw 0.90-1.0 s on straights, so SAD 0.7 makes
+  modeld plan for that (lat_action_t 0.95 s) instead of 0.65 s."""
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mods in (make_carcontroller_mocks(), make_cereal_mocks()):
+      for name, mod in mods.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    class Base:
+      def __init__(self, *a, **kw): pass
+      @staticmethod
+      def configure_torque_tune(*a, **kw): pass
+    monkeypatch.setattr(sys.modules['opendbc.car.interfaces'], 'CarInterfaceBase', Base)
+
+  def test_steer_actuator_delay_matches_the_measured_loop(self):
+    from types import SimpleNamespace
+    import bmw.interface as mod
+    importlib.reload(mod)
+    ret = SimpleNamespace(flags=0, wheelbase=2.76, lateralTuning=None)
+    mod.CarInterface._get_params(ret, 'BMW_E90', {1: {0x22F: 8}}, [], False, False, False)
+    assert ret.steerActuatorDelay == pytest.approx(0.7)
+
+
 class TestSafetyParam:
   """safetyParam tells the panda whether the Ocelot servo is fitted. With
   BMW_PARAM_STEPPER_SERVO the firmware RX-checks the servo status (0x22F) and
