@@ -41,7 +41,9 @@ This document is the canonical reference for the lateral controller registered b
 >    `δ_err` flips sign and the P-term commands torque the other way. Tracking
 >    back to the command *is* the overshoot correction; no separate guard needed.
 > 2. **`STEP_MAX`** — per-decision torque step cap (speed-scaled 0.10→0.05),
->    the jerk bound (~4 Nm/s max slew, halving to ~2 Nm/s at highway).
+>    the jerk bound (~4 Nm/s max slew, halving to ~2 Nm/s at highway). On
+>    straights it is tightened further to `STEP_MAX_STRAIGHT` (0.04, ~1.6 Nm/s),
+>    blended back out over |κ_des| 0.002→0.005 (2026-10-11, below).
 > 3. **Panda `STEER_MAX`** — the hard actuator limit (12 Nm), enforced at the
 >    gateway.
 > 4. **Driver supervision** — hands-on, the ultimate authority.
@@ -195,6 +197,23 @@ This document is the canonical reference for the lateral controller registered b
 > `|κ_meas| > KMEAS_SIGN_FLOOR = 0.0005`. Note jerk_pred also over-predicts
 > since STEP_MAX: commanded pushes can only produce ~0.7 m/s³ at highway —
 > revisit the guard's role if it misfires again.
+
+> **2026-10-11 — straight-line step cap (routes 4d3–4d5, current-control
+> servo).** Sudden corrections on straight lanes; the driver kept some hand
+> friction on the wheel and never trusted hands-off. The decision cadence was
+> already 300 ms (lat_delay pinned at 0.6 → model_action_t 0.65 → half 0.325 →
+> 6 ticks), so cadence was not the lever. Straight decisions (> 50 km/h,
+> |κ_des| < 0.002) step ~0.3 Nm at the median, but 7–13% hit the speed cap
+> (0.9–1.0 Nm per 300 ms) vs 2.8% on route 4a0, and the torque slope into the
+> wheel jumps we drive ran 2.0–3.4 Nm/s vs 1.3. No rate damping exists here,
+> so a capped step lets the wheel accelerate until the yaw-based error catches
+> up — the driver's hand was supplying the damping. Fix: `STEP_MAX_STRAIGHT =
+> 0.04` (0.48 Nm per decision), `step_max = interp(|κ_des|, [0.002, 0.005],
+> [min(STEP_MAX_STRAIGHT, speed cap), speed cap])` — a linear blend, never a
+> gate (the 033df35 curvature cliff), and it can only tighten the speed
+> schedule. Curve entries keep full authority. Off switch: `STEP_MAX_STRAIGHT
+> = 0.10`. Tooling on the C3: `/data/panda_fw/stepcap.py` (share of straight
+> decisions at the cap), `jumps.py` (torque slope into wheel jumps).
 
 > **2026-07-12 — relax-dwell (route 3a0 seg 8: "gives up mid-turn").**
 > modelV2's κ_des dips 40–50% for ~1 s mid-hairpin and recovers (3× in one
