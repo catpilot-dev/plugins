@@ -92,13 +92,15 @@ class CarInterface(CarInterfaceBase):
     # controller (lagd correlates on latcontrol_torque telemetry that our
     # plant-inversion path doesn't produce), so liveDelay.lateralDelay is
     # permanently pinned at initial_lag = steerActuatorDelay + 0.2 (lagd.py:181).
-    # 0.7 → liveDelay = 0.9 s → modeld's lat_action_t ≈ 0.95 s, matching the
-    # measured straight-line loop delay (target → yaw 0.90-1.0 s, routes
-    # 4d4/4d5; was 0.4 → 0.65 s, so the model's corrections landed ~0.3 s
-    # late and drove the sub-Hz in-lane sway). The BMW controller's own timing
-    # does NOT follow lat_delay any more (latcontroller CONTROL_HORIZON_S);
+    # 0.4 → liveDelay = 0.6 s → modeld's lat_action_t ≈ 0.65 s. Route 4d9
+    # (2026-10-12) tried 0.7 to match the measured straight-line loop delay
+    # (target → yaw 0.90-1.0 s, routes 4d4/4d5) and was "hardly driveable":
+    # the model's own corrections overshot, ~2x the sway-band oscillation.
+    # That 0.9-1.0 s is mostly rack stiction on small corrections, not a pure
+    # delay, so do not feed it to the model. The BMW controller's own timing
+    # does not follow lat_delay (latcontroller CONTROL_HORIZON_S = 0.65);
     # lane_keeping's gap prediction (1.5 × lat_delay) still does, by design.
-    ret.steerActuatorDelay = 0.7
+    ret.steerActuatorDelay = 0.4
     ret.steerLimitTimer = 0.4
 
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning, steering_angle_deadzone_deg=0.0)

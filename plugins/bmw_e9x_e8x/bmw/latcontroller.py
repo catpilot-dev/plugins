@@ -246,11 +246,11 @@ OV_RATE_TICKS = 20         # 0.2 s signed-rate window over the shared sb_ring
 
 # Controller timing horizon, DECOUPLED from lat_delay (2026-10-12). It used to
 # follow model_action_t = lat_delay + DT_MDL (0.65 s at steerActuatorDelay 0.4).
-# SAD went to 0.7 so modeld plans for the measured straight-line loop delay
-# (target -> yaw 0.90-1.0 s, routes 4d4/4d5), but this controller's cadence,
-# ramp spread and hold-cap lookahead were all field-tuned at 0.65 s and must
-# not move with it: a 0.95 s horizon stretches the cadence to ~500 ms (added
-# lag - route 4d8) and shrinks hold_cap to 47%, below steady SAT.
+# This controller's cadence, ramp spread and hold-cap lookahead were all
+# field-tuned at 0.65 s and must not move with model timing: a 0.95 s horizon
+# would stretch the cadence to ~500 ms (added lag - route 4d8) and shrink
+# hold_cap to 47%, below steady SAT. (SAD 0.7 was tried and reverted on route
+# 4d9; at SAD 0.4 this constant equals the old coupled value exactly.)
 CONTROL_HORIZON_S = 0.65
 
 

@@ -209,6 +209,13 @@ This document is the canonical reference for the lateral controller registered b
 > SAT). Curves measured shorter (~0.25–0.6 s, little data), so expect slightly
 > earlier turn-in; 0.6 is the fallback compromise. lane_keeping's gap
 > prediction (1.5 × lat_delay) still follows lat_delay by design.
+> **REVERTED to 0.4 the same day (route 4d9):** with no add-ons the drive was
+> "hardly driveable" — sway-band yaw oscillation ~2× (leg average 19.7 vs
+> 10.3 ×1e-4 with Arc Smoothing; 31–50 vs 13–15 on 4d4 at ~45 km/h), the
+> model's own corrections overshooting. The measured 0.9–1.0 s is mostly rack
+> stiction on small corrections, not a pure delay; feeding it to the model is
+> the wrong lever. `CONTROL_HORIZON_S` stays (identical to the old coupled
+> value at SAD 0.4).
 
 > **2026-07-12 — relax-dwell (route 3a0 seg 8: "gives up mid-turn").**
 > modelV2's κ_des dips 40–50% for ~1 s mid-hairpin and recovers (3× in one

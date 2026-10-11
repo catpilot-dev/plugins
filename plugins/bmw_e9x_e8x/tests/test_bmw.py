@@ -1507,8 +1507,10 @@ class TestSetpointDebtLedger:
 class TestLateralTiming:
   """steerActuatorDelay is the only input to lagd's initial_lag, which this car
   never moves off (lagd does not converge here): liveDelay = SAD + 0.2. Routes
-  4d4/4d5 measured target -> yaw 0.90-1.0 s on straights, so SAD 0.7 makes
-  modeld plan for that (lat_action_t 0.95 s) instead of 0.65 s."""
+  4d4/4d5 measured target -> yaw 0.90-1.0 s on straights, but that is mostly
+  rack stiction on small corrections, not a pure delay: SAD 0.7 (route 4d9)
+  made the model's own corrections overshoot - sway-band oscillation ~2x with
+  no add-ons, "hardly driveable". Back to 0.4 (lat_action_t 0.65 s)."""
 
   @pytest.fixture(autouse=True)
   def _mocks(self, monkeypatch):
@@ -1523,13 +1525,13 @@ class TestLateralTiming:
       def configure_torque_tune(*a, **kw): pass
     monkeypatch.setattr(sys.modules['opendbc.car.interfaces'], 'CarInterfaceBase', Base)
 
-  def test_steer_actuator_delay_matches_the_measured_loop(self):
+  def test_steer_actuator_delay_is_the_field_proven_value(self):
     from types import SimpleNamespace
     import bmw.interface as mod
     importlib.reload(mod)
     ret = SimpleNamespace(flags=0, wheelbase=2.76, lateralTuning=None)
     mod.CarInterface._get_params(ret, 'BMW_E90', {1: {0x22F: 8}}, [], False, False, False)
-    assert ret.steerActuatorDelay == pytest.approx(0.7)
+    assert ret.steerActuatorDelay == pytest.approx(0.4)
 
 
 class TestSafetyParam:
