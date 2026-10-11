@@ -86,7 +86,7 @@ def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):
   out = None
   for i in range(600):                           # drift -> bias builds, pub error swallowed
     out = register.on_curvature_correction(0.01, mv_at(0.84 + 0.05*(i/100.0)), 25.0, False, lat_delay=0.45)
-  assert out > 0.01           # biased left (too far from left line), pub error swallowed
+  assert out < 0.01           # biased left (too far from left line) = negative, pub error swallowed
 
 
 def test_hook_passthrough_when_disabled(data_dir, monkeypatch):
@@ -157,8 +157,29 @@ def test_live_toggle_disables_and_releases(data_dir, monkeypatch):
   out = None
   for i in range(600):                           # drift -> stabilizer damps
     out = register.on_curvature_correction(0.0, mv_at(0.84 + 0.05*(i/100.0)), 17.0, False, lat_delay=0.45)
-  assert out > 1e-5
+  assert out < -1e-5                            # damping leftward = negative
   (data_dir / 'LaneKeepEnable').write_text('0')
   for i in range(500):                           # toggle off mid-drift: releases
     out = register.on_curvature_correction(0.0, mv_at(1.14 + 0.05*(i/100.0)), 17.0, False, lat_delay=0.45)
   assert abs(out) < 1e-6
+
+
+def test_load_config_arc_params(data_dir):
+  cfg = register._load_config()
+  assert cfg.arc_smooth is False and cfg.arc_horizon == 1.5   # defaults: off
+  (data_dir / 'LaneKeepArcSmooth').write_text('1')
+  (data_dir / 'LaneKeepArcHorizon').write_text('2.0')
+  cfg = register._load_config()
+  assert cfg.arc_smooth is True and cfg.arc_horizon == 2.0
+
+
+def test_live_arc_toggle(data_dir, monkeypatch):
+  """The Driving-panel Arc Smoothing switch takes effect within ~1 s, like
+  LaneKeepEnable."""
+  monkeypatch.setattr(register, '_publish', lambda telem: None)
+  register.on_curvature_correction(0.0, SimpleNamespace(laneLines=[], laneLineProbs=[]), 20.0, False, 0.9)
+  assert register._anchor.cfg.arc_smooth is False
+  (data_dir / 'LaneKeepArcSmooth').write_text('1')
+  for _ in range(100):
+    register.on_curvature_correction(0.0, SimpleNamespace(laneLines=[], laneLineProbs=[]), 20.0, False, 0.9)
+  assert register._anchor.cfg.arc_smooth is True

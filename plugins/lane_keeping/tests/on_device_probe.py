@@ -4,7 +4,7 @@
 Loads the plugin's anchor.py directly and asserts every control branch. No
 cereal pub needed — anchor.py is pure. modelV2 device frame is +y=RIGHT, so
 the LEFT ego line (laneLines[1]) is at NEGATIVE y and the RIGHT (laneLines[2])
-at POSITIVE y; curvature is left-positive.
+at POSITIVE y; curvature is RIGHT-positive too (GPS-verified 2026-10-12).
 
 Usage (on C3, offroad), pointing PLUGIN_DIR at wherever anchor.py lives:
   source /usr/local/venv/bin/activate
@@ -130,7 +130,7 @@ crit = [-1.11 - 0.7 * (x / 30.0) for x in XS]
 for _ in range(2000):
   out, t = a.update(0.0, mv_geo(crit, flat(1.75)), 25.0, False, lat_delay=0.6)
 check('hard floor: 0.2m gap corrects despite recovering prediction',
-      t['gap_filt'] < 0.3 and out < -1e-5, f"gf={t['gap_filt']:.3f} out={out:.5f}")
+      t['gap_filt'] < 0.3 and out > 1e-5, f"gf={t['gap_filt']:.3f} out={out:.5f}")   # away = right = +
 
 a = LaneAnchor(AnchorConfig())
 drift_plan = [-0.5 * (x / 30.0) for x in XS]      # plan angles toward the left line
@@ -171,12 +171,12 @@ check('constant out-of-band gap is CONCEDED (anti-3c1)', abs(out) < 1e-6 and abs
       f"out={out:.6f} dc={t['gap_dc']:.2f}")
 for i in range(600):
   out, t = a.update(0.0, mv_at(1.39 + 0.05 * (i / 100.0)), 17.0, False, lat_delay=0.6)
-check('drift is damped (positive/leftward vs rightward drift)', out > 1e-5, f'out={out:.6f}')
+check('drift is damped (negative/leftward vs rightward drift)', out < -1e-5, f'out={out:.6f}')
 a2 = LaneAnchor(AnchorConfig())
 out, _t = None, None
 for _ in range(3000):
   out, _t = a2.update(0.0, mv_at(0.2), 17.0, False, lat_delay=0.6)
-check('hard floor still absolute at 0.2 m', out < -1e-5, f'out={out:.6f}')
+check('hard floor still absolute at 0.2 m', out > 1e-5, f'out={out:.6f}')   # away = right = +
 
 
 print(f'\n{PASS} passed, {FAIL} failed')

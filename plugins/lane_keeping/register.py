@@ -62,6 +62,8 @@ def _load_config():
     kappa_rate_max=fget('LaneKeepKappaRateMax', d.kappa_rate_max),
     filter_tau=fget('LaneKeepFilterTau', d.filter_tau),
     kappa_filter_tau=fget('LaneKeepKappaFilterTau', d.kappa_filter_tau),
+    arc_smooth=bget('LaneKeepArcSmooth', d.arc_smooth),
+    arc_horizon=fget('LaneKeepArcHorizon', d.arc_horizon),
     prob_on=fget('LaneKeepProbOn', d.prob_on),
     prob_fade=fget('LaneKeepProbFade', d.prob_fade),
     dc_tau=fget('LaneKeepDcTau', d.dc_tau),
@@ -102,6 +104,8 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
   _tick += 1
   if _tick % 100 == 0:
     _anchor.cfg.enable = _read_param('LaneKeepEnable') not in ('0', 'false', 'False')
+    # Arc Smoothing switch (Driving panel), default off: only '1'/'true' turn it on.
+    _anchor.cfg.arc_smooth = _read_param('LaneKeepArcSmooth') in ('1', 'true', 'True')
   new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing, lat_delay)
   try:
     _publish(telem)

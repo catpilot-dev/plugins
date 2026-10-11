@@ -14,6 +14,8 @@ DT_CTRL = 0.01  # openpilot control-loop period (s); the hook runs at 100 Hz
 LAT_DELAY_FALLBACK = 0.6  # s; used when the hook passes no lat_delay
 X_PRED_MIN = 5.0          # m; keep a meaningful prediction at crawl
 X_PRED_MAX = 50.0         # m; stay inside the model's reliable line region
+ARC_X_MIN = 5.0           # m; arc aim point closer than this (crawl) is
+                          # ill-conditioned -> use the model's curvature
 AC_DEADBAND_V = [15.0, 25.0]  # m/s (54-90 km/h) — speed breakpoints for the
                               # ac_deadband -> ac_deadband_hi taper (2026-08-06,
                               # route 3e7: see the ac_deadband config comment)
@@ -31,6 +33,28 @@ def _interp(x, xp, fp):
     return fp[1]
   t = (x - xp[0]) / (xp[1] - xp[0])
   return fp[0] + t * (fp[1] - fp[0])
+
+
+def arc_curvature(model_v2, horizon):
+  """Pure-pursuit arc through the model's plan point `horizon` seconds ahead:
+  2*y/(x^2+y^2) — the curvature of the circle from the car (tangent to its
+  heading) through that point. Spatial averaging over one frame's path, so no
+  time lag (routes 4d4/4d5: 30-40% less 0.1-1 Hz wander than desiredCurvature
+  at 1.5-2.0 s, same timing). position.y shares desiredCurvature's sign here,
+  so no flip. None when the plan is missing/malformed or the aim point sits
+  closer than ARC_X_MIN."""
+  plan = getattr(model_v2, 'position', None) if model_v2 is not None else None
+  if plan is None:
+    return None
+  ts = [float(p) for p in getattr(plan, 't', [])]
+  xs = [float(p) for p in getattr(plan, 'x', [])]
+  ys = [float(p) for p in getattr(plan, 'y', [])]
+  if not (len(ts) == len(xs) == len(ys)):
+    return None
+  xa, ya = _interp_arr(horizon, ts, xs), _interp_arr(horizon, ts, ys)
+  if xa is None or ya is None or xa < ARC_X_MIN:
+    return None
+  return 2.0 * ya / (xa * xa + ya * ya)
 
 
 def _interp_arr(x, xs, ys):
@@ -78,6 +102,9 @@ class AnchorConfig:
   # tau=0.3s would exceed the reverted 600ms box's 0.275s group delay (route
   # 395: wobbling and lag) -- a first-order tau is NOT comparable to a box
   # window length, so 0.3s was laggier than the mechanism it was meant to match.
+  arc_smooth: bool = False       # reference = plan arc (arc_curvature) instead of
+                                 # desiredCurvature; live Driving-panel toggle
+  arc_horizon: float = 1.5       # plan time (s) of the arc aim point
   dc_tau: float = 20.0           # DC-tracker time constant (s) — the forgetting time.
                                  # The stabilizer concedes any disagreement older than
                                  # ~this: zero-mean correction by construction, so the
@@ -118,17 +145,20 @@ class LaneAnchor:
   def __init__(self, config: AnchorConfig):
     self.cfg = config
     self.driver_idx = 1 if config.driver_side == 'left' else 2
-    # Two different sign conventions are in play:
+    # One sign convention throughout, RIGHT-positive:
     #  - modelV2 laneLines are in the device frame, +y = RIGHT (camera.py), so
     #    laneLines[1] (left ego line) sits at NEGATIVE y and laneLines[2]
     #    (right) at POSITIVE y. Distance from car center to the driver-side
     #    line is therefore -y (left) or +y (right): line_sign converts to it.
     #  - desiredCurvature (what the bias is added to, consumed by the BMW
-    #    controller) is LEFT-positive. To reduce a positive excess (car too far
-    #    from the driver line) steer TOWARD the driver side: left -> +curvature
-    #    (left turn), right -> -curvature: curv_sign gives that direction.
+    #    controller) is RIGHT-positive too — GPS-verified 2026-10-12 (route
+    #    4d4: corr +0.53 with the clockwise bearing rate). To reduce a positive
+    #    excess (car too far from the driver line) steer TOWARD the driver
+    #    side: left -> -curvature (left turn), right -> +curvature, i.e.
+    #    curv_sign == line_sign. Until 2026-10-12 this assumed LEFT-positive
+    #    and the damper pushed the car AWAY from its line (anti-damping).
     self.line_sign = -1.0 if config.driver_side == 'left' else 1.0
-    self.curv_sign = 1.0 if config.driver_side == 'left' else -1.0
+    self.curv_sign = self.line_sign
     self.gap_filt = None
     self.gap_pred_filt = None
     self.kappa_filt = None
@@ -154,7 +184,7 @@ class LaneAnchor:
     return _clip(kappa, -cfg.kappa_bias_max, cfg.kappa_bias_max)
 
   def _telem(self, prob, line_y, gap, excess, authority, v_ego, kappa_in=0.0, kappa_ref=0.0,
-             x_pred=0.0, gap_dc=0.0, excess_ac=0.0):
+             x_pred=0.0, gap_dc=0.0, excess_ac=0.0, kappa_arc=None, arc_on=False):
     return {
       'prob': float(prob), 'line_y': float(line_y), 'gap': float(gap),
       'gap_filt': float(self.gap_filt) if self.gap_filt is not None else 0.0,
@@ -164,6 +194,9 @@ class LaneAnchor:
       'gap_pred': float(self.gap_pred_filt) if self.gap_pred_filt is not None else 0.0,
       'x_pred': float(x_pred),
       'gap_dc': float(gap_dc), 'excess_ac': float(excess_ac),
+      'kappa_arc': float(kappa_arc) if kappa_arc is not None else 0.0,
+      'arc_on': bool(arc_on),
+      'sw_lane_keep': bool(self.cfg.enable), 'sw_arc': bool(self.cfg.arc_smooth),
     }
 
   def update(self, curvature, model_v2, v_ego, lane_changing, lat_delay=None):
@@ -173,12 +206,19 @@ class LaneAnchor:
     # deadzone. Safe because any lag this introduces shows up as position
     # drift, which the position correction below closes. A lane change bypasses
     # it — the model is deliberately reframing the trajectory.
+    #
+    # Arc smoothing (optional): feed the low-pass the plan arc instead of the
+    # model's single curvature sample. Not during a lane change (the raw
+    # reference is already passed through there) or without a usable plan.
+    kappa_arc = arc_curvature(model_v2, cfg.arc_horizon) if cfg.arc_smooth else None
+    arc_on = kappa_arc is not None and not lane_changing
+    kappa_src = kappa_arc if arc_on else curvature
     if lane_changing or self.kappa_filt is None:
-      self.kappa_filt = curvature
-      kappa_ref = curvature
+      self.kappa_filt = kappa_src
+      kappa_ref = kappa_src
     else:
       a_k = 1.0 - math.exp(-DT_CTRL / cfg.kappa_filter_tau)
-      self.kappa_filt += a_k * (curvature - self.kappa_filt)
+      self.kappa_filt += a_k * (kappa_src - self.kappa_filt)
       kappa_ref = self.kappa_filt
     prob = line_y = gap = excess = authority = 0.0
     x_pred = 0.0
@@ -300,4 +340,5 @@ class LaneAnchor:
     return kappa_ref + self.kappa_bias, self._telem(prob, line_y, gap, excess, authority, v_ego,
                                                     curvature, kappa_ref, x_pred=x_pred,
                                                     gap_dc=self.gap_dc if self.gap_dc is not None else 0.0,
-                                                    excess_ac=excess_ac)
+                                                    excess_ac=excess_ac, kappa_arc=kappa_arc,
+                                                    arc_on=arc_on)

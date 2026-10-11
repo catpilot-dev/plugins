@@ -39,9 +39,15 @@ parameter (plus `LaneKeepDriverSide`).
 ## Control law details
 
 - **Gap measurement**: `gap = line_sign · laneLines[idx].y − half_width`
-  (idx 1 = left / 2 = right). Two sign conventions are in play: the modelV2
-  device frame is +y = RIGHT, while desiredCurvature is LEFT-positive — see
-  the `line_sign`/`curv_sign` comment in `anchor.py`. Both the raw and the
+  (idx 1 = left / 2 = right). One sign convention throughout: the modelV2
+  device frame is +y = RIGHT and desiredCurvature is RIGHT-positive too
+  (GPS-verified 2026-10-12: corr +0.53 with the clockwise bearing rate), so
+  `curv_sign = line_sign` — steering toward the driver line has the sign of
+  that line's y. **Until 2026-10-12 the code assumed LEFT-positive curvature
+  and the damper pushed the car away from its line** (anti-damping); every
+  damper tuning result before that date — deadband, asym gate, dc_tau, the
+  failed lp_max trial and the floor stalemates — was measured with the
+  inverted sign and needs re-verification. Both the raw and the
   predicted gap are low-passed with `filter_tau` (0.7 s) against
   measurement noise.
 - **Predictive gap**: evaluated at
@@ -102,6 +108,20 @@ the plugin is **enforced** (`.enforced` marker): full removal (`.disabled`)
 is coupled to reverting the consuming controller. The Driving-panel toggle
 (`LaneKeepEnable`, live ~1 s) gates only the position correction.
 
+## Arc smoothing (optional, default off)
+
+`LaneKeepArcSmooth` (live Driving-panel toggle) swaps the low-pass input from
+the model's single `desiredCurvature` sample to the curvature of the arc
+through the model's plan point `LaneKeepArcHorizon` (1.5 s) ahead:
+`2·y/(x²+y²)` from `modelV2.position` interpolated on `position.t`. It
+averages over one frame's path instead of over time, so it adds no lag;
+offline on routes 4d4/4d5 the 1.5–2.0 s arcs carried 30–40% less 0.1–1 Hz
+wander than `desiredCurvature` at the same timing, with slightly looser curve
+following (corr 0.96 vs 0.995). Bypassed during lane changes, without a plan,
+and when the aim point is closer than 5 m (crawl). The 0.15 s low-pass stays
+on either way. `position.y` shares `desiredCurvature`'s sign in this stack, so
+the arc needs no sign conversion.
+
 ## Configuration
 
 Params are files in `data/` (runtime:
@@ -117,6 +137,8 @@ matter in the field:
 | `LaneKeepDcTau` | 5 | concession time constant (s); code default 20 |
 | `LaneKeepAsymGap` | 0.6 (default) | never-oppose-recovery threshold (m); 0 = symmetric |
 | `LaneKeepGapHardLo` / `Hi` | **−99 / 99 (floors disabled)** | code defaults 0.3/1.5 — see hard floors above |
+| `LaneKeepArcSmooth` | 0 (default) | **live**: reference from the plan arc instead of desiredCurvature (see Arc smoothing) |
+| `LaneKeepArcHorizon` | 1.5 (default) | arc aim point, plan seconds ahead |
 | `LaneKeepLpMax` | 9999 (default, inert) | pure-pursuit aim-point cap (m); lowering it raises highway gain — see the caution in Control law details |
 | `LaneKeepAcDeadband` / `Hi` | 0.10 / 0.10 (defaults, flat) | AC deadband (m); a lower `Hi` opts into the speed taper over 54–90 km/h |
 

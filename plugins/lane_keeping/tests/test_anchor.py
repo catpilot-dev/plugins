@@ -21,14 +21,14 @@ def _mv(left_y, right_y, left_p=1.0, right_p=1.0):
 
 def test_gap_left_driver():
   a = LaneAnchor(AnchorConfig(driver_side='left', half_width=0.91))
-  assert a.driver_idx == 1 and a.line_sign == -1.0 and a.curv_sign == 1.0
+  assert a.driver_idx == 1 and a.line_sign == -1.0 and a.curv_sign == -1.0
   # left line 1.75 m to the left, at y = -1.75 -> wheel gap = 1.75 - 0.91 = 0.84
   assert abs(a._gap(_mv(left_y=-1.75, right_y=1.75)) - 0.84) < 1e-9
 
 
 def test_gap_right_driver():
   a = LaneAnchor(AnchorConfig(driver_side='right', half_width=0.91))
-  assert a.driver_idx == 2 and a.line_sign == 1.0 and a.curv_sign == -1.0
+  assert a.driver_idx == 2 and a.line_sign == 1.0 and a.curv_sign == 1.0
   # right line 1.75 m to the right, at y = +1.75 -> wheel gap = 1.75 - 0.91 = 0.84
   assert abs(a._gap(_mv(left_y=-1.75, right_y=1.75)) - 0.84) < 1e-9
 
@@ -55,12 +55,13 @@ def test_excess_signs_and_clip():
 def test_pursuit_magnitude_and_sign_left():
   a = LaneAnchor(AnchorConfig(driver_side='left', t_preview=1.5, kappa_bias_max=1.0))
   # excess +0.3 (car too far from left line) at 12 m/s (below the lp_max cap):
-  # Lp = 12*1.5 = 18; kappa = 2*0.3/18^2 = 0.00185..., positive (steer left, left-positive curvature)
+  # Lp = 12*1.5 = 18; kappa = -2*0.3/18^2 = -0.00185..., negative (steer left;
+  # desiredCurvature is RIGHT-positive, GPS-verified 2026-10-12)
   k = a._pursuit(0.3, 12.0)
-  assert abs(k - (2 * 0.3 / 18.0 ** 2)) < 1e-9
-  assert k > 0
-  # excess -0.3 (car too close to left line) -> steer right (negative)
-  assert a._pursuit(-0.3, 12.0) < 0
+  assert abs(k + (2 * 0.3 / 18.0 ** 2)) < 1e-9
+  assert k < 0
+  # excess -0.3 (car too close to left line) -> steer right (positive)
+  assert a._pursuit(-0.3, 12.0) > 0
 
 
 def test_pursuit_lookahead_cap():
@@ -69,16 +70,16 @@ def test_pursuit_lookahead_cap():
   a = LaneAnchor(AnchorConfig(driver_side='left', t_preview=1.5, kappa_bias_max=1.0,
                               lp_max=25.0))
   k_at_cap = 2 * 0.3 / 25.0 ** 2
-  assert abs(a._pursuit(0.3, 25.0) - k_at_cap) < 1e-9
-  assert abs(a._pursuit(0.3, 30.0) - k_at_cap) < 1e-9
+  assert abs(a._pursuit(0.3, 25.0) + k_at_cap) < 1e-9
+  assert abs(a._pursuit(0.3, 30.0) + k_at_cap) < 1e-9
   # below the cap speed (lp = v*1.5 < 25 for v < 16.67) the law is unchanged
-  assert abs(a._pursuit(0.3, 12.0) - (2 * 0.3 / 18.0 ** 2)) < 1e-9
+  assert abs(a._pursuit(0.3, 12.0) + (2 * 0.3 / 18.0 ** 2)) < 1e-9
 
 
 def test_pursuit_sign_right_driver():
   a = LaneAnchor(AnchorConfig(driver_side='right', t_preview=1.5, kappa_bias_max=1.0))
-  # right driver, excess +0.3 (car too far from right line = too far left) -> steer right (negative)
-  assert a._pursuit(0.3, 25.0) < 0
+  # right driver, excess +0.3 (car too far from right line = too far left) -> steer right (positive)
+  assert a._pursuit(0.3, 25.0) > 0
 
 
 def test_pursuit_hard_cap():
@@ -203,12 +204,12 @@ def test_pred_hard_floor_low_overrides_prediction():
     out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
   assert t['gap_filt'] < 0.3
   assert t['gap_pred'] > 0.6
-  assert out < -1e-5                              # corrects away regardless
+  assert out > 1e-5                               # corrects away (right) regardless
 
 
 def test_pred_hard_ceiling_overrides_prediction():
   # Gap 1.6 (> 1.5 hard ceiling), prediction says coming back -> correct NOW
-  # toward the driver line (steer left = positive).
+  # toward the driver line (steer left = negative).
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   left = [-2.51 + 0.7 * (x / 30.0) for x in _XS]  # gap 1.6 at car -> 0.9 at 30 m
   mv = _mv_geo(_XS, left, _flat(0.95))
@@ -217,7 +218,7 @@ def test_pred_hard_ceiling_overrides_prediction():
     out, t = a.update(0.0, mv, 25.0, False, lat_delay=0.6)
   assert t['gap_filt'] > 1.5
   assert t['gap_pred'] < 1.0
-  assert out > 1e-5
+  assert out < -1e-5
 
 
 def test_pred_curve_no_phantom_drift():
@@ -341,14 +342,14 @@ def test_constant_offset_is_conceded_anywhere():
 def test_drift_is_damped():
   # A drifting gap (the integrated sub-Hz wander) IS corrected while it
   # drifts: gap rising = car moving away from the left line (rightward)
-  # -> damp with positive (leftward) curvature.
+  # -> damp with negative (leftward) curvature.
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   _run(a, 0.84, 1000)                            # seed DC at 0.84
   out = None
   for i in range(600):                           # 6 s drift at ~0.05 m/s
     g = 0.84 + 0.05 * (i / 100.0)
     out, t = a.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
-  assert out > 1e-5                              # damping the motion, leftward
+  assert out < -1e-5                             # damping the motion, leftward
   assert t['excess_ac'] > 0.1                    # beyond the AC deadband
 
 
@@ -359,8 +360,8 @@ def test_step_damped_then_conceded():
   out_peak = 0.0
   for _ in range(300):                           # 3 s after step to gap 1.2
     out, _t = a.update(0.0, _mv_at(1.2), 17.0, False, lat_delay=0.6)
-    out_peak = max(out_peak, out)
-  assert out_peak > 1e-5                         # transient resistance fired
+    out_peak = min(out_peak, out)
+  assert out_peak < -1e-5                        # transient resistance fired (leftward)
   out, t = _run(a, 1.2, 2000)                    # 20 s >> dc_tau -> conceded
   assert abs(out) < 1e-6
   assert abs(t['gap_dc'] - 1.2) < 0.05
@@ -423,10 +424,10 @@ def test_hard_floors_still_absolute():
   # would concede, a 0.2 m gap keeps a sustained (best-effort) push away.
   a = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   out, _t = _run(a, 0.2, 3000)
-  assert out < -1e-5                             # steering right, sustained
+  assert out > 1e-5                              # steering right, sustained
   a2 = LaneAnchor(AnchorConfig(pred_delay_mult=2.0))
   out, _t = _run(a2, 1.6, 3000)
-  assert out > 1e-5                              # ceiling: steering left
+  assert out < -1e-5                             # ceiling: steering left
 
 
 def test_lane_change_hard_zeros_bias_built_from_drift():
@@ -434,7 +435,7 @@ def test_lane_change_hard_zeros_bias_built_from_drift():
   _run(a, 0.84, 1000)
   for i in range(600):                           # build bias from a drift
     a.update(0.0, _mv_at(0.84 + 0.05 * (i / 100.0)), 17.0, False, lat_delay=0.6)
-  assert a.kappa_bias > 1e-5
+  assert a.kappa_bias < -1e-5
   out, t = a.update(0.01, _mv_at(1.14), 17.0, True, lat_delay=0.6)
   assert a.kappa_bias == 0.0                     # hard-zeroed on the LC tick
   assert out == 0.01                             # bit-identical passthrough
@@ -467,7 +468,7 @@ def test_dc_frozen_during_hard_floor_and_assists_recovery():
   # assists the recovery toward the old line; must NOT push back to the floor
   for _ in range(200):
     out, t = a.update(0.0, _mv_at(0.7), 17.0, False, lat_delay=0.6)
-  assert out <= 1e-6                               # never positive (toward floor)
+  assert out >= -1e-6                              # never negative (toward floor)
 
 
 def test_dc_seed_requires_authority():
@@ -524,7 +525,7 @@ def test_asym_gap_near_line_sag_still_pushed_away():
     g = 0.45 - 0.0145 * (i / 100.0)
     out_asym, _t = a_asym.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
     out_sym, _t = a_sym.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
-  assert out_asym < -1e-6                             # pushed away (right, left-driver)
+  assert out_asym > 1e-6                              # pushed away (right, left-driver)
   assert out_asym == out_sym                          # bit-identical to the symmetric run
 
 
@@ -556,7 +557,7 @@ def test_asym_gap_zero_disables_suppression():
   for i in range(600):
     g = 0.45 + 0.025 * (i / 100.0)
     out, _t = a.update(0.0, _mv_at(g), 17.0, False, lat_delay=0.6)
-  assert out > 1e-6                                   # toward-line bias, NOT suppressed
+  assert out < -1e-6                                  # toward-line bias, NOT suppressed
 
 
 def test_asym_gap_side_agnostic_right_driver():
@@ -597,7 +598,7 @@ def test_crossing_ramp_sag_bounded_gate_inactive_no_sign_flip():
     biases_sym.append(out_s)
     assert abs(a_asym.kappa_bias) <= a_asym.cfg.kappa_bias_max + 1e-12   # (1) bounded
   assert biases_asym == biases_sym                    # (2) gate inactive during the sag
-  assert all(b <= 1e-9 for b in biases_asym)           # (3) never toward the line, no flip
+  assert all(b >= -1e-9 for b in biases_asym)          # (3) never toward the line, no flip
 
 
 def test_disable_resets_dc_for_fresh_ab():
@@ -612,3 +613,125 @@ def test_disable_resets_dc_for_fresh_ab():
   out, t = _run(a, 1.3, 500)                       # re-enable at a NEW position
   assert abs(t['gap_dc'] - 1.3) < 0.05             # fresh seed, no old memory
   assert abs(out) < 1e-6                           # conceded immediately
+
+
+# --- Arc smoothing (2026-10-12) ----------------------------------------------
+# Reference = pure-pursuit arc through the model's plan point at arc_horizon
+# seconds, 2*y/(x^2+y^2), instead of the model's single desiredCurvature.
+# Spatial averaging over one frame's path: no time lag. position.y shares
+# desiredCurvature's sign in this stack (route 4d4: corr +0.95), so the arc
+# needs no sign flip.
+import math as _math
+import pytest
+
+
+def _circle_plan(k, v=20.0, n=41, t_max=10.0):
+  """Plan on an exact circle of curvature k at speed v: arc length s = v*t,
+  x = sin(s*k)/k, y = (1-cos(s*k))/k. 2y/(x^2+y^2) == k exactly at a grid
+  point; the 0.25 s grid puts the 1.5 s aim point on one (between points the
+  plan is interpolated linearly, so off-grid it is only ~1% exact)."""
+  ts = [t_max * i / (n - 1) for i in range(n)]
+  if k == 0.0:
+    xs, ys = [v * t for t in ts], [0.0] * n
+  else:
+    xs = [_math.sin(v * t * k) / k for t in ts]
+    ys = [(1.0 - _math.cos(v * t * k)) / k for t in ts]
+  return SimpleNamespace(t=ts, x=xs, y=ys)
+
+
+def _mv_plan(plan):
+  m = _mv(left_y=-1.75, right_y=1.75)
+  m.position = plan
+  return m
+
+
+def test_arc_curvature_recovers_a_circle():
+  for k in (0.004, -0.004, 0.0123):
+    got = _anchor.arc_curvature(_mv_plan(_circle_plan(k)), 1.5)
+    assert got == pytest.approx(k, rel=1e-6)
+
+
+def test_arc_curvature_none_without_plan_or_at_crawl():
+  assert _anchor.arc_curvature(_mv(left_y=-1.75, right_y=1.75), 1.5) is None
+  # 1.5 s at 2 m/s = 3 m < ARC_X_MIN: ill-conditioned, fall back
+  assert _anchor.arc_curvature(_mv_plan(_circle_plan(0.01, v=2.0)), 1.5) is None
+
+
+def test_arc_off_by_default_reference_is_the_model_curvature():
+  a = LaneAnchor(AnchorConfig(enable=False))
+  out, telem = a.update(0.002, _mv_plan(_circle_plan(0.006)), 20.0, False, 0.9)
+  assert out == pytest.approx(0.002)          # first tick seeds the LPF
+  assert telem['arc_on'] is False
+
+
+def test_arc_on_reference_follows_the_plan_arc():
+  a = LaneAnchor(AnchorConfig(enable=False, arc_smooth=True, arc_horizon=1.5))
+  out, telem = a.update(0.002, _mv_plan(_circle_plan(0.006)), 20.0, False, 0.9)
+  assert out == pytest.approx(0.006, rel=1e-6)
+  assert telem['arc_on'] is True
+  assert telem['kappa_arc'] == pytest.approx(0.006, rel=1e-6)
+  assert telem['kappa_in'] == pytest.approx(0.002)   # raw model value still logged
+
+
+def test_arc_on_still_low_passed():
+  a = LaneAnchor(AnchorConfig(enable=False, arc_smooth=True, arc_horizon=1.5))
+  a.update(0.0, _mv_plan(_circle_plan(0.0)), 20.0, False, 0.9)
+  out, _ = a.update(0.0, _mv_plan(_circle_plan(0.006)), 20.0, False, 0.9)
+  assert 0.0 < out < 0.006
+
+
+def test_arc_falls_back_to_model_curvature_without_plan():
+  a = LaneAnchor(AnchorConfig(enable=False, arc_smooth=True))
+  out, telem = a.update(0.003, _mv(left_y=-1.75, right_y=1.75), 20.0, False, 0.9)
+  assert out == pytest.approx(0.003)
+  assert telem['arc_on'] is False
+
+
+def test_arc_bypassed_during_lane_change():
+  a = LaneAnchor(AnchorConfig(enable=False, arc_smooth=True))
+  out, telem = a.update(0.003, _mv_plan(_circle_plan(0.006)), 20.0, True, 0.9)
+  assert out == pytest.approx(0.003)
+  assert telem['arc_on'] is False
+
+
+# --- Curvature sign (2026-10-12) ---------------------------------------------
+# GPS ground truth (route 4d4, 3261 turning samples): desiredCurvature
+# correlates +0.53 with the GPS bearing rate (clockwise = RIGHT turn), so in
+# this stack desiredCurvature is RIGHT-positive, the same sign as modelV2's
+# +y-right lane lines and plan. The damper assumed LEFT-positive and so pushed
+# the car away from its line instead of back toward it.
+
+def test_left_driver_steers_back_toward_the_left_line():
+  a = LaneAnchor(AnchorConfig(driver_side='left', t_preview=1.5, kappa_bias_max=1.0))
+  # car drifted right, away from the left line (positive excess): steer LEFT,
+  # i.e. NEGATIVE curvature
+  assert a._pursuit(0.3, 12.0) < 0
+  # car too close to the left line (negative excess): steer RIGHT (positive)
+  assert a._pursuit(-0.3, 12.0) > 0
+
+
+def test_right_driver_steers_back_toward_the_right_line():
+  a = LaneAnchor(AnchorConfig(driver_side='right', t_preview=1.5, kappa_bias_max=1.0))
+  # drifted left, away from the right line: steer RIGHT (positive)
+  assert a._pursuit(0.3, 12.0) > 0
+  assert a._pursuit(-0.3, 12.0) < 0
+
+
+def test_curvature_sign_matches_the_lane_line_frame():
+  """A curvature toward a line has the same sign as that line's y: the left
+  line sits at -y, so steering toward it is negative curvature."""
+  left = LaneAnchor(AnchorConfig(driver_side='left'))
+  right = LaneAnchor(AnchorConfig(driver_side='right'))
+  assert left.curv_sign == left.line_sign == -1.0
+  assert right.curv_sign == right.line_sign == 1.0
+
+
+def test_telemetry_logs_both_switch_positions():
+  """A/B drives are classified from the log: the switch positions must be
+  explicit, not inferred from state/arc_on (both also go false on fallbacks)."""
+  a = LaneAnchor(AnchorConfig(enable=False, arc_smooth=True))
+  _, t = a.update(0.0, _mv(left_y=-1.75, right_y=1.75), 20.0, False, 0.9)
+  assert t['sw_lane_keep'] is False and t['sw_arc'] is True
+  a = LaneAnchor(AnchorConfig(enable=True, arc_smooth=False))
+  _, t = a.update(0.0, _mv(left_y=-1.75, right_y=1.75), 20.0, False, 0.9)
+  assert t['sw_lane_keep'] is True and t['sw_arc'] is False
