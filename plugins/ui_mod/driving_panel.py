@@ -163,6 +163,17 @@ class DrivingLayout(Widget):
       )
       items.append(self._lane_keeping)
 
+      current_arc = read_plugin_param('lane_keeping', 'LaneKeepArcSmooth') == '1'
+      self._arc_smooth = toggle_item(
+        "Arc Smoothing",
+        "Steer along an arc through the model's planned path 1.5 s ahead instead "
+        "of its single curvature output. Smooths slow left-right wander; takes "
+        "effect within a second.",
+        current_arc,
+        callback=self._on_arc_smooth,
+      )
+      items.append(self._arc_smooth)
+
     # --- Lane Centering in Turns (if plugin enabled) ---
     if _plugin_enabled('lane_centering'):
       current = read_plugin_param('lane_centering', 'LaneCenteringEnabled') != '0'
@@ -266,6 +277,9 @@ class DrivingLayout(Widget):
 
   def _on_lane_keeping(self, state):
     write_plugin_param('lane_keeping', 'LaneKeepEnable', '1' if state else '0')
+
+  def _on_arc_smooth(self, state):
+    write_plugin_param('lane_keeping', 'LaneKeepArcSmooth', '1' if state else '0')
 
   def _on_lane_centering(self, state):
     write_plugin_param('lane_centering', 'LaneCenteringEnabled', '1' if state else '0')
