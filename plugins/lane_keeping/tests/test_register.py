@@ -46,8 +46,12 @@ def test_passthrough_returns_input_curvature():
 
 
 def test_load_config_defaults(data_dir):
+  """Defaults since 2026-10-12 (routes 4d9/4da/4dc): Arc Smoothing ON, the
+  lane-line position correction OFF - Arc alone was the calmest, and the
+  position correction amplified swings on top of the model's own loop."""
   cfg = register._load_config()
-  assert cfg.enable is True
+  assert cfg.enable is False
+  assert cfg.arc_smooth is True
   assert cfg.driver_side == 'left'
   assert cfg.gap_min == 0.6 and cfg.gap_max == 1.0
   assert cfg.t_preview == 1.5
@@ -68,6 +72,7 @@ def test_load_config_overrides(data_dir):
 
 def test_hook_applies_bias_and_survives_pub_failure(data_dir, monkeypatch):
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
+  (data_dir / 'LaneKeepEnable').write_text('1')   # off by default since 2026-10-12
   # force telemetry publish to raise — control path must still return a value
   monkeypatch.setattr(register, '_publish', lambda telem: (_ for _ in ()).throw(RuntimeError('no bus')))
   # A constant out-of-band gap concedes under the AC stabilizer (zero-mean by
@@ -143,6 +148,7 @@ def test_load_config_ac_params(data_dir):
 
 def test_live_toggle_disables_and_releases(data_dir, monkeypatch):
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
+  (data_dir / 'LaneKeepEnable').write_text('1')   # off by default since 2026-10-12
   monkeypatch.setattr(register, '_publish', lambda telem: None)
   def mv_at(gap):
     y = -(gap + 0.91)
@@ -166,7 +172,9 @@ def test_live_toggle_disables_and_releases(data_dir, monkeypatch):
 
 def test_load_config_arc_params(data_dir):
   cfg = register._load_config()
-  assert cfg.arc_smooth is False and cfg.arc_horizon == 1.5   # defaults: off
+  assert cfg.arc_smooth is True and cfg.arc_horizon == 0.0    # defaults: on, auto horizon
+  (data_dir / 'LaneKeepArcSmooth').write_text('0')
+  assert register._load_config().arc_smooth is False
   (data_dir / 'LaneKeepArcSmooth').write_text('1')
   (data_dir / 'LaneKeepArcHorizon').write_text('2.0')
   cfg = register._load_config()
@@ -178,8 +186,18 @@ def test_live_arc_toggle(data_dir, monkeypatch):
   LaneKeepEnable."""
   monkeypatch.setattr(register, '_publish', lambda telem: None)
   register.on_curvature_correction(0.0, SimpleNamespace(laneLines=[], laneLineProbs=[]), 20.0, False, 0.9)
+  assert register._anchor.cfg.arc_smooth is True              # default on
+  (data_dir / 'LaneKeepArcSmooth').write_text('0')
+  for _ in range(100):
+    register.on_curvature_correction(0.0, SimpleNamespace(laneLines=[], laneLineProbs=[]), 20.0, False, 0.9)
   assert register._anchor.cfg.arc_smooth is False
-  (data_dir / 'LaneKeepArcSmooth').write_text('1')
+
+
+def test_live_defaults_without_param_files(data_dir, monkeypatch):
+  """No stored switch files (fresh install): the live re-read must land on the
+  same defaults as _load_config - arc on, position correction off."""
+  monkeypatch.setattr(register, '_publish', lambda telem: None)
   for _ in range(100):
     register.on_curvature_correction(0.0, SimpleNamespace(laneLines=[], laneLineProbs=[]), 20.0, False, 0.9)
   assert register._anchor.cfg.arc_smooth is True
+  assert register._anchor.cfg.enable is False

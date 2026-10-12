@@ -639,6 +639,14 @@ def _circle_plan(k, v=20.0, n=41, t_max=10.0):
   return SimpleNamespace(t=ts, x=xs, y=ys)
 
 
+def _rates(k, v=20.0, n=41, t_max=10.0, spike_at=None, spike=0.0):
+  """orientationRate / velocity for a constant-curvature plan (yaw rate v*k),
+  optionally with a yaw-rate spike at one time."""
+  ts = [t_max * i / (n - 1) for i in range(n)]
+  z = [v * k + (spike if spike_at is not None and abs(t - spike_at) < 1e-9 else 0.0) for t in ts]
+  return SimpleNamespace(z=z), SimpleNamespace(x=[v] * n), ts
+
+
 def _mv_plan(plan):
   m = _mv(left_y=-1.75, right_y=1.75)
   m.position = plan
@@ -735,3 +743,67 @@ def test_telemetry_logs_both_switch_positions():
   a = LaneAnchor(AnchorConfig(enable=True, arc_smooth=False))
   _, t = a.update(0.0, _mv(left_y=-1.75, right_y=1.75), 20.0, False, 0.9)
   assert t['sw_lane_keep'] is True and t['sw_arc'] is False
+
+
+
+# --- Speed- and curvature-dependent arc look-ahead (2026-10-12) ---------------
+# Longer look-ahead removes more wander on straights at every speed (offline
+# 4d4-4dc: 75-95 km/h arc/raw 0.61 at 1.5 s -> 0.47 at 2.5 s) but softens
+# S-curve legs and turns in earlier, worst at low speed and on curvy roads.
+# Speed sets it on straights (1.5 s <= 45 km/h -> 2.5 s >= 75 km/h); the max
+# plan curvature within 2.5 s pulls it back to 1.5 s (blend 1.5e-3 -> 3e-3;
+# straights p99 1.38e-3, steady curves p10 4.1e-3).
+
+def test_horizon_speed_schedule_on_straights():
+  h = _anchor.arc_horizon
+  assert h(10.0, 0.0) == pytest.approx(1.5)            # 36 km/h
+  assert h(60 / 3.6, 0.0) == pytest.approx(2.0)        # midway
+  assert h(25.0, 0.0) == pytest.approx(2.5)            # 90 km/h
+  assert h(40.0, 0.0) == pytest.approx(2.5)            # clamped
+
+
+def test_horizon_curvy_road_ahead_pulls_back_to_short():
+  h = _anchor.arc_horizon
+  assert h(25.0, 0.003) == pytest.approx(1.5)
+  assert h(25.0, 0.02) == pytest.approx(1.5)
+  assert h(25.0, 0.00225) == pytest.approx(2.0)        # linear blend midpoint
+  assert h(25.0, 0.0015) == pytest.approx(2.5)         # straight edge
+
+
+def test_horizon_without_curvature_info_uses_speed():
+  assert _anchor.arc_horizon(25.0, None) == pytest.approx(2.5)
+
+
+def test_plan_curvature_ahead():
+  m = _mv_plan(_circle_plan(0.0))
+  m.orientationRate, m.velocity, _ = _rates(0.005)
+  assert _anchor.plan_curvature_ahead(m) == pytest.approx(0.005)
+  # a spike beyond the 2.5 s window is ignored
+  m.orientationRate, m.velocity, _ = _rates(0.0, spike_at=5.0, spike=1.0)
+  assert _anchor.plan_curvature_ahead(m) == pytest.approx(0.0)
+  # inside the window it counts, either sign
+  m.orientationRate, m.velocity, _ = _rates(0.0, spike_at=1.0, spike=-0.2)
+  assert _anchor.plan_curvature_ahead(m) == pytest.approx(0.2 / 20.0)
+
+
+def test_plan_curvature_ahead_missing_is_none():
+  assert _anchor.plan_curvature_ahead(_mv_plan(_circle_plan(0.0))) is None
+  assert _anchor.plan_curvature_ahead(None) is None
+
+
+def test_auto_horizon_logged_and_shortened_in_curves():
+  a = LaneAnchor(AnchorConfig(enable=False, arc_smooth=True))     # auto (default)
+  m = _mv_plan(_circle_plan(0.0, v=25.0)); m.orientationRate, m.velocity, _ = _rates(0.0, v=25.0)
+  _, t = a.update(0.0, m, 25.0, False, 0.6)
+  assert t['arc_h'] == pytest.approx(2.5)
+  m = _mv_plan(_circle_plan(0.006, v=25.0)); m.orientationRate, m.velocity, _ = _rates(0.006, v=25.0)
+  _, t = a.update(0.006, m, 25.0, False, 0.6)
+  assert t['arc_h'] == pytest.approx(1.5)
+  assert t['k_ahead'] == pytest.approx(0.006)
+
+
+def test_fixed_horizon_override():
+  a = LaneAnchor(AnchorConfig(enable=False, arc_smooth=True, arc_horizon=2.0))
+  m = _mv_plan(_circle_plan(0.006, v=25.0)); m.orientationRate, m.velocity, _ = _rates(0.006, v=25.0)
+  _, t = a.update(0.006, m, 25.0, False, 0.6)
+  assert t['arc_h'] == pytest.approx(2.0)

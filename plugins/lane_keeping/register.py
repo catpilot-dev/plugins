@@ -33,6 +33,15 @@ def _read_param(key, default=''):
     return default
 
 
+# Plugin-level switch defaults (2026-10-12, routes 4d9/4da/4dc): Arc Smoothing
+# ON, the lane-line position correction OFF. Arc alone was the calmest; the
+# position correction stacked on the model's own lane-centering loop and
+# amplified swings. AnchorConfig's own defaults are the control core's and stay
+# as they are; these decide what an absent param file means.
+LANE_KEEP_DEFAULT = False
+ARC_SMOOTH_DEFAULT = True
+
+
 def _load_config():
   AnchorConfig = _anchor_module().AnchorConfig
   d = AnchorConfig()
@@ -50,7 +59,7 @@ def _load_config():
     return dflt if v == '' else v not in ('0', 'false', 'False')
 
   return AnchorConfig(
-    enable=bget('LaneKeepEnable', d.enable),
+    enable=bget('LaneKeepEnable', LANE_KEEP_DEFAULT),
     driver_side=sget('LaneKeepDriverSide', d.driver_side),
     half_width=fget('LaneKeepHalfWidth', d.half_width),
     gap_min=fget('LaneKeepGapMin', d.gap_min),
@@ -62,7 +71,7 @@ def _load_config():
     kappa_rate_max=fget('LaneKeepKappaRateMax', d.kappa_rate_max),
     filter_tau=fget('LaneKeepFilterTau', d.filter_tau),
     kappa_filter_tau=fget('LaneKeepKappaFilterTau', d.kappa_filter_tau),
-    arc_smooth=bget('LaneKeepArcSmooth', d.arc_smooth),
+    arc_smooth=bget('LaneKeepArcSmooth', ARC_SMOOTH_DEFAULT),
     arc_horizon=fget('LaneKeepArcHorizon', d.arc_horizon),
     prob_on=fget('LaneKeepProbOn', d.prob_on),
     prob_fade=fget('LaneKeepProbFade', d.prob_fade),
@@ -103,9 +112,9 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
   # rate-releases, the stabilizer releases smoothly, smoothing stays on.
   _tick += 1
   if _tick % 100 == 0:
-    _anchor.cfg.enable = _read_param('LaneKeepEnable') not in ('0', 'false', 'False')
-    # Arc Smoothing switch (Driving panel), default off: only '1'/'true' turn it on.
-    _anchor.cfg.arc_smooth = _read_param('LaneKeepArcSmooth') in ('1', 'true', 'True')
+    # Same defaults as _load_config when a switch file is absent.
+    _anchor.cfg.enable = _read_param('LaneKeepEnable') in ('1', 'true', 'True')
+    _anchor.cfg.arc_smooth = _read_param('LaneKeepArcSmooth') not in ('0', 'false', 'False')
   new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing, lat_delay)
   try:
     _publish(telem)
