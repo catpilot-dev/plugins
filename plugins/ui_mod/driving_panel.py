@@ -152,7 +152,7 @@ class DrivingLayout(Widget):
 
     # --- Lane Keeping (driver-side anchor, if plugin enabled) ---
     if _plugin_enabled('lane_keeping'):
-      current = read_plugin_param('lane_keeping', 'LaneKeepEnable') != '0'
+      current = read_plugin_param('lane_keeping', 'LaneKeepEnable') == '1'   # default off
       self._lane_keeping = toggle_item(
         "Lane Keeping",
         "Holds a steady margin to the driver-side lane line (green ring on the "
@@ -163,12 +163,13 @@ class DrivingLayout(Widget):
       )
       items.append(self._lane_keeping)
 
-      current_arc = read_plugin_param('lane_keeping', 'LaneKeepArcSmooth') == '1'
+      current_arc = read_plugin_param('lane_keeping', 'LaneKeepArcSmooth') != '0'   # default on
       self._arc_smooth = toggle_item(
         "Arc Smoothing",
-        "Steer along an arc through the model's planned path 1.5 s ahead instead "
-        "of its single curvature output. Smooths slow left-right wander; takes "
-        "effect within a second.",
+        "Steer along an arc through the model's planned path 1.5-2.5 s ahead "
+        "(longer at speed on straights, shorter on curvy roads) instead of its "
+        "single curvature output. Smooths slow left-right wander; takes effect "
+        "within a second.",
         current_arc,
         callback=self._on_arc_smooth,
       )
