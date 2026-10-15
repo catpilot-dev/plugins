@@ -20,7 +20,7 @@
     },
     "LaneKeepArcSmooth": {
       "default": true,
-      "description": "Reference = arc through the model's plan point ahead (1.5-2.5 s, by speed and curvature ahead; LaneKeepArcHorizon > 0 forces a fixed value) instead of desiredCurvature (live Driving-panel toggle)"
+      "description": "Reference = arc through the model's plan point LaneKeepArcHorizon (1.5 s) ahead instead of desiredCurvature (live Driving-panel toggle)"
     }
   },
   "hooks": {

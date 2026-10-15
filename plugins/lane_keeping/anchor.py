@@ -16,18 +16,6 @@ X_PRED_MIN = 5.0          # m; keep a meaningful prediction at crawl
 X_PRED_MAX = 50.0         # m; stay inside the model's reliable line region
 ARC_X_MIN = 5.0           # m; arc aim point closer than this (crawl) is
                           # ill-conditioned -> use the model's curvature
-# Arc look-ahead, speed- and curvature-dependent (2026-10-12). Longer removes
-# more straight-line wander at every speed (offline 4d4-4dc, 75-95 km/h:
-# arc/raw 0.61 at 1.5 s -> 0.47 at 2.5 s) but softens S-curve legs and turns
-# in earlier, worst at low speed and on curvy roads. Speed sets it on
-# straights; the max plan curvature within ARC_K_AHEAD_T pulls it back to
-# ARC_H_CURVE (straights: p99 1.38e-3; steady curves: p10 4.1e-3). Linear
-# blends only - no gates.
-ARC_H_SPEED_V = [45.0 / 3.6, 75.0 / 3.6]  # m/s
-ARC_H_SPEED = [1.5, 2.5]                  # s
-ARC_H_CURVE = 1.5                         # s, on a curvy road ahead
-ARC_K_AHEAD_BP = [0.0015, 0.003]          # 1/m, straight -> curvy blend edges
-ARC_K_AHEAD_T = 2.5                       # s of plan scanned for curvature
 AC_DEADBAND_V = [15.0, 25.0]  # m/s (54-90 km/h) — speed breakpoints for the
                               # ac_deadband -> ac_deadband_hi taper (2026-08-06,
                               # route 3e7: see the ac_deadband config comment)
@@ -45,32 +33,6 @@ def _interp(x, xp, fp):
     return fp[1]
   t = (x - xp[0]) / (xp[1] - xp[0])
   return fp[0] + t * (fp[1] - fp[0])
-
-
-def plan_curvature_ahead(model_v2, t_max=ARC_K_AHEAD_T):
-  """Max |orientationRate.z / velocity.x| over plan points with t <= t_max (the
-  per-point curvature speedlimitd uses). None when the fields are missing."""
-  if model_v2 is None:
-    return None
-  plan, rate, vel = (getattr(model_v2, n, None) for n in ('position', 'orientationRate', 'velocity'))
-  if plan is None or rate is None or vel is None:
-    return None
-  ts = [float(p) for p in getattr(plan, 't', [])]
-  zs = [float(p) for p in getattr(rate, 'z', [])]
-  vs = [float(p) for p in getattr(vel, 'x', [])]
-  if not ts or not (len(ts) == len(zs) == len(vs)):
-    return None
-  ks = [abs(z / vx) for t, z, vx in zip(ts, zs, vs) if t <= t_max and vx > 1.0]
-  return max(ks) if ks else None
-
-
-def arc_horizon(v_ego, k_ahead):
-  """Look-ahead (s): ARC_H_SPEED by speed on straights, blended down to
-  ARC_H_CURVE as the plan ahead gets curvy. No curvature info -> speed only."""
-  h_speed = _interp(v_ego, ARC_H_SPEED_V, ARC_H_SPEED)
-  if k_ahead is None:
-    return h_speed
-  return _interp(k_ahead, ARC_K_AHEAD_BP, [h_speed, ARC_H_CURVE])
 
 
 def arc_curvature(model_v2, horizon):
@@ -142,8 +104,9 @@ class AnchorConfig:
   # window length, so 0.3s was laggier than the mechanism it was meant to match.
   arc_smooth: bool = False       # reference = plan arc (arc_curvature) instead of
                                  # desiredCurvature; live Driving-panel toggle
-  arc_horizon: float = 0.0       # plan time (s) of the arc aim point; 0 = auto
-                                 # (arc_horizon(): speed + curvature ahead)
+  arc_horizon: float = 1.5       # plan time (s) of the arc aim point. A speed- and
+                                 # curvature-dependent look-ahead (to 2.5 s) felt worse
+                                 # on route 4dd than fixed 1.5 s (4dc/4e2); removed.
   dc_tau: float = 20.0           # DC-tracker time constant (s) — the forgetting time.
                                  # The stabilizer concedes any disagreement older than
                                  # ~this: zero-mean correction by construction, so the
@@ -224,7 +187,7 @@ class LaneAnchor:
 
   def _telem(self, prob, line_y, gap, excess, authority, v_ego, kappa_in=0.0, kappa_ref=0.0,
              x_pred=0.0, gap_dc=0.0, excess_ac=0.0, kappa_arc=None, arc_on=False,
-             arc_h=0.0, k_ahead=None):
+             arc_h=0.0):
     return {
       'prob': float(prob), 'line_y': float(line_y), 'gap': float(gap),
       'gap_filt': float(self.gap_filt) if self.gap_filt is not None else 0.0,
@@ -236,7 +199,6 @@ class LaneAnchor:
       'gap_dc': float(gap_dc), 'excess_ac': float(excess_ac),
       'kappa_arc': float(kappa_arc) if kappa_arc is not None else 0.0,
       'arc_on': bool(arc_on), 'arc_h': float(arc_h),
-      'k_ahead': float(k_ahead) if k_ahead is not None else -1.0,
       'sw_lane_keep': bool(self.cfg.enable), 'sw_arc': bool(self.cfg.arc_smooth),
     }
 
@@ -251,12 +213,8 @@ class LaneAnchor:
     # Arc smoothing (optional): feed the low-pass the plan arc instead of the
     # model's single curvature sample. Not during a lane change (the raw
     # reference is already passed through there) or without a usable plan.
-    k_ahead = arc_h = None
-    kappa_arc = None
-    if cfg.arc_smooth:
-      k_ahead = plan_curvature_ahead(model_v2)
-      arc_h = cfg.arc_horizon if cfg.arc_horizon > 0.0 else arc_horizon(v_ego, k_ahead)
-      kappa_arc = arc_curvature(model_v2, arc_h)
+    arc_h = cfg.arc_horizon
+    kappa_arc = arc_curvature(model_v2, arc_h) if cfg.arc_smooth else None
     arc_on = kappa_arc is not None and not lane_changing
     kappa_src = kappa_arc if arc_on else curvature
     if lane_changing or self.kappa_filt is None:
@@ -387,4 +345,4 @@ class LaneAnchor:
                                                     curvature, kappa_ref, x_pred=x_pred,
                                                     gap_dc=self.gap_dc if self.gap_dc is not None else 0.0,
                                                     excess_ac=excess_ac, kappa_arc=kappa_arc,
-                                                    arc_on=arc_on, arc_h=arc_h or 0.0, k_ahead=k_ahead)
+                                                    arc_on=arc_on, arc_h=arc_h)

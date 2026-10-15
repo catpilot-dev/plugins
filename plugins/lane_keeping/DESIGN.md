@@ -112,7 +112,7 @@ is coupled to reverting the consuming controller. The Driving-panel toggle
 
 `LaneKeepArcSmooth` (live Driving-panel toggle, default on) swaps the low-pass input from
 the model's single `desiredCurvature` sample to the curvature of the arc
-through the model's plan point a look-ahead time H ahead:
+through the model's plan point `LaneKeepArcHorizon` (1.5 s) ahead:
 `2·y/(x²+y²)` from `modelV2.position` interpolated on `position.t`. It
 averages over one frame's path instead of over time, so it adds no lag;
 offline on routes 4d4/4d5 the 1.5–2.0 s arcs carried 30–40% less 0.1–1 Hz
@@ -122,18 +122,13 @@ and when the aim point is closer than 5 m (crawl). The 0.15 s low-pass stays
 on either way. `position.y` shares `desiredCurvature`'s sign in this stack, so
 the arc needs no sign conversion.
 
-**Look-ahead H (2026-10-12), speed- and curvature-dependent.** Longer H removes
-more straight-line wander at every speed (offline 4d4–4dc, 75–95 km/h: arc/raw
-0.61 at 1.5 s → 0.47 at 2.5 s; steady curves stay 0.92–0.97 even at 3 s) but
-softens S-curve legs and turns in earlier (lead ≈ H/3), both scaling with the
-aim distance v·H — worst at low speed and on curvy roads. So:
-`H_speed = interp(v, [45, 75] km/h, [1.5, 2.5] s)` on straights, blended down
-to 1.5 s by `k_ahead`, the max plan curvature within 2.5 s
-(`|orientationRate.z / velocity.x|`, as speedlimitd uses), over
-[1.5e-3, 3e-3] 1/m — straights p99 1.38e-3, steady curves p10 4.1e-3, so the
-model's straight-line wander never shortens H. Linear blends only.
-`LaneKeepArcHorizon` > 0 forces a fixed H (A/B); telemetry logs `arc_h` and
-`k_ahead`.
+**Look-ahead H: fixed 1.5 s** (`LaneKeepArcHorizon`). A speed- and
+curvature-dependent H (1.5 → 2.5 s on straights at speed, back to 1.5 s when
+the plan ahead got curvy) was tried on 2026-10-12. Offline it removed more
+straight-line wander (75–95 km/h arc/raw 0.61 → 0.47) and kept curve entries
+on time, but on route 4dd it felt a little worse than fixed 1.5 s (4dc, 4e2):
+longer look-ahead also softens the model's own lane-centering correction, so
+the car drifts further and more slowly. Removed 2026-10-15.
 
 ## Defaults (2026-10-12)
 
@@ -161,7 +156,7 @@ matter in the field:
 | `LaneKeepAsymGap` | 0.6 (default) | never-oppose-recovery threshold (m); 0 = symmetric |
 | `LaneKeepGapHardLo` / `Hi` | **−99 / 99 (floors disabled)** | code defaults 0.3/1.5 — see hard floors above |
 | `LaneKeepArcSmooth` | 1 (default) | **live**: reference from the plan arc instead of desiredCurvature (see Arc smoothing) |
-| `LaneKeepArcHorizon` | 0 (default = auto) | arc aim point, plan seconds ahead; 0 = speed + curvature schedule, > 0 = fixed |
+| `LaneKeepArcHorizon` | 1.5 (default) | arc aim point, plan seconds ahead |
 | `LaneKeepLpMax` | 9999 (default, inert) | pure-pursuit aim-point cap (m); lowering it raises highway gain — see the caution in Control law details |
 | `LaneKeepAcDeadband` / `Hi` | 0.10 / 0.10 (defaults, flat) | AC deadband (m); a lower `Hi` opts into the speed taper over 54–90 km/h |
 
