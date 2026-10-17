@@ -224,7 +224,7 @@ class LaneAnchor:
 
   def _telem(self, prob, line_y, gap, excess, authority, v_ego, kappa_in=0.0, kappa_ref=0.0,
              x_pred=0.0, gap_dc=0.0, excess_ac=0.0, kappa_arc=None, arc_on=False,
-             arc_h=0.0, k_ahead=None):
+             arc_h=0.0, k_ahead=None, geo=(0.0, 0.0, 0.0, 0.0)):
     return {
       'prob': float(prob), 'line_y': float(line_y), 'gap': float(gap),
       'gap_filt': float(self.gap_filt) if self.gap_filt is not None else 0.0,
@@ -236,6 +236,9 @@ class LaneAnchor:
       'gap_dc': float(gap_dc), 'excess_ac': float(excess_ac),
       'kappa_arc': float(kappa_arc) if kappa_arc is not None else 0.0,
       'arc_on': bool(arc_on), 'arc_h': float(arc_h),
+      # lane geometry, logged whatever the switches (2026-10-17): left/right ego
+      # line y at the car (m, +y right) and their probabilities
+      'line_l': float(geo[0]), 'line_r': float(geo[1]), 'prob_l': float(geo[2]), 'prob_r': float(geo[3]),
       'k_ahead': float(k_ahead) if k_ahead is not None else -1.0,
       'sw_lane_keep': bool(self.cfg.enable), 'sw_arc': bool(self.cfg.arc_smooth),
     }
@@ -266,6 +269,12 @@ class LaneAnchor:
       a_k = 1.0 - math.exp(-DT_CTRL / cfg.kappa_filter_tau)
       self.kappa_filt += a_k * (kappa_src - self.kappa_filt)
       kappa_ref = self.kappa_filt
+    geo = (0.0, 0.0, 0.0, 0.0)
+    if model_v2 is not None and len(getattr(model_v2, 'laneLines', [])) > 2 \
+       and len(getattr(model_v2, 'laneLineProbs', [])) > 2 \
+       and len(model_v2.laneLines[1].y) > 0 and len(model_v2.laneLines[2].y) > 0:
+      geo = (float(model_v2.laneLines[1].y[0]), float(model_v2.laneLines[2].y[0]),
+             float(model_v2.laneLineProbs[1]), float(model_v2.laneLineProbs[2]))
     prob = line_y = gap = excess = authority = 0.0
     x_pred = 0.0
     excess_ac = 0.0
@@ -387,4 +396,5 @@ class LaneAnchor:
                                                     curvature, kappa_ref, x_pred=x_pred,
                                                     gap_dc=self.gap_dc if self.gap_dc is not None else 0.0,
                                                     excess_ac=excess_ac, kappa_arc=kappa_arc,
-                                                    arc_on=arc_on, arc_h=arc_h or 0.0, k_ahead=k_ahead)
+                                                    arc_on=arc_on, arc_h=arc_h or 0.0, k_ahead=k_ahead,
+                                                    geo=geo)

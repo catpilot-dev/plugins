@@ -807,3 +807,19 @@ def test_fixed_horizon_override():
   m = _mv_plan(_circle_plan(0.006, v=25.0)); m.orientationRate, m.velocity, _ = _rates(0.006, v=25.0)
   _, t = a.update(0.006, m, 25.0, False, 0.6)
   assert t['arc_h'] == pytest.approx(2.0)
+
+
+
+def test_lane_geometry_logged_even_with_lane_keeping_off():
+  """With the position correction off (the default) the lane lines must still
+  reach the log: they are how sway and drift are measured (2026-10-17)."""
+  a = LaneAnchor(AnchorConfig(enable=False))
+  _, t = a.update(0.0, _mv(left_y=-1.6, right_y=1.9, left_p=0.9, right_p=0.8), 20.0, False, 0.6)
+  assert t['line_l'] == pytest.approx(-1.6) and t['line_r'] == pytest.approx(1.9)
+  assert t['prob_l'] == pytest.approx(0.9) and t['prob_r'] == pytest.approx(0.8)
+
+
+def test_lane_geometry_absent_lines_logged_as_zero_prob():
+  a = LaneAnchor(AnchorConfig(enable=False))
+  _, t = a.update(0.0, SimpleNamespace(laneLines=[], laneLineProbs=[]), 20.0, False, 0.6)
+  assert t['prob_l'] == 0.0 and t['prob_r'] == 0.0
