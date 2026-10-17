@@ -172,7 +172,7 @@ def test_live_toggle_disables_and_releases(data_dir, monkeypatch):
 
 def test_load_config_arc_params(data_dir):
   cfg = register._load_config()
-  assert cfg.arc_smooth is True and cfg.arc_horizon == 1.5    # defaults: on, 1.5 s
+  assert cfg.arc_smooth is True and cfg.arc_horizon == 0.0    # defaults: on, auto horizon
   (data_dir / 'LaneKeepArcSmooth').write_text('0')
   assert register._load_config().arc_smooth is False
   (data_dir / 'LaneKeepArcSmooth').write_text('1')
