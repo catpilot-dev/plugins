@@ -64,6 +64,18 @@ def should_button_enable(buttonEvents, *, dcc_engaged, dcc_engaged_prev,
   return False
 
 
+def temps_payload(cp_PT, cp_aux, servo):
+  """bmw_temps plugin-bus payload (deg C): engine coolant and oil, plus the
+  stepper servo's board temperature (STEERING_STATUS) when a servo is fitted."""
+  out = {
+    'coolant': round(cp_PT.vl["EngineData"]["TEMP_ENG"]),
+    'oil': round(cp_PT.vl["EngineData"]["TEMP_EOI"]),
+  }
+  if servo:
+    out['servo'] = round(cp_aux.vl['STEERING_STATUS']['TEMPERATURE'])
+  return out
+
+
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
@@ -212,10 +224,7 @@ class CarState(CarStateBase):
         if not hasattr(self, '_temp_pub'):
           from openpilot.selfdrive.plugins.plugin_bus import PluginPub
           self._temp_pub = PluginPub('bmw_temps')
-        self._temp_pub.send({
-          'coolant': round(cp_PT.vl["EngineData"]["TEMP_ENG"]),
-          'oil': round(cp_PT.vl["EngineData"]["TEMP_EOI"]),
-        })
+        self._temp_pub.send(temps_payload(cp_PT, cp_aux, bool(self.CP.flags & BmwFlags.STEPPER_SERVO_CAN)))
       except Exception:
         pass
 

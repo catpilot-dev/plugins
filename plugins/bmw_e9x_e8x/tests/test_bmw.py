@@ -1579,3 +1579,29 @@ class TestSafetyParam:
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'safety', 'bmw.h')).read()
     m = re.search(r'#define BMW_PARAM_STEPPER_SERVO (\d+)U', src)
     assert m and int(m.group(1)) == BmwSafetyFlags.STEPPER_SERVO
+
+
+
+class TestTempsPayload:
+  """bmw_temps plugin-bus payload: engine temps, plus the servo's own board
+  temperature when a servo is fitted (2026-10-17, for drive-to-drive debug)."""
+
+  @pytest.fixture(autouse=True)
+  def _cereal(self, monkeypatch):
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _cp(self, d):
+    from types import SimpleNamespace
+    return SimpleNamespace(vl=d)
+
+  def test_engine_and_servo_temps(self):
+    from bmw.carstate import temps_payload
+    pt = self._cp({'EngineData': {'TEMP_ENG': 88.4, 'TEMP_EOI': 95.6}})
+    aux = self._cp({'STEERING_STATUS': {'TEMPERATURE': 31.0}})
+    assert temps_payload(pt, aux, servo=True) == {'coolant': 88, 'oil': 96, 'servo': 31}
+
+  def test_no_servo_no_servo_temp(self):
+    from bmw.carstate import temps_payload
+    pt = self._cp({'EngineData': {'TEMP_ENG': 88.4, 'TEMP_EOI': 95.6}})
+    assert temps_payload(pt, None, servo=False) == {'coolant': 88, 'oil': 96}

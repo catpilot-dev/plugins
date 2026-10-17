@@ -635,6 +635,32 @@ class TestPersistentLeanEscape:
     assert payloads[-1]['derr_ema'] == pytest.approx(state['derr_ema'])
 
 
+  def test_telemetry_has_steering_signals(self, monkeypatch):
+    """Debug signals ride the plugin bus with the controller state (2026-10-17):
+    wheel angle, servo-to-column gap (slack/windup), steering rate, driver
+    pressed, and the lat_delay the controller was given."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    payloads = []
+    state['lat_pub'] = SimpleNamespace(send=payloads.append)
+    _set_measured(sm, 20.0, 0.0)
+    CS = SimpleNamespace(vEgo=20.0, steeringAngleDeg=-1.5, steeringAngleOffsetDeg=-14.2,
+                         steeringRateDeg=3.0, steeringPressed=True)
+    lac.update(True, CS, None, None, False, 0.001, False, 0.6)
+    p = payloads[-1]
+    assert p['angle'] == pytest.approx(-1.5)
+    assert p['servo_gap'] == pytest.approx(-14.2)
+    assert p['steer_rate'] == pytest.approx(3.0)
+    assert p['pressed'] is True
+    assert p['lat_delay'] == pytest.approx(0.6)
+
+  def test_telemetry_tolerates_a_minimal_car_state(self, monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    payloads = []
+    state['lat_pub'] = SimpleNamespace(send=payloads.append)
+    _set_measured(sm, 20.0, 0.0)
+    _call_update(lac, 0.001, v_ego=20.0)
+    assert payloads and payloads[-1]['servo_gap'] == 0.0 and payloads[-1]['pressed'] is False
+
 # ============================================================
 # FRICTION retirement (2026-08-13): the two epsilon-gates are DELETED.
 # These tests pin the deletions — restoring either conjunct fails here.

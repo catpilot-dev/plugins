@@ -1409,6 +1409,12 @@ def on_lat_controller_init(result, lac, CP):
           'ov_wsd': int(state['ov_wsd']),                     # deliberate correction: deepening wrong-side
           'ov_brake_fires': int(state['ov_brake_fires']),     # fires (any detector) while brakePressed
           'ov_last': int(state['ov_last']),                   # 1=eod 2=hold 3=crawl 4=wsd, 0=none this drive
+          # Steering-side debug signals (2026-10-17): one place for drive analysis.
+          'angle': float(getattr(CS, 'steeringAngleDeg', 0.0)),            # wheel angle, deg, + = LEFT (BMW)
+          'servo_gap': float(getattr(CS, 'steeringAngleOffsetDeg', 0.0)),  # column - servo angle, deg: slack/windup
+          'steer_rate': float(getattr(CS, 'steeringRateDeg', 0.0)),
+          'pressed': bool(getattr(CS, 'steeringPressed', False)),
+          'lat_delay': float(lat_delay) if lat_delay else 0.0,             # s, as given by controlsd
         }
         state['lat_pub'].send(payload)
       except Exception:
