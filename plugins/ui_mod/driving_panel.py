@@ -166,9 +166,10 @@ class DrivingLayout(Widget):
       current_arc = read_plugin_param('lane_keeping', 'LaneKeepArcSmooth') != '0'   # default on
       self._arc_smooth = toggle_item(
         "Arc Smoothing",
-        "Steer along an arc through the model's planned path 1.5 s ahead instead "
-        "of its single curvature output. Smooths slow left-right wander; takes "
-        "effect within a second.",
+        "Steer along an arc through the model's planned path 1.5-2.5 s ahead "
+        "(longer at speed on straights, shorter on curvy roads) instead of its "
+        "single curvature output. Smooths slow left-right wander; takes effect "
+        "within a second.",
         current_arc,
         callback=self._on_arc_smooth,
       )
