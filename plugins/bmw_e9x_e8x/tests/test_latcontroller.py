@@ -2434,7 +2434,7 @@ class TestDirectTracking:
     """Ruling R10: Direct latches only while lane_keeping's register module
     (the Arc reference) is loaded under its registry name; a placeholder
     stands in for it here."""
-    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace())
+    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace(HOOK_READY=True))
 
   def _engaged(self, monkeypatch, direct, v=25.0, contacts=None):
     lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct, contacts=contacts)
@@ -2474,6 +2474,13 @@ class TestDirectTracking:
     state['tick_count'] = 999
     _call_update(lac, 0.0003, v_ego=25.0)       # inside HOLD_BAND_ENTER
     assert state['action'] == 'hold_zero'       # legacy rest state applies
+
+  def test_half_loaded_lane_keeping_latches_off(self, monkeypatch):
+    """R10 hardening: the registry leaves a module whose import raised in
+    sys.modules; without its HOOK_READY sentinel Direct stays off."""
+    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace())
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    assert not state['direct'] and not mod.direct_latched()
 
   @pytest.mark.parametrize('direct', [None, True])
   def test_lateral_engaged_mirrors_active(self, monkeypatch, direct):
@@ -2913,6 +2920,34 @@ class TestDirectTracking:
     assert state['torque'] == pytest.approx(tu - tu / 20)
     assert state['ramp_frames'] == 19
     assert state['action'] == 'ramp'
+
+  @pytest.mark.parametrize('torque0', [-0.02, -0.045, -0.055])
+  def test_step_limited_crossing_still_fires(self, monkeypatch, torque0):
+    """Final-review residual: from 0.24-0.66 Nm of old-side torque at 25 m/s
+    the STEP_MAX-capped crossing lands under TAKEUP_NM (0.0065 frac at
+    -0.055) and the next decision is already past zero. The gate sizes the
+    reversal on the pre-cap demand, so the take-up still fires once."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    g = state['guard']
+    g.side, g._opp = -1, 10                    # opposite sign already persisted
+    state.update(torque=torque0, target_frac=torque0, ramp_frames=0, action='idle',
+                 tick_count=999)
+    for i in range(60):
+      fake_sm.updated = {'livePose': i % 5 == 0}
+      _call_update(lac, 0.0015, v_ego=25.0, gap_deg=65.0)    # P demand >> TAKEUP_NM, right
+    assert state['tu_demand'] * 12.0 > 1.0
+    assert state['takeup'].fires == 1
+
+  def test_takeup_fault_falls_back_to_the_ramp(self, monkeypatch):
+    """A take-up exception on the 100 Hz path drops to the plain ramp."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    def _boom(*a, **k):
+      raise RuntimeError('takeup fault')
+    monkeypatch.setattr(state['takeup'], 'step', _boom)
+    state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20,
+                 action='ramp', tick_count=0)
+    _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0)
+    assert state['torque'] == pytest.approx(0.002) and state['action'] == 'ramp'
 
   def test_no_takeup_fires_while_pressed(self, monkeypatch):
     lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)

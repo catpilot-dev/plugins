@@ -163,6 +163,10 @@ firmware encoder ÷ 7.62, column-scale degrees).
   target is on the new side with |target| ≥ the take-up torque (a smaller target
   would be overshot by the take-up step itself). A take-up in flight ends (hands
   over, as on contact) as soon as the target leaves its side or becomes 0.
+  The size test uses the decision's demand before the per-decision step cap
+  (the larger of the two): a STEP_MAX-limited zero crossing can land under the
+  take-up torque while the reversal itself is large, and the next decision is
+  already past zero, so a capped test would skip that reversal's take-up.
 
 - **Speeds (my call):** take-up runs at all speeds — the free play is the same.
 

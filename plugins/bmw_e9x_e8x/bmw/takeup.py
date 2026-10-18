@@ -192,10 +192,13 @@ class FreePlayTakeUp:
   def _seat_state(self, gap_deg):
     return {+1: 'right', -1: 'left', 0: 'unknown'}[self.seat(gap_deg)]
 
-  def step(self, torque_frac, ramp_step, target_frac, gap_deg, angle_deg, blocked):
+  def step(self, torque_frac, ramp_step, target_frac, gap_deg, angle_deg, blocked,
+           demand_frac=None):
     """torque_frac: commanded now; ramp_step: per-tick ramp toward
-    target_frac, the decision target.  Returns the take-up torque fraction,
-    or None when the caller's ramp owns the torque."""
+    target_frac, the decision target; demand_frac: that decision's target
+    before the per-decision step cap (defaults to target_frac), which sizes
+    the reversal for the TAKEUP_NM gate.  Returns the take-up torque
+    fraction, or None when the caller's ramp owns the torque."""
     c = self._learner.contacts()
     if self.state == 'taking_up':
       s = self._s
@@ -221,7 +224,7 @@ class FreePlayTakeUp:
     s = _sign(ramp_step)
     if (c is not None and not blocked and s != 0
         and torque_frac * s <= 0 and (torque_frac + ramp_step) * s > 0
-        and target_frac * s * self._steer_max >= TAKEUP_NM
+        and self._size(target_frac, demand_frac, s) >= TAKEUP_NM
         and self.seat(gap_deg) != s):
       self._s = s
       self._angle0 = angle_deg
@@ -230,6 +233,14 @@ class FreePlayTakeUp:
       self.state = 'taking_up'
       return s * TAKEUP_NM / self._steer_max
     return None
+
+  def _size(self, target_frac, demand_frac, s):
+    """Reversal size in Nm on side s: the larger of the capped target and
+    the uncapped demand (the demand alone decides a step-limited crossing)."""
+    size = target_frac * s
+    if demand_frac is not None:
+      size = max(size, demand_frac * s)
+    return size * self._steer_max
 
   def reset(self):
     self.state = 'unknown'

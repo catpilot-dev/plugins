@@ -39,6 +39,11 @@ def data_dir(tmp_path, monkeypatch):
   return d
 
 
+def test_hook_ready_is_set_after_a_full_load():
+  """The BMW controller latches Direct Tracking only on this sentinel."""
+  assert register.HOOK_READY is True
+
+
 def test_passthrough_returns_input_curvature():
   mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
   out = register.on_curvature_correction(0.0123, mv, 25.0, False, lat_delay=0.45)

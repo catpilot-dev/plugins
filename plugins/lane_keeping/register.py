@@ -176,3 +176,8 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
   except Exception:
     pass  # telemetry must never break the control path
   return new_curvature
+
+
+# Last statement: the BMW controller latches Direct Tracking only when this is
+# set (a module the registry left half-executed in sys.modules lacks it).
+HOOK_READY = True

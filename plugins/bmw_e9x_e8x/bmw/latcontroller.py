@@ -265,7 +265,14 @@ _DIRECT_LATCHED = False
 # module, by the registry's canonical name (plugins.<id>.<module>); absent
 # (plugin disabled / failed to load) means raw kappa_des reaches a
 # deadzone-free tracker — the documented-unsafe case — so the latch stays off.
+# The registry inserts the module into sys.modules BEFORE executing it and
+# leaves it there when the import raises, so presence alone is not enough:
+# HOOK_READY is the module's last statement, set only when it loaded fully.
 _LK_REGISTER_MODULE = 'plugins.lane_keeping.register'
+
+
+def _lane_keeping_ready():
+  return getattr(sys.modules.get(_LK_REGISTER_MODULE), 'HOOK_READY', False) is True
 
 
 def direct_latched():
@@ -661,6 +668,7 @@ def on_lat_controller_init(result, lac, CP):
     'learner': _learner,     # servo-column contacts, learned in BOTH modes
     'takeup': FreePlayTakeUp(_learner, CCP.STEER_MAX),   # lash take-up (direct only)
     'tu_resume': 'init',     # decision label under 'take_up', restored when it ends
+    'tu_demand': 0.0,        # last decision's target before STEP_MAX (take-up size gate)
   }
 
   def _ov_bump(key, hit, ticks, ident, brake):
@@ -693,7 +701,7 @@ def on_lat_controller_init(result, lac, CP):
     if active and not state['was_active']:
       try:
         state['direct'] = (read_plugin_param('bmw_e9x_e8x', 'DirectTracking', '') == '1'
-                           and _LK_REGISTER_MODULE in sys.modules)
+                           and _lane_keeping_ready())
       except Exception:
         state['direct'] = False
       _DIRECT_LATCHED = state['direct']
@@ -1330,6 +1338,7 @@ def on_lat_controller_init(result, lac, CP):
             # continuous correction, and the correction itself drags the EMA
             # down, so re-fires are self-limiting (replayed on 3f9:
             # 1.54 fires/min, +1.4 entries/min, no churn loop).
+        _tu_demand = None   # set on the P path; the rest path's target is its own demand
         if state['at_rest']:
           # On-target. Low commanded a_y (hold_f=0 — straights and gentle-
           # slow curves): drain to 0, stiction holds. Higher commanded a_y
@@ -1414,6 +1423,11 @@ def on_lat_controller_init(result, lac, CP):
           # so it cannot cross the gap.
           if state['direct'] and not dwelling:
             target_frac = state['guard'].allow(target_frac)
+          # The take-up gate sizes the reversal on this demand, not on the
+          # step-capped target below: a zero crossing under STEP_MAX can land
+          # a few hundredths past zero, and the next decision is already past
+          # zero, so a capped gate would skip that reversal's take-up entirely.
+          _tu_demand = target_frac
           # Per-decision step cap (route 385 seg 27 review, 2026-07-03):
           # human-style gradual steering — move at most STEP_MAX toward the
           # P target per decision, let the plant respond one cadence, then
@@ -1470,6 +1484,7 @@ def on_lat_controller_init(result, lac, CP):
             target_frac = 0.0
 
         state['target_frac'] = target_frac
+        state['tu_demand'] = target_frac if _tu_demand is None else _tu_demand
         state['ramp_step'] = (target_frac - state['torque']) / spread_frames
         state['ramp_frames'] = spread_frames
 
@@ -1511,8 +1526,15 @@ def on_lat_controller_init(result, lac, CP):
       # to the new side": a shed to 0 can land a float epsilon past zero.
       _heading = state['ramp_step'] if (state['ramp_frames'] > 0
                                         and state['target_frac'] * state['ramp_step'] > 0.0) else 0.0
-      _tu_frac = tu.step(state['torque'], _heading, state['target_frac'], _gap, _angle,
-                         blocked=state['sb_block'] > 0 or _pressed)
+      # Guarded like the learner: a take-up fault drops back to the plain
+      # ramp (the 4e5 behaviour), never out of lateral.
+      try:
+        _tu_frac = tu.step(state['torque'], _heading, state['target_frac'], _gap, _angle,
+                           blocked=state['sb_block'] > 0 or _pressed,
+                           demand_frac=state['tu_demand'])
+      except Exception:
+        tu.reset()
+        _tu_frac = None
       if _tu_frac is not None:
         state['torque'] = _tu_frac
         state['action'] = 'take_up'

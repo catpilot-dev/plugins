@@ -143,6 +143,18 @@ def test_small_reversal_target_does_not_fire():
   assert t.fires == 1
 
 
+def test_uncapped_demand_sizes_a_step_limited_crossing():
+  """The capped target can land under TAKEUP_NM while the decision's demand
+  is a real reversal: the demand decides. A same-side small demand does not
+  inflate a small target, and demand off the take-up side never fires."""
+  t = _tu()
+  assert t.step(0.0, +0.0001, 0.0065, 65.0, 0.0, False, demand_frac=0.0005) is None
+  assert t.step(0.0, +0.0001, 0.0005, 65.0, 0.0, False, demand_frac=-0.2) is None
+  assert t.fires == 0
+  assert t.step(0.0, +0.0001, 0.0065, 65.0, 0.0, False, demand_frac=0.2) is not None
+  assert t.fires == 1
+
+
 def test_target_off_the_takeup_side_never_fires():
   t = _tu()
   assert t.step(0.0, +0.002, 0.0, 65.0, 0.0, False) is None
