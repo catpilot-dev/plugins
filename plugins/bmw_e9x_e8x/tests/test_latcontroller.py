@@ -2748,3 +2748,55 @@ class TestDirectTracking:
     p = pay[-1]
     assert p['direct'] is False and p['c_right'] == 0.0 and p['c_left'] == 0.0
     assert p['tu_state'] == 'unknown'
+
+  # ---- Task 4 review fixes ----
+
+  def _shed_left_to_zero(self, lac, state, n=3):
+    """Shed -0.01 to a 0 target over n frames; n=3 lands at +8.7e-19 (new side)
+    in plain float arithmetic. Seated left (gap 65)."""
+    state.update(torque=-0.01, target_frac=0.0, ramp_step=(0.0 - -0.01) / n,
+                 ramp_frames=n, action='ramp')
+    for _ in range(n):
+      state['tick_count'] = 0
+      _call_update(lac, 0.0, v_ego=25.0, gap_deg=65.0)
+
+  def test_shed_to_zero_snaps_exactly_then_reversal_fires(self, monkeypatch):
+    """Review fix 1: a shed to a 0 target ends at exactly 0.0, so the genuine
+    reversal that follows still crosses zero and fires the take-up."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    self._shed_left_to_zero(lac, state)
+    assert state['ramp_frames'] == 0 and state['torque'] == 0.0
+    assert state['takeup'].fires == 0
+    state.update(target_frac=0.04, ramp_step=+0.002, ramp_frames=20, action='ramp',
+                 tick_count=0)
+    _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0)
+    assert state['takeup'].fires == 1 and state['takeup'].state == 'taking_up'
+
+  def test_shed_to_zero_not_snapped_when_not_direct(self, monkeypatch):
+    """Direct off stays bit-identical: no snap, the float residue remains."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, None, contacts=self._CONTACTS)
+    self._shed_left_to_zero(lac, state)
+    assert state['ramp_frames'] == 0 and state['torque'] == pytest.approx(8.673617379884035e-19, abs=0)
+
+  def test_driver_override_mid_takeup_resets_and_resumes_ramp(self, monkeypatch):
+    """Review fix 2 (Focus 3, override half): steeringPressed while still
+    active ends the take-up (driver-driven SZL motion must not hand over
+    against the driver); the held ramp resumes from the take-up level."""
+    from bmw.takeup import TAKEUP_NM
+    lac, fake_sm, mod, state, _ = self._start_takeup(monkeypatch)
+    tu = TAKEUP_NM / 12.0
+    state['tick_count'] = 0
+    _call_update(lac, 0.002, v_ego=25.0, gap_deg=70.0, pressed=True)
+    assert state['takeup'].state != 'taking_up' and state['takeup'].fires == 1
+    assert state['ramp_step'] == pytest.approx((0.04 - tu) / 20)
+    assert state['torque'] == pytest.approx(tu + (0.04 - tu) / 20)
+    assert state['ramp_frames'] == 19
+    assert state['action'] == 'ramp'
+
+  def test_no_takeup_fires_while_pressed(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20,
+                 action='ramp', tick_count=0)
+    _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0, pressed=True)
+    assert state['takeup'].fires == 0
+    assert state['torque'] == pytest.approx(0.002)         # plain ramp

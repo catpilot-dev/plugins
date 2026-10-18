@@ -1458,9 +1458,17 @@ def on_lat_controller_init(result, lac, CP):
     _ramp_held = False
     if state['direct']:
       tu = state['takeup']
+      _pressed = bool(getattr(CS, 'steeringPressed', False))
       # A stall-breakaway block owns the torque (its shed): end the take-up.
       if tu.state == 'taking_up' and state['sb_block'] > 0:
         tu.reset()
+      # Driver override: end the take-up and resume the held ramp (as on
+      # handover) — driver-driven SZL motion must not confirm a contact and
+      # hand over against the driver. No new take-up fires while pressed.
+      if tu.state == 'taking_up' and _pressed:
+        tu.reset()
+        if state['ramp_frames'] > 0:
+          state['ramp_step'] = (state['target_frac'] - state['torque']) / state['ramp_frames']
       _was_taking = tu.state == 'taking_up'
       if state['action'] != 'take_up':
         state['tu_resume'] = state['action']
@@ -1468,7 +1476,8 @@ def on_lat_controller_init(result, lac, CP):
       # to the new side": a shed to 0 can land a float epsilon past zero.
       _heading = state['ramp_step'] if (state['ramp_frames'] > 0
                                         and state['target_frac'] * state['ramp_step'] > 0.0) else 0.0
-      _tu_frac = tu.step(state['torque'], _heading, _gap, _angle, blocked=state['sb_block'] > 0)
+      _tu_frac = tu.step(state['torque'], _heading, _gap, _angle,
+                         blocked=state['sb_block'] > 0 or _pressed)
       if _tu_frac is not None:
         state['torque'] = _tu_frac
         state['action'] = 'take_up'
@@ -1485,6 +1494,13 @@ def on_lat_controller_init(result, lac, CP):
     if state['ramp_frames'] > 0 and not _ramp_held:
       state['torque'] = float(np.clip(state['torque'] + state['ramp_step'], -1.0, 1.0))
       state['ramp_frames'] -= 1
+      # Direct: a ramp that completes on a 0 target ends at exactly 0.0.
+      # (0 - t)/n applied n times lands at +/-eps about half the time; +eps on
+      # the new side makes the later genuine reversal fail take-up's
+      # torque*s <= 0 test, and the take-up is silently lost. Direct off
+      # keeps the float residue (bit-identical).
+      if state['direct'] and state['ramp_frames'] == 0 and state['target_frac'] == 0.0:
+        state['torque'] = 0.0
 
     err = state['desired'] - state['measured']  # for logging only
     output = 0.0 if not active else float(np.clip(state['torque'], -1.0, 1.0))
