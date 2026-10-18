@@ -48,3 +48,68 @@ def test_parse_format_roundtrip_and_rejects():
   assert parse_contacts(format_contacts((77.6, 65.0))) == pytest.approx((77.6, 65.0))
   assert parse_contacts('') is None and parse_contacts('x,y') is None
   assert parse_contacts('70.0,69.0') is None        # width 1 deg
+
+
+from bmw.takeup import SignGuard, FreePlayTakeUp, TAKEUP_NM, TAKEUP_TIMEOUT_S
+
+
+def test_guard_first_push_commits_side():
+  g = SignGuard(); g.observe(+0.002)
+  assert g.allow(+0.1) == 0.1 and g.side == +1
+
+
+def test_guard_suppresses_short_reversal_then_allows_persisted():
+  g = SignGuard(); g.observe(+0.002); g.allow(+0.1)
+  g.observe(-0.002); g.observe(-0.002)                  # 0.10 s < 0.15 s
+  assert g.allow(-0.1) == 0.0 and g.suppressed == 1 and g.side == +1
+  g.observe(-0.002)                                     # 3 ticks = 0.15 s
+  assert g.allow(-0.1) == -0.1 and g.side == -1
+
+
+def test_guard_flicker_never_reverses():
+  g = SignGuard(); g.observe(+0.002); g.allow(+0.1)
+  for k in range(20):
+    g.observe(-0.002 if k % 2 else +0.002)
+    assert g.allow(-0.1) == 0.0
+  assert g.side == +1
+
+
+def _tu():
+  L = ContactLearner(seed=(77.6, 65.0))
+  return FreePlayTakeUp(L, steer_max_nm=12.0)
+
+
+def test_takeup_fires_at_zero_crossing_toward_unseated_side():
+  t = _tu()
+  out = t.step(torque_frac=0.0, ramp_step=+0.002, gap_deg=65.0, angle_deg=0.0, blocked=False)
+  assert out == pytest.approx(TAKEUP_NM / 12.0) and t.state == 'taking_up' and t.fires == 1
+
+
+def test_no_takeup_when_already_seated_or_still_shedding():
+  t = _tu()
+  assert t.step(0.0, +0.002, 77.6, 0.0, False) is None          # seated right already
+  assert t.step(+0.05, -0.002, 77.6, 0.0, False) is None        # shedding old side, not at zero yet
+
+
+def test_handover_on_gap_contact():
+  t = _tu(); t.step(0.0, +0.002, 65.0, 0.0, False)
+  assert t.step(TAKEUP_NM / 12, +0.002, 70.0, 0.0, False) == pytest.approx(TAKEUP_NM / 12)
+  assert t.step(TAKEUP_NM / 12, +0.002, 77.0, 0.0, False) is None and t.state == 'right'
+
+
+def test_handover_on_szl_confirmation():
+  t = _tu(); t.step(0.0, +0.002, 65.0, 10.0, False)
+  assert t.step(TAKEUP_NM / 12, +0.002, 70.0, 10.0 - 0.14, False) is None   # right torque -> SZL negative, 3 quanta
+
+
+def test_timeout_hands_over():
+  t = _tu(); t.step(0.0, +0.002, 65.0, 0.0, False)
+  for _ in range(round(TAKEUP_TIMEOUT_S / 0.01) - 1):
+    assert t.step(TAKEUP_NM / 12, +0.002, 66.0, 0.0, False) is not None
+  assert t.step(TAKEUP_NM / 12, +0.002, 66.0, 0.0, False) is None and t.timeouts == 1
+
+
+def test_blocked_or_unknown_contacts_never_fire():
+  assert _tu().step(0.0, +0.002, 65.0, 0.0, blocked=True) is None
+  t = FreePlayTakeUp(ContactLearner(), steer_max_nm=12.0)
+  assert t.step(0.0, +0.002, 65.0, 0.0, False) is None
