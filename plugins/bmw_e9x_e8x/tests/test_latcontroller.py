@@ -2477,7 +2477,10 @@ class TestDirectTracking:
     state['tick_count'] = 999; _call_update(lac, +0.002, v_ego=25.0)   # commit right
     assert state['target_frac'] > 0.0 and state['guard'].side == +1
     state['tick_count'] = 999; _call_update(lac, -0.002, v_ego=25.0)   # one tick opposite
-    assert state['target_frac'] >= 0.0
+    # Exactly 0, not merely non-negative: only one CAN frame of the right ramp
+    # has been applied, so shedding it is far inside step_max (torque + (-torque)
+    # is exact in floats).
+    assert state['target_frac'] == pytest.approx(0.0)
     assert state['guard'].suppressed == 1
 
   def test_persisted_reversal_crosses(self, monkeypatch):
@@ -2521,3 +2524,44 @@ class TestDirectTracking:
     assert state['delta_err'] == pytest.approx(0.002)
     assert state['action'] == 'ramp'
     assert state['target_frac'] == pytest.approx(0.15)   # floored, not the 0.122 P value
+
+  def test_guard_uncommitted_after_reengage(self, monkeypatch):
+    """Disengage -> re-engage starts the guard with no committed side."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    state['tick_count'] = 999; _call_update(lac, +0.002, v_ego=25.0)   # commit right
+    assert state['guard'].side == +1
+    _call_update(lac, 0.0, v_ego=25.0, active=False)
+    _call_update(lac, 0.0, v_ego=25.0, active=True)
+    assert state['direct'] and state['guard'].side == 0
+
+  def test_relax_dwell_exempt_from_guard(self, monkeypatch):
+    """Ruling R3: relax-dwell never gives up mid-turn. With the guard already
+    committed to the NEW (overshoot-correction) side, the dwell's old-side
+    hold of the current torque must pass untouched — it holds the current
+    torque's sign, so it cannot cross the gap. v=15, κ_des 0.012 < κ_meas
+    0.015 (deep, same side, overshoot) -> dwelling; hold_cap ≈ 0.27 > 0.15."""
+    v = 15.0
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, v=v)
+    _set_measured(fake_sm, v, 0.015)
+    state['guard'].side = -1          # reversal already confirmed (left)
+    state.update(torque=0.15, target_frac=0.15, ramp_frames=0, action='idle',
+                 tick_count=999, relax_ticks=0)
+    _call_update(lac, 0.012, v_ego=v)
+    assert state['action'] == 'relax_dwell'
+    assert state['target_frac'] == pytest.approx(0.15)   # not zeroed / shed
+    assert state['guard'].suppressed == 0
+
+  @pytest.mark.parametrize('direct', [None, True])
+  def test_sb_episode_ends_on_target_in_direct(self, monkeypatch, direct):
+    """Ruling R4: Direct mode has no hold_* actions, so a stall-breakaway
+    episode (sb_state 2) also ends once |δ_err| <= HOLD_BAND. Direct off is
+    unchanged: a ramp action keeps the episode open."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, stall_v2=True, direct=direct)
+    _set_measured(fake_sm, 25.0, 0.0)
+    _call_update(lac, 0.0, v_ego=25.0, active=False)
+    _call_update(lac, 0.0, v_ego=25.0, active=True)
+    assert state['delta_err'] == pytest.approx(0.0)       # on target
+    state.update(sb_state=2, sb_episode_ticks=100, action='ramp',
+                 torque=0.0, ramp_frames=0)
+    _call_update(lac, 0.0, v_ego=25.0)
+    assert state['sb_state'] == (0 if direct else 2)

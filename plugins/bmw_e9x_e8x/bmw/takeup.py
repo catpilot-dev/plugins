@@ -123,6 +123,15 @@ class SignGuard:
     self.side = 0
     self._opp = 0
 
+  # Value equality: controller state snapshots compare guards by content
+  # (latcontroller's twin-lockstep test diffs every state key).
+  __hash__ = None
+
+  def __eq__(self, other):
+    if not isinstance(other, SignGuard):
+      return NotImplemented
+    return vars(self) == vars(other)
+
 
 class FreePlayTakeUp:
   """Fires a small torque step across the servo-column lash when the commanded

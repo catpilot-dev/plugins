@@ -593,14 +593,6 @@ def on_lat_controller_init(result, lac, CP):
 
   _sm = messaging.SubMaster(['livePose'])
 
-  class _Guard(SignGuard):
-    """SignGuard with value equality, so state snapshots compare by content
-    (TestOverrideObservers.test_no_behavior_change diffs every state key)."""
-    __hash__ = None
-
-    def __eq__(self, other):
-      return isinstance(other, SignGuard) and vars(self) == vars(other)
-
   state = {
     'torque': 0.0,             # current commanded torque fraction (advances by ramp_step each CAN tick)
     'target_frac': 0.0,        # plant-inversion target set each decision (cadence ≈ model_action_t/2)
@@ -640,7 +632,7 @@ def on_lat_controller_init(result, lac, CP):
     # Direct Tracking (see _DIRECT_LATCHED at module scope).
     'direct': False,         # DirectTracking latched at the engagement edge; False while inactive
     'was_active': False,     # previous tick's `active`, for the engagement edge
-    'guard': _Guard(),       # noise guard on P-target sign reversals (direct only)
+    'guard': SignGuard(),    # noise guard on P-target sign reversals (direct only)
   }
 
   def _ov_bump(key, hit, ticks, ident, brake):
@@ -791,7 +783,12 @@ def on_lat_controller_init(result, lac, CP):
         # its sweep is in-direction throughout.
         _rate = (ring[-1] - ring[-1 - SB_MOVE_TICKS]) * state['sb_dir'] / (SB_MOVE_TICKS * DT_CAN_TICK) \
                 if len(ring) > SB_MOVE_TICKS else 0.0
-        if state['sb_episode_ticks'] <= 0 or state['action'] in ('hold_zero', 'hold_curve'):
+        # Direct Tracking has no hold_* actions, so the episode also ends on
+        # the on-target condition those actions stood for (|δ_err| <=
+        # HOLD_BAND, last livePose value). Direct off: unchanged.
+        if state['sb_episode_ticks'] <= 0 \
+           or state['action'] in ('hold_zero', 'hold_curve') \
+           or (state['direct'] and abs(state['delta_err']) <= HOLD_BAND):
           state['sb_state'] = 0
         # The kappa gate is applied BOTH instantaneous and latched-at-arm
         # (2026-08-16, drives 3fa/3fb). The instantaneous gate alone is
@@ -1355,7 +1352,10 @@ def on_lat_controller_init(result, lac, CP):
           # GUARD_PERSIST_S. ~0.5 Nm of noise torque at 25 m/s is enough to
           # sweep the servo across the gap, and 0 is itself a hold. The old
           # side still sheds toward 0 under STEP_MAX below.
-          if state['direct']:
+          # Exempt while relax-dwell bridges (ruling R3): the dwell must never
+          # give up mid-turn, and its target holds the current torque's sign,
+          # so it cannot cross the gap.
+          if state['direct'] and not dwelling:
             target_frac = state['guard'].allow(target_frac)
           # Per-decision step cap (route 385 seg 27 review, 2026-07-03):
           # human-style gradual steering — move at most STEP_MAX toward the

@@ -74,6 +74,20 @@ def test_guard_flicker_never_reverses():
   assert g.side == +1
 
 
+def test_guard_value_equality():
+  """Value semantics: controller state snapshots compare guards by content
+  (TestOverrideObservers.test_no_behavior_change diffs every state key)."""
+  a, b = SignGuard(), SignGuard()
+  assert a == b
+  a.observe(+0.002); a.allow(+0.1)
+  assert a != b
+  b.observe(+0.002); b.allow(+0.1)
+  assert a == b
+  assert a != object()
+  with pytest.raises(TypeError):
+    hash(a)
+
+
 def _tu():
   L = ContactLearner(seed=(77.6, 65.0))
   return FreePlayTakeUp(L, steer_max_nm=12.0)
