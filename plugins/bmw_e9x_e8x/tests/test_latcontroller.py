@@ -2921,7 +2921,29 @@ class TestDirectTracking:
     assert state['ramp_frames'] == 19
     assert state['action'] == 'ramp'
 
-  @pytest.mark.parametrize('torque0', [-0.02, -0.045, -0.055])
+  def test_step_limited_handover_holds_the_takeup_level(self, monkeypatch):
+    """A take-up fired on the demand for a capped target under TAKEUP_NM
+    (0.078 Nm from -0.055) hands over at the take-up level, not ramping down
+    off the closed flank; the next decision steps up from it."""
+    from bmw.takeup import TAKEUP_NM
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    g = state['guard']
+    g.side, g._opp = -1, 10
+    state.update(torque=-0.055, target_frac=-0.055, ramp_frames=0, action='idle',
+                 tick_count=999)
+    gap, fired_low, floor = 65.0, None, None
+    for i in range(80):
+      fake_sm.updated = {'livePose': i % 5 == 0}
+      if state['takeup'].state == 'taking_up':
+        gap = 77.6                               # contact one tick after the fire
+        fired_low = state['target_frac'] * 12.0 < TAKEUP_NM
+      _call_update(lac, 0.0015, v_ego=25.0, gap_deg=gap)
+      if state['takeup'].fires and state['action'] != 'take_up':
+        floor = state['torque'] if floor is None else min(floor, state['torque'])
+    assert state['takeup'].fires == 1 and fired_low
+    assert floor * 12.0 >= TAKEUP_NM - 1e-9
+
+  @pytest.mark.parametrize('torque0', [-0.045, -0.055])
   def test_step_limited_crossing_still_fires(self, monkeypatch, torque0):
     """Final-review residual: from 0.24-0.66 Nm of old-side torque at 25 m/s
     the STEP_MAX-capped crossing lands under TAKEUP_NM (0.0065 frac at

@@ -1543,6 +1543,14 @@ def on_lat_controller_init(result, lac, CP):
         if state['action'] == 'take_up':
           state['action'] = state['tu_resume']
         if _was_taking and state['ramp_frames'] > 0:
+          # Handover on the take-up side with a step-capped target below the
+          # take-up level but a demand at/above it: hold the level rather than
+          # ramp down off the flank just closed; the next decision steps up
+          # from it. A reversed or released target still re-aims normally.
+          _t = state['torque']
+          if (state['target_frac'] * _t > 0.0 and abs(state['target_frac']) < abs(_t)
+              and state['tu_demand'] * _t > 0.0 and abs(state['tu_demand']) >= abs(_t)):
+            state['target_frac'] = _t
           state['ramp_step'] = (state['target_frac'] - state['torque']) / state['ramp_frames']
 
     # Apply per-frame ramp step. Panda enforces wire-rate (STEER_DELTA_UP)
