@@ -261,6 +261,11 @@ CONTROL_HORIZON_S = 0.65
 # set) — read it via direct_latched(), never `from ... import _DIRECT_LATCHED`
 # (a copied bool would go stale; registry module-identity lesson).
 _DIRECT_LATCHED = False
+# Ruling R10: never Direct without the Arc reference. lane_keeping's hook
+# module, by the registry's canonical name (plugins.<id>.<module>); absent
+# (plugin disabled / failed to load) means raw kappa_des reaches a
+# deadzone-free tracker — the documented-unsafe case — so the latch stays off.
+_LK_REGISTER_MODULE = 'plugins.lane_keeping.register'
 
 
 def direct_latched():
@@ -676,7 +681,8 @@ def on_lat_controller_init(result, lac, CP):
     global _DIRECT_LATCHED
     if active and not state['was_active']:
       try:
-        state['direct'] = read_plugin_param('bmw_e9x_e8x', 'DirectTracking', '') == '1'
+        state['direct'] = (read_plugin_param('bmw_e9x_e8x', 'DirectTracking', '') == '1'
+                           and _LK_REGISTER_MODULE in sys.modules)
       except Exception:
         state['direct'] = False
       _DIRECT_LATCHED = state['direct']

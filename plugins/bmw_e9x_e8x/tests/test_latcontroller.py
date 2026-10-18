@@ -2425,7 +2425,17 @@ class TestOverrideObservers:
 # hold-floor in curves is kept. Direct off must leave every path unchanged.
 # ============================================================
 
+_LK_REGISTER = 'plugins.lane_keeping.register'
+
+
 class TestDirectTracking:
+  @pytest.fixture(autouse=True)
+  def _lane_keeping_loaded(self, monkeypatch):
+    """Ruling R10: Direct latches only while lane_keeping's register module
+    (the Arc reference) is loaded under its registry name; a placeholder
+    stands in for it here."""
+    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace())
+
   def _engaged(self, monkeypatch, direct, v=25.0, contacts=None):
     lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct, contacts=contacts)
     _set_measured(fake_sm, v, 0.0)
@@ -2453,6 +2463,17 @@ class TestDirectTracking:
     assert not state['direct'] and not mod.direct_latched()
     _call_update(lac, 0.0, v_ego=25.0, active=True)
     assert not state['direct'] and not mod.direct_latched()
+
+  def test_no_lane_keeping_module_latches_off(self, monkeypatch):
+    """Ruling R10: never Direct without the Arc reference — switch '1' but
+    lane_keeping not loaded latches off (deadzone-free tracking on the raw
+    model curvature is the documented-unsafe case)."""
+    monkeypatch.delitem(sys.modules, _LK_REGISTER)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    assert not state['direct'] and not mod.direct_latched()
+    state['tick_count'] = 999
+    _call_update(lac, 0.0003, v_ego=25.0)       # inside HOLD_BAND_ENTER
+    assert state['action'] == 'hold_zero'       # legacy rest state applies
 
   def test_read_failure_is_off(self, monkeypatch):
     import config
