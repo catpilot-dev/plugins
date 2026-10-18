@@ -1476,10 +1476,15 @@ def on_lat_controller_init(result, lac, CP):
     # Contact learning (100 Hz, both modes, observe only): the gap under the
     # torque commanded last tick (state['torque'] has not advanced yet), so
     # contacts are known before the first Direct drive.
+    # Guarded (ruling R12): this runs with Direct off too, and learning is
+    # observe-only — an exception here must never break lateral.
     _gap = float(getattr(CS, 'steeringAngleOffsetDeg', 0.0))
-    state['learner'].observe(_gap, state['torque'] * CCP.STEER_MAX,
-                             float(getattr(CS, 'steeringRateDeg', 0.0)),
-                             ok=active and not getattr(CS, 'steeringPressed', False))
+    try:
+      state['learner'].observe(_gap, state['torque'] * CCP.STEER_MAX,
+                               float(getattr(CS, 'steeringRateDeg', 0.0)),
+                               ok=active and not getattr(CS, 'steeringPressed', False))
+    except Exception:
+      pass
 
     # Free-play take-up (spec §3), per CAN tick, Direct only. Old-side torque
     # has been shed under STEP_MAX; when the ramp crosses zero toward an

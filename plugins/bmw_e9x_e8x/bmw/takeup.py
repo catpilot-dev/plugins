@@ -23,6 +23,7 @@ LEARN_MIN_SAMPLES = 200
 LEARN_TAU_S = 60.0
 LEARN_TQ_NM = 0.45
 LEARN_RATE_DPS = 1.0
+LEARN_HOLD_S = 0.2   # torque sign held this long before a sample counts (ruling R12)
 CONTACT_WIDTH_RANGE = (3.0, 25.0)  # deg
 
 
@@ -47,16 +48,31 @@ def format_contacts(c):
 
 
 class ContactLearner:
-  """Median of the first LEARN_MIN_SAMPLES per side, then EMA (tau LEARN_TAU_S)."""
+  """Median of the first LEARN_MIN_SAMPLES per side, then EMA (tau LEARN_TAU_S).
+
+  A sample counts only once the torque sign has held LEARN_HOLD_S: on a side
+  change the servo sweeps the lash in ~0.1 s at a firm torque while the
+  column (steeringRateDeg) is still, so the rate gate alone admits mid-gap
+  gaps as contacts."""
 
   def __init__(self, seed=None, dt=0.01):
     self._seed = seed
     self._alpha = dt / LEARN_TAU_S
+    self._hold_need = round(LEARN_HOLD_S / dt)
+    self._hold_sign = 0
+    self._hold_n = 0
     self._buf = {0: [], 1: []}   # 0 = right, 1 = left
     self._val = {0: None, 1: None}
 
   def observe(self, gap_deg, torque_nm, steer_rate_dps, ok):
-    if not ok or abs(torque_nm) <= LEARN_TQ_NM or abs(steer_rate_dps) >= LEARN_RATE_DPS:
+    s = _sign(torque_nm) if ok else 0
+    if s != self._hold_sign:
+      self._hold_sign = s
+      self._hold_n = 0
+    if s != 0:
+      self._hold_n += 1
+    if (not ok or self._hold_n < self._hold_need
+        or abs(torque_nm) <= LEARN_TQ_NM or abs(steer_rate_dps) >= LEARN_RATE_DPS):
       return
     s = 0 if torque_nm > 0 else 1
     if self._val[s] is None:

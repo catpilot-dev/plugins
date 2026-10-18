@@ -2764,11 +2764,25 @@ class TestDirectTracking:
     _call_update(lac, 0.0, v_ego=25.0, active=False, gap_deg=77.6)
     assert calls[-1][3] is False                # inactive: no sample
 
+  @pytest.mark.parametrize('direct', [None, True])
+  def test_learner_exception_never_breaks_lateral(self, monkeypatch, direct):
+    """Ruling R12: observe runs every tick in both modes; an exception in it
+    must never break lateral — the tick completes and the ramp still applies."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct)
+    def _boom(*a, **k):
+      raise ValueError('bad sample')
+    monkeypatch.setattr(state['learner'], 'observe', _boom)
+    state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20,
+                 action='ramp', tick_count=0)
+    out = _call_update(lac, 0.002, v_ego=25.0, gap_deg=77.6)
+    assert state['torque'] == pytest.approx(0.002)
+    assert out[0] == pytest.approx(-0.002)
+
   def _make_fresh(self, state):
-    from bmw.takeup import LEARN_MIN_SAMPLES
-    for _ in range(LEARN_MIN_SAMPLES):
-      state['learner'].observe(77.6, +0.8, 0.0, True)
-      state['learner'].observe(65.0, -0.8, 0.0, True)
+    from bmw.takeup import LEARN_MIN_SAMPLES, LEARN_HOLD_S
+    for gap, tq in ((77.6, +0.8), (65.0, -0.8)):     # one held push per side (R12)
+      for _ in range(round(LEARN_HOLD_S / 0.01) - 1 + LEARN_MIN_SAMPLES):
+        state['learner'].observe(gap, tq, 0.0, True)
     assert state['learner'].fresh()
 
   @pytest.mark.parametrize('direct', [None, True])

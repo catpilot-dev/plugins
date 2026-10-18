@@ -5,7 +5,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from bmw.takeup import ContactLearner, parse_contacts, format_contacts, LEARN_MIN_SAMPLES
+from bmw.takeup import (ContactLearner, parse_contacts, format_contacts, LEARN_MIN_SAMPLES,
+                        LEARN_HOLD_S)
+
+# Ticks (dt 0.01) of a side's hold dropped before its samples count (R12).
+HOLD = round(LEARN_HOLD_S / 0.01) - 1
 
 
 def feed(L, gap, tq, n, rate=0.0, ok=True):
@@ -15,9 +19,9 @@ def feed(L, gap, tq, n, rate=0.0, ok=True):
 
 def test_learns_both_sides_by_median():
   L = ContactLearner()
-  feed(L, 77.6, +0.8, LEARN_MIN_SAMPLES)
+  feed(L, 77.6, +0.8, HOLD + LEARN_MIN_SAMPLES)
   assert L.contacts() is None            # one side only
-  feed(L, 65.0, -0.8, LEARN_MIN_SAMPLES)
+  feed(L, 65.0, -0.8, HOLD + LEARN_MIN_SAMPLES)
   assert L.contacts() == pytest.approx((77.6, 65.0))
   assert L.fresh()
 
@@ -31,10 +35,33 @@ def test_ignores_small_torque_moving_wheel_and_not_ok():
   assert L.contacts() is None
 
 
+def test_short_traverse_through_mid_gap_contributes_no_samples():
+  """Ruling R12: the servo sweeps the lash in ~0.1 s at a firm torque while
+  the column (steeringRateDeg) stays still; those mid-gap gaps are not
+  contacts. A sample counts only after the torque sign has held 0.2 s."""
+  L = ContactLearner()
+  feed(L, 60.0, -0.8, 500)                          # seated left, long hold
+  n0 = len(L._buf[1])
+  for k in range(HOLD):                             # 0.19 s ramp traverse, right
+    L.observe(65.0 + 12.6 * k / (HOLD - 1), +0.5 + 0.02 * k, 0.0, True)
+  assert L._buf[0] == []                            # no right samples
+  assert len(L._buf[1]) == n0
+
+
+def test_not_ok_resets_the_sign_hold():
+  L = ContactLearner()
+  feed(L, 77.6, +0.8, 15)
+  L.observe(77.6, +0.8, 0.0, False)                 # hands on / inactive
+  feed(L, 77.6, +0.8, HOLD)
+  assert L._buf[0] == []
+  feed(L, 77.6, +0.8, 1)                            # 0.2 s held: counts
+  assert L._buf[0] == [77.6]
+
+
 def test_seed_used_until_fresh_and_then_replaced():
   L = ContactLearner(seed=(77.0, 64.0))
   assert L.contacts() == (77.0, 64.0) and not L.fresh()
-  feed(L, 78.0, +0.8, LEARN_MIN_SAMPLES); feed(L, 65.0, -0.8, LEARN_MIN_SAMPLES)
+  feed(L, 78.0, +0.8, HOLD + LEARN_MIN_SAMPLES); feed(L, 65.0, -0.8, HOLD + LEARN_MIN_SAMPLES)
   assert L.contacts() == pytest.approx((78.0, 65.0))
 
 
