@@ -110,6 +110,11 @@ curvature can be smoothed by arc smoothing, commands stepper faithfully."*
   capped at `hold_cap`). `hold_f` is 0 on straights, so straights get the new
   behaviour; curves keep their proven hold. `hold_f`, `hold_cap` and `held_target`
   therefore stay in Direct mode (relax-dwell uses `hold_cap` too).
+  *Final-review ruling R8:* when `hold_f > 0` and the P target opposes
+  `held_target` (an in-band overshoot), the target is `held_target + P` — P trims
+  down from the hold instead of dropping the curve torque a full STEP_MAX per
+  decision; then the usual t_cap clip, noise guard and STEP_MAX. A large
+  overshoot still carries the sum past zero.
 - **Speed range (user ruling):** Direct mode applies at ALL speeds, including the
   LKA regime below 30 km/h and the 30–43 km/h blend band. The LKA extras that
   ride the push path carry over unchanged: fast-unwind boost, dwell-length fade.

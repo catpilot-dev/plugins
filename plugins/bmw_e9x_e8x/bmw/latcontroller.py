@@ -1349,6 +1349,17 @@ def on_lat_controller_init(result, lac, CP):
           # actuation deadband; the wheel moves once the P-term grows past
           # friction naturally.
           state['action'] = 'ramp'
+          # Direct curve hold (ruling R8): with no on-target band, an in-band
+          # overshoot gives a small P opposing the held torque. Taken alone it
+          # drops the curve torque a full STEP_MAX per decision (probe: 1.8 Nm
+          # held, delta_err -0.0003 at 25 m/s -> 1.06 Nm; legacy hold_curve
+          # 1.80). Instead P trims down from the hold: held_target + P. A large
+          # overshoot still carries the sum past zero (guard, STEP_MAX below).
+          # Straights: held_target is 0, so this never applies there.
+          _trim_hold = (state['direct'] and hold_f > 0.0
+                        and target_frac * held_target < 0.0)
+          if _trim_hold:
+            target_frac = held_target + target_frac
           # v²·|δ|-scaled cap, clipped at STEER_MAX (panda hard limit).
           # Authority grows with commanded a_y_des — straights stay near BASE,
           # tight turns can reach STEER_MAX (transient over-envelope; speedlimitd
@@ -1369,7 +1380,8 @@ def on_lat_controller_init(result, lac, CP):
           # the same way; opposite-sign P (overshoot correction) is
           # untouched, so torque reduction still happens the moment the
           # error flips sides. Bounded by hold_cap, STEP_MAX, and t_cap.
-          if target_frac * held_target > 0.0:
+          # Not after an R8 trim: the trimmed sum is below the hold by design.
+          if not _trim_hold and target_frac * held_target > 0.0:
             target_frac = math.copysign(max(abs(target_frac), abs(held_target)), target_frac)
           # Relax-dwell bridge (see the deep_relax block above): during the
           # dwell window, an overshoot-side reference dip may NOT command

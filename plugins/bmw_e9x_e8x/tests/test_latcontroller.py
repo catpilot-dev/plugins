@@ -2557,6 +2557,56 @@ class TestDirectTracking:
     assert state['action'] == 'ramp'
     assert state['target_frac'] == pytest.approx(0.15)   # floored, not the 0.122 P value
 
+  def _curve_decision(self, monkeypatch, direct, *, v, kappa, delta_err, torque):
+    """Engage in a curve with delta_err of lag, standing torque `torque`, the
+    guard committed to that push's side; run one decision."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct)
+    _set_measured(fake_sm, v, math.tan(math.atan(kappa * 2.66) - delta_err) / 2.66)
+    _call_update(lac, kappa, v_ego=v, active=False)
+    _call_update(lac, kappa, v_ego=v, active=True)
+    state['guard'].reset(); state['guard'].side = +1     # pushing right
+    state.update(torque=torque, target_frac=torque, ramp_frames=0, action='idle',
+                 tick_count=999, at_rest=not direct)
+    _call_update(lac, kappa, v_ego=v)
+    assert state['delta_err'] == pytest.approx(delta_err)
+    return mod, state
+
+  def test_in_band_overshoot_trims_from_hold(self, monkeypatch):
+    """Ruling R8 (reviewer probe): 1.8 Nm standing in a curve, hold_f 1, an
+    in-band overshoot (delta_err -0.0003) at 25 m/s / kappa 0.004. P opposes
+    held_target, so Direct commands held_target + P (P trims down from the
+    hold) — not a full STEP_MAX drop (was 1.06 Nm)."""
+    v, kappa = 25.0, 0.004
+    mod, state = self._curve_decision(monkeypatch, True, v=v, kappa=kappa,
+                                      delta_err=-0.0003, torque=0.15)
+    assert state['hold_f'] == pytest.approx(1.0) and state['hold_cap'] > 0.15
+    # kappa_scale = interp(0.004, [0.001, 0.01, 0.02], [1.0, 2.5, 3.0]) = 1.5;
+    # P = 1.0 * 1.5 * 625 * -0.0003 / 12 = -0.0234 (0.28 Nm), inside STEP_MAX
+    # (0.0615 at 25 m/s) and far inside t_cap (~1.0).
+    p = 1.0 * 1.5 * v * v * state['delta_err'] / 12.0
+    assert state['action'] == 'ramp'
+    assert state['target_frac'] == pytest.approx(0.15 + p)
+    assert state['guard'].suppressed == 0
+
+  def test_in_band_overshoot_legacy_holds_curve(self, monkeypatch):
+    """Direct off: the same probe is an on-target hold_curve at 0.15."""
+    mod, state = self._curve_decision(monkeypatch, None, v=25.0, kappa=0.004,
+                                      delta_err=-0.0003, torque=0.15)
+    assert state['action'] == 'hold_curve'
+    assert state['target_frac'] == pytest.approx(0.15)
+
+  def test_large_overshoot_still_reduces_torque(self, monkeypatch):
+    """Ruling R8: P larger than the hold drives held_target + P to the other
+    side — the noise guard holds it at 0 until persisted, and the old-side
+    torque sheds under STEP_MAX."""
+    v = 25.0
+    mod, state = self._curve_decision(monkeypatch, True, v=v, kappa=0.004,
+                                      delta_err=-0.004, torque=0.15)
+    step_max = 0.10 + (v - 15.0) / (28.0 - 15.0) * (0.05 - 0.10)   # STEP_MAX schedule
+    assert state['guard'].suppressed == 1
+    assert state['target_frac'] == pytest.approx(max(0.0, 0.15 - step_max))
+    assert state['target_frac'] < 0.15
+
   def test_guard_uncommitted_after_reengage(self, monkeypatch):
     """Disengage -> re-engage starts the guard with no committed side."""
     lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
