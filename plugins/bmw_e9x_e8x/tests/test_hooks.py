@@ -243,7 +243,8 @@ class TestVehicleSettingsRows:
     one trips on rack state, which is what the retirement note requires of
     any replacement. The retired row's own title stays pinned out below."""
     titles = [r.title for r in self._rows(monkeypatch, param_dir)]
-    assert titles == ['Temperature Overlay', 'Stall Breakaway', 'Resume Button Repurposed']
+    assert titles == ['Temperature Overlay', 'Stall Breakaway', 'Direct Tracking',
+                      'Resume Button Repurposed']
     assert 'Steering Push Budget' not in titles
 
   def test_non_bmw_gets_no_rows(self, mock_deps, monkeypatch, param_dir):
@@ -320,6 +321,27 @@ class TestVehicleSettingsRows:
     import register
     items = register.on_vehicle_settings([], SimpleNamespace(brand='toyota'))
     assert [r for r in items if getattr(r, 'title', None) == 'Stall Breakaway'] == []
+
+  def test_direct_tracking_row_state_and_callback(self, mock_deps, monkeypatch, param_dir):
+    """Default-OFF (`== '1'`): absent file reads off, only '1' reads on, and
+    the callback persists '1'/'0' to the param file latcontroller reads at
+    each engagement."""
+    assert self._row(monkeypatch, param_dir, 'Direct Tracking').initial_state is False
+    (param_dir / 'DirectTracking').write_text('1')
+    assert self._row(monkeypatch, param_dir, 'Direct Tracking').initial_state is True
+    (param_dir / 'DirectTracking').write_text('0')
+    row = self._row(monkeypatch, param_dir, 'Direct Tracking')
+    assert row.initial_state is False
+
+    row.callback(True)
+    assert (param_dir / 'DirectTracking').read_text() == '1'
+    row.callback(False)
+    assert (param_dir / 'DirectTracking').read_text() == '0'
+
+  def test_direct_tracking_absent_for_non_bmw(self, mock_deps, monkeypatch, param_dir):
+    import register
+    items = register.on_vehicle_settings([], SimpleNamespace(brand='toyota'))
+    assert [r for r in items if getattr(r, 'title', None) == 'Direct Tracking'] == []
 
   def test_write_param_creates_a_missing_data_dir(self, mock_deps, monkeypatch, tmp_path):
     """`_write_param` does `os.makedirs(..., exist_ok=True)` — on a fresh

@@ -25,6 +25,10 @@
     "StallBreakaway": {
       "default": false,
       "description": "Shed steering torque when a stalled rack breaks away and sweeps more than 2 degrees at speed. Write 1 to enable. Read at drive start."
+    },
+    "DirectTracking": {
+      "default": false,
+      "description": "Steer continuously along the arc-smoothed path with no on-target hold band, with fast free-play take-up on direction changes. Write 1 to enable. Read at each engagement."
     }
   },
   "cereal": {

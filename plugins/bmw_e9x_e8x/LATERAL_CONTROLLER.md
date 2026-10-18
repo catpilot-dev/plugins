@@ -1321,6 +1321,22 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   angle traces around any trip — not straight-line smoothness.
 - **Rollback**: delete the param and restart the drive.
 
+### Direct Tracking mode (`DirectTracking`, 2026-10-18 entry):
+- **Default OFF**, `'1'` enables; Driving-panel toggle "Direct Tracking".
+  Read at **each engagement** (not hot mid-engagement).
+- **Bypasses**: the on-target hold band and its machinery (`at_rest`,
+  `hold_zero` / `hold_curve`, entry/settle hysteresis, persistent-lean escape,
+  `cancel_tol`; § 5). Every decision computes the P target from the full
+  `delta_err`; small targets are commanded as they are.
+- **Keeps**: the plant-inversion law and `t_cap`, the curve hold-floor
+  (`held_target`, `hold_cap`), the LKA-regime extras, a noise guard on changes
+  of sign, and panda torque limits. Forces Arc Smoothing on and Lane Keeping off.
+- **Free-play take-up**: on each change of push direction a quick, small torque
+  (just above the ~0.27 Nm column detent) crosses the servo free play, bypassing
+  `STEP_MAX` for the take-up amount only, then hands over to the normal ramp.
+- **Rollback**: toggle off (or write `0`) and re-engage.
+- Design: `docs/superpowers/specs/2026-10-18-bmw-direct-tracking-design.md`.
+
 ---
 
 ## 13. Code map (`bmw/latcontroller.py`)

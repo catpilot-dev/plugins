@@ -142,6 +142,15 @@ def _set_stall_breakaway(state):
   _write_param('StallBreakaway', '1' if state else '0')
 
 
+def _set_direct_tracking(state):
+  """Persist the DirectTracking switch (param file only).
+
+  Read by latcontroller at each engagement, so it applies at the next
+  engagement; no bus topic or heartbeat to keep in sync.
+  """
+  _write_param('DirectTracking', '1' if state else '0')
+
+
 def on_vehicle_settings(items, CP):
   """Hook callback: populate the Driving panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
@@ -165,6 +174,16 @@ def on_vehicle_settings(items, CP):
     "more than 2 degrees at speed. Applies at the next drive.",
     _read_param('StallBreakaway') == '1',
     callback=_set_stall_breakaway,
+  ))
+
+  # Default-OFF polarity (`== '1'`), same as Stall Breakaway.
+  items.append(toggle_item(
+    "Direct Tracking",
+    "Steer continuously along the arc-smoothed path with no on-target hold "
+    "band, taking up servo free play quickly on each change of direction. "
+    "Forces Arc Smoothing on and Lane Keeping off. Applies at the next engagement.",
+    _read_param('DirectTracking') == '1',
+    callback=_set_direct_tracking,
   ))
 
   items.append(toggle_item(
