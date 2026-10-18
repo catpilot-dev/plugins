@@ -127,3 +127,23 @@ def test_blocked_or_unknown_contacts_never_fire():
   assert _tu().step(0.0, +0.002, 65.0, 0.0, blocked=True) is None
   t = FreePlayTakeUp(ContactLearner(), steer_max_nm=12.0)
   assert t.step(0.0, +0.002, 65.0, 0.0, False) is None
+
+
+def test_learner_and_takeup_value_equality():
+  """Value semantics, as SignGuard: the controller's twin-lockstep test
+  (TestOverrideObservers.test_no_behavior_change) diffs every state key."""
+  a, b = ContactLearner(seed=(77.6, 65.0)), ContactLearner(seed=(77.6, 65.0))
+  assert a == b
+  a.observe(77.6, +0.8, 0.0, True)
+  assert a != b
+  b.observe(77.6, +0.8, 0.0, True)
+  assert a == b and a != object()
+  ta, tb = FreePlayTakeUp(a, steer_max_nm=12.0), FreePlayTakeUp(b, steer_max_nm=12.0)
+  assert ta == tb
+  ta.step(0.0, +0.002, 65.0, 0.0, False)
+  assert ta != tb
+  tb.step(0.0, +0.002, 65.0, 0.0, False)
+  assert ta == tb and ta != object()
+  for x in (a, ta):
+    with pytest.raises(TypeError):
+      hash(x)

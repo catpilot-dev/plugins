@@ -367,7 +367,7 @@ def on_lat_controller_init(result, lac, CP):
   from cereal import log
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
-  from bmw.takeup import SignGuard
+  from bmw.takeup import SignGuard, ContactLearner, FreePlayTakeUp, parse_contacts, format_contacts
 
   # Plugin params are read ONCE here, never per-tick and never on a periodic
   # cache expiry (review fix, Important 4): a Path.read_text() on controlsd's
@@ -411,6 +411,14 @@ def on_lat_controller_init(result, lac, CP):
   # the user can A/B by disengaging and re-engaging. Default OFF — only '1'
   # enables; a failed read (incl. the import above failing, which leaves
   # read_plugin_param unbound) is off.
+  # DirectContacts: the servo-column contacts learned last drive ("c_right,
+  # c_left", written on the disengage edge), seeding the learner until it has
+  # its own samples. Own try: a bad seed must not default the switches above.
+  # Missing, malformed or unreadable -> no seed (take-up waits for learning).
+  try:
+    _contacts_seed = parse_contacts(read_plugin_param('bmw_e9x_e8x', 'DirectContacts', ''))
+  except Exception:
+    _contacts_seed = None
 
   # Decision cadence & CAN-rate spreading — both subscribe to model_action_t
   # per tick, sized to one half of the model's action horizon so exactly two
@@ -592,6 +600,7 @@ def on_lat_controller_init(result, lac, CP):
   L = float(CP.wheelbase)
 
   _sm = messaging.SubMaster(['livePose'])
+  _learner = ContactLearner(seed=_contacts_seed)
 
   state = {
     'torque': 0.0,             # current commanded torque fraction (advances by ramp_step each CAN tick)
@@ -599,7 +608,7 @@ def on_lat_controller_init(result, lac, CP):
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
-    'action': 'init',          # debug: hold_zero / hold_curve / ramp / relax_dwell / cancel_tol / idle
+    'action': 'init',          # debug: hold_zero / hold_curve / ramp / relax_dwell / cancel_tol / idle / take_up
     #                            (cancel_accel / cancel_jerk removed 2026-07-28 — no ISO cancel)
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad), what controller acts on
     'lat_pub': None,
@@ -633,6 +642,9 @@ def on_lat_controller_init(result, lac, CP):
     'direct': False,         # DirectTracking latched at the engagement edge; False while inactive
     'was_active': False,     # previous tick's `active`, for the engagement edge
     'guard': SignGuard(),    # noise guard on P-target sign reversals (direct only)
+    'learner': _learner,     # servo-column contacts, learned in BOTH modes
+    'takeup': FreePlayTakeUp(_learner, CCP.STEER_MAX),   # lash take-up (direct only)
+    'tu_resume': 'init',     # decision label under 'take_up', restored when it ends
   }
 
   def _ov_bump(key, hit, ticks, ident, brake):
@@ -672,8 +684,23 @@ def on_lat_controller_init(result, lac, CP):
       if state['direct']:
         state['at_rest'] = False   # no rest state in Direct mode (telemetry too)
     elif not active:
+      if state['was_active']:
+        # Disengage edge: persist the contacts this drive learned as the next
+        # drive's seed. Rare event, so the file write is acceptable here; it
+        # is wrapped whole (incl. the import) — persistence never affects control.
+        try:
+          _c = state['learner'].contacts()
+          if state['learner'].fresh() and _c is not None:
+            from config import write_plugin_param
+            write_plugin_param('bmw_e9x_e8x', 'DirectContacts', format_contacts(_c))
+        except Exception:
+          pass
       state['direct'] = False
       _DIRECT_LATCHED = False
+      # A take-up in flight ends with the engagement; output is 0 below.
+      state['takeup'].reset()
+      if state['action'] == 'take_up':
+        state['action'] = state['tu_resume']
     state['was_active'] = active
 
     # getattr guard: CS is a stub in some test paths. steeringAngleDeg carries
@@ -1416,10 +1443,46 @@ def on_lat_controller_init(result, lac, CP):
         state['ramp_step'] = (target_frac - state['torque']) / spread_frames
         state['ramp_frames'] = spread_frames
 
+    # Contact learning (100 Hz, both modes, observe only): the gap under the
+    # torque commanded last tick (state['torque'] has not advanced yet), so
+    # contacts are known before the first Direct drive.
+    _gap = float(getattr(CS, 'steeringAngleOffsetDeg', 0.0))
+    state['learner'].observe(_gap, state['torque'] * CCP.STEER_MAX,
+                             float(getattr(CS, 'steeringRateDeg', 0.0)),
+                             ok=active and not getattr(CS, 'steeringPressed', False))
+
+    # Free-play take-up (spec §3), per CAN tick, Direct only. Old-side torque
+    # has been shed under STEP_MAX; when the ramp crosses zero toward an
+    # unseated flank, a TAKEUP_NM step closes the lash (the only un-capped
+    # jump), then the remaining ramp re-aims at target_frac from that level.
+    _ramp_held = False
+    if state['direct']:
+      tu = state['takeup']
+      # A stall-breakaway block owns the torque (its shed): end the take-up.
+      if tu.state == 'taking_up' and state['sb_block'] > 0:
+        tu.reset()
+      _was_taking = tu.state == 'taking_up'
+      if state['action'] != 'take_up':
+        state['tu_resume'] = state['action']
+      # Only a ramp headed to a non-zero target on its own side is "on the way
+      # to the new side": a shed to 0 can land a float epsilon past zero.
+      _heading = state['ramp_step'] if (state['ramp_frames'] > 0
+                                        and state['target_frac'] * state['ramp_step'] > 0.0) else 0.0
+      _tu_frac = tu.step(state['torque'], _heading, _gap, _angle, blocked=state['sb_block'] > 0)
+      if _tu_frac is not None:
+        state['torque'] = _tu_frac
+        state['action'] = 'take_up'
+        _ramp_held = True
+      else:
+        if state['action'] == 'take_up':
+          state['action'] = state['tu_resume']
+        if _was_taking and state['ramp_frames'] > 0:
+          state['ramp_step'] = (state['target_frac'] - state['torque']) / state['ramp_frames']
+
     # Apply per-frame ramp step. Panda enforces wire-rate (STEER_DELTA_UP)
     # downstream; large ramp_step (Δ > 5 Nm spread over 50 frames) gets
-    # clipped at the gateway.
-    if state['ramp_frames'] > 0:
+    # clipped at the gateway. Held while a take-up commands the torque.
+    if state['ramp_frames'] > 0 and not _ramp_held:
       state['torque'] = float(np.clip(state['torque'] + state['ramp_step'], -1.0, 1.0))
       state['ramp_frames'] -= 1
 
@@ -1441,6 +1504,7 @@ def on_lat_controller_init(result, lac, CP):
         if state['lat_pub'] is None:
           from openpilot.selfdrive.plugins.plugin_bus import PluginPub
           state['lat_pub'] = PluginPub('bmw_lat_control')
+        _contacts = state['learner'].contacts()
         payload = {
           'desired': float(state['desired']),
           'desired_raw': float(desired_curvature),     # bit-identical to 'desired' (Phase 2: kept for telemetry schema back-compat)
@@ -1482,6 +1546,15 @@ def on_lat_controller_init(result, lac, CP):
           'steer_rate': float(getattr(CS, 'steeringRateDeg', 0.0)),
           'pressed': bool(getattr(CS, 'steeringPressed', False)),
           'lat_delay': float(lat_delay) if lat_delay else 0.0,             # s, as given by controlsd
+          # Direct Tracking (spec §5). Contacts 0.0 = not known yet.
+          'direct': bool(state['direct']),                    # mode latched this engagement
+          'tu_state': state['takeup'].state,                  # right / left (seated) / taking_up / unknown
+          'c_right': float(_contacts[0]) if _contacts else 0.0,   # gap under right torque, deg
+          'c_left': float(_contacts[1]) if _contacts else 0.0,    # gap under left torque, deg
+          'tu_fires': int(state['takeup'].fires),             # cumulative take-ups
+          'tu_ms': float(state['takeup'].last_ms),            # last take-up duration
+          'tu_timeouts': int(state['takeup'].timeouts),       # cumulative take-ups ended by TAKEUP_TIMEOUT_S
+          'tu_guarded': int(state['guard'].suppressed),       # cumulative reversals held at 0 by the noise guard
         }
         state['lat_pub'].send(payload)
       except Exception:

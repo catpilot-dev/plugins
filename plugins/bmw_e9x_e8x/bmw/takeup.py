@@ -81,6 +81,14 @@ class ContactLearner:
   def fresh(self):
     return self._val[0] is not None and self._val[1] is not None
 
+  # Value equality, as SignGuard (twin-lockstep test diffs every state key).
+  __hash__ = None
+
+  def __eq__(self, other):
+    if not isinstance(other, ContactLearner):
+      return NotImplemented
+    return vars(self) == vars(other)
+
 
 def _sign(x):
   return (x > 0) - (x < 0)
@@ -200,3 +208,11 @@ class FreePlayTakeUp:
     self.state = 'unknown'
     self._s = 0
     self._ticks = 0
+
+  # Value equality, as SignGuard; compares the learner by value too.
+  __hash__ = None
+
+  def __eq__(self, other):
+    if not isinstance(other, FreePlayTakeUp):
+      return NotImplemented
+    return vars(self) == vars(other)
