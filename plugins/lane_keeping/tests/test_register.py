@@ -201,3 +201,78 @@ def test_live_defaults_without_param_files(data_dir, monkeypatch):
     register.on_curvature_correction(0.0, SimpleNamespace(laneLines=[], laneLineProbs=[]), 20.0, False, 0.9)
   assert register._anchor.cfg.arc_smooth is True
   assert register._anchor.cfg.enable is False
+
+
+# ---- BMW Direct Tracking: lane keeping follows Direct mode ----
+
+_BMW_LAT = 'plugins.bmw_e9x_e8x.bmw.latcontroller'
+
+
+def _direct_env(monkeypatch, data_dir, latched, direct_param, enable='1', arc='0'):
+  monkeypatch.syspath_prepend(os.path.dirname(_PLUGIN_DIR))
+  import config
+  (data_dir / 'LaneKeepEnable').write_text(enable)
+  (data_dir / 'LaneKeepArcSmooth').write_text(arc)
+  if latched is None:
+    monkeypatch.delitem(sys.modules, _BMW_LAT, raising=False)
+  else:
+    monkeypatch.setitem(sys.modules, _BMW_LAT,
+                        SimpleNamespace(direct_latched=lambda: latched))
+  monkeypatch.setattr(config, 'read_plugin_param',
+                      lambda pid, key, default='': direct_param if key == 'DirectTracking' else default)
+  monkeypatch.setattr(register, '_publish', lambda t: None)
+  monkeypatch.setattr(register, '_tick', 0)
+  monkeypatch.setattr(register, '_direct_switch', False, raising=False)
+
+
+def _call():
+  mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  return register.on_curvature_correction(0.01, mv, 25.0, False, lat_delay=0.45)
+
+
+def test_direct_forces_arc_on_and_lane_keep_off(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, True, '1')
+  _call()
+  assert register._anchor.cfg.arc_smooth is True
+  assert register._anchor.cfg.enable is False
+
+
+def test_switch_off_while_latched_keeps_arc(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, True, '0')
+  _call()
+  assert register._anchor.cfg.arc_smooth is True
+  assert register._anchor.cfg.enable is False
+
+
+def test_user_switches_respected_when_direct_off(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, None, '')
+  _call()
+  assert register._anchor.cfg.enable is True
+  assert register._anchor.cfg.arc_smooth is False
+
+
+def test_user_switches_restored_after_latch_releases(monkeypatch, data_dir):
+  state = {'on': True}
+  _direct_env(monkeypatch, data_dir, True, '0')
+  monkeypatch.setitem(sys.modules, _BMW_LAT, SimpleNamespace(direct_latched=lambda: state['on']))
+  _call()
+  assert register._anchor.cfg.arc_smooth is True
+  state['on'] = False
+  _call()
+  assert register._anchor.cfg.enable is True
+  assert register._anchor.cfg.arc_smooth is False
+
+
+def test_switch_on_without_latch_applies_after_refresh(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, False, '1')
+  for _ in range(100):
+    _call()
+  assert register._anchor.cfg.arc_smooth is True
+  assert register._anchor.cfg.enable is False
+
+
+def test_broken_bmw_module_means_not_latched(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, None, '')
+  monkeypatch.setitem(sys.modules, _BMW_LAT, SimpleNamespace(direct_latched=lambda: 1 / 0))
+  _call()
+  assert register._anchor.cfg.enable is True
