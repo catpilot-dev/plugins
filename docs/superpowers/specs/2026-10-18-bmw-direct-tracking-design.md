@@ -159,6 +159,10 @@ firmware encoder ÷ 7.62, column-scale degrees).
   under the usual STEP_MAX.
 - **Timeout:** if contact is not reached within a bound, hand over anyway (never
   stall the correction).
+- *Final-review ruling R9:* take-up fires only for a real reversal — the decision
+  target is on the new side with |target| ≥ the take-up torque (a smaller target
+  would be overshot by the take-up step itself). A take-up in flight ends (hands
+  over, as on contact) as soon as the target leaves its side or becomes 0.
 
 - **Speeds (my call):** take-up runs at all speeds — the free play is the same.
 

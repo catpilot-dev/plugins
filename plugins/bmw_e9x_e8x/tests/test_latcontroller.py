@@ -2864,6 +2864,31 @@ class TestDirectTracking:
     assert state['ramp_frames'] == 19
     assert state['action'] == 'ramp'
 
+  def test_small_reversal_target_does_not_fire(self, monkeypatch):
+    """Ruling R9: a 0.012 Nm reversal target is not a real reversal — plain
+    ramp, no take-up."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    state.update(torque=0.0, target_frac=0.001, ramp_step=+0.0001, ramp_frames=10,
+                 action='ramp', tick_count=0)
+    _call_update(lac, 0.0, v_ego=25.0, gap_deg=65.0)
+    assert state['takeup'].fires == 0 and state['takeup'].state != 'taking_up'
+    assert state['torque'] == pytest.approx(0.0001)
+    assert state['action'] == 'ramp'
+
+  def test_reversal_mid_takeup_ends_it(self, monkeypatch):
+    """Ruling R9: a new decision target off the take-up side (here 0, a
+    guard-held reversal) ends the take-up; the ramp re-aims from its level."""
+    from bmw.takeup import TAKEUP_NM
+    lac, fake_sm, mod, state, _ = self._start_takeup(monkeypatch)
+    tu = TAKEUP_NM / 12.0
+    state.update(target_frac=0.0, tick_count=0)
+    _call_update(lac, 0.0, v_ego=25.0, gap_deg=70.0)       # mid-gap, contact not reached
+    assert state['takeup'].state != 'taking_up' and state['takeup'].timeouts == 0
+    assert state['ramp_step'] == pytest.approx((0.0 - tu) / 20)
+    assert state['torque'] == pytest.approx(tu - tu / 20)
+    assert state['ramp_frames'] == 19
+    assert state['action'] == 'ramp'
+
   def test_no_takeup_fires_while_pressed(self, monkeypatch):
     lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
     state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20,

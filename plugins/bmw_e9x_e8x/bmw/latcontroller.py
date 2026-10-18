@@ -1494,7 +1494,7 @@ def on_lat_controller_init(result, lac, CP):
       # to the new side": a shed to 0 can land a float epsilon past zero.
       _heading = state['ramp_step'] if (state['ramp_frames'] > 0
                                         and state['target_frac'] * state['ramp_step'] > 0.0) else 0.0
-      _tu_frac = tu.step(state['torque'], _heading, _gap, _angle,
+      _tu_frac = tu.step(state['torque'], _heading, state['target_frac'], _gap, _angle,
                          blocked=state['sb_block'] > 0 or _pressed)
       if _tu_frac is not None:
         state['torque'] = _tu_frac

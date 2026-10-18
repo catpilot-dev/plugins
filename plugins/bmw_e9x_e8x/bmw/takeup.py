@@ -143,7 +143,12 @@ class SignGuard:
 
 class FreePlayTakeUp:
   """Fires a small torque step across the servo-column lash when the commanded
-  torque crosses zero toward a side whose flank is not seated."""
+  torque crosses zero toward a side whose flank is not seated.
+
+  Only for a real reversal (ruling R9): the decision target must be on the
+  new side and at least TAKEUP_NM — a smaller target would be overshot by the
+  take-up step itself.  A take-up in flight hands over as soon as the target
+  leaves its side (opposite or 0)."""
 
   def __init__(self, learner, steer_max_nm, dt=0.01):
     self._learner = learner
@@ -171,14 +176,19 @@ class FreePlayTakeUp:
   def _seat_state(self, gap_deg):
     return {+1: 'right', -1: 'left', 0: 'unknown'}[self.seat(gap_deg)]
 
-  def step(self, torque_frac, ramp_step, gap_deg, angle_deg, blocked):
+  def step(self, torque_frac, ramp_step, target_frac, gap_deg, angle_deg, blocked):
+    """torque_frac: commanded now; ramp_step: per-tick ramp toward
+    target_frac, the decision target.  Returns the take-up torque fraction,
+    or None when the caller's ramp owns the torque."""
     c = self._learner.contacts()
     if self.state == 'taking_up':
       s = self._s
       self._ticks += 1
       target = None if c is None else (c[0] if s > 0 else c[1])
       done = False
-      if target is not None and abs(gap_deg - target) < CONTACT_TOL_DEG:
+      if _sign(target_frac) != s:
+        done = True   # reversed or released mid-take-up: nothing to take up for
+      elif target is not None and abs(gap_deg - target) < CONTACT_TOL_DEG:
         done = True
       elif (angle_deg - self._angle0) * -s >= SZL_CONFIRM_QUANTA * ANGLE_QUANTUM_DEG:
         done = True
@@ -195,6 +205,7 @@ class FreePlayTakeUp:
     s = _sign(ramp_step)
     if (c is not None and not blocked and s != 0
         and torque_frac * s <= 0 and (torque_frac + ramp_step) * s > 0
+        and target_frac * s * self._steer_max >= TAKEUP_NM
         and self.seat(gap_deg) != s):
       self._s = s
       self._angle0 = angle_deg
