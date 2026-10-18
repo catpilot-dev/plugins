@@ -273,6 +273,17 @@ def direct_latched():
   return _DIRECT_LATCHED
 
 
+# Ruling R11: lane_keeping may apply the cached DirectTracking switch only
+# while lateral is NOT engaged, so its reference never changes mid-engagement
+# (while engaged, direct_latched() alone decides). Same accessor rule as above.
+_LAT_ENGAGED = False
+
+
+def lateral_engaged():
+  """True while lateral control is active (set from the engagement latch)."""
+  return _LAT_ENGAGED
+
+
 def on_lat_controller_init(result, lac, CP):
   """Plant-inversion at 500 ms horizon in front-wheel-angle space.
 
@@ -678,7 +689,7 @@ def on_lat_controller_init(result, lac, CP):
     # Direct Tracking latch: read the switch on the engagement edge only, so
     # the law never changes while pushing; inactive clears it (and the module
     # mirror lane_keeping reads). The guard starts uncommitted each engagement.
-    global _DIRECT_LATCHED
+    global _DIRECT_LATCHED, _LAT_ENGAGED
     if active and not state['was_active']:
       try:
         state['direct'] = (read_plugin_param('bmw_e9x_e8x', 'DirectTracking', '') == '1'
@@ -708,6 +719,7 @@ def on_lat_controller_init(result, lac, CP):
       if state['action'] == 'take_up':
         state['action'] = state['tu_resume']
     state['was_active'] = active
+    _LAT_ENGAGED = bool(active)
 
     # getattr guard: CS is a stub in some test paths. steeringAngleDeg carries
     # a constant ~-1.58 deg alignment offset — DELTAS ONLY, never the

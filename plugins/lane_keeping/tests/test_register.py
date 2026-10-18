@@ -208,7 +208,8 @@ def test_live_defaults_without_param_files(data_dir, monkeypatch):
 _BMW_LAT = 'plugins.bmw_e9x_e8x.bmw.latcontroller'
 
 
-def _direct_env(monkeypatch, data_dir, latched, direct_param, enable='1', arc='0'):
+def _direct_env(monkeypatch, data_dir, latched, direct_param, enable='1', arc='0',
+                engaged=None):
   monkeypatch.syspath_prepend(os.path.dirname(_PLUGIN_DIR))
   import config
   (data_dir / 'LaneKeepEnable').write_text(enable)
@@ -216,8 +217,10 @@ def _direct_env(monkeypatch, data_dir, latched, direct_param, enable='1', arc='0
   if latched is None:
     monkeypatch.delitem(sys.modules, _BMW_LAT, raising=False)
   else:
-    monkeypatch.setitem(sys.modules, _BMW_LAT,
-                        SimpleNamespace(direct_latched=lambda: latched))
+    bmw = SimpleNamespace(direct_latched=lambda: latched)
+    if engaged is not None:
+      bmw.lateral_engaged = lambda: engaged
+    monkeypatch.setitem(sys.modules, _BMW_LAT, bmw)
   monkeypatch.setattr(config, 'read_plugin_param',
                       lambda pid, key, default='': direct_param if key == 'DirectTracking' else default)
   monkeypatch.setattr(register, '_publish', lambda t: None)
@@ -276,3 +279,40 @@ def test_broken_bmw_module_means_not_latched(monkeypatch, data_dir):
   monkeypatch.setitem(sys.modules, _BMW_LAT, SimpleNamespace(direct_latched=lambda: 1 / 0))
   _call()
   assert register._anchor.cfg.enable is True
+
+
+# Ruling R11: no mid-engagement change — while lateral is engaged only the
+# controller's latch decides; the cached switch applies only while disengaged.
+
+def test_switch_on_mid_engagement_keeps_user_switches(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, False, '1', engaged=True)
+  for _ in range(100):
+    _call()
+  assert register._direct_switch is True                  # cached, not applied
+  assert register._anchor.cfg.enable is True
+  assert register._anchor.cfg.arc_smooth is False
+
+
+def test_latched_while_engaged_forces_direct(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, True, '0', engaged=True)
+  _call()
+  assert register._anchor.cfg.arc_smooth is True
+  assert register._anchor.cfg.enable is False
+
+
+def test_switch_on_while_disengaged_applies(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, False, '1', engaged=False)
+  for _ in range(100):
+    _call()
+  assert register._anchor.cfg.arc_smooth is True
+  assert register._anchor.cfg.enable is False
+
+
+def test_engaged_lookup_failure_means_not_engaged(monkeypatch, data_dir):
+  _direct_env(monkeypatch, data_dir, False, '1')
+  monkeypatch.setitem(sys.modules, _BMW_LAT, SimpleNamespace(
+    direct_latched=lambda: False, lateral_engaged=lambda: 1 / 0))
+  for _ in range(100):
+    _call()
+  assert register._anchor.cfg.arc_smooth is True
+  assert register._anchor.cfg.enable is False

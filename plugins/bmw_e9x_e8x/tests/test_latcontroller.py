@@ -2475,6 +2475,17 @@ class TestDirectTracking:
     _call_update(lac, 0.0003, v_ego=25.0)       # inside HOLD_BAND_ENTER
     assert state['action'] == 'hold_zero'       # legacy rest state applies
 
+  @pytest.mark.parametrize('direct', [None, True])
+  def test_lateral_engaged_mirrors_active(self, monkeypatch, direct):
+    """Ruling R11: lateral_engaged() is True while active, in both modes
+    (lane_keeping applies its cached switch only while it is False)."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct)
+    assert mod.lateral_engaged() is True
+    _call_update(lac, 0.0, v_ego=25.0)
+    assert mod.lateral_engaged() is True
+    _call_update(lac, 0.0, v_ego=25.0, active=False)
+    assert mod.lateral_engaged() is False
+
   def test_read_failure_is_off(self, monkeypatch):
     import config
     def _boom(plugin_id, key, default=''):

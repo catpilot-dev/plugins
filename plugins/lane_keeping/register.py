@@ -104,16 +104,31 @@ def _read_direct_switch():
     return False
 
 
-def _direct_latched():
+def _bmw_lat_flag(name):
   # Looked up at call time by canonical registry name; never imported.
+  # Missing module/accessor or any failure reads False.
   try:
-    fn = getattr(sys.modules.get(_BMW_LAT_MODULE), 'direct_latched', None)
+    fn = getattr(sys.modules.get(_BMW_LAT_MODULE), name, None)
     return bool(fn()) if fn is not None else False
   except Exception:
     return False
 
 
+def _direct_latched():
+  return _bmw_lat_flag('direct_latched')
+
+
+def _lateral_engaged():
+  return _bmw_lat_flag('lateral_engaged')
+
+
 def _direct_tracking_on():
+  # While lateral is engaged only the controller's latch decides (ruling
+  # R11): a switch flip mid-engagement must not change the reference under a
+  # controller still running the other law. Disengaged, the cached switch
+  # pre-applies so the first engaged tick already sees the Direct reference.
+  if _lateral_engaged():
+    return _direct_latched()
   return _direct_latched() or _direct_switch
 
 
