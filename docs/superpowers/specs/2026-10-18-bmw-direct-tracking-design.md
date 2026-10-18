@@ -29,8 +29,9 @@ Measured (scratchpad `drift_attr.py`, `overshoot.py`, `lagchain.py`):
    (−0.6° in 1 s). The opposite push came a median 4.8 s later → overshoot,
    then swing.
 3. **Free play adds ~0.3 s per side change.** The servo↔column clearance is
-   ~12–13° at column scale on 4e5 (contacts: servo−column gap ≈ +64.4…65.0° under
-   right torque, +77.6…77.8° under left torque). On a side change the servo
+   ~12–13° at column scale on 4e5 (contacts: servo−column gap ≈ +77.6…77.8° under
+   right torque, +64.4…65.0° under left torque; controller sign, + = right — note
+   `carOutput.actuatorsOutput.torque` carries the opposite sign). On a side change the servo
    sweeps it in ~0.1 s at only 0.13–0.25 Nm commanded (unloaded), then servo and
    wheel move 1:1. Confirmed against stock SZL 0x0C9 and DSC 0x0C4. The user
    rules the free play unavoidable in this mechanical setup (gear not slipping).
