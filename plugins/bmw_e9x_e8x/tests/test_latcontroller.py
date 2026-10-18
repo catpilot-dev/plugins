@@ -81,12 +81,13 @@ class FakeSubMaster:
     return self.lp
 
 
-def _make_controller(monkeypatch, wheelbase=2.66, hold_hyst=None, stall_v2=None):
+def _make_controller(monkeypatch, wheelbase=2.66, hold_hyst=None, stall_v2=None, direct=None):
   """Load bmw.latcontroller and construct a controller instance wired to a
   FakeSubMaster. Returns (lac, fake_sm, mod, state).
 
-  hold_hyst / stall_v2: if not None, patches config.read_plugin_param so
-  HoldHysteresis / StallBreakaway reads as '1' (True) or '0' (False) — must
+  hold_hyst / stall_v2 / direct: if not None, patches config.read_plugin_param
+  so HoldHysteresis / StallBreakaway / DirectTracking reads as '1' (True) or
+  '0' (False) — must
   happen BEFORE
   on_lat_controller_init runs, because the param is read exactly once at
   construction (review fix, Important 4: no more per-tick/cached re-read),
@@ -110,13 +111,15 @@ def _make_controller(monkeypatch, wheelbase=2.66, hold_hyst=None, stall_v2=None)
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
 
   import bmw.latcontroller as mod
-  if hold_hyst is not None or stall_v2 is not None:
+  if hold_hyst is not None or stall_v2 is not None or direct is not None:
     import config
     def _param_stub(plugin_id, key, default=''):
       if key == 'HoldHysteresis' and hold_hyst is not None:
         return '1' if hold_hyst else '0'
       if key == 'StallBreakaway' and stall_v2 is not None:
         return '1' if stall_v2 else '0'
+      if key == 'DirectTracking' and direct is not None:
+        return '1' if direct else '0'
       return default
     monkeypatch.setattr(config, 'read_plugin_param', _param_stub)
 
@@ -2402,3 +2405,119 @@ class TestOverrideObservers:
     assert p['ov_last'] == 2
     assert 'ov_on' not in p
     assert 'ov_push_dir' not in p
+
+
+# ============================================================
+# Direct Tracking decision path (2026-10-18, spec §2/§4): the DirectTracking
+# switch is latched at the engagement edge; in Direct mode there is no rest
+# state and no cancel_tol, P sign reversals pass the noise guard, and the
+# hold-floor in curves is kept. Direct off must leave every path unchanged.
+# ============================================================
+
+class TestDirectTracking:
+  def _engaged(self, monkeypatch, direct, v=25.0):
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct)
+    _set_measured(fake_sm, v, 0.0)
+    _call_update(lac, 0.0, v_ego=v, active=False)
+    _call_update(lac, 0.0, v_ego=v, active=True)
+    return lac, fake_sm, mod, state
+
+  def test_latch_reads_switch_at_engagement(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    assert state['direct'] and mod.direct_latched()
+
+  def test_latch_holds_until_disengage(self, monkeypatch):
+    """A switch flip while engaged takes effect only at the next engagement;
+    disengaging clears the latch."""
+    import config
+    params = {'DirectTracking': '1'}
+    monkeypatch.setattr(config, 'read_plugin_param',
+                        lambda plugin_id, key, default='': params.get(key, default))
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, None)
+    assert state['direct'] and mod.direct_latched()
+    params['DirectTracking'] = '0'
+    _call_update(lac, 0.0, v_ego=25.0, active=True)
+    assert state['direct'] and mod.direct_latched()      # no mid-push law change
+    _call_update(lac, 0.0, v_ego=25.0, active=False)
+    assert not state['direct'] and not mod.direct_latched()
+    _call_update(lac, 0.0, v_ego=25.0, active=True)
+    assert not state['direct'] and not mod.direct_latched()
+
+  def test_read_failure_is_off(self, monkeypatch):
+    import config
+    def _boom(plugin_id, key, default=''):
+      if key == 'DirectTracking':
+        raise OSError('eMMC')
+      return default
+    monkeypatch.setattr(config, 'read_plugin_param', _boom)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, None)
+    assert not state['direct'] and not mod.direct_latched()
+
+  def test_off_by_default_keeps_rest_state(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, None)
+    assert not state['direct'] and not mod.direct_latched()
+    state['tick_count'] = 999
+    _call_update(lac, 0.0003, v_ego=25.0)       # inside HOLD_BAND_ENTER
+    assert state['action'] == 'hold_zero'
+
+  def test_sub_band_error_is_tracked_in_direct(self, monkeypatch):   # the 4e5 arc-only case
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    state['tick_count'] = 999
+    _call_update(lac, 0.0003, v_ego=25.0)       # δ_err ≈ 0.0008 rad < 0.0015
+    assert state['action'] == 'ramp' and state['target_frac'] > 0.0 and not state['at_rest']
+
+  def test_no_cancel_tol_in_direct(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    state.update(action='ramp', ramp_frames=10, torque=0.05, target_frac=0.08)
+    _call_update(lac, 0.0, v_ego=25.0)          # δ_err in 1.2·HOLD_BAND
+    assert state['action'] != 'cancel_tol'
+
+  def test_short_reversal_sheds_to_zero_not_across(self, monkeypatch):  # Review Focus 4
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    state['tick_count'] = 999; _call_update(lac, +0.002, v_ego=25.0)   # commit right
+    assert state['target_frac'] > 0.0 and state['guard'].side == +1
+    state['tick_count'] = 999; _call_update(lac, -0.002, v_ego=25.0)   # one tick opposite
+    assert state['target_frac'] >= 0.0
+    assert state['guard'].suppressed == 1
+
+  def test_persisted_reversal_crosses(self, monkeypatch):
+    """Once the opposite error sign has persisted the guard window (3 livePose
+    ticks), the reversal passes — the guard delays, it never blocks."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    state['tick_count'] = 999; _call_update(lac, +0.002, v_ego=25.0)
+    state['torque'] = 0.0; state['ramp_frames'] = 0       # old side already shed
+    for _ in range(3):
+      _call_update(lac, -0.002, v_ego=25.0)             # persist (no decision)
+    state['tick_count'] = 999; _call_update(lac, -0.002, v_ego=25.0)
+    assert state['target_frac'] < 0.0 and state['guard'].side == -1
+
+  def test_direct_applies_in_lka_regime(self, monkeypatch):        # user ruling: all speeds
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, v=5.0)
+    assert state['direct']
+    state['tick_count'] = 999
+    _call_update(lac, 0.0003, v_ego=5.0)        # sub-band δ_err at 18 km/h
+    assert state['action'] == 'ramp' and state['target_frac'] > 0.0 and not state['at_rest']
+
+  @pytest.mark.parametrize('direct', [None, True])
+  def test_hold_floor_kept_in_curves(self, monkeypatch, direct):
+    """v=20, κ_des=0.006: a_y 2.4 m/s² ≥ HOLD_AY_BP[1] -> hold_f = 1, and
+    hold_cap = 0.192 (see TestCancelTolStillFires). Standing torque 0.15 ->
+    held_target 0.15. κ_meas lags by δ_err ≈ 0.002 rad (past HOLD_BAND_ENTER,
+    so the legacy path leaves rest too): P = 1.833·400·0.002/12 ≈ 0.122,
+    same-sign but under the hold -> floored at held_target. The step from
+    0.15 is zero, so STEP_MAX does not bind."""
+    v, kappa = 20.0, 0.006
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct)
+    kappa_meas = math.tan(math.atan(kappa * 2.66) - 0.002) / 2.66
+    _set_measured(fake_sm, v, kappa_meas)
+    _call_update(lac, kappa, v_ego=v, active=False)
+    _call_update(lac, kappa, v_ego=v, active=True)
+    assert state['direct'] == bool(direct)
+    state.update(torque=0.15, target_frac=0.15, ramp_frames=0, action='idle',
+                 tick_count=999)
+    _call_update(lac, kappa, v_ego=v)
+    assert state['hold_f'] == pytest.approx(1.0)
+    assert 0.15 < state['hold_cap']
+    assert state['delta_err'] == pytest.approx(0.002)
+    assert state['action'] == 'ramp'
+    assert state['target_frac'] == pytest.approx(0.15)   # floored, not the 0.122 P value

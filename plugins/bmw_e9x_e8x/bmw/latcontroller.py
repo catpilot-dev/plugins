@@ -253,6 +253,20 @@ OV_RATE_TICKS = 20         # 0.2 s signed-rate window over the shared sb_ring
 # 4d9; at SAD 0.4 this constant equals the old coupled value exactly.)
 CONTROL_HORIZON_S = 0.65
 
+# Direct Tracking (2026-10-18, docs/superpowers/specs/2026-10-18-bmw-direct-
+# tracking-design.md): no rest state, no cancel_tol, sign-guarded reversals.
+# The DirectTracking switch is latched at each lateral engagement edge and
+# held until disengage, so the law never changes mid-push. The module global
+# mirrors the latch for other plugins (lane_keeping forces Arc on while it is
+# set) — read it via direct_latched(), never `from ... import _DIRECT_LATCHED`
+# (a copied bool would go stale; registry module-identity lesson).
+_DIRECT_LATCHED = False
+
+
+def direct_latched():
+  """True while the engaged controller runs Direct Tracking."""
+  return _DIRECT_LATCHED
+
 
 def on_lat_controller_init(result, lac, CP):
   """Plant-inversion at 500 ms horizon in front-wheel-angle space.
@@ -353,6 +367,7 @@ def on_lat_controller_init(result, lac, CP):
   from cereal import log
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
+  from bmw.takeup import SignGuard
 
   # Plugin params are read ONCE here, never per-tick and never on a periodic
   # cache expiry (review fix, Important 4): a Path.read_text() on controlsd's
@@ -391,6 +406,11 @@ def on_lat_controller_init(result, lac, CP):
   except Exception:
     _hold_hyst_on = True
     _stall_v2_on = False
+  # DirectTracking is the one exception to read-once-at-init: it is read at
+  # each engagement edge in update() (a rare event, not a per-tick read), so
+  # the user can A/B by disengaging and re-engaging. Default OFF — only '1'
+  # enables; a failed read (incl. the import above failing, which leaves
+  # read_plugin_param unbound) is off.
 
   # Decision cadence & CAN-rate spreading — both subscribe to model_action_t
   # per tick, sized to one half of the model's action horizon so exactly two
@@ -573,6 +593,14 @@ def on_lat_controller_init(result, lac, CP):
 
   _sm = messaging.SubMaster(['livePose'])
 
+  class _Guard(SignGuard):
+    """SignGuard with value equality, so state snapshots compare by content
+    (TestOverrideObservers.test_no_behavior_change diffs every state key)."""
+    __hash__ = None
+
+    def __eq__(self, other):
+      return isinstance(other, SignGuard) and vars(self) == vars(other)
+
   state = {
     'torque': 0.0,             # current commanded torque fraction (advances by ramp_step each CAN tick)
     'target_frac': 0.0,        # plant-inversion target set each decision (cadence ≈ model_action_t/2)
@@ -609,6 +637,10 @@ def on_lat_controller_init(result, lac, CP):
     'ov_brake_fires': 0,     # fires (any detector) while CS.brakePressed — the stage-2 context counter
     'ov_last': 0,            # 1=eod 2=hold 3=crawl 4=wsd, last fire this drive
     'ov_push_dir': 0.0, 'ov_push_t': 0,     # push memory (direction, CAN ticks since the push ended)
+    # Direct Tracking (see _DIRECT_LATCHED at module scope).
+    'direct': False,         # DirectTracking latched at the engagement edge; False while inactive
+    'was_active': False,     # previous tick's `active`, for the engagement edge
+    'guard': _Guard(),       # noise guard on P-target sign reversals (direct only)
   }
 
   def _ov_bump(key, hit, ticks, ident, brake):
@@ -633,6 +665,24 @@ def on_lat_controller_init(result, lac, CP):
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 11
+
+    # Direct Tracking latch: read the switch on the engagement edge only, so
+    # the law never changes while pushing; inactive clears it (and the module
+    # mirror lane_keeping reads). The guard starts uncommitted each engagement.
+    global _DIRECT_LATCHED
+    if active and not state['was_active']:
+      try:
+        state['direct'] = read_plugin_param('bmw_e9x_e8x', 'DirectTracking', '') == '1'
+      except Exception:
+        state['direct'] = False
+      _DIRECT_LATCHED = state['direct']
+      state['guard'].reset()
+      if state['direct']:
+        state['at_rest'] = False   # no rest state in Direct mode (telemetry too)
+    elif not active:
+      state['direct'] = False
+      _DIRECT_LATCHED = False
+    state['was_active'] = active
 
     # getattr guard: CS is a stub in some test paths. steeringAngleDeg carries
     # a constant ~-1.58 deg alignment offset — DELTAS ONLY, never the
@@ -1010,6 +1060,9 @@ def on_lat_controller_init(result, lac, CP):
       # so this controller tracks whatever reference it is given, faithfully.
       delta_err = delta_err_raw
       state['delta_err'] = delta_err
+      # Noise guard judges reversal persistence on the 20 Hz error sign, not
+      # the cadence target (spec §3). Read only in Direct mode.
+      state['guard'].observe(delta_err)
 
       # Slow-error EMA for the persistent-lean escape (see HOLD_EMA_TAU).
       state['derr_ema'] += (DT_LIVEPOSE / HOLD_EMA_TAU) * (delta_err - state['derr_ema'])
@@ -1126,8 +1179,10 @@ def on_lat_controller_init(result, lac, CP):
       # Consequence: terminal push ramps with small stale targets now drain to
       # the held target on arrival instead of completing; less residual torque
       # at rest entry.)
-      if (state['action'] == 'ramp' and abs(delta_err) <= 1.2*HOLD_BAND
-            and state['ramp_frames'] > 0):
+      # Direct Tracking has no on-target band, so no band hygiene: the ramp
+      # runs to its decision and the cadence never restarts here.
+      if (not state['direct'] and state['action'] == 'ramp'
+            and abs(delta_err) <= 1.2*HOLD_BAND and state['ramp_frames'] > 0):
         # cancel_tol — HOLD_BAND boundary hygiene, NOT an ISO cancel (this is
         # the only "cancel_"-named path left; it tracks the command tighter, it
         # does not abandon the turn). Error fell into the on-target band (1.2x
@@ -1211,7 +1266,12 @@ def on_lat_controller_init(result, lac, CP):
         # thresholds are HOLD_BAND and this reduces exactly to the legacy
         # per-decision comparison (leave on >, return on <=).
         _enter = HOLD_BAND_ENTER if _hold_hyst_on else HOLD_BAND
-        if state['at_rest']:
+        if state['direct']:
+          # Direct Tracking: no rest state, no hysteresis, no EMA escape —
+          # every decision computes P on the full error. A sub-friction
+          # target is, in effect, a hold (user ruling, spec §2).
+          state['at_rest'] = False
+        elif state['at_rest']:
           if abs(delta_err) > _enter or \
              (_hold_hyst_on and abs(state['derr_ema']) > HOLD_EMA_ESCAPE):
             state['at_rest'] = False
@@ -1290,6 +1350,13 @@ def on_lat_controller_init(result, lac, CP):
           if dwelling:
             target_frac = math.copysign(min(abs(state['torque']), hold_cap), state['torque'])
             state['action'] = 'relax_dwell'
+          # Direct Tracking noise guard (spec §3): a sign change of the target
+          # commands 0 until the opposite error sign has persisted
+          # GUARD_PERSIST_S. ~0.5 Nm of noise torque at 25 m/s is enough to
+          # sweep the servo across the gap, and 0 is itself a hold. The old
+          # side still sheds toward 0 under STEP_MAX below.
+          if state['direct']:
+            target_frac = state['guard'].allow(target_frac)
           # Per-decision step cap (route 385 seg 27 review, 2026-07-03):
           # human-style gradual steering — move at most STEP_MAX toward the
           # P target per decision, let the plant respond one cadence, then
