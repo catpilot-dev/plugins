@@ -253,6 +253,20 @@ OV_RATE_TICKS = 20         # 0.2 s signed-rate window over the shared sb_ring
 # 4d9; at SAD 0.4 this constant equals the old coupled value exactly.)
 CONTROL_HORIZON_S = 0.65
 
+# Slope bias (2026-10-19, docs/superpowers/specs/2026-10-19-bmw-slope-bias-
+# design.md). Direct is P-only, so the steady torque a straight needs against
+# a constant pull (road slope, alignment; route 4e9 ~0.08 Nm left) comes only
+# from a standing error: the car sat +0.15 m right of the model's plan. While
+# the SlopeCompensation switch is latched with Direct, sl_bias integrates the
+# P term on straights and is added to the P target everywhere. The learn gate
+# is the driving situation only, never the error's sign — the hold-bias lesson
+# (37e34b7): anti-windup must never block the unwind.
+SL_TAU_S = 20.0            # integration time constant on the P term (s)
+SL_BIAS_MAX_NM = 0.15      # ~2x the 4e9 need, well below rack breakaway
+SL_MIN_V = 40 / 3.6        # learn only above 40 km/h (m/s)
+SL_KAPPA_DES = 1e-3        # straight: |desired| below this (1/m)
+SL_KAPPA_MEAS = 1.5e-3     # and |measured| below this (1/m)
+
 # Direct Tracking (2026-10-18, docs/superpowers/specs/2026-10-18-bmw-direct-
 # tracking-design.md): no rest state, no cancel_tol, sign-guarded reversals.
 # The DirectTracking switch is latched at each lateral engagement edge and
@@ -669,6 +683,9 @@ def on_lat_controller_init(result, lac, CP):
     'takeup': FreePlayTakeUp(_learner, CCP.STEER_MAX),   # lash take-up (direct only)
     'tu_resume': 'init',     # decision label under 'take_up', restored when it ends
     'tu_demand': 0.0,        # last decision's target before STEP_MAX (take-up size gate)
+    'slope': False,          # SlopeCompensation latched with Direct at the engagement edge
+    'sl_bias': 0.0,          # learned straight-road torque (Nm); kept across engagements, never persisted
+    'sl_learn': False,       # learn gate open this livePose tick (telemetry)
   }
 
   def _ov_bump(key, hit, ticks, ident, brake):
@@ -705,6 +722,11 @@ def on_lat_controller_init(result, lac, CP):
       except Exception:
         state['direct'] = False
       _DIRECT_LATCHED = state['direct']
+      try:
+        state['slope'] = state['direct'] and \
+          read_plugin_param('bmw_e9x_e8x', 'SlopeCompensation', '') == '1'
+      except Exception:
+        state['slope'] = False
       state['guard'].reset()
       if state['direct']:
         state['at_rest'] = False   # no rest state in Direct mode (telemetry too)
@@ -721,6 +743,7 @@ def on_lat_controller_init(result, lac, CP):
         except Exception:
           pass
       state['direct'] = False
+      state['slope'] = False
       _DIRECT_LATCHED = False
       # A take-up in flight ends with the engagement; output is 0 below.
       state['takeup'].reset()
@@ -1127,6 +1150,19 @@ def on_lat_controller_init(result, lac, CP):
       kappa_scale = float(np.interp(abs(state['desired']),
                                     T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP))
 
+      # Slope bias learning (see SL_TAU_S): integrate the P term alone on
+      # straights. The gate never looks at the error's sign.
+      state['sl_learn'] = bool(
+        state['slope'] and active and not getattr(CS, 'steeringPressed', False)
+        and v_true > SL_MIN_V
+        and abs(state['desired']) < SL_KAPPA_DES and abs(state['measured']) < SL_KAPPA_MEAS
+        and state['takeup'].state != 'taking_up'
+        and state['sb_block'] == 0 and state['sb_state'] != 2)   # 1 = armed only: harmless
+      if state['sl_learn']:
+        _p_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
+        state['sl_bias'] = float(np.clip(state['sl_bias'] + (_p_nm / SL_TAU_S) * DT_LIVEPOSE,
+                                         -SL_BIAS_MAX_NM, SL_BIAS_MAX_NM))
+
       # Held torque for the on-target hold / cancel_tol (route 385 seg 27
       # review, 2026-07-03). "Keep what you have" needs two qualifiers:
       #   - sign-guard: never hold torque opposing the commanded curve — on a
@@ -1363,6 +1399,8 @@ def on_lat_controller_init(result, lac, CP):
           # correction (Phase 1, route 3bf: 44% of correcting ticks produced no
           # action at all). Nothing here shrinks the commanded curvature now.
           target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
+          if state['slope']:
+            target_nm += state['sl_bias']
           target_frac = target_nm / CCP.STEER_MAX
           # Sub-breakaway targets are commanded as-is (breakaway ±FRICTION
           # amplification removed 2026-07-03): commands below the rack's
@@ -1636,6 +1674,8 @@ def on_lat_controller_init(result, lac, CP):
           'tu_ms': float(state['takeup'].last_ms),            # last take-up duration
           'tu_timeouts': int(state['takeup'].timeouts),       # cumulative take-ups ended by TAKEUP_TIMEOUT_S
           'tu_guarded': int(state['guard'].suppressed),       # cumulative reversals held at 0 by the noise guard
+          'sl_bias': float(state['sl_bias']),                  # learned straight-road torque (Nm)
+          'sl_learn': bool(state['sl_learn']),                 # slope-bias learn gate open
         }
         state['lat_pub'].send(payload)
       except Exception:

@@ -86,7 +86,7 @@ class FakeSubMaster:
 
 
 def _make_controller(monkeypatch, wheelbase=2.66, hold_hyst=None, stall_v2=None, direct=None,
-                     contacts=None):
+                     contacts=None, slope=None):
   """Load bmw.latcontroller and construct a controller instance wired to a
   FakeSubMaster. Returns (lac, fake_sm, mod, state).
 
@@ -118,7 +118,7 @@ def _make_controller(monkeypatch, wheelbase=2.66, hold_hyst=None, stall_v2=None,
 
   import bmw.latcontroller as mod
   if hold_hyst is not None or stall_v2 is not None or direct is not None \
-     or contacts is not None:
+     or contacts is not None or slope is not None:
     import config
     def _param_stub(plugin_id, key, default=''):
       if key == 'HoldHysteresis' and hold_hyst is not None:
@@ -129,6 +129,8 @@ def _make_controller(monkeypatch, wheelbase=2.66, hold_hyst=None, stall_v2=None,
         return '1' if direct else '0'
       if key == 'DirectContacts' and contacts is not None:
         return contacts
+      if key == 'SlopeCompensation' and slope is not None:
+        return '1' if slope else '0'
       return default
     monkeypatch.setattr(config, 'read_plugin_param', _param_stub)
 
@@ -2978,3 +2980,129 @@ class TestDirectTracking:
     _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0, pressed=True)
     assert state['takeup'].fires == 0
     assert state['torque'] == pytest.approx(0.002)         # plain ramp
+
+
+# ============================================================
+# Slope bias (docs/superpowers/specs/2026-10-19-bmw-slope-bias-design.md):
+# a slow, bounded torque bias learned from the P term on straights while
+# Direct Tracking is latched, added to Direct's P target.
+# ============================================================
+
+class TestSlopeBias:
+  V = 25.0
+  L = 2.66
+
+  @pytest.fixture(autouse=True)
+  def _lane_keeping_loaded(self, monkeypatch):
+    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace(HOOK_READY=True))
+
+  def _engaged(self, monkeypatch, direct=True, slope=True, v=V, stall_v2=None):
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct, slope=slope,
+                                                stall_v2=stall_v2)
+    _set_measured(fake_sm, v, 0.0)
+    _call_update(lac, 0.0, v_ego=v, active=False)
+    _call_update(lac, 0.0, v_ego=v, active=True)
+    return lac, fake_sm, mod, state
+
+  def _p_nm(self, kappa_meas, v=V):
+    # T_CAP_SLOPE_BASE 1.0 x kappa_scale 1.0 (straight) x v^2 x delta_err
+    return v * v * (0.0 - math.atan(kappa_meas * self.L))
+
+  def _run(self, lac, fake_sm, n, desired=0.0, kappa_meas=0.0, v=V, **kw):
+    _set_measured(fake_sm, v, kappa_meas)
+    for _ in range(n):
+      fake_sm.updated = {'livePose': True}
+      _call_update(lac, desired, v_ego=v, **kw)
+
+  @pytest.mark.parametrize('kappa_meas', [2e-4, -2e-4])
+  def test_learns_toward_standing_p_both_signs(self, monkeypatch, kappa_meas):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    b0 = state['sl_bias']
+    self._run(lac, fake_sm, 10, kappa_meas=kappa_meas)
+    expect = 10 * self._p_nm(kappa_meas) * 0.05 / mod.SL_TAU_S
+    assert state['sl_bias'] - b0 == pytest.approx(expect, rel=0.15)
+    assert math.copysign(1.0, state['sl_bias']) == -math.copysign(1.0, kappa_meas)
+    self._run(lac, fake_sm, 2000, kappa_meas=kappa_meas)
+    assert state['sl_bias'] == pytest.approx(-math.copysign(mod.SL_BIAS_MAX_NM, kappa_meas))
+
+  def test_bias_added_to_p_target(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    state.update(sl_bias=-0.1, torque=-0.1 / 12.0, tick_count=999)
+    _set_measured(fake_sm, self.V, 0.0)
+    fake_sm.updated = {'livePose': True}
+    _call_update(lac, 0.0, v_ego=self.V)
+    assert state['target_frac'] * 12.0 == pytest.approx(-0.1, abs=1e-6)
+
+  def test_curve_holds_bias_without_learning(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    state['sl_bias'] = -0.05
+    self._run(lac, fake_sm, 200, desired=3e-3, kappa_meas=2e-3)
+    assert state['sl_bias'] == -0.05 and state['sl_learn'] is False
+
+  def test_low_speed_no_learning(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, v=10.0)
+    self._run(lac, fake_sm, 100, kappa_meas=2e-4, v=10.0)
+    assert state['sl_bias'] == 0.0
+
+  @pytest.mark.parametrize('kappa_meas', [2e-4, -2e-4])
+  def test_press_freezes_bias(self, monkeypatch, kappa_meas):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    state['sl_bias'] = 0.03
+    self._run(lac, fake_sm, 100, kappa_meas=kappa_meas, pressed=True)
+    assert state['sl_bias'] == 0.03
+
+  @pytest.mark.parametrize('blocker', ['takeup', 'sb_block', 'sb_episode'])
+  def test_takeup_and_sb_close_gate(self, monkeypatch, blocker):
+    """A take-up in flight, a stall-breakaway block, or an active breakaway
+    episode (sb_state 2; state 1 is only 'armed') closes the gate."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, stall_v2=True)
+    self._run(lac, fake_sm, 1, kappa_meas=1.2e-3)   # straight, |delta_err| > HOLD_BAND
+    state['sl_bias'] = 0.03
+    if blocker == 'sb_episode':
+      state.update(sb_state=2, sb_episode_ticks=10000, sb_brk_angle=0.0, sb_dir=1.0, action='ramp')
+    for _ in range(20):
+      if blocker == 'takeup':
+        state['takeup'].state = 'taking_up'
+      elif blocker == 'sb_block':
+        state['sb_block'] = 5
+      else:
+        assert state['sb_state'] == 2
+      fake_sm.updated = {'livePose': True}
+      _call_update(lac, 0.0, v_ego=self.V)
+      assert state['sl_bias'] == 0.03 and state['sl_learn'] is False
+
+  def test_bias_survives_reengage(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    self._run(lac, fake_sm, 50, kappa_meas=2e-4)
+    b = state['sl_bias']
+    assert b < 0.0
+    _set_measured(fake_sm, self.V, 0.0)          # zero error: no learning on the re-engage tick
+    _call_update(lac, 0.0, v_ego=self.V, active=False)
+    assert not state['slope']
+    _call_update(lac, 0.0, v_ego=self.V, active=True)
+    assert state['slope'] and state['sl_bias'] == b
+
+  def _mixed(self, lac, fake_sm):
+    out = []
+    for i in range(300):
+      v = 25.0 if i < 200 else 9.0
+      desired = 3e-3 if 60 <= i < 120 else 0.0
+      _set_measured(fake_sm, v, 2e-4 if i % 40 < 20 else -1e-4)
+      fake_sm.updated = {'livePose': i % 5 == 0}
+      _call_update(lac, desired, v_ego=v, pressed=150 <= i < 170)
+      out.append(lac.update.__closure__ and _closure_state(lac.update)['torque'])
+    return out
+
+  def test_slope_needs_direct(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct=False, slope=True)
+    assert not state['slope']
+    a = self._mixed(lac, fake_sm)
+    assert state['sl_bias'] == 0.0
+    lac2, fake_sm2, _, _ = self._engaged(monkeypatch, direct=False, slope=None)
+    assert a == self._mixed(lac2, fake_sm2)
+
+  def test_slope_off_bit_identical(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct=True, slope=False)
+    a = self._mixed(lac, fake_sm)
+    lac2, fake_sm2, _, _ = self._engaged(monkeypatch, direct=True, slope=None)
+    assert a == self._mixed(lac2, fake_sm2)
