@@ -262,7 +262,7 @@ CONTROL_HORIZON_S = 0.65
 # is the driving situation only, never the error's sign — the hold-bias lesson
 # (37e34b7): anti-windup must never block the unwind.
 SL_TAU_S = 20.0            # integration time constant on the P term (s)
-SL_BIAS_MAX_NM = 0.15      # ~2x the 4e9 need, well below rack breakaway
+SL_BIAS_MAX_NM = 0.25      # route 4ea: roll >= 2.3 deg roads need 0.20-0.25; well below rack breakaway
 SL_MIN_V = 40 / 3.6        # learn only above 40 km/h (m/s)
 SL_KAPPA_DES = 1e-3        # straight: |desired| below this (1/m)
 SL_KAPPA_MEAS = 1.5e-3     # and |measured| below this (1/m)

@@ -3025,6 +3025,14 @@ class TestSlopeBias:
     self._run(lac, fake_sm, 2000, kappa_meas=kappa_meas)
     assert state['sl_bias'] == pytest.approx(-math.copysign(mod.SL_BIAS_MAX_NM, kappa_meas))
 
+  def test_clamp_covers_steep_road_need(self, monkeypatch):
+    """Route 4ea: roads with roll >= 2.3 deg need -0.20..-0.25 Nm; the 0.15
+    clamp pinned the bias and left the car +0.3 m right on them."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    self._run(lac, fake_sm, 4000, kappa_meas=2e-4)
+    assert state['sl_bias'] == pytest.approx(-0.25)
+    assert mod.SL_BIAS_MAX_NM < 0.5   # still well below rack breakaway
+
   def test_bias_added_to_p_target(self, monkeypatch):
     lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state.update(sl_bias=-0.1, torque=-0.1 / 12.0, tick_count=999)

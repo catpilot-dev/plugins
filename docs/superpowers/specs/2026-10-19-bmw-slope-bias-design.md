@@ -47,7 +47,7 @@ and b stops moving.
 | Constant | Value | Why |
 |---|---|---|
 | TAU_BIAS | 20 s | Far slower than corrections (0.1–1 Hz), so it only sees the DC part. Noise on b ≈ ±0.01 Nm. |
-| BIAS_MAX | 0.15 Nm | About 2× the measured need (0.08). Well below rack breakaway (~0.5 Nm), so b alone can never steer the car. |
+| BIAS_MAX | 0.25 Nm | Well below rack breakaway (~0.5 Nm), so b alone can never steer the car. First set to 0.15 (about 2× the 4e9 need of 0.08); raised after route 4ea, where roads with roll ≥ 2.3° needed 0.20–0.25. |
 
 **Learn gate.** It depends only on the driving situation, never on the error's
 sign (the hold-bias lesson: anti-windup must never block the unwind):

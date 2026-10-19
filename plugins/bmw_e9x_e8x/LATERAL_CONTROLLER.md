@@ -1349,8 +1349,14 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   37e34b7): latched with Direct, active, not pressed, v > 40 km/h,
   |κ_des| < 1e-3 and |κ_meas| < 1.5e-3, no take-up in flight, no stall-breakaway
   block or episode (`sb_state` 2; the armed state 1 does not close it).
-- **Constants**: `SL_TAU_S` 20 s, `SL_BIAS_MAX_NM` 0.15 (≈2× the 4e9 need,
-  well below rack breakaway), `SL_MIN_V` 40 km/h.
+- **Constants**: `SL_TAU_S` 20 s, `SL_BIAS_MAX_NM` 0.25 (well below rack
+  breakaway, ~0.5 Nm), `SL_MIN_V` 40 km/h. Was 0.15 (≈2× the 4e9 need): on
+  route 4ea it pinned the bias 20% of the time on roads with roll ≥ 2.3°,
+  which need 0.20–0.25 Nm, and the car stayed +0.3 m right there.
+- **Route 4ea result** (switch on from seg 12, same drive): straight offset
+  +0.22 → +0.07 m, sway 0.050 → 0.047 m/s², take-ups 2.0 → 2.7/min, 0 timeouts.
+  Per segment the need tracks roll (43 segments, r −0.50, ≈0.14 Nm/deg, zero
+  near +1.35° roll) — a candidate roll feedforward, not built yet.
 - **Lifetime**: 0 at controller start (each drive), kept across engagements,
   never persisted.
 - **Telemetry**: `sl_bias` (Nm), `sl_learn`.
