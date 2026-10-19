@@ -1133,9 +1133,6 @@ def on_lat_controller_init(result, lac, CP):
       # so this controller tracks whatever reference it is given, faithfully.
       delta_err = delta_err_raw
       state['delta_err'] = delta_err
-      # Noise guard judges reversal persistence on the 20 Hz error sign, not
-      # the cadence target (spec §3). Read only in Direct mode.
-      state['guard'].observe(delta_err)
 
       # Slow-error EMA for the persistent-lean escape (see HOLD_EMA_TAU).
       state['derr_ema'] += (DT_LIVEPOSE / HOLD_EMA_TAU) * (delta_err - state['derr_ema'])
@@ -1162,6 +1159,17 @@ def on_lat_controller_init(result, lac, CP):
         _p_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
         state['sl_bias'] = float(np.clip(state['sl_bias'] + (_p_nm / SL_TAU_S) * DT_LIVEPOSE,
                                          -SL_BIAS_MAX_NM, SL_BIAS_MAX_NM))
+
+      # Noise guard judges reversal persistence on the 20 Hz error sign, not
+      # the cadence target (spec §3). Read only in Direct mode. With the slope
+      # bias latched it observes the biased demand (P + sl_bias, as an error)
+      # — the sign allow() later judges; on delta_err alone a steady small
+      # error against the bias would hold the target at 0 and drop the bias.
+      if state['slope']:
+        state['guard'].observe(delta_err + state['sl_bias']
+                               / (T_CAP_SLOPE_BASE * kappa_scale * v * v))
+      else:
+        state['guard'].observe(delta_err)
 
       # Held torque for the on-target hold / cancel_tol (route 385 seg 27
       # review, 2026-07-03). "Keep what you have" needs two qualifiers:

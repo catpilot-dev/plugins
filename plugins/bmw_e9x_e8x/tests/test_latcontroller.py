@@ -3082,6 +3082,26 @@ class TestSlopeBias:
     _call_update(lac, 0.0, v_ego=self.V, active=True)
     assert state['slope'] and state['sl_bias'] == b
 
+  def test_guard_judges_the_biased_demand(self, monkeypatch):
+    """Final review, Important 1: the noise guard must observe the same
+    demand it judges. With a left bias (-0.1 Nm) and the guard committed right
+    after a correction, a steady small positive error (P +0.05 Nm) asks for
+    P + b = -0.05 Nm. The error itself never turns negative, so a guard that
+    observes delta_err alone would hold the target at 0 and drop the bias."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    state['sl_bias'] = -0.10
+    state['guard'].side = +1
+    kappa = -math.tan(0.05 / (self.V * self.V)) / self.L     # P = +0.05 Nm
+    targets = []
+    _set_measured(fake_sm, self.V, kappa)
+    for _ in range(40):
+      fake_sm.updated = {'livePose': True}
+      _call_update(lac, 0.0, v_ego=self.V)
+      if state['tick_count'] == 0:
+        targets.append(state['target_frac'] * 12.0)
+    assert state['guard'].side == -1
+    assert min(targets) < -0.01
+
   def _mixed(self, lac, fake_sm):
     out = []
     for i in range(300):
