@@ -29,6 +29,10 @@
     "DirectTracking": {
       "default": false,
       "description": "Steer continuously along the arc-smoothed path with no on-target hold band, with fast free-play take-up on direction changes. Write 1 to enable. Read at each engagement."
+    },
+    "SlopeCompensation": {
+      "default": false,
+      "description": "Learn and apply the steady straight-road torque (road slope, alignment) in Direct Tracking. Write 1 to enable. Read at each engagement."
     }
   },
   "cereal": {

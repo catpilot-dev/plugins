@@ -151,6 +151,15 @@ def _set_direct_tracking(state):
   _write_param('DirectTracking', '1' if state else '0')
 
 
+def _set_slope_compensation(state):
+  """Persist the SlopeCompensation switch (param file only).
+
+  Read by latcontroller at each engagement, latched only together with
+  Direct Tracking.
+  """
+  _write_param('SlopeCompensation', '1' if state else '0')
+
+
 def on_vehicle_settings(items, CP):
   """Hook callback: populate the Driving panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
@@ -184,6 +193,16 @@ def on_vehicle_settings(items, CP):
     "Forces Arc Smoothing on and Lane Keeping off. Applies at the next engagement.",
     _read_param('DirectTracking') == '1',
     callback=_set_direct_tracking,
+  ))
+
+  # Default-OFF polarity (`== '1'`), same as Direct Tracking.
+  items.append(toggle_item(
+    "Slope Compensation",
+    "Learn the small steady torque the car needs to drive straight (road "
+    "slope, alignment) and apply it. Works only with Direct Tracking. "
+    "Applies at the next engagement.",
+    _read_param('SlopeCompensation') == '1',
+    callback=_set_slope_compensation,
   ))
 
   items.append(toggle_item(

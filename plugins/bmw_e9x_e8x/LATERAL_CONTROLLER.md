@@ -1337,6 +1337,30 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - **Rollback**: toggle off (or write `0`) and re-engage.
 - Design: `docs/superpowers/specs/2026-10-18-bmw-direct-tracking-design.md`.
 
+### Slope Compensation (`SlopeCompensation`, 2026-10-19 entry):
+- **Why**: Direct is P-only, so the steady torque a straight needs against a
+  constant pull (road slope, alignment) comes only from a standing error. On
+  route 4e9 that was δ_err ≈ −2.2e-4 rad / ~0.08 Nm left, and the car sat
+  +0.15 m right of the model's plan (plan at 3 s: +0.03 m).
+- **Law**: `sl_bias += (P_nm / SL_TAU_S)·dt` each livePose tick while the gate
+  is open, clamped to ±`SL_BIAS_MAX_NM`; `target_nm = P_nm + sl_bias` on the
+  Direct P path, applied whether or not the gate is open.
+- **Gate** (situation only, never the error's sign; see the hold-bias failure,
+  37e34b7): latched with Direct, active, not pressed, v > 40 km/h,
+  |κ_des| < 1e-3 and |κ_meas| < 1.5e-3, no take-up in flight, no stall-breakaway
+  block or episode (`sb_state` 2; the armed state 1 does not close it).
+- **Constants**: `SL_TAU_S` 20 s, `SL_BIAS_MAX_NM` 0.15 (≈2× the 4e9 need,
+  well below rack breakaway), `SL_MIN_V` 40 km/h.
+- **Lifetime**: 0 at controller start (each drive), kept across engagements,
+  never persisted.
+- **Telemetry**: `sl_bias` (Nm), `sl_learn`.
+- **Not included**: upstream-style `−g·roll` feedforward. On 4e9 roll varied
+  ±0.4° between roads without tracking the pull (|r| ≤ 0.1), and the mount roll
+  is unknown. Revisit if the learned `sl_bias` correlates with roll.
+- **Default OFF**; Driving-panel toggle "Slope Compensation". Rollback: toggle
+  off and re-engage.
+- Design: `docs/superpowers/specs/2026-10-19-bmw-slope-bias-design.md`.
+
 ---
 
 ## 13. Code map (`bmw/latcontroller.py`)
