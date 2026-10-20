@@ -10,17 +10,9 @@
   "conflicts": [],
   "dependencies": [],
   "params": {
-    "LaneKeepEnable": {
-      "default": false,
-      "description": "Enable driver-side lane keeping (position anchor)"
-    },
     "LaneKeepDriverSide": {
       "default": "left",
       "description": "Which ego lane line to anchor to: left or right"
-    },
-    "LaneKeepArcSmooth": {
-      "default": true,
-      "description": "Reference = arc through the model's plan point ahead (1.5-2.5 s, by speed and curvature ahead; LaneKeepArcHorizon > 0 forces a fixed value) instead of desiredCurvature (live Driving-panel toggle)"
     }
   },
   "hooks": {

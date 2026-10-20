@@ -150,31 +150,6 @@ class DrivingLayout(Widget):
     )
     items.append(self._personality)
 
-    # --- Lane Keeping (driver-side anchor, if plugin enabled) ---
-    if _plugin_enabled('lane_keeping'):
-      current = read_plugin_param('lane_keeping', 'LaneKeepEnable') == '1'   # default off
-      self._lane_keeping = toggle_item(
-        "Lane Keeping",
-        "Holds a steady margin to the driver-side lane line (green ring on the "
-        "emblem when working). Turn off to compare with pure model driving — "
-        "takes effect within a second, releasing smoothly.",
-        current,
-        callback=self._on_lane_keeping,
-      )
-      items.append(self._lane_keeping)
-
-      current_arc = read_plugin_param('lane_keeping', 'LaneKeepArcSmooth') != '0'   # default on
-      self._arc_smooth = toggle_item(
-        "Arc Smoothing",
-        "Steer along an arc through the model's planned path 1.5-2.5 s ahead "
-        "(longer at speed on straights, shorter on curvy roads) instead of its "
-        "single curvature output. Smooths slow left-right wander; takes effect "
-        "within a second.",
-        current_arc,
-        callback=self._on_arc_smooth,
-      )
-      items.append(self._arc_smooth)
-
     # --- Lane Centering in Turns (if plugin enabled) ---
     if _plugin_enabled('lane_centering'):
       current = read_plugin_param('lane_centering', 'LaneCenteringEnabled') != '0'
@@ -275,12 +250,6 @@ class DrivingLayout(Widget):
 
   def _set_personality(self, button_index):
     self._params.put("LongitudinalPersonality", button_index)
-
-  def _on_lane_keeping(self, state):
-    write_plugin_param('lane_keeping', 'LaneKeepEnable', '1' if state else '0')
-
-  def _on_arc_smooth(self, state):
-    write_plugin_param('lane_keeping', 'LaneKeepArcSmooth', '1' if state else '0')
 
   def _on_lane_centering(self, state):
     write_plugin_param('lane_centering', 'LaneCenteringEnabled', '1' if state else '0')
