@@ -127,7 +127,10 @@ more straight-line wander at every speed (offline 4d4–4dc, 75–95 km/h: arc/r
 0.61 at 1.5 s → 0.47 at 2.5 s; steady curves stay 0.92–0.97 even at 3 s) but
 softens S-curve legs and turns in earlier (lead ≈ H/3), both scaling with the
 aim distance v·H — worst at low speed and on curvy roads. So:
-`H_speed = interp(v, [45, 75] km/h, [1.5, 2.5] s)` on straights, blended down
+`H_speed = interp(v, [35, 55] km/h, [1.5, 2.5] s)` on straights (speed edges
+were [45, 75] km/h until route 4eb, 2026-10-20: the swing felt at ~60 km/h was
+the 2.1 s look-ahead passing 0.52 of the model's wobble vs 0.46 at 2.5 s;
+curves replay identical because the curvature pull-back sets H there), blended down
 to 1.5 s by `k_ahead`, the max plan curvature within 2.5 s
 (`|orientationRate.z / velocity.x|`, as speedlimitd uses), over
 [1.5e-3, 3e-3] 1/m — straights p99 1.38e-3, steady curves p10 4.1e-3, so the

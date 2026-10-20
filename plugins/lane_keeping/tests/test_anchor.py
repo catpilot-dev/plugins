@@ -750,14 +750,18 @@ def test_telemetry_logs_both_switch_positions():
 # Longer look-ahead removes more wander on straights at every speed (offline
 # 4d4-4dc: 75-95 km/h arc/raw 0.61 at 1.5 s -> 0.47 at 2.5 s) but softens
 # S-curve legs and turns in earlier, worst at low speed and on curvy roads.
-# Speed sets it on straights (1.5 s <= 45 km/h -> 2.5 s >= 75 km/h); the max
+# Speed sets it on straights (1.5 s <= 35 km/h -> 2.5 s >= 55 km/h; was
+# 45 -> 75 km/h until route 4eb: 60 km/h passed 0.52 of the model's wobble vs
+# 0.43 at 2.5 s, curves unchanged by the pull-back); the max
 # plan curvature within 2.5 s pulls it back to 1.5 s (blend 1.5e-3 -> 3e-3;
 # straights p99 1.38e-3, steady curves p10 4.1e-3).
 
 def test_horizon_speed_schedule_on_straights():
   h = _anchor.arc_horizon
-  assert h(10.0, 0.0) == pytest.approx(1.5)            # 36 km/h
-  assert h(60 / 3.6, 0.0) == pytest.approx(2.0)        # midway
+  assert h(35 / 3.6, 0.0) == pytest.approx(1.5)        # 35 km/h
+  assert h(45 / 3.6, 0.0) == pytest.approx(2.0)        # midway
+  assert h(55 / 3.6, 0.0) == pytest.approx(2.5)        # 55 km/h
+  assert h(60 / 3.6, 0.0) == pytest.approx(2.5)        # route 4eb swing speed
   assert h(25.0, 0.0) == pytest.approx(2.5)            # 90 km/h
   assert h(40.0, 0.0) == pytest.approx(2.5)            # clamped
 

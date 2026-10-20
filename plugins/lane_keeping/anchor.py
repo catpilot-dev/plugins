@@ -22,8 +22,11 @@ ARC_X_MIN = 5.0           # m; arc aim point closer than this (crawl) is
 # in earlier, worst at low speed and on curvy roads. Speed sets it on
 # straights; the max plan curvature within ARC_K_AHEAD_T pulls it back to
 # ARC_H_CURVE (straights: p99 1.38e-3; steady curves: p10 4.1e-3). Linear
-# blends only - no gates.
-ARC_H_SPEED_V = [45.0 / 3.6, 75.0 / 3.6]  # m/s
+# blends only - no gates. Speed edges 45/75 -> 35/55 km/h (route 4eb,
+# 2026-10-20): at 60 km/h the 2.1 s look-ahead passed 0.52 of the model's
+# wobble vs 0.46 at 2.5 s (offline 4e5/4e9/4ea/4eb); curves with
+# |kappa_des| > 5e-3 replay identical, the pull-back sets H there.
+ARC_H_SPEED_V = [35.0 / 3.6, 55.0 / 3.6]  # m/s
 ARC_H_SPEED = [1.5, 2.5]                  # s
 ARC_H_CURVE = 1.5                         # s, on a curvy road ahead
 ARC_K_AHEAD_BP = [0.0015, 0.003]          # 1/m, straight -> curvy blend edges
