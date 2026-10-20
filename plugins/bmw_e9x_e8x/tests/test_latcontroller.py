@@ -372,30 +372,12 @@ class TestUnwindStepBoost:
     assert got == pytest.approx(-0.05 - 0.10, abs=1e-6), got
 
 
-def _dwell_tick(monkeypatch, *, v, relax_ticks):
-  """One decision that WOULD dwell: deep measured curve, standing torque, and
-  an overshoot-side kappa_des dip on the same side. relax_ticks is the value
-  BEFORE the tick — deep_relax increments it before `dwelling` is evaluated,
-  so the dwell is tested against relax_ticks + 1."""
-  lac, sm, mod, state = _make_controller(monkeypatch)
-  _set_measured(sm, v, 0.012)          # |κ_meas| > RELAX_DWELL_KAPPA
-  state['torque'] = -0.3
-  state['target_frac'] = -0.3
-  state['ramp_frames'] = 0
-  state['action'] = 'idle'
-  state['relax_ticks'] = relax_ticks
-  state['tick_count'] = 999            # force the cadence decision
-  _call_update(lac, 0.001, v_ego=v)
-  return state['action'], mod
-
-
 class TestLkaSpeedBlend:
   """Route 41b (2026-08-24): LKA_MAX_V was a cliff on the v axis. Three
   behaviours flipped together at 30 km/h and all in the same direction, so a
   turn one side of the line got a wholly different controller from a turn on
   the other. Seg 33 12:01:37 is the reference case — a driver turn entered at
-  31.8 km/h, 1.8 km/h over the line, got relax_dwell armed (1.46 Nm pinned
-  flat for a full second) and no unwind boost, then decelerated THROUGH 30
+  31.8 km/h, 1.8 km/h over the line, got no unwind boost, then decelerated THROUGH 30
   mid-turn and switched regime halfway. 13-19% of that drive sat within
   +-1.8 km/h of the line.
 
@@ -413,7 +395,7 @@ class TestLkaSpeedBlend:
   meaning, now folded into the full-boost edge.
 
   Deliberately still SPEED ONLY: no curvature conjunct (that would repeat the
-  gain-floor cliff on the kappa axis, see the deep_relax comment).
+  gain-floor cliff on the kappa axis).
   """
   DESIRED = -0.02
   TORQUE = 0.60
@@ -466,19 +448,6 @@ class TestLkaSpeedBlend:
     got, mod = self._target(monkeypatch, 20.0)
     step = 0.10 + (20.0 - 15.0) / (28.0 - 15.0) * (0.05 - 0.10)
     assert got == pytest.approx(self.TORQUE - step, abs=1e-6), got
-
-  # --- relax dwell length across the band ---
-  def _max_dwell(self, monkeypatch, v, cap=40):
-    """Longest dwell the bridge will sustain at speed v, in ticks (0 = it can
-    never form). Probed rather than read off RELAX_DWELL_TICKS, which is a
-    local inside on_lat_controller_init and not reachable from the module."""
-    n = 0
-    for t in range(cap):
-      action, _ = _dwell_tick(monkeypatch, v=v, relax_ticks=t)
-      if action != 'relax_dwell':
-        break
-      n = t + 1
-    return n
 
 
 def _kappa_for_delta_err(kappa_des, delta_err, L=2.66):
@@ -575,10 +544,9 @@ class TestControllerHorizonDecoupled:
   """2026-10-12: CP.steerActuatorDelay 0.4 -> 0.7 so modeld plans for the
   measured straight-line loop delay (target -> yaw 0.90-1.0 s on routes
   4d4/4d5 vs the 0.65 s action point). The controller's own timing must NOT
-  follow: its cadence/ramp spread and the hold-cap lookahead stay on the
-  field-tuned 0.65 s horizon. A 0.95 s horizon would stretch the cadence to
-  ~500 ms (more lag - the 4d8 lesson) and shrink hold_cap to (0.65/0.95)^2 =
-  47%, below steady SAT, breaking the curve hold."""
+  follow: its cadence and ramp spread stay on the field-tuned 0.65 s horizon.
+  A 0.95 s horizon would stretch the cadence to ~500 ms (more lag - the 4d8
+  lesson)."""
 
   def _decision(self, monkeypatch, lat_delay):
     lac, sm, mod, state = _make_controller(monkeypatch)
@@ -637,7 +605,7 @@ class TestSteeringAngleGuard:
 #   ARM       action=='ramp' and the 0.4 s angle ring spans < 2 quanta
 #   BREAKAWAY >= 3 quanta of advance inside 0.2 s; latches sb_brk_angle and
 #             sb_dir (the OBSERVED motion direction over that window)
-#   TRIP      all four: not relax_dwell; |kappa_des| <= SB_TRIP_KAPPA_MAX;
+#   TRIP      all of: |kappa_des| <= SB_TRIP_KAPPA_MAX;
 #             the wheel has travelled >= SB_TRIP_DISP_DEG past the breakaway
 #             point IN THE BREAKAWAY DIRECTION; and it is sweeping at
 #             >= SB_TRIP_RATE_DPS -> shed to 0 over SB_SHED_FRAMES + block
@@ -660,8 +628,7 @@ _SB_V = 20.0
 # Mild curve, like the route 3f2 seg 10 lurch (kappa_des -0.0035): inside
 # SB_TRIP_KAPPA_MAX, so the deep-curve gate is open.
 _SB_KAPPA_DES = -0.004
-# Under-tracking on the same side, and shallow enough that relax_dwell stays
-# disarmed (it needs |kappa_meas| > RELAX_DWELL_KAPPA).
+# Under-tracking on the same side.
 _SB_KAPPA_MEAS = -0.002
 _SB_A0 = 5.0            # arbitrary start angle — only deltas from it matter
 
@@ -1046,7 +1013,7 @@ class TestStallBreakawayV2:
   def test_block_zeroes_same_side_push_whatever_the_label(self, monkeypatch):
     """During a post-trip block a same-side push is zeroed by the decision
     even in a deep measured curve with the reference below the measured
-    curvature (the case the relax-dwell hold used to exempt)."""
+    curvature."""
     lac, sm, mod, state = _sb_make(monkeypatch)
     v = 12.0
     _set_measured(sm, v, -0.012)          # deep left curve, overshooting
@@ -1416,8 +1383,7 @@ class TestDirectTracking:
 
   def test_overshoot_in_deep_curve_reverses_at_once(self, monkeypatch):
     """Deep measured curve (kappa_meas 0.012 at 12 m/s) with the reference
-    already lower (0.008): the decision reduces the torque immediately — no
-    relax-dwell bridge holds it for a second."""
+    already lower (0.008): the decision reduces the torque immediately."""
     v = 12.0
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
     _set_measured(fake_sm, v, 0.012)
