@@ -8,9 +8,8 @@ LATERAL_CONTROLLER.md (current law at the top, dated history below).
 The law, per livePose tick (20 Hz) and per CAN tick (100 Hz):
   delta_err = atan(kappa_ref*L) - atan(kappa_meas*L)        front-wheel angle (rad)
   P_nm      = T_CAP_SLOPE_BASE * kappa_scale * v^2 * delta_err  (+ sl_bias)
-Every CONTROL_HORIZON_S/2 a decision takes P through the curve hold-floor,
-relax-dwell, the noise guard, STEP_MAX, t_cap and the stall-breakaway block,
-and the torque ramps to it over the next half horizon; the free-play take-up
+Every CONTROL_HORIZON_S/2 a decision takes P through t_cap, the noise guard,
+STEP_MAX and the stall-breakaway block, and the torque ramps to it over the next half horizon; the free-play take-up
 closes the servo lash on each change of push direction.
 
 Lateral acceleration is bounded by speedlimitd through v, never by draining
@@ -33,17 +32,6 @@ if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
 import numpy as np
-
-# Curve hold gate on commanded lateral accel v^2*|kappa_ref| (m/s^2): below [0]
-# stiction holds the wheel at zero torque; at/above [1] the standing torque is
-# kept — self-aligning torque beats stiction there (routes 380/384, 3ca seg 23).
-HOLD_AY_BP = [0.5, 0.9]
-
-
-def hold_factor(v_ego, kappa_des_abs):
-  """Curve-hold blend factor [0, 1] on commanded lateral accel; pure function."""
-  return float(np.interp(v_ego * v_ego * kappa_des_abs, HOLD_AY_BP, [0.0, 1.0]))
-
 
 # Stall/breakaway v2 (StallBreakaway switch; route 3f2 seg 10 is the event).
 # A stalled rack that releases sweeps the wheel far past the command while the
@@ -75,8 +63,8 @@ SB_SETTLED_RAD = 0.001        # episode ends once |delta_err| is within the erro
 V_GAIN_FLOOR = 2.778
 
 # LKA regime: DCC cannot engage below 30 km/h, so v_true < LKA_MAX_V is lateral-
-# only driving. Its two behaviours (relax-dwell length, unwind step boost) blend
-# in over [LKA_MAX_V, LKA_BLEND_V] because the plant does not step at 30 km/h
+# only driving. Its behaviour (the unwind step boost) blends in over
+# [LKA_MAX_V, LKA_BLEND_V] because the plant does not step at 30 km/h
 # (route 41b: a hard threshold switched the law mid-turn).
 LKA_MAX_V = 8.5            # m/s (30 km/h) -- lower edge of the blend band
 LKA_BLEND_V = 12.0         # m/s (43 km/h) -- upper edge of the blend band (user choice)
@@ -90,7 +78,7 @@ def gain_reference_speed(v_true):
 
 # Controller timing horizon (s): the decision cadence and the ramp spread are
 # each half of it. Fixed, independent of lat_delay: a 0.95 s horizon stretched
-# the cadence to ~500 ms of added lag (route 4d8) and shrank hold_cap below SAT.
+# the cadence to ~500 ms of added lag (route 4d8).
 CONTROL_HORIZON_S = 0.65
 
 # Slope bias (SlopeCompensation switch; docs/superpowers/specs/2026-10-19-bmw-
@@ -128,11 +116,9 @@ def on_lat_controller_init(result, lac, CP):
 
   Decision, every CONTROL_HORIZON_S/2 while active, on the full error:
     P_nm   = T_CAP_SLOPE_BASE * kappa_scale(|kappa_ref|) * v^2 * delta_err  (+ sl_bias)
-    target = P, trimmed from or floored at the curve hold (hold_f * torque,
-             sign-guarded, capped at hold_cap), bridged by relax-dwell in a
-             deep curve, clipped to t_cap, sign changes gated by the noise
-             guard, moved at most STEP_MAX from the current torque, zeroed on
-             a same-side push during a stall-breakaway block.
+    target = P, clipped to t_cap, sign changes gated by the noise guard, moved
+             at most STEP_MAX from the current torque, zeroed on a same-side
+             push during a stall-breakaway block.
   The torque ramps to the target over the next half horizon, one CAN tick at
   a time; the free-play take-up (bmw/takeup.py) owns the torque while it
   crosses the servo lash on a change of push direction. Sub-breakaway targets
@@ -189,21 +175,11 @@ def on_lat_controller_init(result, lac, CP):
   T_CAP_SCALE_KAPPA = [0.001, 0.01, 0.02]        # |kappa_ref| breakpoints (1/m)
   T_CAP_SCALE_BP    = [1.0, 2.5, 3.0]           # scale factor on T_CAP_SLOPE_BASE
 
-  # Reference lateral drift (m) the hold cap is sized at: the P value for this
-  # drift over the horizon bounds the held torque (route 385 seg 27).
-  HOLD_CAP_DRIFT_M = 0.10
-
   # Per-decision torque step cap (frac): human-style gradual steering, 1.2 Nm
   # per decision up to 54 km/h (~4 Nm/s) tapering to 0.6 Nm at 100 km/h, where
   # lane margin is consumed faster (routes 385 seg 27, 39b seg 18).
   STEP_MAX_V  = [15.0, 28.0]     # vEgo breakpoints (m/s)
   STEP_MAX_BP = [0.10, 0.05]     # per-decision torque step cap (frac)
-
-  # Relax-dwell: in a measured deep curve an overshoot-side error must persist
-  # this long before the decision may command below the current torque — it
-  # bridges the model's ~1 s mid-hairpin reference dips (route 3a0 seg 8).
-  RELAX_DWELL_TICKS = 20      # livePose ticks (1.0 s at 20 Hz)
-  RELAX_DWELL_KAPPA = 0.010   # |kappa_meas| defining a deep curve (1/m)
 
   # Rear-axle bicycle-model wheelbase (m), for kappa <-> delta conversion.
   L = float(CP.wheelbase)
@@ -217,13 +193,10 @@ def on_lat_controller_init(result, lac, CP):
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
-    'action': 'init',          # debug: ramp / relax_dwell / idle / take_up
+    'action': 'init',          # debug: ramp / idle / take_up
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad), what controller acts on
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
-    'hold_f': 0.0,                # debug: curve hold factor [0,1] (gated on v²·|kappa_ref|)
-    'hold_cap': 0.0,              # debug: cap on held torque (P value at the HOLD_CAP_DRIFT_M reference drift, frac)
-    'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
     # Stall/breakaway v2 (see the SB_* constants at module scope).
     'sb_ring': deque(maxlen=SB_FROZEN_TICKS + 1),  # 100 Hz steerAngleDeg, active only
     'sb_state': 0,          # 0=idle, 1=armed(stall), 2=breakaway episode
@@ -338,8 +311,7 @@ def on_lat_controller_init(result, lac, CP):
         # on 3fb kappa_ref decayed 0.019 -> 0.0096 during a hairpin exit and a
         # plain unwind read as a release. SB_TRIP_MIN_TORQUE: no windup, nothing
         # to shed.
-        elif state['action'] != 'relax_dwell' \
-             and abs(state['torque']) >= SB_TRIP_MIN_TORQUE \
+        elif abs(state['torque']) >= SB_TRIP_MIN_TORQUE \
              and abs(state['desired']) <= SB_TRIP_KAPPA_MAX \
              and state['sb_arm_kappa'] <= SB_TRIP_KAPPA_MAX \
              and (ring[-1] - state['sb_brk_angle']) * state['sb_dir'] >= SB_TRIP_DISP_DEG \
@@ -382,19 +354,11 @@ def on_lat_controller_init(result, lac, CP):
 
       # Two speeds (user ruling): v_true divides the yaw rate — kappa_meas must
       # use the actual speed or the loop settles at the wrong curvature at low
-      # speed; v is the gain reference (P, t_cap, hold_cap, hold gate, step_max),
+      # speed; v is the gain reference (P, t_cap, step_max),
       # floored at V_GAIN_FLOOR so v^2 never collapses toward zero.
       v_true = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 1.0)
       v = gain_reference_speed(v_true)
       state['measured'] = float(lp.angularVelocityDevice.z) / v_true
-
-      # Curve hold factor on commanded a_y (see HOLD_AY_BP): in a curve the
-      # torque that holds the wheel on target approximates the self-aligning
-      # torque, which exceeds rack stiction; letting go there unwinds the wheel
-      # (route 380/384: a 0.6 Hz limit cycle). Re-derived from state['torque']
-      # every decision: no learning state, no ratchet.
-      hold_f = hold_factor(v, abs(state['desired']))
-      state['hold_f'] = hold_f
 
       # Front-wheel-angle error (rear-axle bicycle model).
       delta_des = math.atan(state['desired'] * L)
@@ -403,9 +367,6 @@ def on_lat_controller_init(result, lac, CP):
 
       delta_err = delta_err_raw
       state['delta_err'] = delta_err
-
-      # Look-ahead distance for the hold cap, on the fixed horizon.
-      lookahead_m = v * CONTROL_HORIZON_S
 
       # Curvature scale for the P term and caps, keyed on |kappa_ref|.
       kappa_scale = float(np.interp(abs(state['desired']),
@@ -435,43 +396,10 @@ def on_lat_controller_init(result, lac, CP):
       else:
         state['guard'].observe(delta_err)
 
-      # Held torque for the curve hold: "keep what you have", sign-guarded
-      # (never hold torque opposing the commanded curve — on a rack with no
-      # self-centering that drives the wrong way, route 385 seg 27) and capped
-      # at the P value for HOLD_CAP_DRIFT_M over the horizon (anything above
-      # what P would command while almost on target is arrival momentum, not
-      # holding torque; steady SAT measures 0.08-0.15 frac).
-      hold_cap = (T_CAP_SLOPE_BASE * kappa_scale * v * v
-                  * (2.0 * HOLD_CAP_DRIFT_M * L / (lookahead_m ** 2))) / CCP.STEER_MAX
-      state['hold_cap'] = hold_cap
-      held = hold_f * state['torque']
-      if held * delta_des < 0.0:
-        held = 0.0
-      held_target = float(np.clip(held, -hold_cap, hold_cap))
-
-      # Relax-dwell: the model's reference dips 40-50 % for ~1 s mid-hairpin
-      # while the measured curvature holds (route 3a0 seg 8). Following the dip
-      # surrenders held torque and SAT flings the wheel ~20 deg out of the
-      # turn; rebuilding under STEP_MAX takes 1.5-2 s. So while deep in a
-      # MEASURED curve, an overshoot-side error must persist RELAX_DWELL_TICKS
-      # before the decision may command below the current torque. A sign flip
-      # of kappa_ref (S-curve) disarms it at once. Below LKA_MAX_V stiction
-      # holds a surrendered wheel, so the dwell is off there and its length
-      # grows over the blend band (route 417: a full-length dwell at an
-      # intersection exit fought the driver's return of the wheel).
-      deep_relax = (v_true >= LKA_MAX_V
-                    and abs(state['measured']) > RELAX_DWELL_KAPPA
-                    and state['desired'] * state['measured'] > 0.0
-                    and delta_err * delta_des < 0.0)
-      state['relax_ticks'] = state['relax_ticks'] + 1 if deep_relax else 0
-      dwell_ticks = float(np.interp(v_true, [LKA_MAX_V, LKA_BLEND_V],
-                                    [0.0, float(RELAX_DWELL_TICKS)]))
-      dwelling = 0 < state['relax_ticks'] <= dwell_ticks
-
       state['tick_count'] += 1
       # Expire transient action labels once their ramp completes, so telemetry
       # occupancy is not over-attributed; holds keep their label.
-      if state['ramp_frames'] == 0 and state['action'] in ('ramp', 'relax_dwell'):
+      if state['ramp_frames'] == 0 and state['action'] == 'ramp':
         state['action'] = 'idle'
 
       if active and state['tick_count'] >= action_cadence_ticks:
@@ -487,15 +415,6 @@ def on_lat_controller_init(result, lac, CP):
           target_nm += state['sl_bias']
         target_frac = target_nm / CCP.STEER_MAX
         state['action'] = 'ramp'
-        # Curve hold trim (ruling R8): an in-band overshoot gives a small P
-        # opposing the held torque; taken alone it would drop the curve torque
-        # a full STEP_MAX per decision (1.8 Nm held -> 1.06 Nm). P trims down
-        # from the hold instead: held_target + P. A large overshoot still
-        # carries the sum past zero. On straights held_target is 0.
-        _trim_hold = (hold_f > 0.0
-                      and target_frac * held_target < 0.0)
-        if _trim_hold:
-          target_frac = held_target + target_frac
         # Authority cap, v^2*|delta_ref|-scaled and clipped at STEER_MAX:
         # straights stay near T_CAP_BASE_NM, tight turns can reach the panda
         # limit (transient over-envelope; speedlimitd bleeds v).
@@ -503,26 +422,11 @@ def on_lat_controller_init(result, lac, CP):
                        T_CAP_BASE_NM + T_CAP_SLOPE_BASE * kappa_scale * v * v * abs(delta_des))
         t_cap_frac = t_cap_nm / CCP.STEER_MAX
         target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
-        # Hold-floor: a same-direction push never commands less than the held
-        # torque — keep holding while adding trim (route 393: a P below the
-        # holding level let SAT unwind the wheel and grow the very error being
-        # corrected). Opposite-sign P is untouched, so torque still drops the
-        # moment the error flips sides. Not after an R8 trim, which is below
-        # the hold by design.
-        if not _trim_hold and target_frac * held_target > 0.0:
-          target_frac = math.copysign(max(abs(target_frac), abs(held_target)), target_frac)
-        # Relax-dwell bridge: during the dwell an overshoot-side reference dip
-        # may not command below the current (capped) torque.
-        if dwelling:
-          target_frac = math.copysign(min(abs(state['torque']), hold_cap), state['torque'])
-          state['action'] = 'relax_dwell'
         # Noise guard (Direct spec §3): a sign change of the target commands 0
         # until the opposite error sign has persisted GUARD_PERSIST_S — ~0.5 Nm
         # of noise torque at 25 m/s is enough to sweep the servo across the
-        # lash, and 0 is itself a hold. Exempt while relax-dwell bridges
-        # (ruling R3): its target keeps the current torque's sign.
-        if not dwelling:
-          target_frac = state['guard'].allow(target_frac)
+        # lash, and 0 is itself a hold.
+        target_frac = state['guard'].allow(target_frac)
         # The take-up sizes the reversal on this demand, not on the step-capped
         # target: a zero crossing under STEP_MAX can land a few hundredths
         # past zero and the next decision is already past it.
@@ -546,10 +450,8 @@ def on_lat_controller_init(result, lac, CP):
         # counter-steer passes (the controller may stop pushing, never give up
         # correcting). sb_dir is the wheel's motion in angle space (+ = left)
         # and torque is opposite in sign to angle, so the push behind it is
-        # target_frac * (-sb_dir) > 0. Gated on 'ramp': a relax-dwell hold of
-        # the current torque is not a push and must not be zeroed.
-        if state['action'] == 'ramp' and state['sb_block'] > 0 \
-           and target_frac * (-state['sb_dir']) > 0.0:
+        # target_frac * (-sb_dir) > 0.
+        if state['sb_block'] > 0 and target_frac * (-state['sb_dir']) > 0.0:
           target_frac = 0.0
 
         state['target_frac'] = target_frac
@@ -663,9 +565,6 @@ def on_lat_controller_init(result, lac, CP):
           'output': float(output),
           'vEgo': float(CS.vEgo),
           'active': active,
-          'hold_f': float(state['hold_f']),
-          'hold_cap': float(state['hold_cap']),
-          'relax_ticks': int(state['relax_ticks']),
           'sb_state': int(state['sb_state']),                 # stall/breakaway v2: 0=idle, 1=armed, 2=episode
           'sb_trips': int(state['sb_trips']),                 # cumulative trips this drive
           'sb_block': int(state['sb_block']),                 # same-side push suppression ticks left
