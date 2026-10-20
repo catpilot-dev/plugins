@@ -387,31 +387,12 @@ def on_lat_controller_init(result, lac, CP):
   # enables; a failed read (incl. the import above failing, which leaves
   # read_plugin_param unbound) is off.
 
-  # Decision cadence & CAN-rate spreading — both subscribe to model_action_t
-  # per tick, sized to one half of the model's action horizon so exactly two
-  # decision-and-ramp cycles fit within one horizon. This keeps the
-  # controller's correction bandwidth matched to the model's planning
-  # bandwidth: when CP.steerActuatorDelay changes, both (cadence, ramp) move
-  # together — no parallel-constant drift. (model_action_t also sets the
-  # jerk_pred telemetry horizon; jerk_pred no longer gates anything.)
-  #
-  #   action_cadence_ticks = round( (model_action_t / 2) / DT_LIVEPOSE )
-  #   spread_frames        = round( (model_action_t / 2) / DT_CAN_TICK  )
-  #
-  # Each ramp completes when the next decision lands; no overlapping ramps.
-  # No internal rate cap — panda enforces wire-rate (STEER_DELTA_UP =
-  # 0.1 Nm/frame). For typical deltas (≤ 2.5 Nm), ramp_step ≤ 0.1 Nm/frame
-  # and demand tracks rack reality. For large transients, panda clips and
-  # state['torque'] briefly leads the rack — accepted; the controller keeps
-  # tracking the command and catches up.
-  #
-  # Computed inside update() from model_action_t — see action_cadence_ticks
-  # / spread_frames below. Fallbacks here are used only for state-init at
-  # construction time, before any lat_delay has arrived.
+  # Decision cadence (livePose ticks) and CAN-rate ramp spread: both are half
+  # of CONTROL_HORIZON_S, so two decision-and-ramp cycles fit one horizon and
+  # each ramp completes as the next decision lands. Panda enforces wire-rate.
   DT_LIVEPOSE = 0.05                        # one livePose tick (s)
   DT_CAN_TICK = 0.01                        # one CAN tick at 100 Hz (s)
-  ACTION_CADENCE_TICKS_FALLBACK = 5         # state-init only (= 250 ms cadence)
-  SPREAD_FRAMES_FALLBACK = 25               # state-init only (= 250 ms ramp)
+  ACTION_CADENCE_TICKS_FALLBACK = 5         # state-init only: primes the first decision
   # T_CAP_SLOPE: aligning-torque gain (κ-independent). Linear tire regime:
   #     τ_Nm_hold = T_CAP_SLOPE · v² · δ                (aligning torque)
   # Drives both authority cap and target torque:
@@ -429,21 +410,6 @@ def on_lat_controller_init(result, lac, CP):
   T_CAP_SLOPE_BASE = 1.0
   T_CAP_SCALE_KAPPA = [0.001, 0.01, 0.02]        # |κ_des| breakpoints (1/m)
   T_CAP_SCALE_BP    = [1.0, 2.5, 3.0]           # scale factor on T_CAP_SLOPE_BASE
-  # Plant prediction horizon — sourced per-tick from controlsd's lat_delay
-  # (= liveDelay.lateralDelay + LAT_SMOOTH_SECONDS) and matched to where
-  # modeld samples κ_des: lat_action_t = lat_delay + DT_MDL (modeld.py:391).
-  # Used by the hold-cap's fixed-reference drift formula (HOLD_CAP_DRIFT_M
-  # block below) and by the jerk_pred telemetry (log-only since 2026-07-28;
-  # no longer an overshoot guard).
-  #
-  # For BMW: lagd never converges (it correlates on latcontrol_torque
-  # telemetry that our front-wheel-angle plant-inversion controller doesn't
-  # produce), so liveDelay.lateralDelay is permanently pinned at initial_lag
-  # = CP.steerActuatorDelay + 0.2 (lagd.py:181). CP.steerActuatorDelay in
-  # bmw/interface.py is therefore the single knob controlling both modeld's
-  # lat_action_t AND our model_action_t — change it there to retune both.
-  DT_MDL = 0.05                                  # openpilot model dt (common/realtime.py)
-  MODEL_ACTION_T_FALLBACK = 0.55                 # used only if lat_delay arrives as 0/None
 
   # Curvature-dependent hold: SEE HOLD_AY_BP / hold_factor() at module scope
   # (top of file). The gate moved from |κ_des| to commanded lateral accel
@@ -523,7 +489,7 @@ def on_lat_controller_init(result, lac, CP):
 
   state = {
     'torque': 0.0,             # current commanded torque fraction (advances by ramp_step each CAN tick)
-    'target_frac': 0.0,        # plant-inversion target set each decision (cadence ≈ model_action_t/2)
+    'target_frac': 0.0,        # plant-inversion target set each decision (cadence = CONTROL_HORIZON_S/2)
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
@@ -531,8 +497,6 @@ def on_lat_controller_init(result, lac, CP):
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad), what controller acts on
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
-    'a_y_meas': 0.0,              # debug: v²·κ_meas (m/s²)
-    'jerk_pred': 0.0,             # debug: v²·κ_err/τ (m/s³)
     'hold_f': 0.0,                # debug: lateral-accel hold factor [0,1] (gated on v²·|kappa_des|)
     'hold_cap': 0.0,              # debug: cap on held torque (P value at the HOLD_CAP_DRIFT_M reference drift, frac)
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
@@ -752,14 +716,6 @@ def on_lat_controller_init(result, lac, CP):
     # previous correction (≥ 2.5τ → ~92% response for BMW rack τ ≈ 130 ms).
     # CAN tick (100 Hz): apply ramp_step toward target_frac.
     if livepose_updated:
-      # Plant prediction horizon — match modeld's lat_action_t (where the
-      # model targets κ). lat_delay is controlsd's liveDelay.lateralDelay +
-      # LAT_SMOOTH_SECONDS; modeld adds DT_MDL on top (modeld.py:391) for the
-      # actual sample point, so we do the same here. For BMW this is pinned at
-      # CP.steerActuatorDelay + 0.2 + DT_MDL since lagd never converges — see
-      # MODEL_ACTION_T_FALLBACK block above.
-      model_action_t = (lat_delay + DT_MDL) if lat_delay and lat_delay > 0 else MODEL_ACTION_T_FALLBACK
-
       # Decision cadence and CAN ramp length — both equal half of the
       # controller horizon, CONTROL_HORIZON_S (fixed 0.65 s since 2026-10-12;
       # it used to track model_action_t, see that constant).
@@ -946,18 +902,6 @@ def on_lat_controller_init(result, lac, CP):
       dwell_ticks = float(np.interp(v_true, [LKA_MAX_V, LKA_BLEND_V],
                                     [0.0, float(RELAX_DWELL_TICKS)]))
       dwelling = 0 < state['relax_ticks'] <= dwell_ticks
-
-      # a_y_meas / jerk_pred: TELEMETRY ONLY since 2026-07-28. The ISO accel/
-      # jerk cancel guard that used to read these (the `overshooting` predicate
-      # + accel_guard_threshold + the drain-to-0) was removed — a_y is bounded
-      # at the system level by speedlimitd's curve-speed capping, and this
-      # controller never abandons a turn (see the SAFETY ARCHITECTURE notes at
-      # module scope and in the docstring). We still compute them for log
-      # analysis / field-health telemetry; nothing here reads them for control.
-      a_y_meas = v * v * state['measured']
-      jerk_pred = v * v * (state['desired'] - state['measured']) / model_action_t
-      state['a_y_meas'] = a_y_meas
-      state['jerk_pred'] = jerk_pred
 
       state['tick_count'] += 1
       # Expire transient action labels once their ramp completes, so telemetry
@@ -1210,7 +1154,6 @@ def on_lat_controller_init(result, lac, CP):
         _contacts = state['learner'].contacts()
         payload = {
           'desired': float(state['desired']),
-          'desired_raw': float(desired_curvature),     # bit-identical to 'desired' (Phase 2: kept for telemetry schema back-compat)
           'measured': float(state['measured']),
           'err': float(err),
           'delta_err': float(state['delta_err']),             # what controller acts on (Phase 2: raw, no filter)
@@ -1222,15 +1165,12 @@ def on_lat_controller_init(result, lac, CP):
           'output': float(output),
           'vEgo': float(CS.vEgo),
           'active': active,
-          'a_y_meas': float(state['a_y_meas']),
-          'jerk_pred': float(state['jerk_pred']),
           'hold_f': float(state['hold_f']),
           'hold_cap': float(state['hold_cap']),
           'relax_ticks': int(state['relax_ticks']),
           'sb_state': int(state['sb_state']),                 # stall/breakaway v2: 0=idle, 1=armed, 2=episode
           'sb_trips': int(state['sb_trips']),                 # cumulative trips this drive
           'sb_block': int(state['sb_block']),                 # same-side push suppression ticks left
-          'sb_on': bool(_stall_v2_on),                        # StallBreakaway param, drive self-label
           # Steering-side debug signals (2026-10-17): one place for drive analysis.
           'angle': float(getattr(CS, 'steeringAngleDeg', 0.0)),            # wheel angle, deg, + = LEFT (BMW)
           'servo_gap': float(getattr(CS, 'steeringAngleOffsetDeg', 0.0)),  # column - servo angle, deg: slack/windup

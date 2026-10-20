@@ -143,7 +143,7 @@ _CANCELS = ('cancel_accel', 'cancel_jerk')
 # ============================================================
 # (1) NEW — the SAFETY ARCHITECTURE change. Formerly-cancelling conditions now
 # produce normal P-tracking. Scenario: overshoot ((κ_des - κ_meas)·κ_meas < 0)
-# with high measured lateral accel (a_y_meas = v²·κ_meas ≈ 5.6 m/s², well past
+# with high measured lateral accel (v²·κ_meas ≈ 5.6 m/s², well past
 # any old ISO threshold) and into-turn torque (torque·κ_meas > 0). Kept just
 # below the deep-curve threshold (|κ_meas| < RELAX_DWELL_KAPPA) so the decision
 # is a plain ramp, not a relax_dwell bridge.
@@ -156,7 +156,7 @@ _CANCELS = ('cancel_accel', 'cancel_jerk')
 class TestFormerlyCancellingNowTracks:
   V = 25.0
   DESIRED = 0.001      # κ_des collapsed near straight
-  MEASURED = 0.009     # κ_meas still turning -> a_y_meas ≈ 5.6, |κ| < deep-curve
+  MEASURED = 0.009     # κ_meas still turning -> a_y ≈ 5.6, |κ| < deep-curve
 
   def _prime(self, monkeypatch, desired, measured, torque):
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
@@ -198,16 +198,6 @@ class TestFormerlyCancellingNowTracks:
     assert state['target_frac'] > torque      # reduced magnitude (unwinding)
     assert state['target_frac'] < 0.0         # not drained to zero
     assert state['ramp_frames'] > 0
-
-  def test_no_a_y_or_jerk_field_triggers_a_cancel_action(self, monkeypatch):
-    """a_y_meas / jerk_pred are still computed (telemetry), but nothing reads
-    them to make a control decision anymore. Even with an extreme measured a_y
-    the action never lands on a cancel."""
-    lac, state = self._prime(monkeypatch, self.DESIRED, 0.02, 0.6)  # a_y ≈ 12.5
-    _call_update(lac, self.DESIRED, v_ego=self.V)
-    assert state['action'] not in _CANCELS
-    # telemetry fields still populated for log analysis
-    assert state['a_y_meas'] == pytest.approx(self.V * self.V * 0.02)
 
 
 # ============================================================
@@ -1193,8 +1183,6 @@ class TestStallBreakawayV2:
     assert isinstance(p['sb_state'], int)
     assert isinstance(p['sb_trips'], int)
     assert isinstance(p['sb_block'], int)
-    assert isinstance(p['sb_on'], bool)
-    assert p['sb_on'] is True
     assert 'sb_off' not in p
     assert 'sb_ready' not in p
 
@@ -1780,6 +1768,18 @@ class TestDirectTracking:
     assert p['tu_guarded'] == 2
     _call_update(lac, 0.002, v_ego=25.0, gap_deg=77.6)
     assert pay[-1]['action'] != 'take_up'
+
+  def test_payload_exact_key_set(self, monkeypatch):
+    """The telemetry carries exactly the fields the current law produces."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    pay = []
+    state['lat_pub'] = SimpleNamespace(send=pay.append)
+    _call_update(lac, 0.001, v_ego=25.0)
+    assert set(pay[-1]) == {
+      'desired', 'measured', 'err', 'delta_err', 'target_frac', 'ramp_step', 'ramp_frames', 'action',
+      'torque', 'output', 'vEgo', 'active', 'hold_f', 'hold_cap', 'relax_ticks', 'sb_state', 'sb_trips',
+      'sb_block', 'angle', 'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right',
+      'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn'}
 
   def test_telemetry_action_take_up(self, monkeypatch):
     lac, fake_sm, mod, state, _ = self._start_takeup(monkeypatch)

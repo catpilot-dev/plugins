@@ -1163,45 +1163,40 @@ Stall/breakaway v2 (2026-08-15) adds **no action label**: a trip writes `target_
 
 ## 9. Telemetry (plugin_bus topic `bmw_lat_control`, 20 Hz)
 
-Published each livePose tick:
+Published each livePose tick. The exact field set is pinned by
+`test_payload_exact_key_set`.
 
 | field | meaning |
 |---|---|
-| `desired` | κ_des actually used by controller (= raw, since no κ filter) |
-| `desired_raw` | identical to `desired` (kept for back-compat with older filter designs) |
-| `measured` | κ_meas from livePose yaw rate / v_ego |
-| `err` | κ_des − κ_meas (debug) |
-| `delta_err` | front-wheel angle error (rad) — what controller acts on |
-| `target_frac` | current cadence-decision target torque fraction (−1..1) |
+| `desired` | κ_ref the controller tracks (the lane_keeping Arc reference, 1/m) |
+| `measured` | κ_meas = livePose yaw rate / v_true (1/m) |
+| `err` | κ_ref − κ_meas (debug) |
+| `delta_err` | front-wheel angle error (rad) — what the P law acts on |
+| `target_frac` | the decision's target torque fraction (−1..1), after guard, STEP_MAX and caps |
 | `ramp_step` | per-CAN-tick torque increment |
-| `ramp_frames` | CAN frames remaining in current ramp |
-| `action` | state machine label (see §8) |
-| `torque` | current commanded torque fraction (−1..1) |
-| `output` | clipped torque fraction returned to controlsd |
-| `vEgo` | from CS.vEgo |
-| `active` | controller active flag |
-| `a_y_meas` | `v²·κ_meas` (m/s²) |
-| `jerk_pred` | `v²·(κ_des - κ_meas)/model_action_t` (m/s³) |
-| `hold_f` | curvature hold factor [0, 1] |
-| `hold_cap` | cap on held torque (P value implied by the fixed `HOLD_CAP_DRIFT_M` reference, frac — independent of the deleted tolerance) |
-| `relax_ticks` | consecutive ticks of overshoot-side error while deep in a curve (dwell counter) |
-| `hold_band` | (2026-07-22) fixed stiction hold trigger (rad) — not a deadzone; P acts on full error |
-| `hb_enter` | (2026-08-13) live leave-rest threshold in effect this tick (rad) — `0.0015` with `HoldHysteresis` on, `0.001` kill-switched; also each drive's self-label (absent = pre-hysteresis build) |
-| `derr_ema` | (2026-08-14) slow (2 s, `HOLD_EMA_TAU`) EMA of `delta_err` (rad) — the lean signal behind the persistent-lean escape; `\|derr_ema\| > 0.0012` leaves rest |
-| `sb_state` | (2026-08-15) stall/breakaway v2 machine state — `0` idle, `1` armed (rack frozen while ramping), `2` breakaway episode. Excursions to 1 are routine and harmless |
-| `sb_trips` | (2026-08-15) cumulative trips this drive. Budget on ordinary driving: **≈ 0** (replay residue 0.071/min). A drive with many is a refutation |
-| `sb_block` | (2026-08-15) same-side push-suppression ticks left after a trip (counts down from `SB_BLOCK_TICKS` = 50 = 0.5 s) |
-| `sb_on` | (2026-08-15) `StallBreakaway` param as read at drive start — each drive's A/B self-label (absent = pre-v2 build) |
-| `ov_eod` | (2026-08-17) driver-override observer, cumulative fires this drive: **panic yank** — fast motion against our torque. Clean-at-speed budget **0 / 3.2 h**, *and only on an `sb_on: true` drive* — with v2 off nothing claims plant rebounds and they land here (see the dated note) |
-| `ov_hold` | (2026-08-17) cumulative: **rigid hold** — frozen wheel at supra-knee torque. Clean-at-speed budget **0 / 3.2 h** |
-| `ov_crawl` | (2026-08-17) cumulative: **firm resist** — supra-knee torque, sub-sweep rate. Clean-at-speed budget **2 / 3.2 h** |
-| `ov_wsd` | (2026-08-17) cumulative: **deliberate correction** — deepening onto the wrong side of intent. Clean-at-speed budget **4 / 3.2 h** |
-
-The four `ov_*` counts are **not summable** — independent hypotheses, not a partition (`HOLD ∧ |torque| ≥ 0.30 ⊆ CRAWL`; frozen at `0.25 ≤ |torque| < 0.30` fires HOLD alone). See the 2026-08-17 dated note for all four reading caveats.
-| `ov_brake_fires` | (2026-08-17) fires (any detector) that landed while `brakePressed` — the stage-2 context counter. Counts **fires, not ticks**: several detectors firing together each add one |
-| `ov_last` | (2026-08-17) last detector to fire this drive: `1`=eod `2`=hold `3`=crawl `4`=wsd, `0`=none. Last-**evaluated** in block order, so on a shared tick CRAWL masks HOLD and WSD masks all |
-
-Removed 2026-08-14 with the push-budget retirement (see the dated note in the header): `push_moved`, `budget_spent`, `budget_on`. Payloads from drives before that date still carry them; a build after it carries none of the three.
+| `ramp_frames` | CAN frames remaining in the current ramp |
+| `action` | `ramp` / `relax_dwell` / `take_up` / `idle` (§8) |
+| `torque` | commanded torque fraction (−1..1) |
+| `output` | clipped torque fraction returned to controlsd (0 while inactive) |
+| `vEgo` | CS.vEgo |
+| `active` | lateral active |
+| `hold_f` | curve hold factor [0, 1] (`hold_factor`) |
+| `hold_cap` | cap on the held torque (frac) |
+| `relax_ticks` | consecutive overshoot-side ticks while deep in a curve (dwell counter) |
+| `sb_state` | stall/breakaway v2: `0` idle, `1` armed, `2` breakaway episode |
+| `sb_trips` | cumulative trips this drive (budget on ordinary driving ≈ 0) |
+| `sb_block` | same-side push-suppression ticks left after a trip |
+| `angle` | steering wheel angle (deg, + = LEFT) |
+| `servo_gap` | column − servo angle (deg): slack / windup |
+| `steer_rate` | steering rate (deg/s) |
+| `pressed` | steeringPressed |
+| `lat_delay` | as given by controlsd (s) |
+| `tu_state` | `right` / `left` (seated) / `taking_up` / `unknown` |
+| `c_right`, `c_left` | learned contacts (deg); 0.0 = not known yet this drive |
+| `tu_fires`, `tu_ms`, `tu_timeouts` | cumulative take-ups, last duration, cumulative timeouts |
+| `tu_guarded` | cumulative reversals held at 0 by the noise guard |
+| `sl_bias` | learned straight-road torque (Nm) |
+| `sl_learn` | slope-bias learn gate open this tick |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 
