@@ -2,6 +2,71 @@
 
 This document is the canonical reference for the lateral controller registered by `bmw/latcontroller.py::on_lat_controller_init` (hook: `controls.lat_controller_init`). It describes **what** the controller does, **why** it's shaped this way for the BMW hydraulic rack, **how** the single-knob timing design propagates, and **what was tried and rejected**. Future maintainers should be able to retune without re-litigating the failed experiments.
 
+## Current law (2026-10-20)
+
+`bmw/latcontroller.py` installs Direct Tracking as `lac.update` when the
+`lane_keeping` plugin is loaded (`HOOK_READY`); without it the stock lateral
+controller runs and a warning is logged. The exact field set of the
+`bmw_lat_control` telemetry is in §9; the code map in §13. Everything below the
+**History** heading is the dated record of how the law got here.
+
+**Signal path.** `lane_keeping` turns the model's curvature into the reference:
+an arc through the planned path 1.5–2.5 s ahead (by speed, pulled back to 1.5 s
+when a bend is coming), low-passed 0.15 s. The controller tracks that reference
+with no filtering of its own.
+
+**Error and gain** (rear-axle bicycle model, `L = CP.wheelbase`):
+
+    delta_err = atan(kappa_ref·L) − atan(kappa_meas·L)      kappa_meas = yaw rate / v_true
+    v         = max(v_true, V_GAIN_FLOOR)                   gain reference speed
+    P_nm      = T_CAP_SLOPE_BASE · kappa_scale(|kappa_ref|) · v² · delta_err  (+ sl_bias)
+
+**Decision**, every `CONTROL_HORIZON_S / 2` (325 ms) while active, in order:
+P on the full error (no on-target band — a sub-friction target is a hold);
+curve hold: P trims down from `held_target = hold_f · torque` on an in-band
+overshoot (R8) and a same-side push never commands less than it (hold-floor);
+clip to `t_cap`; relax-dwell bridge in a deep measured curve; the noise guard
+(a sign change commands 0 until the opposite error sign has persisted
+`GUARD_PERSIST_S`); `STEP_MAX` toward the target (×`UNWIND_STEP_GAIN` when
+shedding in the LKA regime); a same-side push during a stall-breakaway block
+is zeroed. The torque ramps to the target over the next 325 ms, one CAN tick
+at a time. The free-play take-up (`bmw/takeup.py`) commands `TAKEUP_NM` across
+the servo lash on a change of push direction once the contacts are learned,
+then hands back to the ramp. Inactive: no decision runs; torque, target and
+ramp are 0, so every engagement ramps from 0.
+
+**Constants**
+
+| constant | value | role |
+|---|---|---|
+| `CONTROL_HORIZON_S` | 0.65 s | cadence and ramp spread are each half of it |
+| `T_CAP_BASE_NM`, `T_CAP_SLOPE_BASE` | 2.0 Nm, 1.0 | `t_cap = min(STEER_MAX, BASE + SLOPE·kappa_scale·v²·|delta_ref|)` |
+| `T_CAP_SCALE_KAPPA` / `_BP` | [1e-3, 1e-2, 2e-2] → [1.0, 2.5, 3.0] | gain scale on `|kappa_ref|` |
+| `V_GAIN_FLOOR` | 2.778 m/s | gain reference speed floor |
+| `HOLD_AY_BP` | [0.5, 0.9] m/s² | `hold_f` on commanded a_y |
+| `HOLD_CAP_DRIFT_M` | 0.10 m | hold cap = P for this drift over the horizon |
+| `STEP_MAX_V` / `_BP` | [15, 28] m/s → [0.10, 0.05] frac | per-decision step cap |
+| `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
+| `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band and unwind boost |
+| `SB_*` | see module scope | stall-breakaway v2 (`StallBreakaway` switch, default off) |
+| `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3 | Slope Compensation (`SlopeCompensation` switch, default off) |
+| `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
+
+**Switches** (Driving panel, param files under `bmw_e9x_e8x/data/`):
+`StallBreakaway` (read at drive start) and `SlopeCompensation` (read at each
+engagement). Both default off.
+
+**Verification.** Unit tests in `tests/test_latcontroller.py` and
+`tests/test_takeup.py`; a differential replay against the previous build is the
+proof for every refactor that claims no behaviour change.
+
+---
+
+## History
+
+Dated notes in the order they were written. Mechanisms they describe may be
+gone; the current law above is authoritative.
+
 > **2026-07-28 — SAFETY ARCHITECTURE: the lateral controller never gives up in
 > a turn. The ISO 11270 cancel machinery was removed.** The controller's
 > contract is now singular: **track the commanded curvature, always.**
@@ -1139,25 +1204,19 @@ Fire only when **the plant has actually overshot** `(κ_des - κ_meas) · κ_mea
 
 ## 8. Action state machine (debug field)
 
-State held in `state['action']`, published in `bmw_lat_control` telemetry. Useful for forensic analysis.
+`state['action']`, published in `bmw_lat_control` telemetry.
 
 | state | when entered |
 |---|---|
 | `init` | controller construction |
-| `hold_zero` | `state['at_rest']`, straight (`hold_f = 0`) — target 0, stiction holds |
-| `hold_curve` | `state['at_rest']`, curve (`hold_f > 0`) — target `hold_f·torque`, holds the standing torque against self-aligning torque |
-| `ramp` | not `state['at_rest']` — active plant-inversion push toward `target_nm` (sub-friction targets commanded as-is since 2026-07-03) |
-| `relax_dwell` | overshoot-side error in a measured deep curve, within the 1 s dwell — target bridges at current (capped) torque |
-| `cancel_tol` | error fell into the on-target band (1.2× `HOLD_BAND`) mid **push** ramp (`action=='ramp'` only); drain to the sign-guarded, capped hold (0 on straights). **NOT an ISO cancel** — HOLD_BAND boundary hygiene; the only `cancel_`-named action still present |
-| ~~`cancel_accel`~~ | **removed 2026-07-28** — was: overshoot AND `|a_y_meas| > BMW_LATERAL_ACCEL` → drain to 0 |
-| ~~`cancel_jerk`~~ | **removed 2026-07-28** — was: overshoot AND `|jerk_pred| > BMW_LATERAL_JERK` → drain to 0 |
-| `idle` | (2026-07-19) between cadence decisions after a transient label's ramp completed — expires ramp/relax_dwell/cancel_tol so telemetry occupancy counts are honest; holds never expire (they re-fire each cadence) |
+| `ramp` | a decision ran: the torque ramps toward `target_frac` |
+| `relax_dwell` | overshoot-side error in a measured deep curve, within the dwell — the target bridges at the current (capped) torque |
+| `take_up` | the free-play take-up owns the torque while it crosses the servo lash |
+| `idle` | between decisions once a transient label's ramp completed, so telemetry occupancy counts are honest |
 
-Removed 2026-07-03 (see header note): `brake_zero`, `breakaway`. Added: `hold_curve`. Telemetry gains `hold_f`.
-Removed 2026-07-28 (SAFETY ARCHITECTURE, top of doc): `cancel_accel`, `cancel_jerk` — the lateral controller no longer abandons a turn; `a_y` is bounded by speedlimitd.
-`hold_zero`/`hold_curve` vs. `ramp` are now decided by `state['at_rest']` (2026-08-13, entry/settle hysteresis — see the dated note above): leaving rest needs `|delta_err| > HOLD_BAND_ENTER` (0.0015 rad, or `HOLD_BAND` with the `HoldHysteresis` kill-switch off), returning needs `|delta_err| ≤ HOLD_BAND` (0.001, unchanged). Since 2026-08-14 rest is also left when the slow error persists — `|EMA(2 s) of delta_err| > HOLD_EMA_ESCAPE` (0.0012 rad, strict `>`, same kill-switch) — see the persistent-lean-escape note above.
-
-Stall/breakaway v2 (2026-08-15) adds **no action label**: a trip writes `target_frac`/`ramp_step`/`ramp_frames` directly and leaves `action` alone, so the shed appears in telemetry as `sb_trips` incrementing plus `target_frac → 0`, not as a new state. Its own state is published separately as `sb_state` (§ 9).
+Stall/breakaway v2 adds no label: a trip writes `target_frac` / `ramp_step` /
+`ramp_frames` directly, so the shed appears as `sb_trips` incrementing plus
+`target_frac → 0`; its own state is `sb_state` (§9).
 
 ---
 
@@ -1205,9 +1264,9 @@ Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 ## 10. Constraints baked into the design
 
 - **Vision-only stack**: catpilot has no HD-map, lidar, radar fusion, or IMU-fusion for κ. All correction must come from `modelV2` outputs. Don't propose external-sensor escape hatches for vision-noise problems.
-- **Position-feedback layer (2026-07-22, Phase 2)**: `lane_keeping` IS registered on `controls.curvature_correction` — it low-passes `modelV2` κ_des (killing fast chatter) and closes a driver-side lane-offset position loop (cancelling sub-Hz wander, which cannot be filtered out of the reference alone). It now owns modelV2 noise handling and lateral position entirely; this `latcontroller` is a faithful tracker with no noise reasoning of its own (§3, §5).
+- **Reference conditioning**: `lane_keeping` is registered on `controls.curvature_correction` — it hands this controller an arc through the model's planned path, low-passed. This `latcontroller` is a faithful tracker with no noise reasoning of its own; the controller requires the plugin (R10).
 - **lagd never converges for BMW**: `liveDelay.lateralDelay` is permanently pinned at `SAD + 0.2` because lagd correlates on latcontrol_torque telemetry our controller doesn't produce. `SAD` is the effective knob — not a hint to be overridden.
-- **BMW hydraulic rack**: stiction holds δ at zero torque, no self-centering. The plant-inversion controller is designed around this. **Don't add a FF term on κ_des** (correct for EPS, wrong here).
+- **BMW hydraulic rack**: stiction holds δ at zero torque near centre, no self-centering there. Below ~0.3 m/s² of lateral acceleration no steady torque is needed; above it curves need steady torque (routes 4e9–4ec, 440 steady windows: ~1.5 Nm per m/s² beyond ~0.25) — see the 2026-10-20 curve-feed-forward design.
 
 ---
 
@@ -1282,55 +1341,20 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   thread. Git history around commits fbb899b / 7afd501 has the working
   implementation.
 
-### To toggle `HoldHysteresis` (entry/settle hysteresis, 2026-08-13 entry):
-- **Not hot** — there is no bus topic or heartbeat for it. The param is read
-  once at controller construction, so a change only takes effect at the
-  **next drive start** (controlsd is onroad-only and re-reads fresh each
-  ignition).
-- Write the param: `echo -n 0 > /data/plugins-runtime/bmw_e9x_e8x/data/HoldHysteresis`
-  to roll back to the legacy single threshold; delete the file or write `1`
-  (or anything other than `0`) to re-enable — **default is ON**.
-- **A/B across drives, not within one**: since it's restart-scoped, compare
-  whole drives rather than flipping mid-drive at a landmark. Baseline is
-  route 3f4 segments 37–85 (see the 2026-08-13 dated note above).
-- **Verify a drive picked it up**: `bmw_lat_control` telemetry's `hb_enter`
-  field is `0.0015` (hysteresis active), `0.001` (kill-switched), or absent
-  (pre-hysteresis build) — self-labels every tick of the drive.
-- **Rollback**: write `0` and restart the drive (ignition cycle); no
-  redeploy needed, it's a param not a source constant.
-
 ### To toggle `StallBreakaway` (stall/breakaway v2 displacement trip, 2026-08-15 entry):
-- **Default OFF**, `'1'` enables — the opposite polarity to `HoldHysteresis`.
+- **Default OFF**, `'1'` enables.
 - **Not hot**, same as above: read once at controller construction, so it
   applies at the **next drive start**. There is deliberately no bus topic, no
   heartbeat and **no panel toggle** — a rare-event safety net does not need
   mid-drive flipping.
 - Enable: `echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/StallBreakaway`.
   Disable: write anything else, or delete the file.
-- **Verify a drive picked it up**: `bmw_lat_control` telemetry's `sb_on` field
-  (absent = pre-v2 build). There is no warm-up gate: with the param on, the
-  machine can arm from the first engaged tick, so `sb_state` excursions to 1
-  should show up early and often.
+- **Verify a drive picked it up**: with the param on the machine arms from the
+  first engaged tick, so `sb_state` excursions to 1 show up early and often.
 - **The A/B is telemetry, not feel**: the question is "did a windup release
   get caught", so compare `sb_trips` (expect ≈ 0 per ordinary drive) and the
   angle traces around any trip — not straight-line smoothness.
 - **Rollback**: delete the param and restart the drive.
-
-### Direct Tracking mode (`DirectTracking`, 2026-10-18 entry):
-- **Default OFF**, `'1'` enables; Driving-panel toggle "Direct Tracking".
-  Read at **each engagement** (not hot mid-engagement).
-- **Bypasses**: the on-target hold band and its machinery (`at_rest`,
-  `hold_zero` / `hold_curve`, entry/settle hysteresis, persistent-lean escape,
-  `cancel_tol`; § 5). Every decision computes the P target from the full
-  `delta_err`; small targets are commanded as they are.
-- **Keeps**: the plant-inversion law and `t_cap`, the curve hold-floor
-  (`held_target`, `hold_cap`), the LKA-regime extras, a noise guard on changes
-  of sign, and panda torque limits. Forces Arc Smoothing on and Lane Keeping off.
-- **Free-play take-up**: on each change of push direction a quick, small torque
-  (just above the ~0.27 Nm column detent) crosses the servo free play, bypassing
-  `STEP_MAX` for the take-up amount only, then hands over to the normal ramp.
-- **Rollback**: toggle off (or write `0`) and re-engage.
-- Design: `docs/superpowers/specs/2026-10-18-bmw-direct-tracking-design.md`.
 
 ### Slope Compensation (`SlopeCompensation`, 2026-10-19 entry):
 - **Why**: Direct is P-only, so the steady torque a straight needs against a
@@ -1366,20 +1390,18 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 
 ## 13. Code map (`bmw/latcontroller.py`)
 
-| section | line range (approx) | content |
-|---|---:|---|
-| Constants block | 210-360 | All tuning constants with rationale comments |
-| State init dict | 320-360 | Per-controller persistent state |
-| `update()` function | 360+ | Per-CAN-tick body, with livePose-gated heavy logic |
-| Plant horizon block | inside update | `model_action_t`, cadence/spread computed from `lat_delay` |
-| Hold-cap / hold-floor block | inside update | `hold_cap` (HOLD_CAP_DRIFT_M reference), `held_target`, sign-guard |
-| HOLD_BAND / HOLD_BAND_ENTER on-target check | inside update | Entry/settle hysteresis on `state['at_rest']` (2026-08-13); stiction hold-retrigger threshold, not a deadzone (§ 5) |
-| cancel_tol | inside update | HOLD_BAND boundary hygiene — stops an in-flight push ramp on-target (the ISO overshoot-gated cancel_jerk / cancel_accel that used to sit here was removed 2026-07-28) |
-| Cadence decision | inside update | hold_zero / hold_curve / ramp / target_nm formula |
-| Ramp application | inside update | Per-CAN-tick torque ramp |
-| Stall/breakaway v2 | module scope (`SB_*`) + top of `update()` | Displacement trip machine (2026-08-15): ring / arm / breakaway / trip plus the shed-rate enforcement, all run before the livePose branch; the same-side block sits at the end of the ramp branch. No absolute-geometry helper — every comparison is a difference of angle samples |
-| Driver-override observers | module scope (`OV_*`) + `_ov_bump()` + after the sb machine in `update()` | Phase 1 (2026-08-17): four detectors (EOD / HOLD / CRAWL / WSD) that count driver-override signatures and **act on nothing**. Reuses `sb_ring` read-only; writes `ov_*` state keys only — no `ov_*` key is read in the actuator path |
-| Telemetry publish | inside update | `bmw_lat_control` topic via plugin_bus |
+| section | where | content |
+|---|---|---|
+| Module constants | top of file | `HOLD_AY_BP`/`hold_factor`, `SB_*`, `V_GAIN_FLOOR`, LKA band, `CONTROL_HORIZON_S`, `SL_*`, the lane_keeping readiness check (R10) |
+| `on_lat_controller_init` | module | R10 guard, `StallBreakaway` read, cadence/gain/step/dwell constants, the state dict, `update` closure |
+| Engagement edge | top of `update()` | `SlopeCompensation` latch, guard reset; inactive zeroes torque/target/ramp |
+| Stall/breakaway v2 | `update()`, before the livePose branch | ring / arm / breakaway / trip, shed-rate enforcement |
+| livePose tick | `update()` | reference, speeds, `hold_f`, `delta_err`, `kappa_scale`, slope-bias learning, guard observe, `held_target`, relax-dwell |
+| Decision | `update()`, every `action_cadence_ticks` while active | P → R8 trim → `t_cap` → hold-floor → dwell bridge → guard → `STEP_MAX` → sb block |
+| Contact learning, take-up | `update()`, every CAN tick | `ContactLearner.observe`, `FreePlayTakeUp.step`, handover |
+| Ramp and telemetry | end of `update()` | per-frame ramp step, zero snap, `bmw_lat_control` payload (§9) |
+
+`bmw/takeup.py`: `ContactLearner`, `SignGuard`, `FreePlayTakeUp` and their constants.
 
 ---
 

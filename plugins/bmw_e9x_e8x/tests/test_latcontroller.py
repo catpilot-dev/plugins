@@ -201,9 +201,8 @@ class TestFormerlyCancellingNowTracks:
 
 
 # ============================================================
-# (3) NON-cancel decision paths still work (ramp / hold_zero / hold_curve /
-# relax_dwell). These pass on both the pre- and post-removal controller — they
-# exercise the paths the removal must leave untouched.
+# (3) The decision paths (ramp / relax_dwell): torque is commanded toward the
+# reference and never drained to respect a lateral-accel ceiling.
 # ============================================================
 
 class TestNonCancelPaths:
@@ -1428,8 +1427,8 @@ class TestLowSpeedGainFloor:
     for v in (1.4, 8.5):
       lac, fake_sm, mod, state = _make_controller(monkeypatch)
       # near-straight, but a real delta_err: kappa_des ~0 with kappa_meas ~0
-      # lands under HOLD_BAND and commands nothing on BOTH sides, which would
-      # pass the assertion vacuously (0 < 0 is false, but 0 vs 0 tests nothing)
+      # commands ~nothing on BOTH sides, which would pass the assertion
+      # vacuously (0 vs 0 tests nothing)
       _set_measured(fake_sm, v, 0.004)
       _call_update(lac, 0.005, v_ego=v)
       torques.append(abs(state['torque']))
@@ -1438,10 +1437,8 @@ class TestLowSpeedGainFloor:
 
 
 # ============================================================
-# Direct Tracking decision path (2026-10-18, spec §2/§4): the DirectTracking
-# switch is latched at the engagement edge; in Direct mode there is no rest
-# state and no cancel_tol, P sign reversals pass the noise guard, and the
-# hold-floor in curves is kept. Direct off must leave every path unchanged.
+# Direct Tracking decision path (spec §2/§4): the only law. No rest state; P
+# sign reversals pass the noise guard; the hold-floor in curves is kept.
 # ============================================================
 
 

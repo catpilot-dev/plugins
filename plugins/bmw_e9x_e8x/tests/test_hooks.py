@@ -165,10 +165,8 @@ class TestHoldFactor:
 # ============================================================
 # ISO accel/jerk cancel guard — REMOVED 2026-07-28 (lateral never gives up in
 # a turn; a_y is bounded at the system level by speedlimitd's curve-speed
-# capping). accel_guard_threshold() and the cancel machinery no longer exist,
-# so the TestAccelGuardThreshold suite that used to sit here was removed. The
-# no-cancel behaviour and the surviving cancel_tol boundary-hygiene path are
-# covered by tests/test_latcontroller.py.
+# capping); there is no accel guard or cancel machinery here. The no-cancel
+# behaviour is covered by tests/test_latcontroller.py.
 # ============================================================
 
 
