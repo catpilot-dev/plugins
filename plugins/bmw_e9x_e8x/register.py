@@ -142,20 +142,11 @@ def _set_stall_breakaway(state):
   _write_param('StallBreakaway', '1' if state else '0')
 
 
-def _set_direct_tracking(state):
-  """Persist the DirectTracking switch (param file only).
-
-  Read by latcontroller at each engagement, so it applies at the next
-  engagement; no bus topic or heartbeat to keep in sync.
-  """
-  _write_param('DirectTracking', '1' if state else '0')
-
-
 def _set_slope_compensation(state):
   """Persist the SlopeCompensation switch (param file only).
 
-  Read by latcontroller at each engagement, latched only together with
-  Direct Tracking.
+  Read by latcontroller at each engagement, so it applies at the next
+  engagement; no bus topic or heartbeat to keep in sync.
   """
   _write_param('SlopeCompensation', '1' if state else '0')
 
@@ -187,20 +178,9 @@ def on_vehicle_settings(items, CP):
 
   # Default-OFF polarity (`== '1'`), same as Stall Breakaway.
   items.append(toggle_item(
-    "Direct Tracking",
-    "Steer continuously along the arc-smoothed path with no on-target hold "
-    "band, taking up servo free play quickly on each change of direction. "
-    "Forces Arc Smoothing on and Lane Keeping off. Applies at the next engagement.",
-    _read_param('DirectTracking') == '1',
-    callback=_set_direct_tracking,
-  ))
-
-  # Default-OFF polarity (`== '1'`), same as Direct Tracking.
-  items.append(toggle_item(
     "Slope Compensation",
     "Learn the small steady torque the car needs to drive straight (road "
-    "slope, alignment) and apply it. Works only with Direct Tracking. "
-    "Applies at the next engagement.",
+    "slope, alignment) and apply it. Applies at the next engagement.",
     _read_param('SlopeCompensation') == '1',
     callback=_set_slope_compensation,
   ))

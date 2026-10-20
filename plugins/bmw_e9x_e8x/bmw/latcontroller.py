@@ -130,6 +130,7 @@ SB_TRIP_MIN_TORQUE = 0.12   # frac (~1.4 Nm): a release without windup worth she
                             # event carried 0.293. (2026-08-16)
 SB_SHED_FRAMES = 10           # drain torque -> 0 over 100 ms on trip
 SB_BLOCK_TICKS = 50           # 0.5 s same-side push suppression after trip
+SB_SETTLED_RAD = 0.001        # episode ends once |delta_err| is within the error noise floor (rad)
 
 # Driver-override observers, phase 1 (2026-08-17): four detectors that COUNT
 # driver-override signatures and publish telemetry — they act on nothing.
@@ -222,12 +223,6 @@ LKA_BLEND_V = 12.0         # m/s (43 km/h) -- UPPER edge of the blend band.
 # full-boost edge. Upper edge chosen by the user 2026-08-24; it is a judgement
 # call, not a measurement.
 UNWIND_STEP_GAIN = 3.0     # step-cap multiplier while shedding torque in LKA
-UNWIND_CADENCE_TQ = 0.10   # frac (1.2 Nm): standing torque past which a
-                           # cancel_tol on a REVERSING error leaves the cadence
-                           # running instead of restarting it. One base
-                           # step_max — below it the next decision sheds the
-                           # lot in a single step whenever it lands, so
-                           # rescheduling buys nothing. See the cancel_tol block.
 
 
 def gain_reference_speed(v_true):
@@ -267,42 +262,19 @@ SL_MIN_V = 40 / 3.6        # learn only above 40 km/h (m/s)
 SL_KAPPA_DES = 1e-3        # straight: |desired| below this (1/m)
 SL_KAPPA_MEAS = 1.5e-3     # and |measured| below this (1/m)
 
-# Direct Tracking (2026-10-18, docs/superpowers/specs/2026-10-18-bmw-direct-
-# tracking-design.md): no rest state, no cancel_tol, sign-guarded reversals.
-# The DirectTracking switch is latched at each lateral engagement edge and
-# held until disengage, so the law never changes mid-push. The module global
-# mirrors the latch for other plugins (lane_keeping forces Arc on while it is
-# set) — read it via direct_latched(), never `from ... import _DIRECT_LATCHED`
-# (a copied bool would go stale; registry module-identity lesson).
-_DIRECT_LATCHED = False
-# Ruling R10: never Direct without the Arc reference. lane_keeping's hook
-# module, by the registry's canonical name (plugins.<id>.<module>); absent
-# (plugin disabled / failed to load) means raw kappa_des reaches a
-# deadzone-free tracker — the documented-unsafe case — so the latch stays off.
-# The registry inserts the module into sys.modules BEFORE executing it and
-# leaves it there when the import raises, so presence alone is not enough:
-# HOOK_READY is the module's last statement, set only when it loaded fully.
+# Direct Tracking (docs/superpowers/specs/2026-10-18-bmw-direct-tracking-
+# design.md) is the only law: no rest state, sign-guarded reversals, free-play
+# take-up. It tracks the Arc reference from lane_keeping; raw kappa_des on a
+# deadzone-free tracker is the documented-unsafe case, so without that plugin
+# the hook leaves the stock controller in place (ruling R10). The registry
+# inserts a module into sys.modules BEFORE executing it and leaves it there
+# when the import raises, so presence alone is not enough: HOOK_READY is the
+# module's last statement, set only when it loaded fully.
 _LK_REGISTER_MODULE = 'plugins.lane_keeping.register'
 
 
 def _lane_keeping_ready():
   return getattr(sys.modules.get(_LK_REGISTER_MODULE), 'HOOK_READY', False) is True
-
-
-def direct_latched():
-  """True while the engaged controller runs Direct Tracking."""
-  return _DIRECT_LATCHED
-
-
-# Ruling R11: lane_keeping may apply the cached DirectTracking switch only
-# while lateral is NOT engaged, so its reference never changes mid-engagement
-# (while engaged, direct_latched() alone decides). Same accessor rule as above.
-_LAT_ENGAGED = False
-
-
-def lateral_engaged():
-  """True while lateral control is active (set from the engagement latch)."""
-  return _LAT_ENGAGED
 
 
 def on_lat_controller_init(result, lac, CP):
@@ -406,6 +378,16 @@ def on_lat_controller_init(result, lac, CP):
   from bmw.values import CarControllerParams as CCP
   from bmw.takeup import SignGuard, ContactLearner, FreePlayTakeUp, parse_contacts, format_contacts
 
+  # Ruling R10: Direct needs the Arc reference. Without lane_keeping the stock
+  # lateral controller stays in place.
+  if not _lane_keeping_ready():
+    try:
+      from openpilot.common.swaglog import cloudlog
+      cloudlog.warning("bmw latcontroller: lane_keeping not loaded, stock lateral controller in use")
+    except Exception:
+      pass
+    return result
+
   # Plugin params are read ONCE here, never per-tick and never on a periodic
   # cache expiry (review fix, Important 4): a Path.read_text() on controlsd's
   # 100 Hz RT thread can cost a control frame under eMMC contention, and even
@@ -423,13 +405,6 @@ def on_lat_controller_init(result, lac, CP):
   # silently fall the car back to stock LatControlTorque, which is worse than
   # just defaulting a toggle.
   #
-  # HoldHysteresis kill-switch (2026-08-13, route 3f4 data): default ON —
-  # '0' is the rollback to the legacy single threshold. No bus topic, no
-  # heartbeat, no hot toggle: a restart-scoped kill-switch is enough. If the
-  # import above failed, read_plugin_param is undefined here and the except
-  # branch defaults hysteresis ON, matching that polarity. See
-  # HOLD_BAND_ENTER below and LATERAL_CONTROLLER.md.
-  #
   # StallBreakaway kill-switch (2026-08-15, stall/breakaway v2): default OFF —
   # '1' enables. Same restart-scoped polarity as the retired AngleBudget: no
   # bus topic, no heartbeat, no hot toggle (a rare-event safety net does not
@@ -438,12 +413,10 @@ def on_lat_controller_init(result, lac, CP):
   # onroad-only. See the SB_* constants at module scope.
   try:
     from config import read_plugin_param
-    _hold_hyst_on = read_plugin_param('bmw_e9x_e8x', 'HoldHysteresis', '') != '0'
     _stall_v2_on = read_plugin_param('bmw_e9x_e8x', 'StallBreakaway', '') == '1'
   except Exception:
-    _hold_hyst_on = True
     _stall_v2_on = False
-  # DirectTracking is the one exception to read-once-at-init: it is read at
+  # SlopeCompensation is the one exception to read-once-at-init: it is read at
   # each engagement edge in update() (a rare event, not a per-tick read), so
   # the user can A/B by disengaging and re-engaging. Default OFF — only '1'
   # enables; a failed read (incl. the import above failing, which leaves
@@ -573,54 +546,6 @@ def on_lat_controller_init(result, lac, CP):
   # friction constant; nothing in this controller should pretend to model the
   # rack.)
 
-  # Dead band of front-wheel error. It shall be a constant; 0.001 is a good
-  # choice. (User's definition, 2026-08-13 — this one line IS the design.)
-  # Why 0.001 is good, as measured footnotes, not derivation:
-  #   - It sits at ~1σ of the error signal's band-passed noise floor
-  #     (σ = 0.00081 rad on route 3f4's clean straights, 1.23σ; the 12-route
-  #     2026-07-19 study gave σ·L = 0.00099, 1.0σ). Resting tighter would be
-  #     resting on noise. The noise is speed-independent, which is why the
-  #     band is correctly FIXED rather than 1/v².
-  #   - At 25 m/s it tolerates 0.23 m/s² of lateral-accel error — about the
-  #     driver perception threshold.
-  #   - It is small enough not to attenuate the lane_keeping position
-  #     correction — the Phase 1 failure mode, where a 0.0012–0.0021 rad
-  #     tolerance ate 44% of the anchor's command (route 3bf).
-  # k_sigma is live telemetry: if a future model upgrade halves the wander,
-  # the telemetry itself will show this band has headroom to tighten.
-  HOLD_BAND = 0.001        # rad of front-wheel-angle error treated as on-target
-
-  # Entry/settle hysteresis (2026-08-13, route 3f4 data). One shared threshold
-  # made the controller flicker across the band boundary ~89x/min on straights
-  # (error noise sigma = 0.00081 rad, so HOLD_BAND is only 1.23 sigma),
-  # starting ~22.6 sub-breakaway ramp episodes/min. Leaving rest now requires
-  # clearing the noise core (> HOLD_BAND_ENTER); settling back keeps the
-  # original tight point (<= HOLD_BAND), so a growing lane_keeping correction
-  # still lands at 0.001 — plain widening was measured on route 3f4 and
-  # rejected (-18% activations only, and it re-enters the Phase-1 regime
-  # where a 0.0012-0.0021 tolerance ate 44% of the anchor's commands).
-  # Replay: -63% activation episodes. Kill-switch: HoldHysteresis param
-  # ('0' disables -> both thresholds = HOLD_BAND -> exact legacy behaviour).
-  HOLD_BAND_ENTER = 0.0015
-
-  # Persistent-lean escape (2026-08-14, route 3f8 on-car verdict). The entry
-  # gap (0.001, 0.0015) rejects symmetric noise but also hid a constant
-  # road-crown pull: slow |err| > 0.002 grew to 8.2% of straight time
-  # (0.3% baseline speed-matched) and the user felt a left-hug with slow
-  # correction. A second leave-rest condition on the SLOW error bounds the
-  # lean latency: escape when |EMA(2 s) of delta_err| > HOLD_EMA_ESCAPE.
-  # Flicker cannot move a 2-s average (replayed cost: +1.4 entries/min,
-  # still ~30% under legacy); a sustained bias of 0.002 escapes in ~1.8 s,
-  # 0.0014 in ~4 s, <= 0.0012 never (that zone IS the noise floor).
-  # The EMA is deliberately NOT re-primed on settle (route 3f9, 2026-08-15):
-  # re-priming starved the escape to zero fires, and a still-high EMA that
-  # re-exits right after a settle is the intended behaviour on a crowned road,
-  # where the correction itself drags the EMA back down. Gated on the same
-  # HoldHysteresis kill-switch ('0' disables escape AND hysteresis -> exact
-  # legacy behaviour).
-  HOLD_EMA_TAU = 2.0        # s
-  HOLD_EMA_ESCAPE = 0.0012  # rad; strict > so a bias exactly at threshold never escapes
-
   # SAFETY ARCHITECTURE (2026-07-28): NO ISO accel/jerk cancel guard. It used
   # to live here (a κ-indexed BMW_LATERAL_JERK table + a commanded-a_y
   # accel_guard_threshold, both gated on an `overshooting` predicate, draining
@@ -645,8 +570,7 @@ def on_lat_controller_init(result, lac, CP):
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
     'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
-    'action': 'init',          # debug: hold_zero / hold_curve / ramp / relax_dwell / cancel_tol / idle / take_up
-    #                            (cancel_accel / cancel_jerk removed 2026-07-28 — no ISO cancel)
+    'action': 'init',          # debug: ramp / relax_dwell / idle / take_up
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad), what controller acts on
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
@@ -655,8 +579,6 @@ def on_lat_controller_init(result, lac, CP):
     'hold_f': 0.0,                # debug: lateral-accel hold factor [0,1] (gated on v²·|kappa_des|)
     'hold_cap': 0.0,              # debug: cap on held torque (P value at the HOLD_CAP_DRIFT_M reference drift, frac)
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
-    'at_rest': True,   # hysteresis state: True = holding, False = correcting
-    'derr_ema': 0.0,   # slow (HOLD_EMA_TAU) EMA of delta_err, livePose rate
     # Stall/breakaway v2 (see the SB_* constants at module scope). Entirely
     # separate from the EMA escape / hysteresis above: different state,
     # different trigger, different action — the two never interact.
@@ -675,8 +597,7 @@ def on_lat_controller_init(result, lac, CP):
     'ov_brake_fires': 0,     # fires (any detector) while CS.brakePressed — the stage-2 context counter
     'ov_last': 0,            # 1=eod 2=hold 3=crawl 4=wsd, last fire this drive
     'ov_push_dir': 0.0, 'ov_push_t': 0,     # push memory (direction, CAN ticks since the push ended)
-    # Direct Tracking (see _DIRECT_LATCHED at module scope).
-    'direct': False,         # DirectTracking latched at the engagement edge; False while inactive
+    # Direct Tracking.
     'was_active': False,     # previous tick's `active`, for the engagement edge
     'guard': SignGuard(),    # noise guard on P-target sign reversals (direct only)
     'learner': _learner,     # servo-column contacts, learned in BOTH modes
@@ -711,25 +632,14 @@ def on_lat_controller_init(result, lac, CP):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 11
 
-    # Direct Tracking latch: read the switch on the engagement edge only, so
-    # the law never changes while pushing; inactive clears it (and the module
-    # mirror lane_keeping reads). The guard starts uncommitted each engagement.
-    global _DIRECT_LATCHED, _LAT_ENGAGED
+    # Engagement edge: latch the SlopeCompensation switch (read here only, so
+    # the law never changes while pushing); the guard starts uncommitted.
     if active and not state['was_active']:
       try:
-        state['direct'] = (read_plugin_param('bmw_e9x_e8x', 'DirectTracking', '') == '1'
-                           and _lane_keeping_ready())
-      except Exception:
-        state['direct'] = False
-      _DIRECT_LATCHED = state['direct']
-      try:
-        state['slope'] = state['direct'] and \
-          read_plugin_param('bmw_e9x_e8x', 'SlopeCompensation', '') == '1'
+        state['slope'] = read_plugin_param('bmw_e9x_e8x', 'SlopeCompensation', '') == '1'
       except Exception:
         state['slope'] = False
       state['guard'].reset()
-      if state['direct']:
-        state['at_rest'] = False   # no rest state in Direct mode (telemetry too)
     elif not active:
       if state['was_active']:
         # Disengage edge: persist the contacts this drive learned as the next
@@ -742,15 +652,16 @@ def on_lat_controller_init(result, lac, CP):
             write_plugin_param('bmw_e9x_e8x', 'DirectContacts', format_contacts(_c))
         except Exception:
           pass
-      state['direct'] = False
       state['slope'] = False
-      _DIRECT_LATCHED = False
-      # A take-up in flight ends with the engagement; output is 0 below.
+      # Inactive: the law does not run on the state. Torque, target and ramp
+      # are zeroed so the next engagement ramps from 0 under STEP_MAX on its
+      # first livePose tick instead of jumping to a torque built while the
+      # output was 0 (the rack never received it). A take-up in flight ends.
+      state.update(torque=0.0, target_frac=0.0, ramp_step=0.0, ramp_frames=0)
       state['takeup'].reset()
       if state['action'] == 'take_up':
         state['action'] = state['tu_resume']
     state['was_active'] = active
-    _LAT_ENGAGED = bool(active)
 
     # getattr guard: CS is a stub in some test paths. steeringAngleDeg carries
     # a constant ~-1.58 deg alignment offset — DELTAS ONLY, never the
@@ -859,12 +770,8 @@ def on_lat_controller_init(result, lac, CP):
         # its sweep is in-direction throughout.
         _rate = (ring[-1] - ring[-1 - SB_MOVE_TICKS]) * state['sb_dir'] / (SB_MOVE_TICKS * DT_CAN_TICK) \
                 if len(ring) > SB_MOVE_TICKS else 0.0
-        # Direct Tracking has no hold_* actions, so the episode also ends on
-        # the on-target condition those actions stood for (|δ_err| <=
-        # HOLD_BAND, last livePose value). Direct off: unchanged.
-        if state['sb_episode_ticks'] <= 0 \
-           or state['action'] in ('hold_zero', 'hold_curve') \
-           or (state['direct'] and abs(state['delta_err']) <= HOLD_BAND):
+        # The episode also ends once the error has settled (last livePose value).
+        if state['sb_episode_ticks'] <= 0 or abs(state['delta_err']) <= SB_SETTLED_RAD:
           state['sb_state'] = 0
         # The kappa gate is applied BOTH instantaneous and latched-at-arm
         # (2026-08-16, drives 3fa/3fb). The instantaneous gate alone is
@@ -1134,9 +1041,6 @@ def on_lat_controller_init(result, lac, CP):
       delta_err = delta_err_raw
       state['delta_err'] = delta_err
 
-      # Slow-error EMA for the persistent-lean escape (see HOLD_EMA_TAU).
-      state['derr_ema'] += (DT_LIVEPOSE / HOLD_EMA_TAU) * (delta_err - state['derr_ema'])
-
       # Lookahead is still needed for the hold cap below. Fixed horizon, not
       # model_action_t - see CONTROL_HORIZON_S.
       lookahead_m = v * CONTROL_HORIZON_S
@@ -1268,82 +1172,13 @@ def on_lat_controller_init(result, lac, CP):
       state['a_y_meas'] = a_y_meas
       state['jerk_pred'] = jerk_pred
 
-      # (|target_frac| > FRICTION conjunct deleted 2026-08-13, user ruling:
-      # redundant — it was HOLD_BAND in torque coordinates through the P gain.
-      # Consequence: terminal push ramps with small stale targets now drain to
-      # the held target on arrival instead of completing; less residual torque
-      # at rest entry.)
-      # Direct Tracking has no on-target band, so no band hygiene: the ramp
-      # runs to its decision and the cadence never restarts here.
-      if (not state['direct'] and state['action'] == 'ramp'
-            and abs(delta_err) <= 1.2*HOLD_BAND and state['ramp_frames'] > 0):
-        # cancel_tol — HOLD_BAND boundary hygiene, NOT an ISO cancel (this is
-        # the only "cancel_"-named path left; it tracks the command tighter, it
-        # does not abandon the turn). Error fell into the on-target band (1.2x
-        # HOLD_BAND) while a PUSH ramp is still in flight. Without this, the
-        # ramp keeps driving torque toward a stale target until the next 250 ms
-        # cadence.
-        # Gated on action=='ramp' (route 385 review, 2026-07-03): hold
-        # ramps also set ramp_frames, and un-gated this branch fired on
-        # them every in-band tick — pinning tick_count (cadence stretched
-        # 300→550 ms) and flooding telemetry with phantom cancel_tol
-        # (~10 of 11 in-curve ticks), corrupting the action field-health
-        # metric. Gating also removes the float-equality re-arm fragility
-        # in the blend region. Drain to the sign-guarded, capped hold
-        # (0 on straights; ≈steady SAT in curves — "stop the ramp, keep
-        # what you have" without keeping arrival momentum).
-        unwind_target = held_target
-        if state['target_frac'] != unwind_target:
-          state['target_frac'] = unwind_target
-          state['ramp_step'] = (unwind_target - state['torque']) / spread_frames
-          state['ramp_frames'] = spread_frames
-        state['action'] = 'cancel_tol'
-        # Cadence: restart it on ARRIVAL, leave it running on TRANSIT.
-        #
-        # Route 418 seg 4 (2026-08-22). cancel_tol fires on |δ_err| ≤
-        # 1.2·HOLD_BAND whichever way the error is travelling, and restarting
-        # the cadence assumes the error is settling. When it is instead
-        # crossing the band on its way out the far side — a driver hauling the
-        # wheel back through centre — the restart costs a whole extra cadence
-        # of stale standing torque. Measured: hold_f was 1.0 so the retarget
-        # above equalled the standing 0.2598 frac and re-armed nothing; the
-        # reset was cancel_tol's ONLY effect, ramp_frames ran out, the action
-        # fell to idle, and 3.1 Nm sat frozen for five ticks while the wheel
-        # came back at up to 228 deg/s. 250 ms of a 560 ms shed was rescheduling.
-        #
-        # Transit needs no new state to read: target_nm ∝ δ_err, so δ_err on
-        # the opposite side from the standing torque means the next P target
-        # opposes what we hold — the next decision sheds. Leaving the counter
-        # to run lands that decision on its ORIGINAL schedule; it does not
-        # force an out-of-cadence one, so decision bandwidth is unchanged.
-        #
-        # Narrow, on the same terms as the dwell gate and the unwind boost
-        # (user ruling: LKA at intersections only, normal HOLD untouched):
-        # below LKA_MAX_V, and only past UNWIND_CADENCE_TQ of standing torque.
-        # Under one step_max there is nothing to gain — whenever the decision
-        # lands it can shed the lot in one step — so straight-line band
-        # hygiene, and its settling behaviour, keep the restart.
-        _shed_next = delta_err * state['torque'] < 0.0
-        if (v_true < LKA_MAX_V and _shed_next
-            and abs(state['torque']) > UNWIND_CADENCE_TQ):
-          state['tick_count'] += 1
-        else:
-          state['tick_count'] = 0
-      else:
-        state['tick_count'] += 1
-        # Expire transient action labels once their ramp completes (parked
-        # fix, folded in 2026-07-19): between cadence decisions the label
-        # used to persist after the ramp finished, so naive telemetry
-        # occupancy counts over-attributed ramp/relax states (transition-
-        # level counting was the workaround). Holds keep their label — they
-        # re-fire every cadence and their occupancy IS meaningful. The
-        # cancel_tol gate is unaffected: it requires ramp_frames > 0, and
-        # in-flight ramps (ramp_frames > 0) never expire here.
-        if state['ramp_frames'] == 0 and state['action'] in (
-            'ramp', 'relax_dwell', 'cancel_tol'):
-          state['action'] = 'idle'
+      state['tick_count'] += 1
+      # Expire transient action labels once their ramp completes, so telemetry
+      # occupancy is not over-attributed; holds keep their label.
+      if state['ramp_frames'] == 0 and state['action'] in ('ramp', 'relax_dwell'):
+        state['action'] = 'idle'
 
-      if state['tick_count'] >= action_cadence_ticks:
+      if active and state['tick_count'] >= action_cadence_ticks:
         state['tick_count'] = 0
 
         # Plant-inversion target torque in angle domain — the steady-state
@@ -1353,181 +1188,137 @@ def on_lat_controller_init(result, lac, CP):
         # LATERAL_CONTROLLER.md for why (it was attenuating the upstream
         # lane_keeping position correction).
         #   τ_Nm = T_CAP_SLOPE · v² · δ_err
-        # On-target (|δ_err| ≤ HOLD_BAND) → stiction holds; no chatter at
-        # the boundary (see the hold_curve / hold_zero branch below).
-        # Entry/settle hysteresis: leave rest only past HOLD_BAND_ENTER,
-        # return only at/below HOLD_BAND. With the kill-switch off both
-        # thresholds are HOLD_BAND and this reduces exactly to the legacy
-        # per-decision comparison (leave on >, return on <=).
-        _enter = HOLD_BAND_ENTER if _hold_hyst_on else HOLD_BAND
-        if state['direct']:
-          # Direct Tracking: no rest state, no hysteresis, no EMA escape —
-          # every decision computes P on the full error. A sub-friction
-          # target is, in effect, a hold (user ruling, spec §2).
-          state['at_rest'] = False
-        elif state['at_rest']:
-          if abs(delta_err) > _enter or \
-             (_hold_hyst_on and abs(state['derr_ema']) > HOLD_EMA_ESCAPE):
-            state['at_rest'] = False
-        else:
-          if abs(delta_err) <= HOLD_BAND:
-            state['at_rest'] = True
-            # NO re-prime on settle (route 3f9, 2026-08-15): re-priming to the
-            # settle-point error starved the escape — instantaneous noise wins
-            # the race to HOLD_BAND_ENTER within ~1-2 decisions of any lean,
-            # and a freshly re-primed 2-s EMA can never reach HOLD_EMA_ESCAPE
-            # during rest (measured: 0 escape fires in 15 straight-min, all
-            # 190 rest-exits threshold-driven). A still-high EMA re-exiting
-            # right after settle is the escape working: a crowned road needs
-            # continuous correction, and the correction itself drags the EMA
-            # down, so re-fires are self-limiting (replayed on 3f9:
-            # 1.54 fires/min, +1.4 entries/min, no churn loop).
-        _tu_demand = None   # set on the P path; the rest path's target is its own demand
-        if state['at_rest']:
-          # On-target. Low commanded a_y (hold_f=0 — straights and gentle-
-          # slow curves): drain to 0, stiction holds. Higher commanded a_y
-          # (hold_f→1): keep the torque that achieved on-target — it
-          # approximates the self-aligning torque, which beats stiction at
-          # that loading; target-0 here was the 0.6 Hz limit cycle's driver
-          # (route 380/384) and, before the a_y gate, also the route 3ca
-          # seg 23 mild-fast-curve hunting. Re-derived from state['torque']
-          # each decision: bounded by the P-term's own command, no ratchet.
-          # (brake_zero one-shot reverse pulse removed 2026-07-03 —
-          # residual on-target-entry momentum is left to rack friction.)
-          # held_target is sign-guarded (never counter-curve) and capped at
-          # the P value implied by HOLD_CAP_DRIFT_M — see the hold_cap
-          # block above.
-          target_frac = held_target
-          state['action'] = 'hold_curve' if held_target != 0.0 else 'hold_zero'
-        else:
-          # kappa_scale computed per tick above (shared with hold_cap):
-          # 1.0 on straights rising to 3.0 at |κ_des| ≥ 0.02.
-          # Phase 2: P acts on the FULL error — the tolerance subtraction is
-          # gone. It was the term that attenuated the lane_keeping position
-          # correction (Phase 1, route 3bf: 44% of correcting ticks produced no
-          # action at all). Nothing here shrinks the commanded curvature now.
-          target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
-          if state['slope']:
-            target_nm += state['sl_bias']
-          target_frac = target_nm / CCP.STEER_MAX
-          # Sub-breakaway targets are commanded as-is (breakaway ±FRICTION
-          # amplification removed 2026-07-03): commands below the rack's
-          # breakaway torque don't move the wheel — an intentional soft
-          # actuation deadband; the wheel moves once the P-term grows past
-          # friction naturally.
-          state['action'] = 'ramp'
-          # Direct curve hold (ruling R8): with no on-target band, an in-band
-          # overshoot gives a small P opposing the held torque. Taken alone it
-          # drops the curve torque a full STEP_MAX per decision (probe: 1.8 Nm
-          # held, delta_err -0.0003 at 25 m/s -> 1.06 Nm; legacy hold_curve
-          # 1.80). Instead P trims down from the hold: held_target + P. A large
-          # overshoot still carries the sum past zero (guard, STEP_MAX below).
-          # Straights: held_target is 0, so this never applies there.
-          _trim_hold = (state['direct'] and hold_f > 0.0
-                        and target_frac * held_target < 0.0)
-          if _trim_hold:
-            target_frac = held_target + target_frac
-          # v²·|δ|-scaled cap, clipped at STEER_MAX (panda hard limit).
-          # Authority grows with commanded a_y_des — straights stay near BASE,
-          # tight turns can reach STEER_MAX (transient over-envelope; speedlimitd
-          # bleeds v).
-          t_cap_nm = min(CCP.STEER_MAX,
-                         T_CAP_BASE_NM + T_CAP_SLOPE_BASE * kappa_scale * v * v * abs(delta_des))
-          t_cap_frac = t_cap_nm / CCP.STEER_MAX
-          target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
-          # Hold-floor (route 393 segs 7/8, 2026-07-06): a same-direction
-          # push never commands LESS than the held torque — "keep holding
-          # while adding trim; don't ease off while still understeering."
-          # Route 393 showed 15–31% of in-curve ramp ticks commanded
-          # sub-friction targets: with the wheel held at e.g. 0.08 and the
-          # error drifting just outside the band, P computed ~0.04 and the
-          # ramp DROPPED torque below the holding level — SAT unwound the
-          # wheel and accelerated the very error being corrected. The floor
-          # applies only when P and the (sign-guarded, capped) hold point
-          # the same way; opposite-sign P (overshoot correction) is
-          # untouched, so torque reduction still happens the moment the
-          # error flips sides. Bounded by hold_cap, STEP_MAX, and t_cap.
-          # Not after an R8 trim: the trimmed sum is below the hold by design.
-          if not _trim_hold and target_frac * held_target > 0.0:
-            target_frac = math.copysign(max(abs(target_frac), abs(held_target)), target_frac)
-          # Relax-dwell bridge (see the deep_relax block above): during the
-          # dwell window, an overshoot-side reference dip may NOT command
-          # below the current (capped) torque — keep the curve and wait the
-          # dip out. Persisting overshoot (> dwell) falls through to the
-          # normal relax staircase (the ISO cancel that used to bypass this
-          # is gone as of 2026-07-28).
-          if dwelling:
-            target_frac = math.copysign(min(abs(state['torque']), hold_cap), state['torque'])
-            state['action'] = 'relax_dwell'
-          # Direct Tracking noise guard (spec §3): a sign change of the target
-          # commands 0 until the opposite error sign has persisted
-          # GUARD_PERSIST_S. ~0.5 Nm of noise torque at 25 m/s is enough to
-          # sweep the servo across the gap, and 0 is itself a hold. The old
-          # side still sheds toward 0 under STEP_MAX below.
-          # Exempt while relax-dwell bridges (ruling R3): the dwell must never
-          # give up mid-turn, and its target holds the current torque's sign,
-          # so it cannot cross the gap.
-          if state['direct'] and not dwelling:
-            target_frac = state['guard'].allow(target_frac)
-          # The take-up gate sizes the reversal on this demand, not on the
-          # step-capped target below: a zero crossing under STEP_MAX can land
-          # a few hundredths past zero, and the next decision is already past
-          # zero, so a capped gate would skip that reversal's take-up entirely.
-          _tu_demand = target_frac
-          # Per-decision step cap (route 385 seg 27 review, 2026-07-03):
-          # human-style gradual steering — move at most STEP_MAX toward the
-          # P target per decision, let the plant respond one cadence, then
-          # re-measure and step again. Never apply excessive torque
-          # abruptly: seg 27 showed single decisions swinging Δ0.69 frac
-          # (8.3 Nm) which drove 150 deg/s wheel bursts and the
-          # over-latch → (then-present ISO) cancel_accel dump → deep-unwind
-          # cycle — the step cap prevents the over-latch at the source. Max
-          # slew is now ~0.33 frac/s (~4 Nm/s); the P-law reverses on
-          # overshoot, speedlimitd handles curve-entry speed (a_y bound).
-          step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
-          # Fast unwind in the LKA regime (route 417, 2026-08-21). STEP_MAX
-          # exists to stop abrupt APPLICATION — seg 27's single decisions
-          # swinging 0.69 frac drove 150 deg/s wheel bursts. RELEASING torque
-          # carries no such hazard below 30 km/h: SAT cannot fling the freed
-          # wheel and stiction holds the angle at zero torque. Without this,
-          # shedding the ~3.9 Nm held through an intersection takes ~1 s at
-          # 4 Nm/s and the driver fights the wheel's return the whole way.
-          #
-          # Only while the step moves torque TOWARD zero. Once past zero the
-          # step is building in the new direction and the normal cap applies
-          # again, so the seg-27 hazard stays covered in both directions.
-          #
-          # NOT gated on curvature: κ_meas collapses through
-          # RELAX_DWELL_KAPPA partway through the exit (seg 2: 0.037 -> 0.003
-          # during the return), so a κ conjunct would switch the fast decay
-          # off exactly when it is needed.
-          if (target_frac - state['torque']) * state['torque'] < 0.0:
-            # Full boost at/below LKA_MAX_V, fading to none by LKA_BLEND_V.
-            # Building torque is still untouched at every speed -- that
-            # conjunct is what keeps the seg-27 abrupt-application hazard
-            # covered, and STEP_MAX's own schedule (move LESS per decision as
-            # v rises) must not be inverted at highway speed.
-            step_max *= float(np.interp(v_true, [LKA_MAX_V, LKA_BLEND_V],
-                                        [UNWIND_STEP_GAIN, 1.0]))
-          step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
-          target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
-          # Post-trip block: no same-side re-push while the release is
-          # still settling. Opposite-side correction passes untouched —
-          # this must never block counter-steer (SAFETY ARCHITECTURE:
-          # the controller may stop pushing, never give up correcting).
-          # Sign pairing: sb_dir is the wheel's breakaway MOTION direction
-          # in ANGLE space (+ = leftward) and torque is OPPOSITE in sign to
-          # angle (torque negative = left), so the push driving that motion
-          # is target_frac * (-sb_dir) > 0. Pinned in both directions by
-          # TestStallBreakawayV2.test_block_suppresses_same_side_only.
-          # Gated on action == 'ramp' (review Minor): by this point the
-          # relax-dwell bridge may have replaced target_frac with a HOLD of
-          # the current torque, which is not a push and must not be zeroed —
-          # zeroing it is the give-up-mid-turn failure mode relax_dwell
-          # exists to prevent.
-          if state['action'] == 'ramp' and state['sb_block'] > 0 \
-             and target_frac * (-state['sb_dir']) > 0.0:
-            target_frac = 0.0
+        # No on-target band: every decision computes P on the full error; a
+        # sub-friction target is, in effect, a hold (Direct spec §2).
+        _tu_demand = None   # the decision's demand before the step cap (take-up size gate)
+        # kappa_scale computed per tick above (shared with hold_cap):
+        # 1.0 on straights rising to 3.0 at |κ_des| ≥ 0.02.
+        # Phase 2: P acts on the FULL error — the tolerance subtraction is
+        # gone. It was the term that attenuated the lane_keeping position
+        # correction (Phase 1, route 3bf: 44% of correcting ticks produced no
+        # action at all). Nothing here shrinks the commanded curvature now.
+        target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
+        if state['slope']:
+          target_nm += state['sl_bias']
+        target_frac = target_nm / CCP.STEER_MAX
+        # Sub-breakaway targets are commanded as-is (breakaway ±FRICTION
+        # amplification removed 2026-07-03): commands below the rack's
+        # breakaway torque don't move the wheel — an intentional soft
+        # actuation deadband; the wheel moves once the P-term grows past
+        # friction naturally.
+        state['action'] = 'ramp'
+        # Direct curve hold (ruling R8): with no on-target band, an in-band
+        # overshoot gives a small P opposing the held torque. Taken alone it
+        # drops the curve torque a full STEP_MAX per decision (probe: 1.8 Nm
+        # held, delta_err -0.0003 at 25 m/s -> 1.06 Nm; legacy hold_curve
+        # 1.80). Instead P trims down from the hold: held_target + P. A large
+        # overshoot still carries the sum past zero (guard, STEP_MAX below).
+        # Straights: held_target is 0, so this never applies there.
+        _trim_hold = (hold_f > 0.0
+                      and target_frac * held_target < 0.0)
+        if _trim_hold:
+          target_frac = held_target + target_frac
+        # v²·|δ|-scaled cap, clipped at STEER_MAX (panda hard limit).
+        # Authority grows with commanded a_y_des — straights stay near BASE,
+        # tight turns can reach STEER_MAX (transient over-envelope; speedlimitd
+        # bleeds v).
+        t_cap_nm = min(CCP.STEER_MAX,
+                       T_CAP_BASE_NM + T_CAP_SLOPE_BASE * kappa_scale * v * v * abs(delta_des))
+        t_cap_frac = t_cap_nm / CCP.STEER_MAX
+        target_frac = float(np.clip(target_frac, -t_cap_frac, t_cap_frac))
+        # Hold-floor (route 393 segs 7/8, 2026-07-06): a same-direction
+        # push never commands LESS than the held torque — "keep holding
+        # while adding trim; don't ease off while still understeering."
+        # Route 393 showed 15–31% of in-curve ramp ticks commanded
+        # sub-friction targets: with the wheel held at e.g. 0.08 and the
+        # error drifting just outside the band, P computed ~0.04 and the
+        # ramp DROPPED torque below the holding level — SAT unwound the
+        # wheel and accelerated the very error being corrected. The floor
+        # applies only when P and the (sign-guarded, capped) hold point
+        # the same way; opposite-sign P (overshoot correction) is
+        # untouched, so torque reduction still happens the moment the
+        # error flips sides. Bounded by hold_cap, STEP_MAX, and t_cap.
+        # Not after an R8 trim: the trimmed sum is below the hold by design.
+        if not _trim_hold and target_frac * held_target > 0.0:
+          target_frac = math.copysign(max(abs(target_frac), abs(held_target)), target_frac)
+        # Relax-dwell bridge (see the deep_relax block above): during the
+        # dwell window, an overshoot-side reference dip may NOT command
+        # below the current (capped) torque — keep the curve and wait the
+        # dip out. Persisting overshoot (> dwell) falls through to the
+        # normal relax staircase (the ISO cancel that used to bypass this
+        # is gone as of 2026-07-28).
+        if dwelling:
+          target_frac = math.copysign(min(abs(state['torque']), hold_cap), state['torque'])
+          state['action'] = 'relax_dwell'
+        # Direct Tracking noise guard (spec §3): a sign change of the target
+        # commands 0 until the opposite error sign has persisted
+        # GUARD_PERSIST_S. ~0.5 Nm of noise torque at 25 m/s is enough to
+        # sweep the servo across the gap, and 0 is itself a hold. The old
+        # side still sheds toward 0 under STEP_MAX below.
+        # Exempt while relax-dwell bridges (ruling R3): the dwell must never
+        # give up mid-turn, and its target holds the current torque's sign,
+        # so it cannot cross the gap.
+        if not dwelling:
+          target_frac = state['guard'].allow(target_frac)
+        # The take-up gate sizes the reversal on this demand, not on the
+        # step-capped target below: a zero crossing under STEP_MAX can land
+        # a few hundredths past zero, and the next decision is already past
+        # zero, so a capped gate would skip that reversal's take-up entirely.
+        _tu_demand = target_frac
+        # Per-decision step cap (route 385 seg 27 review, 2026-07-03):
+        # human-style gradual steering — move at most STEP_MAX toward the
+        # P target per decision, let the plant respond one cadence, then
+        # re-measure and step again. Never apply excessive torque
+        # abruptly: seg 27 showed single decisions swinging Δ0.69 frac
+        # (8.3 Nm) which drove 150 deg/s wheel bursts and the
+        # over-latch → (then-present ISO) cancel_accel dump → deep-unwind
+        # cycle — the step cap prevents the over-latch at the source. Max
+        # slew is now ~0.33 frac/s (~4 Nm/s); the P-law reverses on
+        # overshoot, speedlimitd handles curve-entry speed (a_y bound).
+        step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
+        # Fast unwind in the LKA regime (route 417, 2026-08-21). STEP_MAX
+        # exists to stop abrupt APPLICATION — seg 27's single decisions
+        # swinging 0.69 frac drove 150 deg/s wheel bursts. RELEASING torque
+        # carries no such hazard below 30 km/h: SAT cannot fling the freed
+        # wheel and stiction holds the angle at zero torque. Without this,
+        # shedding the ~3.9 Nm held through an intersection takes ~1 s at
+        # 4 Nm/s and the driver fights the wheel's return the whole way.
+        #
+        # Only while the step moves torque TOWARD zero. Once past zero the
+        # step is building in the new direction and the normal cap applies
+        # again, so the seg-27 hazard stays covered in both directions.
+        #
+        # NOT gated on curvature: κ_meas collapses through
+        # RELAX_DWELL_KAPPA partway through the exit (seg 2: 0.037 -> 0.003
+        # during the return), so a κ conjunct would switch the fast decay
+        # off exactly when it is needed.
+        if (target_frac - state['torque']) * state['torque'] < 0.0:
+          # Full boost at/below LKA_MAX_V, fading to none by LKA_BLEND_V.
+          # Building torque is still untouched at every speed -- that
+          # conjunct is what keeps the seg-27 abrupt-application hazard
+          # covered, and STEP_MAX's own schedule (move LESS per decision as
+          # v rises) must not be inverted at highway speed.
+          step_max *= float(np.interp(v_true, [LKA_MAX_V, LKA_BLEND_V],
+                                      [UNWIND_STEP_GAIN, 1.0]))
+        step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
+        target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
+        # Post-trip block: no same-side re-push while the release is
+        # still settling. Opposite-side correction passes untouched —
+        # this must never block counter-steer (SAFETY ARCHITECTURE:
+        # the controller may stop pushing, never give up correcting).
+        # Sign pairing: sb_dir is the wheel's breakaway MOTION direction
+        # in ANGLE space (+ = leftward) and torque is OPPOSITE in sign to
+        # angle (torque negative = left), so the push driving that motion
+        # is target_frac * (-sb_dir) > 0. Pinned in both directions by
+        # TestStallBreakawayV2.test_block_suppresses_same_side_only.
+        # Gated on action == 'ramp' (review Minor): by this point the
+        # relax-dwell bridge may have replaced target_frac with a HOLD of
+        # the current torque, which is not a push and must not be zeroed —
+        # zeroing it is the give-up-mid-turn failure mode relax_dwell
+        # exists to prevent.
+        if state['action'] == 'ramp' and state['sb_block'] > 0 \
+           and target_frac * (-state['sb_dir']) > 0.0:
+          target_frac = 0.0
 
         state['target_frac'] = target_frac
         state['tu_demand'] = target_frac if _tu_demand is None else _tu_demand
@@ -1547,57 +1338,56 @@ def on_lat_controller_init(result, lac, CP):
     except Exception:
       pass
 
-    # Free-play take-up (spec §3), per CAN tick, Direct only. Old-side torque
+    # Free-play take-up (spec §3), per CAN tick. Old-side torque
     # has been shed under STEP_MAX; when the ramp crosses zero toward an
     # unseated flank, a TAKEUP_NM step closes the lash (the only un-capped
     # jump), then the remaining ramp re-aims at target_frac from that level.
     _ramp_held = False
-    if state['direct']:
-      tu = state['takeup']
-      _pressed = bool(getattr(CS, 'steeringPressed', False))
-      # A stall-breakaway block owns the torque (its shed): end the take-up.
-      if tu.state == 'taking_up' and state['sb_block'] > 0:
-        tu.reset()
-      # Driver override: end the take-up and resume the held ramp (as on
-      # handover) — driver-driven SZL motion must not confirm a contact and
-      # hand over against the driver. No new take-up fires while pressed.
-      if tu.state == 'taking_up' and _pressed:
-        tu.reset()
-        if state['ramp_frames'] > 0:
-          state['ramp_step'] = (state['target_frac'] - state['torque']) / state['ramp_frames']
-      _was_taking = tu.state == 'taking_up'
-      if state['action'] != 'take_up':
-        state['tu_resume'] = state['action']
-      # Only a ramp headed to a non-zero target on its own side is "on the way
-      # to the new side": a shed to 0 can land a float epsilon past zero.
-      _heading = state['ramp_step'] if (state['ramp_frames'] > 0
-                                        and state['target_frac'] * state['ramp_step'] > 0.0) else 0.0
-      # Guarded like the learner: a take-up fault drops back to the plain
-      # ramp (the 4e5 behaviour), never out of lateral.
-      try:
-        _tu_frac = tu.step(state['torque'], _heading, state['target_frac'], _gap, _angle,
-                           blocked=state['sb_block'] > 0 or _pressed,
-                           demand_frac=state['tu_demand'])
-      except Exception:
-        tu.reset()
-        _tu_frac = None
-      if _tu_frac is not None:
-        state['torque'] = _tu_frac
-        state['action'] = 'take_up'
-        _ramp_held = True
-      else:
-        if state['action'] == 'take_up':
-          state['action'] = state['tu_resume']
-        if _was_taking and state['ramp_frames'] > 0:
-          # Handover on the take-up side with a step-capped target below the
-          # take-up level but a demand at/above it: hold the level rather than
-          # ramp down off the flank just closed; the next decision steps up
-          # from it. A reversed or released target still re-aims normally.
-          _t = state['torque']
-          if (state['target_frac'] * _t > 0.0 and abs(state['target_frac']) < abs(_t)
-              and state['tu_demand'] * _t > 0.0 and abs(state['tu_demand']) >= abs(_t)):
-            state['target_frac'] = _t
-          state['ramp_step'] = (state['target_frac'] - state['torque']) / state['ramp_frames']
+    tu = state['takeup']
+    _pressed = bool(getattr(CS, 'steeringPressed', False))
+    # A stall-breakaway block owns the torque (its shed): end the take-up.
+    if tu.state == 'taking_up' and state['sb_block'] > 0:
+      tu.reset()
+    # Driver override: end the take-up and resume the held ramp (as on
+    # handover) — driver-driven SZL motion must not confirm a contact and
+    # hand over against the driver. No new take-up fires while pressed.
+    if tu.state == 'taking_up' and _pressed:
+      tu.reset()
+      if state['ramp_frames'] > 0:
+        state['ramp_step'] = (state['target_frac'] - state['torque']) / state['ramp_frames']
+    _was_taking = tu.state == 'taking_up'
+    if state['action'] != 'take_up':
+      state['tu_resume'] = state['action']
+    # Only a ramp headed to a non-zero target on its own side is "on the way
+    # to the new side": a shed to 0 can land a float epsilon past zero.
+    _heading = state['ramp_step'] if (state['ramp_frames'] > 0
+                                      and state['target_frac'] * state['ramp_step'] > 0.0) else 0.0
+    # Guarded like the learner: a take-up fault drops back to the plain
+    # ramp (the 4e5 behaviour), never out of lateral.
+    try:
+      _tu_frac = tu.step(state['torque'], _heading, state['target_frac'], _gap, _angle,
+                         blocked=state['sb_block'] > 0 or _pressed,
+                         demand_frac=state['tu_demand'])
+    except Exception:
+      tu.reset()
+      _tu_frac = None
+    if _tu_frac is not None:
+      state['torque'] = _tu_frac
+      state['action'] = 'take_up'
+      _ramp_held = True
+    else:
+      if state['action'] == 'take_up':
+        state['action'] = state['tu_resume']
+      if _was_taking and state['ramp_frames'] > 0:
+        # Handover on the take-up side with a step-capped target below the
+        # take-up level but a demand at/above it: hold the level rather than
+        # ramp down off the flank just closed; the next decision steps up
+        # from it. A reversed or released target still re-aims normally.
+        _t = state['torque']
+        if (state['target_frac'] * _t > 0.0 and abs(state['target_frac']) < abs(_t)
+            and state['tu_demand'] * _t > 0.0 and abs(state['tu_demand']) >= abs(_t)):
+          state['target_frac'] = _t
+        state['ramp_step'] = (state['target_frac'] - state['torque']) / state['ramp_frames']
 
     # Apply per-frame ramp step. Panda enforces wire-rate (STEER_DELTA_UP)
     # downstream; large ramp_step (Δ > 5 Nm spread over 50 frames) gets
@@ -1605,12 +1395,11 @@ def on_lat_controller_init(result, lac, CP):
     if state['ramp_frames'] > 0 and not _ramp_held:
       state['torque'] = float(np.clip(state['torque'] + state['ramp_step'], -1.0, 1.0))
       state['ramp_frames'] -= 1
-      # Direct: a ramp that completes on a 0 target ends at exactly 0.0.
-      # (0 - t)/n applied n times lands at +/-eps about half the time; +eps on
-      # the new side makes the later genuine reversal fail take-up's
-      # torque*s <= 0 test, and the take-up is silently lost. Direct off
-      # keeps the float residue (bit-identical).
-      if state['direct'] and state['ramp_frames'] == 0 and state['target_frac'] == 0.0:
+      # A ramp that completes on a 0 target ends at exactly 0.0: (0 - t)/n
+      # applied n times lands at +/-eps about half the time, and +eps on the
+      # new side makes the later genuine reversal fail take-up's torque*s <= 0
+      # test, so the take-up is silently lost.
+      if state['ramp_frames'] == 0 and state['target_frac'] == 0.0:
         state['torque'] = 0.0
 
     err = state['desired'] - state['measured']  # for logging only
@@ -1650,10 +1439,6 @@ def on_lat_controller_init(result, lac, CP):
           'jerk_pred': float(state['jerk_pred']),
           'hold_f': float(state['hold_f']),
           'hold_cap': float(state['hold_cap']),
-          'hold_band': float(HOLD_BAND),                      # stiction hold trigger (rad)
-          'hb_enter': float(HOLD_BAND_ENTER if _hold_hyst_on else HOLD_BAND),  # leave-rest threshold (rad); drive self-label: 0.0015=hysteresis, 0.001=kill-switched, absent=old build
-          'derr_ema': float(state['derr_ema']),               # slow (2 s) error EMA driving the persistent-lean escape (rad)
-          'at_rest': bool(state['at_rest']),                  # hysteresis decision state (observable even when action is cancel_tol/idle, where action is not a proxy for it)
           'relax_ticks': int(state['relax_ticks']),
           'sb_state': int(state['sb_state']),                 # stall/breakaway v2: 0=idle, 1=armed, 2=episode
           'sb_trips': int(state['sb_trips']),                 # cumulative trips this drive
@@ -1674,7 +1459,6 @@ def on_lat_controller_init(result, lac, CP):
           'pressed': bool(getattr(CS, 'steeringPressed', False)),
           'lat_delay': float(lat_delay) if lat_delay else 0.0,             # s, as given by controlsd
           # Direct Tracking (spec §5). Contacts 0.0 = not known yet.
-          'direct': bool(state['direct']),                    # mode latched this engagement
           'tu_state': state['takeup'].state,                  # right / left (seated) / taking_up / unknown
           'c_right': float(_contacts[0]) if _contacts else 0.0,   # gap under right torque, deg
           'c_left': float(_contacts[1]) if _contacts else 0.0,    # gap under left torque, deg

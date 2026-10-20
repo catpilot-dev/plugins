@@ -1,26 +1,12 @@
 """Tests for the BMW lateral controller's update() call site
 (on_lat_controller_init / update()).
 
-2026-07-28 — SAFETY ARCHITECTURE change (lateral never gives up in a turn).
-The ISO accel/jerk cancel machinery was removed: keeping lateral acceleration
-within comfort/ISO limits is speedlimitd's job (it caps vEgo for curves), and
-the lateral controller's contract is to track the commanded curvature, always.
-Draining torque mid-turn converted a comfort exceedance into a trajectory
-failure (car runs wide) — the incident record (routes 326, 385 seg27, 2ba
-1.29 m off-lane, 3ce hunting, 3cf seg15 firing 75% of a sharp curve) shows
-every cancel caused harm and none prevented any.
-
-These tests pin, at the update() call-site level:
-  - Formerly-cancelling conditions (overshoot + high measured a_y + into-turn
-    torque) now produce normal P-tracking: torque is commanded toward κ_des,
-    NOT drained to zero, and the action is never a cancel. (This test is RED
-    against the pre-removal controller — it cancel_accel'd instead of ramping.)
-  - The NON-cancel decision paths (ramp, hold_zero, hold_curve, relax_dwell)
-    still work unchanged.
-  - cancel_tol — which is NOT ISO machinery (it is HOLD_BAND boundary hygiene:
-    stop an in-flight push ramp once the error falls into the on-target band,
-    draining to the sign-guarded, capped hold, 0 on straights) — still fires
-    identically in its boundary case.
+The controller tracks the commanded curvature with Direct Tracking as its only
+law: no rest state or hold band, the P target on the full error every decision,
+sign-guarded reversals with free-play take-up, the hold-floor / relax-dwell
+curve machinery, stall-breakaway v2, the LKA-regime unwind boost, Slope
+Compensation. It never drains torque to respect an a_y ceiling (speedlimitd
+owns a_y through v); the P-law reversing on overshoot IS the correction.
 
 Harness notes:
   - cereal.messaging is a MagicMock (test_helpers.install_all_mocks); we
@@ -33,6 +19,8 @@ Harness notes:
     seed state['torque'] directly (bypassing the ramp) to control the
     torque/measured sign relationship precisely, and read back
     state['action'] / state['target_frac'] afterward.
+  - The controller patches lac.update only when plugins.lane_keeping.register
+    is loaded with HOOK_READY (ruling R10); mock_deps installs that stub.
 """
 import math
 import os
@@ -54,6 +42,9 @@ if _PLUGIN_DIR not in sys.path:
 from test_helpers import install_all_mocks
 
 
+_LK_REGISTER = 'plugins.lane_keeping.register'
+
+
 @pytest.fixture(autouse=True)
 def mock_deps(monkeypatch):
   install_all_mocks(monkeypatch)
@@ -61,6 +52,8 @@ def mock_deps(monkeypatch):
   # keep every test off the real plugin data dir (and let tests assert on it).
   import config
   monkeypatch.setattr(config, 'write_plugin_param', MagicMock())
+  # The controller patches lac.update only with lane_keeping loaded (ruling R10).
+  monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace(HOOK_READY=True))
 
 
 class FakeSubMaster:
@@ -85,48 +78,27 @@ class FakeSubMaster:
     return self.lp
 
 
-def _make_controller(monkeypatch, wheelbase=2.66, hold_hyst=None, stall_v2=None, direct=None,
-                     contacts=None, slope=None):
+def _make_controller(monkeypatch, wheelbase=2.66, stall_v2=None, contacts=None, slope=None):
   """Load bmw.latcontroller and construct a controller instance wired to a
   FakeSubMaster. Returns (lac, fake_sm, mod, state).
 
-  hold_hyst / stall_v2 / direct: if not None, patches config.read_plugin_param
-  so HoldHysteresis / StallBreakaway / DirectTracking reads as '1' (True) or
-  '0' (False) — must
-  happen BEFORE
-  on_lat_controller_init runs, because the param is read exactly once at
-  construction (review fix, Important 4: no more per-tick/cached re-read),
-  so patching it *after* construction has no effect. Patches the `config`
-  module's attribute, not `mod`'s (review fix, Important 2:
-  on_lat_controller_init does `from config import read_plugin_param` at
-  function scope, mirroring bmw/carstate.py and speedlimitd/speedlimitd.py,
-  so `bmw.latcontroller` has no `read_plugin_param` module attribute to
-  patch — same pattern as speedlimitd/tests/test_speedlimitd.py's
-  `monkeypatch.setattr(config, 'read_plugin_param', ...)`).
-
-  Every param this controller reads goes through that one call, so the stub
-  dispatches on the param KEY rather than returning one value for every key
-  (2026-08-13 — a key-blind stub would make one param silently inherit
-  another's test value). A kwarg left None falls through to the `default`
-  argument production passes (''), i.e. the real unpatched-param behaviour
-  for that key. contacts, if not None, is returned verbatim for DirectContacts
-  (the persisted "c_right,c_left" seed).
+  stall_v2 / slope: if not None, StallBreakaway / SlopeCompensation read as
+  '1' (True) or '0' (False); contacts is returned verbatim for DirectContacts.
+  Patched on the `config` module BEFORE on_lat_controller_init runs (the
+  controller does `from config import read_plugin_param` at function scope and
+  reads StallBreakaway once, at construction). The stub dispatches on the param
+  KEY; a kwarg left None falls through to the production default ('').
   """
   import cereal.messaging as messaging
   fake_sm = FakeSubMaster([])
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
 
   import bmw.latcontroller as mod
-  if hold_hyst is not None or stall_v2 is not None or direct is not None \
-     or contacts is not None or slope is not None:
+  if stall_v2 is not None or contacts is not None or slope is not None:
     import config
     def _param_stub(plugin_id, key, default=''):
-      if key == 'HoldHysteresis' and hold_hyst is not None:
-        return '1' if hold_hyst else '0'
       if key == 'StallBreakaway' and stall_v2 is not None:
         return '1' if stall_v2 else '0'
-      if key == 'DirectTracking' and direct is not None:
-        return '1' if direct else '0'
       if key == 'DirectContacts' and contacts is not None:
         return contacts
       if key == 'SlopeCompensation' and slope is not None:
@@ -239,52 +211,6 @@ class TestFormerlyCancellingNowTracks:
 
 
 # ============================================================
-# (2) cancel_tol still fires, unchanged. NOT ISO machinery — it is HOLD_BAND
-# boundary hygiene: an in-flight PUSH ramp (action=='ramp', ramp_frames>0,
-# |target_frac| > FRICTION) whose error has fallen into the on-target band
-# (|δ_err| ≤ 1.2·HOLD_BAND) is stopped and drained to the sign-guarded, capped
-# hold (hold_f·torque) instead of continuing toward a stale push target.
-# ============================================================
-
-class TestCancelTolStillFires:
-  def test_boundary_case_drains_to_held(self, monkeypatch):
-    """κ_des ≈ κ_meas (δ_err ≈ 0, inside the band) mid push-ramp: cancel_tol
-    fires and re-arms the ramp toward the held value (hold_f·torque, capped),
-    NOT toward the stale push target and NOT to zero."""
-    lac, fake_sm, mod, state = _make_controller(monkeypatch)
-    v = 20.0
-    kappa = 0.006          # δ_des = δ_meas -> δ_err ≈ 0, inside 1.2·HOLD_BAND
-    _set_measured(fake_sm, v, kappa)
-    # held = hold_f(=1.0)·0.15 = 0.15, under the production hold_cap (0.192 at
-    # v=20, κ=0.006 on the fixed 0.65 s CONTROL_HORIZON_S)
-    state['torque'] = 0.15
-    state['target_frac'] = 0.6     # stale in-flight push target (!= held, arms re-drain)
-    state['ramp_frames'] = 5       # a ramp still in flight
-    state['action'] = 'ramp'
-    state['tick_count'] = 0
-
-    _call_update(lac, kappa, v_ego=v)
-
-    assert state['action'] == 'cancel_tol'
-    assert state['target_frac'] == pytest.approx(0.15)  # drained to the hold, not 0.6, not 0
-    assert state['ramp_frames'] > 0
-
-  def test_cancel_tol_does_not_fire_off_target(self, monkeypatch):
-    """Well outside the on-target band, cancel_tol must NOT fire (it is not a
-    general drain — it only stops a ramp that already arrived)."""
-    lac, fake_sm, mod, state = _make_controller(monkeypatch)
-    v = 20.0
-    _set_measured(fake_sm, v, 0.001)     # δ_err large vs κ_des below
-    state['torque'] = 0.2
-    state['target_frac'] = 0.3
-    state['ramp_frames'] = 5
-    state['action'] = 'ramp'
-    state['tick_count'] = 0
-    _call_update(lac, 0.010, v_ego=v)    # κ_des far from κ_meas
-    assert state['action'] != 'cancel_tol'
-
-
-# ============================================================
 # (3) NON-cancel decision paths still work (ramp / hold_zero / hold_curve /
 # relax_dwell). These pass on both the pre- and post-removal controller — they
 # exercise the paths the removal must leave untouched.
@@ -306,35 +232,7 @@ class TestNonCancelPaths:
     assert state['target_frac'] > 0.0    # pushing into the turn
     assert state['ramp_frames'] > 0
 
-  def test_on_target_straight_holds_zero(self, monkeypatch):
-    """On-target with low commanded a_y (straight): drain to zero, stiction
-    holds."""
-    lac, fake_sm, mod, state = _make_controller(monkeypatch)
-    v = 20.0
-    _set_measured(fake_sm, v, 0.0)
-    state['torque'] = 0.0
-    state['target_frac'] = 0.0
-    state['ramp_frames'] = 0
-    state['action'] = 'idle'
-    state['tick_count'] = 999
-    _call_update(lac, 0.0, v_ego=v)
-    assert state['action'] == 'hold_zero'
 
-  def test_on_target_curve_holds_curve(self, monkeypatch):
-    """On-target in a curve with high commanded a_y: keep the standing torque
-    (hold_curve), not drain."""
-    lac, fake_sm, mod, state = _make_controller(monkeypatch)
-    v = 20.0
-    kappa = 0.006
-    _set_measured(fake_sm, v, kappa)
-    state['torque'] = 0.15           # under the production hold_cap (0.192 here)
-    state['target_frac'] = 0.15
-    state['ramp_frames'] = 0
-    state['action'] = 'hold_curve'   # NOT 'ramp' -> cancel_tol gate stays shut
-    state['tick_count'] = 999
-    _call_update(lac, kappa, v_ego=v)
-    assert state['action'] == 'hold_curve'
-    assert state['target_frac'] == pytest.approx(0.15)
 
   def test_counter_turn_torque_runs_normal_decision(self, monkeypatch):
     """Deep in a measured curve with torque already opposing the turn (an
@@ -367,176 +265,6 @@ class TestNonCancelPaths:
     _call_update(lac, 0.001, v_ego=v)
     assert state['action'] not in _CANCELS
 
-
-# ============================================================
-# Entry/settle hysteresis on the HOLD_BAND rest band (2026-08-13, route 3f4
-# data). One shared threshold made the controller flicker across the
-# boundary ~89x/min on straights (error noise sigma = 0.00081 rad); leaving
-# rest now requires clearing HOLD_BAND_ENTER (0.0015), settling back still
-# only needs HOLD_BAND (0.001) -- the settle point is unchanged.
-#
-# _drive_to(lac, sm, state, E) places delta_err at exactly E rad (measured
-# pinned to 0, so delta_err == delta_des == atan(desired*L); desired is
-# chosen as tan(E)/L so atan(tan(E)) round-trips to E) and forces the cadence
-# decision to run this tick (tick_count = 999). Every scenario below was
-# verified against the real controller before being pinned here -- see
-# hysteresis-report.md for the derivation, including the one case
-# (E=0.0012 continuing a correction) where the decision that tick is
-# cancel_tol rather than a fresh hysteresis-branch evaluation: at_rest is
-# only ever written inside the cadence decision block, so when cancel_tol
-# preempts that block (it fires first, resets tick_count to 0, and the
-# cadence condition then reads false), at_rest simply keeps whatever value
-# the prior decision left it at -- which is exactly the "still correcting"
-# assertion this test makes, just reached by a different code path than the
-# plain else-branch case exercises on its own.
-# ============================================================
-
-def _drive_to(lac, sm, state, err_rad, v=20.0, wheelbase=2.66):
-  """Force delta_err to err_rad (measured=0) and run one cadence decision."""
-  desired = math.tan(err_rad) / wheelbase
-  _set_measured(sm, v, 0.0)
-  state['tick_count'] = 999
-  _call_update(lac, desired, v_ego=v)
-
-
-def test_between_settle_and_enter_from_rest_stays_holding(monkeypatch):
-  """err = 0.0012 sustained from a resting controller: legacy single
-  threshold (0.0012 > HOLD_BAND=0.001) would ramp; hysteresis's leave-rest
-  gate (HOLD_BAND_ENTER=0.0015) is not cleared, so it must stay holding."""
-  lac, sm, mod, state = _make_controller(monkeypatch)
-  _drive_to(lac, sm, state, 0.0012)
-  assert state['at_rest'] is True
-  assert state['action'] in ('hold_zero', 'hold_curve')
-
-
-def test_beyond_enter_leaves_rest(monkeypatch):
-  """err = 0.0018 sustained clears HOLD_BAND_ENTER (0.0015): leaves rest."""
-  lac, sm, mod, state = _make_controller(monkeypatch)
-  _drive_to(lac, sm, state, 0.0018)
-  assert state['at_rest'] is False
-  assert state['action'] == 'ramp'
-
-
-def test_correcting_continues_below_enter_until_settle(monkeypatch):
-  """Leave rest at 0.0018, then hold err below HOLD_BAND_ENTER but above the
-  HOLD_BAND settle point: must NOT snap back to holding.
-
-  Two sub-cases, in separate controllers so neither's decision path can mask
-  the other (review fix, Important 1):
-
-  Case 1 -- err=0.0012, the cancel_tol boundary (1.2*HOLD_BAND). cancel_tol
-  fires first (it's HOLD_BAND boundary hygiene on an in-flight push ramp,
-  <=, unrelated to this state machine) and resets tick_count to 0, which
-  makes the cadence condition read false THIS tick -- so the hysteresis
-  decision block (where at_rest is written) never runs, and at_rest merely
-  carries forward its prior value. That is a real, worth-pinning interaction
-  (a regression that made cancel_tol stop preempting here would matter), but
-  by itself it does NOT exercise the settle branch's own comparison -- a
-  mutant that widens the settle branch from `<= HOLD_BAND` to `<= _enter`
-  still passes this case, because the branch is never reached.
-
-  Case 2 -- err=0.0014: strictly above the cancel_tol gate (0.0012, so
-  cancel_tol does NOT preempt) and strictly below HOLD_BAND_ENTER (0.0015).
-  This is the case that actually reaches and evaluates the settle
-  comparison: unmutated, 0.0014 > HOLD_BAND (0.001) so it stays correcting
-  (ramp); under the rejected single-threshold-widening mutation (settle
-  branch changed to `<= _enter` = 0.0015), 0.0014 would incorrectly settle.
-  """
-  # Case 1: cancel_tol boundary.
-  lac, sm, mod, state = _make_controller(monkeypatch)
-  _drive_to(lac, sm, state, 0.0018)
-  assert state['at_rest'] is False
-  _drive_to(lac, sm, state, 0.0012)
-  assert state['action'] == 'cancel_tol'
-  assert state['at_rest'] is False
-
-  # Case 2: the settle branch itself, isolated from cancel_tol.
-  lac2, sm2, mod2, state2 = _make_controller(monkeypatch)
-  _drive_to(lac2, sm2, state2, 0.0018)
-  assert state2['at_rest'] is False
-  _drive_to(lac2, sm2, state2, 0.0014)
-  assert state2['at_rest'] is False
-  assert state2['action'] == 'ramp'
-
-
-def test_settle_returns_to_rest(monkeypatch):
-  """Continuing from the correcting state, dropping err to 0.0008 (at/below
-  the unchanged HOLD_BAND settle point) returns to rest."""
-  lac, sm, mod, state = _make_controller(monkeypatch)
-  _drive_to(lac, sm, state, 0.0018)
-  _drive_to(lac, sm, state, 0.0012)
-  assert state['at_rest'] is False
-  _drive_to(lac, sm, state, 0.0008)
-  assert state['at_rest'] is True
-  assert state['action'] in ('hold_zero', 'hold_curve')
-
-
-def test_killswitch_reproduces_legacy_single_threshold(monkeypatch):
-  """HoldHysteresis='0': both thresholds collapse to HOLD_BAND, reproducing
-  the legacy single-comparison decision-for-decision. This is the
-  legacy-identity pin: err 0.0012 (> HOLD_BAND) must RAMP, err 0.0008
-  (<= HOLD_BAND) must hold, and err exactly HOLD_BAND (the boundary itself)
-  must hold too -- legacy was `abs(delta_err) <= HOLD_BAND`, a <=, so
-  equality is on-target. (Review fix, Minor 4: the doc claims this test pins
-  "including the boundary case"; it didn't until this third construction was
-  added -- 0.0012/0.0008 both sit strictly off the boundary.)
-
-  The boundary value itself: `desired = tan(HOLD_BAND)/L` round-trips through
-  `atan(desired*L)` to bit-exact 0.001 at this L (verified: no float-precision
-  hair to chase here), so this asserts the exact `<=` behaviour directly
-  rather than approximately."""
-  lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=False)
-  _drive_to(lac, sm, state, 0.0012)
-  assert state['at_rest'] is False
-  assert state['action'] == 'ramp'
-
-  lac2, sm2, mod2, state2 = _make_controller(monkeypatch, hold_hyst=False)
-  _drive_to(lac2, sm2, state2, 0.0008)
-  assert state2['at_rest'] is True
-  assert state2['action'] in ('hold_zero', 'hold_curve')
-
-  lac3, sm3, mod3, state3 = _make_controller(monkeypatch, hold_hyst=False)
-  boundary_err = 0.001   # == HOLD_BAND in latcontroller.py
-  _drive_to(lac3, sm3, state3, boundary_err)
-  assert state3['delta_err'] == boundary_err   # bit-exact, see docstring
-  assert state3['at_rest'] is True
-  assert state3['action'] in ('hold_zero', 'hold_curve')
-
-
-def test_default_is_enabled(monkeypatch):
-  """No param patched (hold_hyst left None -> real
-  read_plugin_param, which sees no param file and returns the default ''):
-  hysteresis is active by default. err 0.0012 stays holding, the same
-  scenario that pins hysteresis-on behaviour in
-  test_between_settle_and_enter_from_rest_stays_holding above, here without
-  any monkeypatch at all."""
-  lac, sm, mod, state = _make_controller(monkeypatch)
-  _drive_to(lac, sm, state, 0.0012)
-  assert state['at_rest'] is True
-  assert state['action'] in ('hold_zero', 'hold_curve')
-
-
-def test_hb_enter_telemetry_reflects_killswitch(monkeypatch):
-  """Review fix, Minor 3: `hb_enter` is documented as each drive's A/B
-  self-label (LATERAL_CONTROLLER.md: 0.0015 = hysteresis active, 0.001 =
-  kill-switched). Hardcoding `float(HOLD_BAND_ENTER)` in the payload would
-  pass every other test in this file (none of them read `hb_enter`) while
-  silently mislabeling every kill-switched drive. Pin both legs directly
-  from the published telemetry payload, not from the internal `_enter`
-  local."""
-  lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=False)
-  payloads = []
-  state['lat_pub'] = SimpleNamespace(send=payloads.append)
-  _drive_to(lac, sm, state, 0.0008)
-  assert payloads and payloads[-1]['hb_enter'] == pytest.approx(0.001)
-
-  lac2, sm2, mod2, state2 = _make_controller(monkeypatch, hold_hyst=True)
-  payloads2 = []
-  state2['lat_pub'] = SimpleNamespace(send=payloads2.append)
-  _drive_to(lac2, sm2, state2, 0.0008)
-  assert payloads2 and payloads2[-1]['hb_enter'] == pytest.approx(0.0015)
-
-
 # ============================================================
 # Persistent-lean escape (2026-08-14, route 3f8 on-car verdict). The entry
 # gap (0.001, 0.0015) rejects symmetric noise but also hid a constant
@@ -553,155 +281,19 @@ def test_hb_enter_telemetry_reflects_killswitch(monkeypatch):
 
 _EMA_ESCAPE = 0.0012   # == HOLD_EMA_ESCAPE in latcontroller.py
 
-
-class TestPersistentLeanEscape:
-  def test_sustained_lean_escapes_rest(self, monkeypatch):
-    """delta_err = 0.0014 sits inside the entry gap: the plain hysteresis
-    would rest forever. The 2 s EMA climbs past 0.0012 (~78 ticks) and forces
-    the correction."""
-    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
-    for _ in range(150):
-      _drive_to(lac, sm, state, 0.0014)
-    assert state['at_rest'] is False
-    assert state['action'] == 'ramp'
-    assert abs(state['derr_ema']) > _EMA_ESCAPE
-
-  def test_lean_at_threshold_never_escapes(self, monkeypatch):
-    """delta_err = 0.0012 exactly: the EMA converges to 0.0012 from below and
-    the comparison is strict >, so the escape never fires. This is also what
-    keeps test_between_settle_and_enter_from_rest_stays_holding valid.
-
-    Convergence alone does NOT pin the strictness: after 200 ticks the EMA is
-    only ~0.0011924, where `>` and `>=` are indistinguishable (mutation
-    survived review). So the second phase forces the EMA to the threshold
-    EXACTLY and keeps it there: with derr_ema == delta_err == 0.0012 the EMA
-    update is bit-identity (x + a*(x - x) == x), so every subsequent tick
-    evaluates the comparison precisely AT 0.0012 -- `>` holds rest, `>=`
-    escapes."""
-    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
-    for _ in range(200):
-      _drive_to(lac, sm, state, _EMA_ESCAPE)
-    assert state['at_rest'] is True
-    assert state['action'] in ('hold_zero', 'hold_curve')
-    assert abs(state['derr_ema']) <= _EMA_ESCAPE
-
-    # Exact-threshold pin for the strict `>`.
-    state['derr_ema'] = _EMA_ESCAPE
-    for _ in range(5):
-      _drive_to(lac, sm, state, _EMA_ESCAPE)
-      assert state['derr_ema'] == _EMA_ESCAPE   # bit-identity, no drift
-      assert state['at_rest'] is True
-    assert state['action'] in ('hold_zero', 'hold_curve')
-
-  def test_symmetric_flicker_does_not_escape(self, monkeypatch):
-    """The calm-preservation pin: +/-0.0013 alternating every tick (both legs
-    inside the entry gap) averages to ~0 over 2 s, so the escape stays quiet
-    and the controller keeps resting."""
-    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
-    for i in range(200):
-      _drive_to(lac, sm, state, 0.0013 if i % 2 == 0 else -0.0013)
-      assert state['at_rest'] is True
-    assert abs(state['derr_ema']) < _EMA_ESCAPE
-
-  def test_ema_survives_settle_and_escape_fires(self, monkeypatch):
-    """Mutation pin for the settle re-prime's REMOVAL (route 3f9, 2026-08-15).
-    The re-prime reset derr_ema to the settle-point error, which starved the
-    escape to zero on-car fires. A still-high lean average must survive the
-    settle and immediately re-exit rest -- that is the escape working."""
-    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
-    _drive_to(lac, sm, state, 0.0018)
-    assert state['at_rest'] is False
-    # Same shape as test_settle_returns_to_rest: the 0.0012 tick is consumed
-    # by cancel_tol (which preempts the cadence decision), so the settle
-    # branch is only reached on the following tick.
-    _drive_to(lac, sm, state, 0.0012)
-    assert state['at_rest'] is False
-
-    state['derr_ema'] = 0.005              # standing lean, far past the escape point
-    _drive_to(lac, sm, state, 0.0008)      # settles (<= HOLD_BAND)
-    assert state['at_rest'] is True
-    # NOT re-primed to the small current error: only normal EMA decay applies.
-    assert state['derr_ema'] != pytest.approx(state['delta_err'])
-    assert abs(state['derr_ema']) > 0.003
-
-    _drive_to(lac, sm, state, 0.0008)      # escape fires right back out of rest
-    assert state['at_rest'] is False
-    assert abs(state['derr_ema']) > _EMA_ESCAPE
-
-  def test_killswitch_disables_escape(self, monkeypatch):
-    """Mutation pin for the `_hold_hyst_on and ...` gate: with the
-    kill-switch off, an EMA well past the escape threshold must not move
-    at_rest -- HoldHysteresis='0' is exact legacy behaviour."""
-    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=False)
-    state['derr_ema'] = 0.005
-    for _ in range(3):
-      _drive_to(lac, sm, state, 0.0009)    # below HOLD_BAND: legacy holds
-      assert state['at_rest'] is True
-    # The escape condition WOULD have been true throughout (decays slowly).
-    assert abs(state['derr_ema']) > _EMA_ESCAPE
-    assert state['action'] in ('hold_zero', 'hold_curve')
-
-  def test_telemetry_has_derr_ema(self, monkeypatch):
-    lac, sm, mod, state = _make_controller(monkeypatch, hold_hyst=True)
-    payloads = []
-    state['lat_pub'] = SimpleNamespace(send=payloads.append)
-    _drive_to(lac, sm, state, 0.0008)
-    assert payloads
-    assert isinstance(payloads[-1]['derr_ema'], float)
-    assert payloads[-1]['derr_ema'] == pytest.approx(state['derr_ema'])
-
-
-  def test_telemetry_has_steering_signals(self, monkeypatch):
-    """Debug signals ride the plugin bus with the controller state (2026-10-17):
-    wheel angle, servo-to-column gap (slack/windup), steering rate, driver
-    pressed, and the lat_delay the controller was given."""
-    lac, sm, mod, state = _make_controller(monkeypatch)
-    payloads = []
-    state['lat_pub'] = SimpleNamespace(send=payloads.append)
-    _set_measured(sm, 20.0, 0.0)
-    CS = SimpleNamespace(vEgo=20.0, steeringAngleDeg=-1.5, steeringAngleOffsetDeg=-14.2,
-                         steeringRateDeg=3.0, steeringPressed=True)
-    lac.update(True, CS, None, None, False, 0.001, False, 0.6)
-    p = payloads[-1]
-    assert p['angle'] == pytest.approx(-1.5)
-    assert p['servo_gap'] == pytest.approx(-14.2)
-    assert p['steer_rate'] == pytest.approx(3.0)
-    assert p['pressed'] is True
-    assert p['lat_delay'] == pytest.approx(0.6)
-
-  def test_telemetry_tolerates_a_minimal_car_state(self, monkeypatch):
-    lac, sm, mod, state = _make_controller(monkeypatch)
-    payloads = []
-    state['lat_pub'] = SimpleNamespace(send=payloads.append)
-    _set_measured(sm, 20.0, 0.0)
-    _call_update(lac, 0.001, v_ego=20.0)
-    assert payloads and payloads[-1]['servo_gap'] == 0.0 and payloads[-1]['pressed'] is False
-
 # ============================================================
 # FRICTION retirement (2026-08-13): the two epsilon-gates are DELETED.
 # These tests pin the deletions — restoring either conjunct fails here.
 # ============================================================
 
 class TestFrictionGatesDeleted:
-  def test_cancel_tol_fires_even_for_tiny_inflight_targets(self, monkeypatch):
-    """Pre-deletion, |target_frac| <= 0.05 blocked cancel_tol and tiny stale
-    ramps ran to completion. Now arrival hygiene applies to every push ramp."""
-    lac, sm, mod, state = _make_controller(monkeypatch)
-    _set_measured(sm, 20.0, 0.0005)          # measured ~ desired: err in band
-    state['torque'] = 0.02
-    state['target_frac'] = 0.03              # tiny — the old gate blocked this
-    state['ramp_frames'] = 5
-    state['action'] = 'ramp'
-    state['tick_count'] = 0                  # not a cadence decision tick
-    _call_update(lac, 0.0005, steering_angle_deg=0.0)
-    assert state['action'] == 'cancel_tol'
 
   def test_deep_relax_arms_even_with_tiny_held_torque(self, monkeypatch):
     """Pre-deletion, |torque| <= 0.05 blocked the dwell from arming."""
     lac, sm, mod, state = _make_controller(monkeypatch)
     _set_measured(sm, 9.0, 0.012)            # deep curve, |κ_meas| > 0.010
     state['torque'] = 0.02                   # tiny — the old gate blocked this
-    state['action'] = 'hold_curve'
+    state['action'] = 'idle'
     state['tick_count'] = 0
     before = state['relax_ticks']
     # overshoot-side error: desired same side but smaller than measured
@@ -739,7 +331,7 @@ class TestRelaxDwellLowSpeedGate:
     lac, sm, mod, state = _make_controller(monkeypatch)
     _set_measured(sm, v, 0.012)          # deep curve, |κ_meas| > RELAX_DWELL_KAPPA
     state['torque'] = 0.30
-    state['action'] = 'hold_curve'
+    state['action'] = 'idle'
     state['tick_count'] = 0
     before = state['relax_ticks']
     # overshoot-side error: desired same side but smaller than measured
@@ -881,7 +473,7 @@ def _dwell_tick(monkeypatch, *, v, relax_ticks):
   state['torque'] = -0.3
   state['target_frac'] = -0.3
   state['ramp_frames'] = 0
-  state['action'] = 'hold_curve'
+  state['action'] = 'idle'
   state['relax_ticks'] = relax_ticks
   state['tick_count'] = 999            # force the cadence decision
   _call_update(lac, 0.001, v_ego=v)
@@ -1012,116 +604,12 @@ def _kappa_for_delta_err(kappa_des, delta_err, L=2.66):
 
   δ_err = atan(κ_des·L) − atan(κ_meas·L), so invert the second atan. Solving
   it rather than approximating κ_des − δ_err/L matters here: the band is
-  1.2·HOLD_BAND = 0.0012 rad wide and at the intersection operating point
+  0.0012 rad wide and at the intersection operating point
   (κ ≈ 0.1) the atan is well off its linear region.
   """
   return math.tan(math.atan(kappa_des * L) - delta_err) / L
 
 
-def _cancel_tol_tick(monkeypatch, *, v, torque, delta_err, kappa_des=0.10,
-                     tick_count=2):
-  """One tick arranged to land in cancel_tol, with the cadence part-spent.
-
-  Mirrors the measured route-418 seg-4 exit: a converged push ramp
-  (target_frac == torque) still in flight when δ_err transits the on-target
-  band. lat_delay=0.6 → model_action_t 0.65 → cadence 6 livePose ticks, the
-  production value, so a part-spent tick_count=2 cannot reach the cadence
-  inside the tick and the counter itself stays observable.
-  """
-  lac, sm, mod, state = _make_controller(monkeypatch)
-  _set_measured(sm, v, _kappa_for_delta_err(kappa_des, delta_err))
-  state['torque'] = torque
-  state['target_frac'] = torque      # converged — the retarget is a no-op
-  state['ramp_frames'] = 8           # a ramp still in flight
-  state['action'] = 'ramp'
-  state['tick_count'] = tick_count
-  _call_update(lac, kappa_des, v_ego=v, lat_delay=0.6)
-  return state, mod
-
-
-class TestCancelTolCadenceOnReversal:
-  """Route 418 (2026-08-22), what was left of the intersection-exit fight.
-
-  With the relax-dwell freeze gone and the unwind step boosted, the seg-4
-  exit still took 560 ms to shed 3.12 Nm while the wheel came back at up to
-  228 deg/s. The telemetry shows where it went: hold_f was 1.0, so cancel_tol's
-  retarget (held = hold_f·torque) equalled the standing torque exactly and
-  re-armed nothing — its ONLY effect was `tick_count = 0`. ramp_frames then ran
-  out, the action fell to `idle`, and torque sat frozen at 0.2598 frac for five
-  ticks until the cadence came round again. 250 ms of the 560 was pure
-  rescheduling.
-
-  cancel_tol cannot tell ARRIVAL from TRANSIT. It fires on |δ_err| ≤
-  1.2·HOLD_BAND whichever way the error is travelling. On arrival, restarting
-  the cadence is right: the error is settling and an immediate re-decision
-  would only re-push. On transit — δ_err crossing zero on its way out the far
-  side, which is what a driver hauling the wheel back looks like — restarting
-  it is exactly wrong, and buys a full extra cadence of stale standing torque.
-
-  Transit is readable without new state: δ_err and the standing torque on
-  opposite sides means the next P target opposes what we hold, i.e. the next
-  decision sheds (target_nm ∝ δ_err). So on reversal the cadence is left to
-  run and the decision lands on its original schedule.
-
-  Kept narrow, per the LKA-only ruling that shaped the dwell gate:
-    - below LKA_MAX_V only, the same regime conjunct the unwind boost uses;
-    - only past UNWIND_CADENCE_TQ of standing torque. Below one step_max
-      there is nothing to gain — the next decision can shed it whole in a
-      single step whenever it lands — and holding the reset there keeps
-      straight-line band hygiene, and its settling behaviour, untouched.
-  """
-
-  V_LKA = 4.0        # 14 km/h, an intersection
-  TORQUE = 0.26      # the measured seg-4 exit hold (3.1 Nm)
-  DERR = 0.0005      # inside 1.2·HOLD_BAND (0.0012 rad) either way
-
-  def test_reversal_below_30kph_keeps_the_cadence_running(self, monkeypatch):
-    """δ_err has crossed to the far side of the standing torque: the next
-    decision would shed, so it must not be pushed a cadence out."""
-    state, _ = _cancel_tol_tick(monkeypatch, v=self.V_LKA, torque=self.TORQUE,
-                                delta_err=-self.DERR)
-    assert state['action'] == 'cancel_tol'
-    assert state['tick_count'] == 3        # 2 + 1, cadence preserved
-
-  def test_arrival_below_30kph_still_restarts_the_cadence(self, monkeypatch):
-    """Same band, same speed, error still on the torque's own side — an
-    ordinary arrival. Settling behaviour is unchanged."""
-    state, _ = _cancel_tol_tick(monkeypatch, v=self.V_LKA, torque=self.TORQUE,
-                                delta_err=self.DERR)
-    assert state['action'] == 'cancel_tol'
-    assert state['tick_count'] == 0
-
-  def test_reversal_at_30kph_still_restarts_the_cadence(self, monkeypatch):
-    """Boundary: at LKA_MAX_V and above, nothing changes."""
-    import bmw.latcontroller as mod
-    state, _ = _cancel_tol_tick(monkeypatch, v=mod.LKA_MAX_V, torque=self.TORQUE,
-                                delta_err=-self.DERR)
-    assert state['action'] == 'cancel_tol'
-    assert state['tick_count'] == 0
-
-  def test_reversal_at_speed_still_restarts_the_cadence(self, monkeypatch):
-    state, _ = _cancel_tol_tick(monkeypatch, v=20.0, torque=self.TORQUE,
-                                delta_err=-self.DERR)
-    assert state['action'] == 'cancel_tol'
-    assert state['tick_count'] == 0
-
-  def test_reversal_below_the_torque_gate_still_restarts_the_cadence(self, monkeypatch):
-    """Straight-line band hygiene: too little standing torque to be worth
-    rescheduling for."""
-    import bmw.latcontroller as mod
-    state, _ = _cancel_tol_tick(monkeypatch, v=self.V_LKA,
-                                torque=mod.UNWIND_CADENCE_TQ * 0.5,
-                                delta_err=-self.DERR)
-    assert state['action'] == 'cancel_tol'
-    assert state['tick_count'] == 0
-
-  def test_cancel_tol_primary_job_is_untouched_on_reversal(self, monkeypatch):
-    """The cadence change must not disturb what cancel_tol is FOR. With
-    hold_f = 1 the retarget is a no-op, exactly as measured on seg 4 — the
-    standing command is left alone, not dumped."""
-    state, _ = _cancel_tol_tick(monkeypatch, v=self.V_LKA, torque=self.TORQUE,
-                                delta_err=-self.DERR)
-    assert state['target_frac'] == pytest.approx(self.TORQUE)
 
 
 class TestStepMaxSpeedSchedule:
@@ -1208,7 +696,7 @@ class TestControllerHorizonDecoupled:
   follow: its cadence/ramp spread and the hold-cap lookahead stay on the
   field-tuned 0.65 s horizon. A 0.95 s horizon would stretch the cadence to
   ~500 ms (more lag - the 4d8 lesson) and shrink hold_cap to (0.65/0.95)^2 =
-  47%, below steady SAT, breaking hold_curve."""
+  47%, below steady SAT, breaking the curve hold."""
 
   def _decision(self, monkeypatch, lat_delay):
     lac, sm, mod, state = _make_controller(monkeypatch)
@@ -1385,7 +873,7 @@ class TestStallBreakawayV2:
 
     lac2, sm2, mod2, state2 = _sb_make(monkeypatch)
     for _ in range(45):
-      _sb_tick(lac2, _SB_A0, action='hold_zero')
+      _sb_tick(lac2, _SB_A0, action='idle')
     assert state2['sb_state'] == 0
 
   def test_breakaway_and_trip(self, monkeypatch):
@@ -1530,9 +1018,9 @@ class TestStallBreakawayV2:
     # staleness the instantaneous gate has always had; it errs toward NOT
     # tripping, so it needs no correction — only respecting.)
     mild = 0.001
-    _sb_tick(lac, _SB_A0, action='hold_curve', kappa_des=deep)
+    _sb_tick(lac, _SB_A0, action='idle', kappa_des=deep)
     assert state['sb_state'] == 0
-    _sb_tick(lac, _SB_A0, action='hold_curve', kappa_des=mild)
+    _sb_tick(lac, _SB_A0, action='idle', kappa_des=mild)
 
     # Fresh arm in a mild curve -> the latch takes the NEW curvature.
     _sb_arm(lac, ticks=45, kappa_des=mild)
@@ -1625,7 +1113,7 @@ class TestStallBreakawayV2:
     state['torque'] = -0.3               # standing left push
     state['target_frac'] = -0.3
     state['ramp_frames'] = 0
-    state['action'] = 'hold_curve'
+    state['action'] = 'idle'
     state['sb_block'] = 10
     state['sb_dir'] = 1.0                # a left push is the "same side"
     state['relax_ticks'] = 1             # already dwelling
@@ -2427,105 +1915,73 @@ class TestOverrideObservers:
 # hold-floor in curves is kept. Direct off must leave every path unchanged.
 # ============================================================
 
-_LK_REGISTER = 'plugins.lane_keeping.register'
 
 
 class TestDirectTracking:
-  @pytest.fixture(autouse=True)
-  def _lane_keeping_loaded(self, monkeypatch):
-    """Ruling R10: Direct latches only while lane_keeping's register module
-    (the Arc reference) is loaded under its registry name; a placeholder
-    stands in for it here."""
-    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace(HOOK_READY=True))
 
-  def _engaged(self, monkeypatch, direct, v=25.0, contacts=None):
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct, contacts=contacts)
+  def _engaged(self, monkeypatch, v=25.0, contacts=None):
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, contacts=contacts)
     _set_measured(fake_sm, v, 0.0)
     _call_update(lac, 0.0, v_ego=v, active=False)
     _call_update(lac, 0.0, v_ego=v, active=True)
     return lac, fake_sm, mod, state
 
-  def test_latch_reads_switch_at_engagement(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
-    assert state['direct'] and mod.direct_latched()
+  def test_no_lane_keeping_means_stock_controller(self, monkeypatch):
+    """lane_keeping not loaded (disabled or failed): the hook does not patch
+    lac.update, so the stock lateral controller runs."""
+    monkeypatch.delitem(sys.modules, _LK_REGISTER)
+    import bmw.latcontroller as mod
+    sentinel = object()
+    lac = SimpleNamespace(update=sentinel); result = SimpleNamespace()
+    out = mod.on_lat_controller_init(result, lac, SimpleNamespace(wheelbase=2.66, steerActuatorDelay=0.4))
+    assert lac.update is sentinel and out is result
 
-  def test_latch_holds_until_disengage(self, monkeypatch):
-    """A switch flip while engaged takes effect only at the next engagement;
-    disengaging clears the latch."""
+  def test_half_loaded_lane_keeping_means_stock_controller(self, monkeypatch):
+    """A module the registry left half-executed has no HOOK_READY: same."""
+    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace())
+    import bmw.latcontroller as mod
+    sentinel = object()
+    lac = SimpleNamespace(update=sentinel); result = SimpleNamespace()
+    out = mod.on_lat_controller_init(result, lac, SimpleNamespace(wheelbase=2.66, steerActuatorDelay=0.4))
+    assert lac.update is sentinel and out is result
+
+  def test_slope_latches_at_engagement(self, monkeypatch):
     import config
-    params = {'DirectTracking': '1'}
+    params = {'SlopeCompensation': '1'}
     monkeypatch.setattr(config, 'read_plugin_param',
                         lambda plugin_id, key, default='': params.get(key, default))
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, None)
-    assert state['direct'] and mod.direct_latched()
-    params['DirectTracking'] = '0'
-    _call_update(lac, 0.0, v_ego=25.0, active=True)
-    assert state['direct'] and mod.direct_latched()      # no mid-push law change
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    assert state['slope']
     _call_update(lac, 0.0, v_ego=25.0, active=False)
-    assert not state['direct'] and not mod.direct_latched()
+    assert not state['slope']
+    params['SlopeCompensation'] = '0'
     _call_update(lac, 0.0, v_ego=25.0, active=True)
-    assert not state['direct'] and not mod.direct_latched()
+    assert not state['slope']
 
-  def test_no_lane_keeping_module_latches_off(self, monkeypatch):
-    """Ruling R10: never Direct without the Arc reference — switch '1' but
-    lane_keeping not loaded latches off (deadzone-free tracking on the raw
-    model curvature is the documented-unsafe case)."""
-    monkeypatch.delitem(sys.modules, _LK_REGISTER)
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
-    assert not state['direct'] and not mod.direct_latched()
+  def test_disengage_zeroes_the_ramp_state(self, monkeypatch):
+    """While lateral is inactive the law does not run on the state: disengaging
+    zeroes torque/target/ramp, and the next engagement ramps from 0 on its
+    first livePose tick instead of jumping to a torque built while inactive."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    state.update(torque=0.3, target_frac=0.4, ramp_step=0.002, ramp_frames=10, action='ramp')
+    _call_update(lac, 0.004, v_ego=25.0, active=False)
+    assert state['torque'] == 0.0 and state['target_frac'] == 0.0 and state['ramp_frames'] == 0
+    for _ in range(20):
+      _call_update(lac, 0.004, v_ego=25.0, active=False)
+    assert state['torque'] == 0.0 and state['target_frac'] == 0.0   # inactive: no decision runs
+    out = _call_update(lac, 0.004, v_ego=25.0, active=True)        # first engaged tick decides, from 0
+    assert state['action'] == 'ramp' and state['target_frac'] > 0.0
+    assert abs(out[0]) < 0.004                                      # one ramp frame of one STEP_MAX
+
+  def test_sub_band_error_is_tracked(self, monkeypatch):   # the 4e5 arc-only case
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state['tick_count'] = 999
-    _call_update(lac, 0.0003, v_ego=25.0)       # inside HOLD_BAND_ENTER
-    assert state['action'] == 'hold_zero'       # legacy rest state applies
+    _call_update(lac, 0.0003, v_ego=25.0)       # δ_err ≈ 0.0008 rad: no band, tracked
+    assert state['action'] == 'ramp' and state['target_frac'] > 0.0
 
-  def test_half_loaded_lane_keeping_latches_off(self, monkeypatch):
-    """R10 hardening: the registry leaves a module whose import raised in
-    sys.modules; without its HOOK_READY sentinel Direct stays off."""
-    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace())
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
-    assert not state['direct'] and not mod.direct_latched()
-
-  @pytest.mark.parametrize('direct', [None, True])
-  def test_lateral_engaged_mirrors_active(self, monkeypatch, direct):
-    """Ruling R11: lateral_engaged() is True while active, in both modes
-    (lane_keeping applies its cached switch only while it is False)."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct)
-    assert mod.lateral_engaged() is True
-    _call_update(lac, 0.0, v_ego=25.0)
-    assert mod.lateral_engaged() is True
-    _call_update(lac, 0.0, v_ego=25.0, active=False)
-    assert mod.lateral_engaged() is False
-
-  def test_read_failure_is_off(self, monkeypatch):
-    import config
-    def _boom(plugin_id, key, default=''):
-      if key == 'DirectTracking':
-        raise OSError('eMMC')
-      return default
-    monkeypatch.setattr(config, 'read_plugin_param', _boom)
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, None)
-    assert not state['direct'] and not mod.direct_latched()
-
-  def test_off_by_default_keeps_rest_state(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, None)
-    assert not state['direct'] and not mod.direct_latched()
-    state['tick_count'] = 999
-    _call_update(lac, 0.0003, v_ego=25.0)       # inside HOLD_BAND_ENTER
-    assert state['action'] == 'hold_zero'
-
-  def test_sub_band_error_is_tracked_in_direct(self, monkeypatch):   # the 4e5 arc-only case
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
-    state['tick_count'] = 999
-    _call_update(lac, 0.0003, v_ego=25.0)       # δ_err ≈ 0.0008 rad < 0.0015
-    assert state['action'] == 'ramp' and state['target_frac'] > 0.0 and not state['at_rest']
-
-  def test_no_cancel_tol_in_direct(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
-    state.update(action='ramp', ramp_frames=10, torque=0.05, target_frac=0.08)
-    _call_update(lac, 0.0, v_ego=25.0)          # δ_err in 1.2·HOLD_BAND
-    assert state['action'] != 'cancel_tol'
 
   def test_short_reversal_sheds_to_zero_not_across(self, monkeypatch):  # Review Focus 4
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state['tick_count'] = 999; _call_update(lac, +0.002, v_ego=25.0)   # commit right
     assert state['target_frac'] > 0.0 and state['guard'].side == +1
     state['tick_count'] = 999; _call_update(lac, -0.002, v_ego=25.0)   # one tick opposite
@@ -2538,7 +1994,7 @@ class TestDirectTracking:
   def test_persisted_reversal_crosses(self, monkeypatch):
     """Once the opposite error sign has persisted the guard window (3 livePose
     ticks), the reversal passes — the guard delays, it never blocks."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state['tick_count'] = 999; _call_update(lac, +0.002, v_ego=25.0)
     state['torque'] = 0.0; state['ramp_frames'] = 0       # old side already shed
     for _ in range(3):
@@ -2547,27 +2003,23 @@ class TestDirectTracking:
     assert state['target_frac'] < 0.0 and state['guard'].side == -1
 
   def test_direct_applies_in_lka_regime(self, monkeypatch):        # user ruling: all speeds
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, v=5.0)
-    assert state['direct']
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, v=5.0)
     state['tick_count'] = 999
     _call_update(lac, 0.0003, v_ego=5.0)        # sub-band δ_err at 18 km/h
-    assert state['action'] == 'ramp' and state['target_frac'] > 0.0 and not state['at_rest']
+    assert state['action'] == 'ramp' and state['target_frac'] > 0.0
 
-  @pytest.mark.parametrize('direct', [None, True])
-  def test_hold_floor_kept_in_curves(self, monkeypatch, direct):
+  def test_hold_floor_kept_in_curves(self, monkeypatch):
     """v=20, κ_des=0.006: a_y 2.4 m/s² ≥ HOLD_AY_BP[1] -> hold_f = 1, and
     hold_cap = 0.192 (see TestCancelTolStillFires). Standing torque 0.15 ->
-    held_target 0.15. κ_meas lags by δ_err ≈ 0.002 rad (past HOLD_BAND_ENTER,
-    so the legacy path leaves rest too): P = 1.833·400·0.002/12 ≈ 0.122,
+    held_target 0.15. κ_meas lags by δ_err ≈ 0.002 rad: P = 1.833·400·0.002/12 ≈ 0.122,
     same-sign but under the hold -> floored at held_target. The step from
     0.15 is zero, so STEP_MAX does not bind."""
     v, kappa = 20.0, 0.006
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct)
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
     kappa_meas = math.tan(math.atan(kappa * 2.66) - 0.002) / 2.66
     _set_measured(fake_sm, v, kappa_meas)
     _call_update(lac, kappa, v_ego=v, active=False)
     _call_update(lac, kappa, v_ego=v, active=True)
-    assert state['direct'] == bool(direct)
     state.update(torque=0.15, target_frac=0.15, ramp_frames=0, action='idle',
                  tick_count=999)
     _call_update(lac, kappa, v_ego=v)
@@ -2577,16 +2029,16 @@ class TestDirectTracking:
     assert state['action'] == 'ramp'
     assert state['target_frac'] == pytest.approx(0.15)   # floored, not the 0.122 P value
 
-  def _curve_decision(self, monkeypatch, direct, *, v, kappa, delta_err, torque):
+  def _curve_decision(self, monkeypatch, *, v, kappa, delta_err, torque):
     """Engage in a curve with delta_err of lag, standing torque `torque`, the
     guard committed to that push's side; run one decision."""
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct)
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
     _set_measured(fake_sm, v, math.tan(math.atan(kappa * 2.66) - delta_err) / 2.66)
     _call_update(lac, kappa, v_ego=v, active=False)
     _call_update(lac, kappa, v_ego=v, active=True)
     state['guard'].reset(); state['guard'].side = +1     # pushing right
     state.update(torque=torque, target_frac=torque, ramp_frames=0, action='idle',
-                 tick_count=999, at_rest=not direct)
+                 tick_count=999)
     _call_update(lac, kappa, v_ego=v)
     assert state['delta_err'] == pytest.approx(delta_err)
     return mod, state
@@ -2597,7 +2049,7 @@ class TestDirectTracking:
     held_target, so Direct commands held_target + P (P trims down from the
     hold) — not a full STEP_MAX drop (was 1.06 Nm)."""
     v, kappa = 25.0, 0.004
-    mod, state = self._curve_decision(monkeypatch, True, v=v, kappa=kappa,
+    mod, state = self._curve_decision(monkeypatch, v=v, kappa=kappa,
                                       delta_err=-0.0003, torque=0.15)
     assert state['hold_f'] == pytest.approx(1.0) and state['hold_cap'] > 0.15
     # kappa_scale = interp(0.004, [0.001, 0.01, 0.02], [1.0, 2.5, 3.0]) = 1.5;
@@ -2608,19 +2060,13 @@ class TestDirectTracking:
     assert state['target_frac'] == pytest.approx(0.15 + p)
     assert state['guard'].suppressed == 0
 
-  def test_in_band_overshoot_legacy_holds_curve(self, monkeypatch):
-    """Direct off: the same probe is an on-target hold_curve at 0.15."""
-    mod, state = self._curve_decision(monkeypatch, None, v=25.0, kappa=0.004,
-                                      delta_err=-0.0003, torque=0.15)
-    assert state['action'] == 'hold_curve'
-    assert state['target_frac'] == pytest.approx(0.15)
 
   def test_large_overshoot_still_reduces_torque(self, monkeypatch):
     """Ruling R8: P larger than the hold drives held_target + P to the other
     side — the noise guard holds it at 0 until persisted, and the old-side
     torque sheds under STEP_MAX."""
     v = 25.0
-    mod, state = self._curve_decision(monkeypatch, True, v=v, kappa=0.004,
+    mod, state = self._curve_decision(monkeypatch, v=v, kappa=0.004,
                                       delta_err=-0.004, torque=0.15)
     step_max = 0.10 + (v - 15.0) / (28.0 - 15.0) * (0.05 - 0.10)   # STEP_MAX schedule
     assert state['guard'].suppressed == 1
@@ -2629,12 +2075,12 @@ class TestDirectTracking:
 
   def test_guard_uncommitted_after_reengage(self, monkeypatch):
     """Disengage -> re-engage starts the guard with no committed side."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state['tick_count'] = 999; _call_update(lac, +0.002, v_ego=25.0)   # commit right
     assert state['guard'].side == +1
     _call_update(lac, 0.0, v_ego=25.0, active=False)
     _call_update(lac, 0.0, v_ego=25.0, active=True)
-    assert state['direct'] and state['guard'].side == 0
+    assert state['guard'].side == 0
 
   def test_relax_dwell_exempt_from_guard(self, monkeypatch):
     """Ruling R3: relax-dwell never gives up mid-turn. With the guard already
@@ -2643,7 +2089,7 @@ class TestDirectTracking:
     torque's sign, so it cannot cross the gap. v=15, κ_des 0.012 < κ_meas
     0.015 (deep, same side, overshoot) -> dwelling; hold_cap ≈ 0.27 > 0.15."""
     v = 15.0
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, v=v)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, v=v)
     _set_measured(fake_sm, v, 0.015)
     state['guard'].side = -1          # reversal already confirmed (left)
     state.update(torque=0.15, target_frac=0.15, ramp_frames=0, action='idle',
@@ -2653,12 +2099,9 @@ class TestDirectTracking:
     assert state['target_frac'] == pytest.approx(0.15)   # not zeroed / shed
     assert state['guard'].suppressed == 0
 
-  @pytest.mark.parametrize('direct', [None, True])
-  def test_sb_episode_ends_on_target_in_direct(self, monkeypatch, direct):
-    """Ruling R4: Direct mode has no hold_* actions, so a stall-breakaway
-    episode (sb_state 2) also ends once |δ_err| <= HOLD_BAND. Direct off is
-    unchanged: a ramp action keeps the episode open."""
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, stall_v2=True, direct=direct)
+  def test_sb_episode_ends_when_settled(self, monkeypatch):
+    """A stall-breakaway episode (sb_state 2) ends once |δ_err| <= SB_SETTLED_RAD."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, stall_v2=True)
     _set_measured(fake_sm, 25.0, 0.0)
     _call_update(lac, 0.0, v_ego=25.0, active=False)
     _call_update(lac, 0.0, v_ego=25.0, active=True)
@@ -2666,16 +2109,17 @@ class TestDirectTracking:
     state.update(sb_state=2, sb_episode_ticks=100, action='ramp',
                  torque=0.0, ramp_frames=0)
     _call_update(lac, 0.0, v_ego=25.0)
-    assert state['sb_state'] == (0 if direct else 2)
+    assert state['sb_state'] == 0
+    assert mod.SB_SETTLED_RAD == 0.001
 
   # ---- Task 4: free-play take-up, contact learning/persistence, telemetry ----
   # Seeded contacts (route 4e5): gap 77.6 deg under right torque, 65.0 under left.
   _CONTACTS = '77.60,65.00'
 
-  def _start_takeup(self, monkeypatch, direct=True):
+  def _start_takeup(self, monkeypatch):
     """Seated left (gap 65), torque at 0, a right ramp in flight: this tick
     crosses zero toward the unseated right flank."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20,
                  action='ramp', tick_count=0)
     out = _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0)
@@ -2690,13 +2134,6 @@ class TestDirectTracking:
     assert state['ramp_frames'] == 20          # ramp held, not applied or decremented
     assert state['action'] == 'take_up'
 
-  def test_takeup_off_when_not_direct(self, monkeypatch):
-    lac, fake_sm, mod, state, out = self._start_takeup(monkeypatch, direct=None)
-    assert not state['direct']
-    assert state['takeup'].state != 'taking_up' and state['takeup'].fires == 0
-    assert state['torque'] == pytest.approx(0.002)   # plain ramp
-    assert state['ramp_frames'] == 19
-    assert state['action'] != 'take_up'
 
   def test_takeup_handover_ramps_from_takeup_level(self, monkeypatch):
     """Gap reaches the right contact -> hand over: the remaining ramp is
@@ -2735,7 +2172,7 @@ class TestDirectTracking:
   def test_shed_to_zero_does_not_fire(self, monkeypatch):
     """Shedding to a zero target (e.g. a guard-suppressed reversal) can land a
     float epsilon past zero; that is not a push toward the new side."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     state.update(torque=0.01, target_frac=0.0, ramp_step=-(0.01 + 1e-12), ramp_frames=1,
                  tick_count=0)
     _call_update(lac, 0.0, v_ego=25.0, gap_deg=77.6)       # seated right
@@ -2743,10 +2180,10 @@ class TestDirectTracking:
     assert state['torque'] == pytest.approx(0.0, abs=1e-9)
 
   def test_contacts_seeded_from_param(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     assert state['learner'].contacts() == pytest.approx((77.6, 65.0))
     assert not state['learner'].fresh()
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts='junk')
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts='junk')
     assert state['learner'].contacts() is None
 
   def test_contacts_seed_read_failure_is_none(self, monkeypatch):
@@ -2756,12 +2193,11 @@ class TestDirectTracking:
         raise OSError('eMMC')
       return default
     monkeypatch.setattr(config, 'read_plugin_param', _boom)
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, None)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     assert state['learner'].contacts() is None
 
-  @pytest.mark.parametrize('direct', [None, True])
-  def test_learner_observes_every_tick_in_both_modes(self, monkeypatch, direct):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct)
+  def test_learner_observes_every_tick_in_both_modes(self, monkeypatch):
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     calls = []
     monkeypatch.setattr(state['learner'], 'observe',
                         lambda gap, tq, rate, ok: calls.append((gap, tq, rate, ok)))
@@ -2773,11 +2209,10 @@ class TestDirectTracking:
     _call_update(lac, 0.0, v_ego=25.0, active=False, gap_deg=77.6)
     assert calls[-1][3] is False                # inactive: no sample
 
-  @pytest.mark.parametrize('direct', [None, True])
-  def test_learner_exception_never_breaks_lateral(self, monkeypatch, direct):
+  def test_learner_exception_never_breaks_lateral(self, monkeypatch):
     """Ruling R12: observe runs every tick in both modes; an exception in it
     must never break lateral — the tick completes and the ramp still applies."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     def _boom(*a, **k):
       raise ValueError('bad sample')
     monkeypatch.setattr(state['learner'], 'observe', _boom)
@@ -2794,10 +2229,9 @@ class TestDirectTracking:
         state['learner'].observe(gap, tq, 0.0, True)
     assert state['learner'].fresh()
 
-  @pytest.mark.parametrize('direct', [None, True])
-  def test_contacts_persisted_on_disengage_when_fresh(self, monkeypatch, direct):
+  def test_contacts_persisted_on_disengage_when_fresh(self, monkeypatch):
     import config
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     self._make_fresh(state)
     _call_update(lac, 0.0, v_ego=25.0)
     config.write_plugin_param.assert_not_called()          # engaged: no write
@@ -2808,14 +2242,14 @@ class TestDirectTracking:
 
   def test_contacts_not_persisted_when_not_fresh(self, monkeypatch):
     import config
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     _call_update(lac, 0.0, v_ego=25.0, active=False)
     config.write_plugin_param.assert_not_called()          # seed only: nothing new learned
 
   def test_contacts_write_failure_never_affects_control(self, monkeypatch):
     import config
     config.write_plugin_param.side_effect = OSError('eMMC full')
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     self._make_fresh(state)
     out = _call_update(lac, 0.0, v_ego=25.0, active=False)
     assert out[0] == 0.0
@@ -2829,7 +2263,6 @@ class TestDirectTracking:
     state['guard'].suppressed = 2
     _call_update(lac, 0.002, v_ego=25.0, gap_deg=77.6)     # handover tick
     p = pay[-1]
-    assert p['direct'] is True
     assert p['tu_state'] == 'right'
     assert p['c_right'] == pytest.approx(77.6) and p['c_left'] == pytest.approx(65.0)
     assert p['tu_fires'] == 1 and p['tu_timeouts'] == 0
@@ -2846,12 +2279,12 @@ class TestDirectTracking:
     assert pay[-1]['action'] == 'take_up' and pay[-1]['tu_state'] == 'taking_up'
 
   def test_telemetry_unknown_contacts_read_zero(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, None)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     pay = []
     state['lat_pub'] = SimpleNamespace(send=pay.append)
     _call_update(lac, 0.0, v_ego=25.0)
     p = pay[-1]
-    assert p['direct'] is False and p['c_right'] == 0.0 and p['c_left'] == 0.0
+    assert p['c_right'] == 0.0 and p['c_left'] == 0.0
     assert p['tu_state'] == 'unknown'
 
   # ---- Task 4 review fixes ----
@@ -2868,7 +2301,7 @@ class TestDirectTracking:
   def test_shed_to_zero_snaps_exactly_then_reversal_fires(self, monkeypatch):
     """Review fix 1: a shed to a 0 target ends at exactly 0.0, so the genuine
     reversal that follows still crosses zero and fires the take-up."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     self._shed_left_to_zero(lac, state)
     assert state['ramp_frames'] == 0 and state['torque'] == 0.0
     assert state['takeup'].fires == 0
@@ -2877,11 +2310,6 @@ class TestDirectTracking:
     _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0)
     assert state['takeup'].fires == 1 and state['takeup'].state == 'taking_up'
 
-  def test_shed_to_zero_not_snapped_when_not_direct(self, monkeypatch):
-    """Direct off stays bit-identical: no snap, the float residue remains."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, None, contacts=self._CONTACTS)
-    self._shed_left_to_zero(lac, state)
-    assert state['ramp_frames'] == 0 and state['torque'] == pytest.approx(8.673617379884035e-19, abs=0)
 
   def test_driver_override_mid_takeup_resets_and_resumes_ramp(self, monkeypatch):
     """Review fix 2 (Focus 3, override half): steeringPressed while still
@@ -2901,7 +2329,7 @@ class TestDirectTracking:
   def test_small_reversal_target_does_not_fire(self, monkeypatch):
     """Ruling R9: a 0.012 Nm reversal target is not a real reversal — plain
     ramp, no take-up."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     state.update(torque=0.0, target_frac=0.001, ramp_step=+0.0001, ramp_frames=10,
                  action='ramp', tick_count=0)
     _call_update(lac, 0.0, v_ego=25.0, gap_deg=65.0)
@@ -2928,7 +2356,7 @@ class TestDirectTracking:
     (0.078 Nm from -0.055) hands over at the take-up level, not ramping down
     off the closed flank; the next decision steps up from it."""
     from bmw.takeup import TAKEUP_NM
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     g = state['guard']
     g.side, g._opp = -1, 10
     state.update(torque=-0.055, target_frac=-0.055, ramp_frames=0, action='idle',
@@ -2951,7 +2379,7 @@ class TestDirectTracking:
     the STEP_MAX-capped crossing lands under TAKEUP_NM (0.0065 frac at
     -0.055) and the next decision is already past zero. The gate sizes the
     reversal on the pre-cap demand, so the take-up still fires once."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     g = state['guard']
     g.side, g._opp = -1, 10                    # opposite sign already persisted
     state.update(torque=torque0, target_frac=torque0, ramp_frames=0, action='idle',
@@ -2964,7 +2392,7 @@ class TestDirectTracking:
 
   def test_takeup_fault_falls_back_to_the_ramp(self, monkeypatch):
     """A take-up exception on the 100 Hz path drops to the plain ramp."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     def _boom(*a, **k):
       raise RuntimeError('takeup fault')
     monkeypatch.setattr(state['takeup'], 'step', _boom)
@@ -2974,7 +2402,7 @@ class TestDirectTracking:
     assert state['torque'] == pytest.approx(0.002) and state['action'] == 'ramp'
 
   def test_no_takeup_fires_while_pressed(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, True, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
     state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20,
                  action='ramp', tick_count=0)
     _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0, pressed=True)
@@ -2992,12 +2420,9 @@ class TestSlopeBias:
   V = 25.0
   L = 2.66
 
-  @pytest.fixture(autouse=True)
-  def _lane_keeping_loaded(self, monkeypatch):
-    monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace(HOOK_READY=True))
 
-  def _engaged(self, monkeypatch, direct=True, slope=True, v=V, stall_v2=None):
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, direct=direct, slope=slope,
+  def _engaged(self, monkeypatch, slope=True, v=V, stall_v2=None):
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, slope=slope,
                                                 stall_v2=stall_v2)
     _set_measured(fake_sm, v, 0.0)
     _call_update(lac, 0.0, v_ego=v, active=False)
@@ -3064,7 +2489,7 @@ class TestSlopeBias:
     """A take-up in flight, a stall-breakaway block, or an active breakaway
     episode (sb_state 2; state 1 is only 'armed') closes the gate."""
     lac, fake_sm, mod, state = self._engaged(monkeypatch, stall_v2=True)
-    self._run(lac, fake_sm, 1, kappa_meas=1.2e-3)   # straight, |delta_err| > HOLD_BAND
+    self._run(lac, fake_sm, 1, kappa_meas=1.2e-3)   # straight, a clear error
     state['sl_bias'] = 0.03
     if blocker == 'sb_episode':
       state.update(sb_state=2, sb_episode_ticks=10000, sb_brk_angle=0.0, sb_dir=1.0, action='ramp')
@@ -3121,16 +2546,9 @@ class TestSlopeBias:
       out.append(lac.update.__closure__ and _closure_state(lac.update)['torque'])
     return out
 
-  def test_slope_needs_direct(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct=False, slope=True)
-    assert not state['slope']
-    a = self._mixed(lac, fake_sm)
-    assert state['sl_bias'] == 0.0
-    lac2, fake_sm2, _, _ = self._engaged(monkeypatch, direct=False, slope=None)
-    assert a == self._mixed(lac2, fake_sm2)
 
   def test_slope_off_bit_identical(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, direct=True, slope=False)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, slope=False)
     a = self._mixed(lac, fake_sm)
-    lac2, fake_sm2, _, _ = self._engaged(monkeypatch, direct=True, slope=None)
+    lac2, fake_sm2, _, _ = self._engaged(monkeypatch, slope=None)
     assert a == self._mixed(lac2, fake_sm2)

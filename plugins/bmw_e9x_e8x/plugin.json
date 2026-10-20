@@ -18,17 +18,9 @@
       "default": true,
       "description": "Show coolant and oil temperature on the onroad HUD"
     },
-    "HoldHysteresis": {
-      "default": true,
-      "description": "Hysteresis on the steering rest band: leave rest at 0.0015 rad error, settle at 0.001. Write 0 to disable (legacy single threshold)."
-    },
     "StallBreakaway": {
       "default": false,
       "description": "Shed steering torque when a stalled rack breaks away and sweeps more than 2 degrees at speed. Write 1 to enable. Read at drive start."
-    },
-    "DirectTracking": {
-      "default": false,
-      "description": "Steer continuously along the arc-smoothed path with no on-target hold band, with fast free-play take-up on direction changes. Write 1 to enable. Read at each engagement."
     },
     "SlopeCompensation": {
       "default": false,
