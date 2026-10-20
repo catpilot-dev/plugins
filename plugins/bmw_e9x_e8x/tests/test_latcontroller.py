@@ -238,7 +238,7 @@ class TestNonCancelPaths:
     state['tick_count'] = 999
     _call_update(lac, 0.001, v_ego=v)    # κ_des collapsed (leg exit)
     assert state['action'] not in _CANCELS
-    assert state['action'] == 'ramp'
+    assert state['action'] in ('ramp', 'relax_dwell')
 
   def test_zero_torque_runs_normal_decision(self, monkeypatch):
     """No torque applied: never a cancel; normal off-target ramp."""
@@ -307,6 +307,59 @@ def _decide_from_torque(lac, sm, state, *, v, desired, torque):
   _call_update(lac, desired, v_ego=v)
 
 
+class TestRelaxDwellLowSpeedGate:
+  """Route 417 (2026-08-21): at LKA intersection EXITS the dwell froze torque
+  at 3.9 Nm for its full 1.0 s while the driver hauled the wheel back from
+  -160 to -75 deg and delta_err grew to -0.097. The wheel's return was late
+  and had to be fought. Seg 2 09:43:53.5-54.5 is the reference case; seg 16
+  is the milder variant where kappa_des crossed zero and aborted the dwell
+  early (its only escape is a SIGN flip -- a merely decaying reference is
+  bridged for the whole second no matter how large the overshoot grows).
+
+  The dwell guards ONE failure: surrender torque mid-turn -> SAT flings the
+  freed wheel ~20 deg out of the curve -> slow step-capped rebuild. SAT scales
+  with v^2, so that hazard fades at low speed -- and on this rack stiction
+  HOLDS the angle at zero torque (the stall/breakaway story), the opposite of
+  being flung. Below 30 km/h the dwell insures against a hazard that is not
+  present, and route 417 shows it actively fighting the driver instead.
+
+  Scope is SPEED ONLY (user ruling 2026-08-21: must not affect normal HOLD).
+  The 'intersection' half is already inherent -- deep_relax needs
+  |kappa_meas| > RELAX_DWELL_KAPPA -- so this cannot leak into straight-line
+  driving, and gating on curvature as well would repeat the gain-floor
+  mistake of putting a cliff on the kappa axis. Below 30 km/h is LKA by
+  construction: DCC cannot engage there.
+  """
+
+  def _arm_attempt(self, monkeypatch, v):
+    """One tick that WOULD arm the dwell; returns the relax_ticks increment."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(sm, v, 0.012)          # deep curve, |κ_meas| > RELAX_DWELL_KAPPA
+    state['torque'] = 0.30
+    state['action'] = 'idle'
+    state['tick_count'] = 0
+    before = state['relax_ticks']
+    # overshoot-side error: desired same side but smaller than measured
+    _call_update(lac, 0.008, steering_angle_deg=0.0, v_ego=v)
+    return state['relax_ticks'] - before
+
+  def test_dwell_disarmed_below_30kph(self, monkeypatch):
+    """The route 417 regime: 18 km/h intersection exit."""
+    assert self._arm_attempt(monkeypatch, 5.0) == 0
+
+  def test_dwell_disarmed_at_walking_pace(self, monkeypatch):
+    assert self._arm_attempt(monkeypatch, 2.0) == 0
+
+  def test_dwell_still_arms_at_30kph(self, monkeypatch):
+    """Boundary: the dwell's own hairpin validation was at ~9 m/s."""
+    assert self._arm_attempt(monkeypatch, 8.5) == 1
+
+  def test_dwell_still_arms_at_speed(self, monkeypatch):
+    """Normal HOLD behaviour is untouched — the whole point of the ruling."""
+    for v in (12.0, 20.0, 30.0):
+      assert self._arm_attempt(monkeypatch, v) == 1, v
+
+
 class TestUnwindStepBoost:
   """Route 417 (2026-08-21), the second half of the intersection-exit fight.
 
@@ -370,6 +423,23 @@ class TestUnwindStepBoost:
     """Past zero the step is building in the NEW direction — normal cap."""
     got, mod = self._target(monkeypatch, 5.0, torque=-0.05)
     assert got == pytest.approx(-0.05 - 0.10, abs=1e-6), got
+
+
+def _dwell_tick(monkeypatch, *, v, relax_ticks):
+  """One decision that WOULD dwell: deep measured curve, standing torque, and
+  an overshoot-side kappa_des dip on the same side. relax_ticks is the value
+  BEFORE the tick — deep_relax increments it before `dwelling` is evaluated,
+  so the dwell is tested against relax_ticks + 1."""
+  lac, sm, mod, state = _make_controller(monkeypatch)
+  _set_measured(sm, v, 0.012)          # |κ_meas| > RELAX_DWELL_KAPPA
+  state['torque'] = -0.3
+  state['target_frac'] = -0.3
+  state['ramp_frames'] = 0
+  state['action'] = 'idle'
+  state['relax_ticks'] = relax_ticks
+  state['tick_count'] = 999            # force the cadence decision
+  _call_update(lac, 0.001, v_ego=v)
+  return state['action'], mod
 
 
 class TestLkaSpeedBlend:
@@ -461,6 +531,45 @@ def _kappa_for_delta_err(kappa_des, delta_err, L=2.66):
   return math.tan(math.atan(kappa_des * L) - delta_err) / L
 
 
+  # --- relax dwell length across the band ---
+  def _max_dwell(self, monkeypatch, v, cap=40):
+    """Longest dwell the bridge will sustain at speed v, in ticks (0 = it can
+    never form). Probed rather than read off RELAX_DWELL_TICKS, which is a
+    local inside on_lat_controller_init and not reachable from the module."""
+    n = 0
+    for t in range(cap):
+      action, _ = _dwell_tick(monkeypatch, v=v, relax_ticks=t)
+      if action != 'relax_dwell':
+        break
+      n = t + 1
+    return n
+
+  def test_dwell_never_engages_at_the_band_floor(self, monkeypatch):
+    """30 km/h: dwell length interpolates to 0, so the bridge cannot form —
+    the previously verified e748434 behaviour. deep_relax still counts its
+    ticks, so the rlx telemetry column keeps its meaning."""
+    assert self._max_dwell(monkeypatch, 8.5) == 0
+
+  def test_dwell_never_engages_below_the_band(self, monkeypatch):
+    assert self._max_dwell(monkeypatch, 5.0) == 0
+
+  def test_dwell_is_full_length_at_the_band_ceiling(self, monkeypatch):
+    """43 km/h and above is untouched — normal HOLD is the thing this must
+    not disturb."""
+    full = self._max_dwell(monkeypatch, 12.0)
+    assert full > 0
+    assert self._max_dwell(monkeypatch, 20.0) == full
+    assert self._max_dwell(monkeypatch, 30.0) == full
+
+  def test_dwell_is_half_length_at_the_band_midpoint(self, monkeypatch):
+    full = self._max_dwell(monkeypatch, 12.0)
+    assert self._max_dwell(monkeypatch, 10.25) == full // 2
+
+  def test_dwell_grows_monotonically_through_the_band(self, monkeypatch):
+    lens = [self._max_dwell(monkeypatch, v)
+            for v in (8.5, 9.4, 10.25, 11.1, 12.0)]
+    assert all(a <= b for a, b in zip(lens, lens[1:])), lens
+    assert lens[0] == 0 and lens[-1] > 0, lens
 
 
 class TestStepMaxSpeedSchedule:
@@ -1025,19 +1134,46 @@ class TestStallBreakawayV2:
       assert state['ff_nm'] == pytest.approx(0.95)
       assert (state['target_frac'] == 0.0) is zeroed
 
-  def test_block_zeroes_same_side_push_whatever_the_label(self, monkeypatch):
-    """During a post-trip block a same-side push is zeroed by the decision
-    even in a deep measured curve with the reference below the measured
-    curvature."""
+  def test_relax_dwell_no_trip(self, monkeypatch):
+    """The dwell gate: while relax_dwell is bridging a kappa_des dip the trip
+    is suppressed — certified doctrine, and it costs nothing. The follow-up
+    tick proves the setup was otherwise fully trip-ready."""
     lac, sm, mod, state = _sb_make(monkeypatch)
-    v = 12.0
-    _set_measured(sm, v, -0.012)          # deep left curve, overshooting
-    _call_update(lac, -0.008, v_ego=v, active=False)
-    _call_update(lac, -0.008, v_ego=v, active=True)
-    state.update(torque=-0.3, target_frac=-0.3, ramp_frames=0, action='idle',
-                 sb_block=10, sb_dir=1.0, tick_count=999)     # the left push drove the +angle motion
-    _call_update(lac, -0.008, v_ego=v)
-    assert state['target_frac'] == 0.0
+    _sb_arm(lac)
+    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
+    assert state['sb_state'] == 2
+    state['torque'] = -0.3               # windup worth shedding (SB_TRIP_MIN_TORQUE)
+    for k in range(2, self.TRIP_K):
+      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
+
+    _sb_tick(lac, _SB_A0 + self.TRIP_K * self.FAST_STEP, action='relax_dwell')
+    assert state['sb_trips'] == 0
+    assert state['sb_state'] == 2          # episode still live, not consumed
+
+    _sb_tick(lac, _SB_A0 + (self.TRIP_K + 1) * self.FAST_STEP)
+    assert state['sb_trips'] == 1
+
+  def test_block_does_not_zero_a_relax_dwell_hold(self, monkeypatch):
+    """Review Minor: the block zeroes PUSHES. By the time it runs, the
+    relax-dwell bridge may have replaced target_frac with a HOLD of the
+    current torque — zeroing that is the give-up-mid-turn failure mode the
+    dwell exists to prevent, so the block is gated on action == 'ramp'."""
+    lac, sm, mod, state = _make_controller(monkeypatch, stall_v2=True)
+    v = 9.0
+    _set_measured(sm, v, 0.012)          # deep curve -> dwell can arm
+    state['torque'] = -0.3               # standing left push
+    state['target_frac'] = -0.3
+    state['ramp_frames'] = 0
+    state['action'] = 'idle'
+    state['sb_block'] = 10
+    state['sb_dir'] = 1.0                # a left push is the "same side"
+    state['relax_ticks'] = 1             # already dwelling
+    state['tick_count'] = 999
+    # Overshoot-side kappa_des dip: same side as kappa_meas (the dwell aborts
+    # on S-curve sign flips) but smaller, so delta_err opposes delta_des.
+    _call_update(lac, 0.001, v_ego=v)
+    assert state['action'] == 'relax_dwell'
+    assert state['target_frac'] != 0.0   # the curve hold survived the block
 
   def test_disengage_clears(self, monkeypatch):
     """active=False mid-episode drops the whole machine: ring, state and the
@@ -1418,20 +1554,24 @@ class TestDirectTracking:
     assert state['ff_nm'] == pytest.approx(2.0)
     assert state['target_frac'] == pytest.approx(0.15 + 0.0807692307, abs=1e-6)
     assert not hasattr(mod, 'hold_factor')
-    assert 'hold_f' not in state and 'relax_ticks' not in state
+    assert 'hold_f' not in state and 'hold_cap' not in state
 
-  def test_overshoot_in_deep_curve_reverses_at_once(self, monkeypatch):
-    """Deep measured curve (kappa_meas 0.012 at 12 m/s) with the reference
-    already lower (0.008): the decision reduces the torque immediately."""
+  def test_hairpin_reference_dip_is_bridged(self, monkeypatch):
+    """Route 3a0 / 4e9 seg 9: in a deep measured curve (kappa_meas 0.012 at
+    12 m/s) the reference dips 40 % for under a second while the wheel holds.
+    The FF is at its cap there and cannot bridge the dip, so relax-dwell
+    keeps the standing torque for the dip: the decision targets the current
+    torque, not the dropped demand."""
     v = 12.0
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
     _set_measured(fake_sm, v, 0.012)
-    _call_update(lac, 0.008, v_ego=v, active=False)
-    _call_update(lac, 0.008, v_ego=v, active=True)
+    _call_update(lac, 0.012, v_ego=v, active=False)
+    _call_update(lac, 0.012, v_ego=v, active=True)
     state.update(torque=0.3, target_frac=0.3, ramp_frames=0, action='idle', tick_count=999)
-    _call_update(lac, 0.008, v_ego=v)
-    assert state['target_frac'] < 0.3
-    assert state['action'] == 'ramp'
+    _call_update(lac, 0.0072, v_ego=v)                     # the dip: 40 % below the measured curve
+    assert state['action'] == 'relax_dwell'
+    assert state['target_frac'] == pytest.approx(0.3)
+    assert state['relax_ticks'] == 1
 
   def _curve_decision(self, monkeypatch, *, v, kappa, delta_err, torque):
     """Engage in a curve with delta_err of lag, standing torque `torque`, the
@@ -1536,6 +1676,23 @@ class TestDirectTracking:
                                       delta_err=-0.40 / self._G, torque=0.05)
     assert state['guard'].side == +1 and state['guard'].suppressed == 0
 
+
+  def test_relax_dwell_exempt_from_guard(self, monkeypatch):
+    """Ruling R3: relax-dwell never gives up mid-turn. With the guard already
+    committed to the NEW (overshoot-correction) side, the dwell's old-side
+    hold of the current torque must pass untouched — it holds the current
+    torque's sign, so it cannot cross the gap. v=15, κ_des 0.012 < κ_meas
+    0.015 (deep, same side, overshoot) -> dwelling; t_cap > 0.15."""
+    v = 15.0
+    lac, fake_sm, mod, state = self._engaged(monkeypatch, v=v)
+    _set_measured(fake_sm, v, 0.015)
+    state['guard'].side = -1          # reversal already confirmed (left)
+    state.update(torque=0.15, target_frac=0.15, ramp_frames=0, action='idle',
+                 tick_count=999, relax_ticks=0)
+    _call_update(lac, 0.012, v_ego=v)
+    assert state['action'] == 'relax_dwell'
+    assert state['target_frac'] == pytest.approx(0.15)   # not zeroed / shed
+    assert state['guard'].suppressed == 0
 
   def test_guard_uncommitted_after_reengage(self, monkeypatch):
     """Disengage -> re-engage starts the guard with no committed side."""
@@ -1695,7 +1852,7 @@ class TestDirectTracking:
     _call_update(lac, 0.001, v_ego=25.0)
     assert set(pay[-1]) == {
       'desired', 'measured', 'err', 'delta_err', 'target_frac', 'ramp_step', 'ramp_frames', 'action',
-      'torque', 'output', 'vEgo', 'active', 'ff_nm', 'a_ref', 'sb_state', 'sb_trips',
+      'torque', 'output', 'vEgo', 'active', 'ff_nm', 'a_ref', 'relax_ticks', 'sb_state', 'sb_trips',
       'sb_block', 'angle', 'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right',
       'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn'}
 

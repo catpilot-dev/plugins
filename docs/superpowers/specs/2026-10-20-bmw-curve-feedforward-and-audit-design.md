@@ -1,6 +1,6 @@
 # BMW lateral: curve feed-forward, and a lateral-stack audit (design)
 
-Status: Part A implemented 2026-10-20 (plan docs/superpowers/plans/2026-10-20-bmw-curve-feedforward.md); Part B merged at 2df1b63. Builds on
+Status: Part A implemented 2026-10-20 (plan docs/superpowers/plans/2026-10-20-bmw-curve-feedforward.md), with two amendments from its review — relax-dwell is KEPT (the feed-forward sits at its cap in a hairpin and cannot bridge a reference dip; on 4e9–4ec the dwell bridged nine dips holding 1.9–3.8 Nm), and the replay bound is a tolerance (ff ≤ need in ≥ 85 % of same-sign steady windows, over-supply p99 ≤ 0.4 Nm; measured 14 % / 0.39 / max 0.79) rather than "never exceeds". Part B merged at 2df1b63. Builds on
 `2026-10-18-bmw-direct-tracking-design.md` and `2026-10-19-bmw-slope-bias-design.md`.
 
 Evidence routes: 4e9, 4ea, 4eb, 4ec (114 min Direct-active; scratchpad
@@ -57,8 +57,9 @@ by itself.
 Slope learning gate gains `|a_ref| < 0.15 m/s²` (κ < 4e-4 at 80 km/h): on 4ec
 the bias change tracked the model's gentle-bend curvature (r +0.72), not roll.
 
-No new switch (rollback: `CF_GAIN = 0`, one constant). Telemetry: `ff_nm`,
-`a_ref`.
+No new switch. Rollback: `CF_GAIN = 0` turns the feed-forward off inside the new
+law (no curve hold-floor) — a law no drive has run; the driven baseline is
+`dev` @ 2df1b63. Telemetry: `ff_nm`, `a_ref`.
 
 ### Verification
 
@@ -81,8 +82,8 @@ What the four Direct drives show (`audit_ev.py`):
 | mechanism | activity | verdict |
 |---|---|---|
 | legacy rest state (hold_zero/curve, hysteresis, EMA escape, cancel_tol) | 0 % — Direct bypasses it | **delete** |
-| relax-dwell | 0.1–0.3 % of ticks | **delete** (with FF the conflict it bridged is gone) |
-| hold_f / hold-floor / R8 | hold_f > 0 for 15 % of ticks | **delete** (FF replaces it) |
+| relax-dwell | 0.1–0.3 % of ticks | ~~delete~~ **keep** (review: the FF is at its cap in a hairpin and cannot bridge a dip; bridge capped at `t_cap`) |
+| hold_f / hold-floor / R8 | hold_f > 0 for 15 % of ticks | **delete** (FF replaces the hold's level, not its ratchet) |
 | driver-override observers (ov_*) | 0–4 fires per drive, telemetry only, Phase 2 never built | **delete** |
 | stall-breakaway v2 | on; 1–3 trips per drive | **keep**, re-audit the trips after FF |
 | DirectContacts persistence | seed 47° off on 4e9, relearned in 3 segments | **delete** (keep the online learner) |

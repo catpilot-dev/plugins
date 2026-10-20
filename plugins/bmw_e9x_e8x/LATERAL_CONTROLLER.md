@@ -27,8 +27,10 @@ with no filtering of its own.
 **Decision**, every `CONTROL_HORIZON_S / 2` (6 livePose ticks, 300 ms) while active, in order:
 the demand on the full error (no on-target band — a sub-friction target is a
 hold; the feed-forward supplies the steady curve torque, ~55 % of the measured
-need, and P closes the rest); clip to `t_cap`; the noise guard (a sign change
-of the demand commands 0 until the new sign has persisted `GUARD_PERSIST_S`);
+need, and P closes the rest); clip to `t_cap`; relax-dwell bridge in a deep
+measured curve (the current torque is held through a reference dip, within
+`t_cap`); the noise guard (a sign change of the demand commands 0 until the new
+sign has persisted `GUARD_PERSIST_S`);
 `STEP_MAX` toward the target (×`UNWIND_STEP_GAIN` when shedding in the LKA
 regime); a same-side push during a stall-breakaway block is zeroed. The torque ramps to the target over the next 300 ms, one CAN tick
 at a time. The free-play take-up (`bmw/takeup.py`) commands `TAKEUP_NM` across
@@ -45,8 +47,9 @@ ramp are 0, so every engagement ramps from 0.
 | `T_CAP_SCALE_KAPPA` / `_BP` | [1e-3, 1e-2, 2e-2] → [1.0, 2.5, 3.0] | gain scale on `|kappa_ref|` |
 | `V_GAIN_FLOOR` | 2.778 m/s | gain reference speed floor |
 | `CF_AY0`, `CF_GAIN`, `CF_MAX_NM` | 0.3 m/s², 1.0 Nm per m/s², 2.0 Nm | curve feed-forward deadband, gain, cap |
+| `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
 | `STEP_MAX_V` / `_BP` | [15, 28] m/s → [0.10, 0.05] frac | per-decision step cap |
-| `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band for the unwind boost |
+| `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
 | `SB_*` | see module scope | stall-breakaway v2 (`StallBreakaway` switch, default off) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
 | `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
@@ -58,6 +61,10 @@ engagement). Both default off.
 **Verification.** Unit tests in `tests/test_latcontroller.py` and
 `tests/test_takeup.py`; a differential replay against the previous build is the
 proof for every refactor that claims no behaviour change.
+
+**Rollback.** `CF_GAIN = 0` switches the feed-forward off inside this law (P
+alone, no curve hold-floor) — a law no drive has run. The driven baseline is
+`dev` @ 2df1b63 (4ec's law plus the audit); roll back by redeploying it.
 
 ---
 
@@ -954,11 +961,18 @@ gone; the current law above is authoritative.
 > on 4e9–4ec showed curves need steady torque, ~1.5 Nm per m/s² beyond ~0.25,
 > that P alone paid for with a standing error. `ff_nm = clip(1.0 · (|a_ref| −
 > 0.3), ±2 Nm)` on `a_ref = v_true²·κ_ref` now supplies ~55 % of it (replay:
-> ff/need median 0.52, over-supply p99 0.39 Nm); P closes the rest. With a
-> physical floor in place the curve hold (`hold_f`, `hold_cap`, hold-floor, R8
-> trim) and relax-dwell went (D2 of the 2026-10-20 design). Slope learning
-> stops above 0.15 m/s² of `a_ref`. Straights are unchanged (replay against
-> 2df1b63 bit-identical).
+> ff/need median 0.52, over-supply p99 0.39 Nm); P closes the rest. The curve
+> hold (`hold_f`, `hold_cap`, hold-floor, R8 trim) went with it (D2 of the
+> 2026-10-20 design): the feed-forward replaces the hold's level, not its
+> ratchet, so a P below the standing torque now lowers it — watch for 0.3–1 Hz
+> torque breathing in steady 0.5–1.5 m/s² bends. **Relax-dwell stays**: the
+> design assumed the feed-forward would bridge mid-hairpin reference dips, but
+> in a hairpin it sits at its cap while P drops by κ_scale·v²·L·Δκ; on 4e9–4ec
+> the dwell bridged nine such dips holding 1.9–3.8 Nm (final review). Its
+> bridge is now capped at `t_cap` instead of the deleted `hold_cap`. Slope
+> learning stops above 0.15 m/s² of `a_ref`. Straights are unchanged (replay
+> against 2df1b63 bit-identical). Rollback: `CF_GAIN = 0` is a law no drive has
+> run; the driven baseline is `dev` @ 2df1b63.
 
 ---
 
@@ -1232,6 +1246,7 @@ Fire only when **the plant has actually overshot** `(κ_des - κ_meas) · κ_mea
 |---|---|
 | `init` | controller construction |
 | `ramp` | a decision ran: the torque ramps toward `target_frac` |
+| `relax_dwell` | overshoot-side error in a measured deep curve, within the dwell — the target holds the current torque (within `t_cap`) |
 | `take_up` | the free-play take-up owns the torque while it crosses the servo lash |
 | `idle` | between decisions once a transient label's ramp completed, so telemetry occupancy counts are honest |
 
@@ -1255,13 +1270,14 @@ Published each livePose tick. The exact field set is pinned by
 | `target_frac` | the decision's target torque fraction (−1..1), after guard, STEP_MAX and caps |
 | `ramp_step` | per-CAN-tick torque increment |
 | `ramp_frames` | CAN frames remaining in the current ramp |
-| `action` | `ramp` / `take_up` / `idle` (§8) |
+| `action` | `ramp` / `relax_dwell` / `take_up` / `idle` (§8) |
 | `torque` | commanded torque fraction (−1..1) |
 | `output` | clipped torque fraction returned to controlsd (0 while inactive) |
 | `vEgo` | CS.vEgo |
 | `active` | lateral active |
 | `ff_nm` | curve feed-forward (Nm) |
 | `a_ref` | reference lateral accel `v_true² · kappa_ref` (m/s²) |
+| `relax_ticks` | consecutive overshoot-side ticks while deep in a curve (dwell counter) |
 | `sb_state` | stall/breakaway v2: `0` idle, `1` armed, `2` breakaway episode |
 | `sb_trips` | cumulative trips this drive (budget on ordinary driving ≈ 0) |
 | `sb_block` | same-side push-suppression ticks left after a trip |
@@ -1376,8 +1392,8 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   route 4e9 that was δ_err ≈ −2.2e-4 rad / ~0.08 Nm left, and the car sat
   +0.15 m right of the model's plan (plan at 3 s: +0.03 m).
 - **Law**: `sl_bias += (P_nm / SL_TAU_S)·dt` each livePose tick while the gate
-  is open, clamped to ±`SL_BIAS_MAX_NM`; `target_nm = P_nm + sl_bias` on the
-  P path, applied whether or not the gate is open.
+  is open, clamped to ±`SL_BIAS_MAX_NM`; `demand = ff_nm + P_nm + sl_bias`,
+  applied whether or not the gate is open.
 - **Gate** (situation only, never the error's sign; see the hold-bias failure,
   37e34b7): latched at engagement, active, not pressed, v > 40 km/h,
   |κ_des| < 1e-3, |κ_meas| < 1.5e-3 and |a_ref| < 0.15 m/s² (gentle bends charged
@@ -1408,11 +1424,11 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | section | where | content |
 |---|---|---|
 | Module constants | top of file | `SB_*`, `V_GAIN_FLOOR`, LKA band, `CONTROL_HORIZON_S`, `SL_*`, `CF_*` + `curve_ff_nm`, the lane_keeping readiness check (R10) |
-| `on_lat_controller_init` | module | R10 guard, `StallBreakaway` read, cadence/gain/step constants, the state dict, `update` closure |
+| `on_lat_controller_init` | module | R10 guard, `StallBreakaway` read, cadence/gain/step/dwell constants, the state dict, `update` closure |
 | Engagement edge | top of `update()` | `SlopeCompensation` latch, guard reset; inactive zeroes torque/target/ramp |
 | Stall/breakaway v2 | `update()`, before the livePose branch | ring / arm / breakaway / trip, shed-rate enforcement |
-| livePose tick | `update()` | reference, speeds, `delta_err`, `kappa_scale`, `a_ref`/`ff_nm`, slope-bias learning, `demand_nm`, guard observe |
-| Decision | `update()`, every `action_cadence_ticks` while active | demand → `t_cap` → guard → `STEP_MAX` → sb block |
+| livePose tick | `update()` | reference, speeds, `delta_err`, `kappa_scale`, `a_ref`/`ff_nm`, slope-bias learning, `demand_nm`, guard observe, relax-dwell |
+| Decision | `update()`, every `action_cadence_ticks` while active | demand → `t_cap` → dwell bridge → guard → `STEP_MAX` → sb block |
 | Contact learning, take-up | `update()`, every CAN tick | `ContactLearner.observe`, `FreePlayTakeUp.step`, handover |
 | Ramp and telemetry | end of `update()` | per-frame ramp step, zero snap, `bmw_lat_control` payload (§9) |
 
