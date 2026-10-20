@@ -288,12 +288,11 @@ if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
     touch "$PLUGINS_DEST/c3_compat/.enforced"
   fi
 fi
-# lane_keeping is coupled to the Phase-2 BMW lateral controller: the tracker
-# needs its smoothed reference unconditionally, so removing the plugin from
-# the hook (.disabled) is the documented-unsafe rollback. Enforced always-on;
-# the ONLY user control is the Driving-panel "Lane Keeping" toggle, which
-# gates the position anchor while the conditioning keeps running. Clear any
-# stale .disabled — the registry loader honors it even when enforced.
+# lane_keeping is required by the BMW lateral controller: it tracks the Arc
+# reference, and without the plugin the hook leaves the stock lateral
+# controller in place (ruling R10). Enforced always-on; there is no user
+# control. Clear any stale .disabled — the registry loader honors it even when
+# enforced.
 if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
   if $DRY_RUN; then
     echo "  ENFORCE lane_keeping (touch .enforced, rm .disabled)"

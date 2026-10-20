@@ -140,13 +140,6 @@ resized to fit the button. Tapping toggles the stock `ExperimentalMode` param
 (only when `ExperimentalModeConfirmed` and the car has longitudinal control),
 with a 2 s visual hold on the new state.
 
-**Green ring = lane keeping working.** Each `_update_state`, the button reads
-the `lane_keeping` topic off the plugin bus (`PluginSub(['lane_keeping'])`,
-live) and, as a replay fallback, from `pluginBusLog` entries. `state ==
-'anchor'` means the driver-side line is trusted and the position loop is live;
-the ring is drawn (green, `RING_WIDTH` 12 px) only when that is true **and**
-openpilot is `enabled`.
-
 ## Road info overlay (`road_info_overlay.py`)
 
 `on_render_overlay` draws the current road identifier (highway ref, e.g.
@@ -177,8 +170,6 @@ start/end markers, and a small URL caption.
 
 | Source | Where | Used for |
 |---|---|---|
-| `lane_keeping` (plugin bus) | `exp_button.py` | `state == 'anchor'` → green ring |
-| `pluginBusLog` (cereal) | `exp_button.py` | replay fallback for `lane_keeping` |
 | `speedLimitState` (plugin bus) | `road_info_overlay.py` | `wayRef` / `roadName` overlay |
 | COD `GET /v1.1/devices/{id}/stats` | `drive_stats.py` | weekly stats |
 | COD `POST /v1/route/{id}/drive_stats` | `drive_tracker.py` | push per-drive summary |
@@ -216,7 +207,7 @@ ui_mod/
   drive_tracker.py     # DriveTracker — live drive-stats accumulator + COD POST
   route_map.py         # RouteMapRenderer — CartoDB dark tiles + GPS trace
   route_map_widget.py  # RouteMapWidget — home left column wrapper
-  exp_button.py        # ExpButton — branded emblem, lane-keeping green ring
+  exp_button.py        # ExpButton — branded emblem
   road_info_overlay.py # ui.render_overlay — road name/ref from speedlimitd
   tests/               # test_drive_tracker.py, test_route_map.py
 ```

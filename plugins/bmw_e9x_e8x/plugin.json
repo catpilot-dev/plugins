@@ -24,7 +24,7 @@
     },
     "SlopeCompensation": {
       "default": false,
-      "description": "Learn and apply the steady straight-road torque (road slope, alignment) in Direct Tracking. Write 1 to enable. Read at each engagement."
+      "description": "Learn and apply the steady straight-road torque (road slope, alignment). Write 1 to enable. Read at each engagement."
     }
   },
   "cereal": {

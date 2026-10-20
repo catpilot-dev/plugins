@@ -90,7 +90,7 @@ def test_guard_flicker_never_reverses():
 
 def test_guard_value_equality():
   """Value semantics: controller state snapshots compare guards by content
-  (TestOverrideObservers.test_no_behavior_change diffs every state key)."""
+  (controller state snapshots compare by content)."""
   a, b = SignGuard(), SignGuard()
   assert a == b
   a.observe(+0.002); a.allow(+0.1)

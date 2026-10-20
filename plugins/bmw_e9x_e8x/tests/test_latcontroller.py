@@ -1536,7 +1536,7 @@ class TestDirectTracking:
 
   def test_hold_floor_kept_in_curves(self, monkeypatch):
     """v=20, κ_des=0.006: a_y 2.4 m/s² ≥ HOLD_AY_BP[1] -> hold_f = 1, and
-    hold_cap = 0.192 (see TestCancelTolStillFires). Standing torque 0.15 ->
+    hold_cap = 0.192 (P for HOLD_CAP_DRIFT_M over the horizon). Standing torque 0.15 ->
     held_target 0.15. κ_meas lags by δ_err ≈ 0.002 rad: P = 1.833·400·0.002/12 ≈ 0.122,
     same-sign but under the hold -> floored at held_target. The step from
     0.15 is zero, so STEP_MAX does not bind."""
@@ -1738,7 +1738,7 @@ class TestDirectTracking:
     assert calls[-1][3] is False                # inactive: no sample
 
   def test_learner_exception_never_breaks_lateral(self, monkeypatch):
-    """Ruling R12: observe runs every tick in both modes; an exception in it
+    """Ruling R12: observe runs every tick; an exception in it
     must never break lateral — the tick completes and the ramp still applies."""
     lac, fake_sm, mod, state = self._engaged(monkeypatch)
     def _boom(*a, **k):
@@ -1777,6 +1777,32 @@ class TestDirectTracking:
       'torque', 'output', 'vEgo', 'active', 'hold_f', 'hold_cap', 'relax_ticks', 'sb_state', 'sb_trips',
       'sb_block', 'angle', 'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right',
       'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn'}
+
+  def test_telemetry_has_steering_signals(self, monkeypatch):
+    """Steering-side signals ride the plugin bus with the controller state:
+    wheel angle, servo-to-column gap (slack/windup), steering rate, driver
+    pressed, and the lat_delay the controller was given."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    payloads = []
+    state['lat_pub'] = SimpleNamespace(send=payloads.append)
+    _set_measured(sm, 20.0, 0.0)
+    CS = SimpleNamespace(vEgo=20.0, steeringAngleDeg=-1.5, steeringAngleOffsetDeg=-14.2,
+                         steeringRateDeg=3.0, steeringPressed=True)
+    lac.update(True, CS, None, None, False, 0.001, False, 0.6)
+    p = payloads[-1]
+    assert p['angle'] == pytest.approx(-1.5)
+    assert p['servo_gap'] == pytest.approx(-14.2)
+    assert p['steer_rate'] == pytest.approx(3.0)
+    assert p['pressed'] is True
+    assert p['lat_delay'] == pytest.approx(0.6)
+
+  def test_telemetry_tolerates_a_minimal_car_state(self, monkeypatch):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    payloads = []
+    state['lat_pub'] = SimpleNamespace(send=payloads.append)
+    _set_measured(sm, 20.0, 0.0)
+    _call_update(lac, 0.001, v_ego=20.0)
+    assert payloads and payloads[-1]['servo_gap'] == 0.0 and payloads[-1]['pressed'] is False
 
   def test_telemetry_action_take_up(self, monkeypatch):
     lac, fake_sm, mod, state, _ = self._start_takeup(monkeypatch)

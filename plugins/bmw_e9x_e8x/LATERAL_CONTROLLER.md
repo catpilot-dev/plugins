@@ -21,7 +21,7 @@ with no filtering of its own.
     v         = max(v_true, V_GAIN_FLOOR)                   gain reference speed
     P_nm      = T_CAP_SLOPE_BASE · kappa_scale(|kappa_ref|) · v² · delta_err  (+ sl_bias)
 
-**Decision**, every `CONTROL_HORIZON_S / 2` (325 ms) while active, in order:
+**Decision**, every `CONTROL_HORIZON_S / 2` (6 livePose ticks, 300 ms) while active, in order:
 P on the full error (no on-target band — a sub-friction target is a hold);
 curve hold: P trims down from `held_target = hold_f · torque` on an in-band
 overshoot (R8) and a same-side push never commands less than it (hold-floor);
@@ -29,7 +29,7 @@ clip to `t_cap`; relax-dwell bridge in a deep measured curve; the noise guard
 (a sign change commands 0 until the opposite error sign has persisted
 `GUARD_PERSIST_S`); `STEP_MAX` toward the target (×`UNWIND_STEP_GAIN` when
 shedding in the LKA regime); a same-side push during a stall-breakaway block
-is zeroed. The torque ramps to the target over the next 325 ms, one CAN tick
+is zeroed. The torque ramps to the target over the next 300 ms, one CAN tick
 at a time. The free-play take-up (`bmw/takeup.py`) commands `TAKEUP_NM` across
 the servo lash on a change of push direction once the contacts are learned,
 then hands back to the ramp. Inactive: no decision runs; torque, target and
@@ -950,6 +950,8 @@ gone; the current law above is authoritative.
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
 
+> Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
+
 The BMW E9x/E8x uses an **AC Delco / Ocelot stepper servo on the hydraulic rack**, not an EPS motor. The plant has two properties that make stock torque controllers misbehave:
 
 1. **High static stiction, no self-centering** — at zero applied torque the rack *holds its current angle* indefinitely. There is no aligning-torque-driven return-to-center. This is the opposite of most EPS racks, where the steering self-centers.
@@ -971,6 +973,8 @@ When `|δ_err| ≤ HOLD_BAND` the cadence decision holds (target → 0 on straig
 ---
 
 ## 2. Single-knob timing design
+
+> Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
 
 There is one knob — `CP.steerActuatorDelay` in `bmw/interface.py:87` — and every timing constant downstream subscribes to it via the liveDelay chain. Change SAD and the whole stack adapts.
 
@@ -1019,6 +1023,8 @@ liveDelay.lateralDelay             (= 0.6 s; permanently pinned for BMW —
 ---
 
 ## 3. Reference signal & filter chain
+
+> Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
 
 ```
 modelV2.action.desiredCurvature   (raw model output, ~20 Hz)
@@ -1119,6 +1125,8 @@ state['delta_err_raw'] = delta_err_raw    # both published in telemetry
 ---
 
 ## 5. The kinematic deadzone
+
+> Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
 
 **DELETED 2026-07-22 (Phase 2).** The kinematic `DRIFT_M` deadzone, the
 σ-observer noise floor and the sign-persistence gate are gone. They existed
@@ -1291,20 +1299,16 @@ These were tried, deployed, and reverted. Each appears here so future maintainer
 Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user: "solid in straight, agile and accurate in turns"). Only retune if a new failure mode appears.
 
 ### To change the controller's overall timing (cadence, ramp, jerk horizon, modeld lookahead all together):
-- Change `ret.steerActuatorDelay` in `bmw/interface.py:87`
-- Range `[0.3, 0.5]` keeps cadence in `[5, 7]` ticks (250-350 ms). Don't go below 0.3.
+- `CONTROL_HORIZON_S` (0.65 s): the decision cadence and the ramp spread are
+  each half of it. It does not follow `lat_delay`. modeld's own look-ahead is
+  `CP.steerActuatorDelay` in `bmw/interface.py`, a separate knob.
 
 ### To suppress more wobble at near-straight (filter):
-- `KD_GATE` and `kd_filter_window` no longer exist — the κ-gated delta_err box
-  filter was deleted in Phase 2 (2026-07-22, see § 4). There is nothing to
-  retune in this controller for near-straight wobble suppression.
-- Reference smoothing now lives in the `lane_keeping` plugin: retune
-  `KAPPA_FILTER_TAU` there (currently 0.15 s) to trade group delay for
-  smoothing on its κ_des low-pass.
-- In this controller, the only near-straight knob left is `HOLD_BAND`
-  (currently 0.001 rad) — the fixed stiction hold-retrigger threshold. It is
-  sized by rack breakaway, not by allowed wobble; widening it to fight noise
-  reintroduces the drift failure mode the deleted deadzone had (§ 5).
+- The reference is conditioned in `lane_keeping`: the arc look-ahead schedule
+  (`ARC_H_SPEED_V` / `ARC_H_SPEED`, pulled back by `ARC_K_AHEAD_BP`) and the
+  low-pass `LaneKeepKappaFilterTau` (0.15 s). Longer removes more wander and
+  adds delay or early turn-in. This controller has no near-straight knob of its
+  own beyond its straight gain `T_CAP_SCALE_BP[0]`.
 
 ### If lane-change overshoot reappears on the post-LC phase:
 - Look at `bmw_lat_control` log for that LC: is `de_at_end_raw > 0.3°`? Is post-LC `|torque|` > 3 N?
@@ -1312,10 +1316,9 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - Don't apply a global LC torque cap — most LCs are fine. Targeted options exist (magnitude-gated cancel, soft post-LC re-engagement); see commit history around routes 326/32a/32d for the analysis.
 
 ### If straights feel less smooth than today:
-- First, check that the κ_des wobble character hasn't changed (newer model versions may have different noise).
-- This controller no longer filters — check `lane_keeping`'s `KAPPA_FILTER_TAU`
-  (currently 0.15 s) first; that low-pass is what shapes straight-line feel now.
-  Shortening it trades smoothing for responsiveness on its position loop.
+- Compare `kappa_ref` against `kappa_in` in the `lane_keeping` topic first (the
+  reference's share of the model wobble), then the noise guard's `tu_guarded`
+  rate and the take-ups per minute in `bmw_lat_control`.
 
 ### If real-curve tracking feels under-aggressive:
 - Increase `T_CAP_SCALE_BP[1]` or `T_CAP_SCALE_BP[2]` (currently 2.5, 3.0 at `|κ| = 0.01, 0.02`).
@@ -1345,8 +1348,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - **Default OFF**, `'1'` enables.
 - **Not hot**, same as above: read once at controller construction, so it
   applies at the **next drive start**. There is deliberately no bus topic, no
-  heartbeat and **no panel toggle** — a rare-event safety net does not need
-  mid-drive flipping.
+  heartbeat; the Driving-panel "Stall Breakaway" toggle writes the param.
 - Enable: `echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/StallBreakaway`.
   Disable: write anything else, or delete the file.
 - **Verify a drive picked it up**: with the param on the machine arms from the
@@ -1363,9 +1365,9 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   +0.15 m right of the model's plan (plan at 3 s: +0.03 m).
 - **Law**: `sl_bias += (P_nm / SL_TAU_S)·dt` each livePose tick while the gate
   is open, clamped to ±`SL_BIAS_MAX_NM`; `target_nm = P_nm + sl_bias` on the
-  Direct P path, applied whether or not the gate is open.
+  P path, applied whether or not the gate is open.
 - **Gate** (situation only, never the error's sign; see the hold-bias failure,
-  37e34b7): latched with Direct, active, not pressed, v > 40 km/h,
+  37e34b7): latched at engagement, active, not pressed, v > 40 km/h,
   |κ_des| < 1e-3 and |κ_meas| < 1.5e-3, no take-up in flight, no stall-breakaway
   block or episode (`sb_state` 2; the armed state 1 does not close it).
 - **Constants**: `SL_TAU_S` 20 s, `SL_BIAS_MAX_NM` 0.25 (well below rack
@@ -1428,7 +1430,6 @@ ev = list(log.Event.read_multiple_bytes(zstandard.ZstdDecompressor().decompress(
 Key metrics to compute per route:
 - **Reference-smoothing efficacy** (Phase 2: this now lives in `lane_keeping`, not `latcontroller`): compare `kappa_in` vs `kappa_ref` sign-flips per second from the `lane_keeping` telemetry topic — `delta_err_raw` no longer exists in `bmw_lat_control` telemetry, since the box filter it fed was deleted from this controller.
 - **Lane offset**: from `modelV2.laneLines[1].y[0]` and `modelV2.laneLines[2].y[0]` averaged. RMS should be 0.30-0.45 m on healthy drives.
-- **cancel_jerk / cancel_accel counts**: removed 2026-07-28 (no ISO cancel) — these actions no longer exist in telemetry. `cancel_tol` (boundary hygiene) still appears and is expected; it is not an abandonment of the turn.
 - **`de_at_end_raw`**: δ_err at the moment laneChangeState flips back to `off`. Should be < 0.3° on healthy LCs.
 - **`post_tq_max`**: peak `|output·STEER_MAX|` in the 1.5 s after each LC end. Should be < 2-3 Nm.
 

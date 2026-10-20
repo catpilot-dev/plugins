@@ -75,7 +75,7 @@ class ContactLearner:
     c = (self._val[0], self._val[1])
     return c if _width_ok(*c) else None
 
-  # Value equality, as SignGuard (twin-lockstep test diffs every state key).
+  # Value equality, as SignGuard: controller state snapshots compare by content.
   __hash__ = None
 
   def __eq__(self, other):
@@ -126,7 +126,7 @@ class SignGuard:
     self._opp = 0
 
   # Value equality: controller state snapshots compare guards by content
-  # (latcontroller's twin-lockstep test diffs every state key).
+  # (controller state snapshots compare by content).
   __hash__ = None
 
   def __eq__(self, other):

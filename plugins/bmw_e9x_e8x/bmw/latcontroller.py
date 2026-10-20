@@ -18,9 +18,9 @@ torque here: this controller tracks the commanded curvature and never gives
 up in a turn (routes 326, 385, 2ba, 3ce, 3cf: every mid-turn drain ran the car
 wide). The P law reversing on overshoot is the correction.
 
-Loaded by the plugin registry as `plugins.bmw_e9x_e8x.bmw.latcontroller`.
-Never import it as `bmw.latcontroller` from other modules: a second module
-instance would carry its own state dict.
+Loaded by the plugin registry under its canonical name (manifest id + module
+path). Never import it as `bmw.latcontroller` from other modules: a second
+module instance would carry its own state dict.
 """
 import os
 import sys
@@ -366,7 +366,7 @@ def on_lat_controller_init(result, lac, CP):
     livepose_updated = _sm.updated['livePose']
 
     # livePose tick (20 Hz): measured and desired every tick, a decision every
-    # action_cadence_ticks (~325 ms: >= 2.5 tau of the rack's ~130 ms response,
+    # action_cadence_ticks (6 ticks, 300 ms: >= 2.5 tau of the rack's ~130 ms response,
     # so the plant has answered the previous step). CAN tick (100 Hz): ramp.
     if livepose_updated:
       # Cadence and ramp length, both half of CONTROL_HORIZON_S; spread_frames

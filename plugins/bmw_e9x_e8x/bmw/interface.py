@@ -99,7 +99,7 @@ class CarInterface(CarInterfaceBase):
     # That 0.9-1.0 s is mostly rack stiction on small corrections, not a pure
     # delay, so do not feed it to the model. The BMW controller's own timing
     # does not follow lat_delay (latcontroller CONTROL_HORIZON_S = 0.65);
-    # lane_keeping's gap prediction (1.5 × lat_delay) still does, by design.
+    # lane_keeping's arc look-ahead is scheduled by speed and curvature, not by it.
     ret.steerActuatorDelay = 0.4
     ret.steerLimitTimer = 0.4
 
