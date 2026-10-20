@@ -1010,6 +1010,21 @@ class TestStallBreakawayV2:
     assert not [k for k in pay[-1] if k.startswith('ov_')]
     assert not hasattr(mod, 'OV_EOD_RATE_DPS')
 
+  def test_sb_block_zeroes_ff_push(self, monkeypatch):
+    """A right curve carried by the FF (ff +0.95, P 0) during a post-trip block:
+    with sb_dir -1.0 (the wheel broke away moving right, so a right push is
+    same-side) the decision is zeroed; with sb_dir +1.0 it passes."""
+    for sb_dir, zeroed in ((-1.0, True), (1.0, False)):
+      lac, sm, mod, state = _make_controller(monkeypatch, stall_v2=True)
+      _set_measured(sm, 25.0, 0.002)
+      _call_update(lac, 0.002, v_ego=25.0, active=False)
+      _call_update(lac, 0.002, v_ego=25.0, active=True)
+      state.update(torque=0.0, target_frac=0.0, ramp_frames=0, action='idle',
+                   sb_block=10, sb_dir=sb_dir, tick_count=999)
+      _call_update(lac, 0.002, v_ego=25.0)
+      assert state['ff_nm'] == pytest.approx(0.95)
+      assert (state['target_frac'] == 0.0) is zeroed
+
   def test_block_zeroes_same_side_push_whatever_the_label(self, monkeypatch):
     """During a post-trip block a same-side push is zeroed by the decision
     even in a deep measured curve with the reference below the measured
@@ -1271,6 +1286,28 @@ class TestLowSpeedGainFloor:
 
 
 
+# ============================================================
+# Curve feed-forward: ff_nm = clip(CF_GAIN * sign(a_ref) * max(|a_ref| - CF_AY0, 0), +/-CF_MAX_NM)
+# with a_ref = v_true^2 * kappa_ref (docs/superpowers/specs/2026-10-20-bmw-curve-
+# feedforward-and-audit-design.md, Part A).
+# ============================================================
+
+def test_curve_ff_zero_inside_deadband():
+  from bmw.latcontroller import curve_ff_nm
+  assert curve_ff_nm(0.29) == 0.0 == curve_ff_nm(-0.29) == curve_ff_nm(0.0)
+
+
+def test_curve_ff_sign_and_gain():
+  from bmw.latcontroller import curve_ff_nm
+  assert curve_ff_nm(1.3) == pytest.approx(1.0)
+  assert curve_ff_nm(-1.3) == pytest.approx(-1.0)
+
+
+def test_curve_ff_cap():
+  from bmw.latcontroller import curve_ff_nm
+  assert curve_ff_nm(5.0) == 2.0 and curve_ff_nm(-5.0) == -2.0
+
+
 class TestDirectTracking:
 
   def _engaged(self, monkeypatch, v=25.0):
@@ -1363,9 +1400,10 @@ class TestDirectTracking:
     assert state['action'] == 'ramp' and state['target_frac'] > 0.0
 
   def test_no_hold_floor_in_curves(self, monkeypatch):
-    """v=20, kappa_des=0.006, standing torque 0.15, kappa_meas lagging by
-    delta_err 0.002: P = 1.833*400*0.002/12 = 0.122, same side but below the
-    standing torque. The decision is P itself: no hold factor, no hold-floor."""
+    """v=20, kappa_des=0.006 (a_ref 2.4 -> ff 2.0 Nm), standing torque 0.15,
+    kappa_meas lagging by delta_err 0.002: P = 1.833*400*0.002 = 1.47 Nm. The
+    decision targets ff + P = 3.47 Nm = 0.289 frac, step-limited from 0.15 by
+    STEP_MAX(20) = 0.0808 — the standing torque is neither held nor floored."""
     v, kappa = 20.0, 0.006
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
     kappa_meas = math.tan(math.atan(kappa * 2.66) - 0.002) / 2.66
@@ -1377,7 +1415,8 @@ class TestDirectTracking:
     _call_update(lac, kappa, v_ego=v)
     assert state['delta_err'] == pytest.approx(0.002)
     assert state['action'] == 'ramp'
-    assert state['target_frac'] == pytest.approx(0.122, abs=0.005)
+    assert state['ff_nm'] == pytest.approx(2.0)
+    assert state['target_frac'] == pytest.approx(0.15 + 0.0807692307, abs=1e-6)
     assert not hasattr(mod, 'hold_factor')
     assert 'hold_f' not in state and 'relax_ticks' not in state
 
@@ -1398,6 +1437,7 @@ class TestDirectTracking:
     """Engage in a curve with delta_err of lag, standing torque `torque`, the
     guard committed to that push's side; run one decision."""
     lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    self._last_lac = lac
     _set_measured(fake_sm, v, math.tan(math.atan(kappa * 2.66) - delta_err) / 2.66)
     _call_update(lac, kappa, v_ego=v, active=False)
     _call_update(lac, kappa, v_ego=v, active=True)
@@ -1407,6 +1447,94 @@ class TestDirectTracking:
     _call_update(lac, kappa, v_ego=v)
     assert state['delta_err'] == pytest.approx(delta_err)
     return mod, state
+
+  # v=25, kappa_ref 0.002: kappa_scale 1.1667, gain G = 729.17 Nm/rad, a_ref 1.25 -> ff 0.95 Nm,
+  # step_max 0.0615 frac, t_cap ~0.49 frac.
+  _G = 1.0 * (1.0 + (0.001 / 0.009) * 1.5) * 625.0
+
+  def test_decision_is_ff_plus_p(self, monkeypatch):
+    mod, state = self._curve_decision(monkeypatch, v=25.0, kappa=0.002,
+                                      delta_err=0.60 / self._G, torque=0.125)
+    assert state['ff_nm'] == pytest.approx(0.95)
+    assert state['target_frac'] * 12.0 == pytest.approx(1.55, abs=0.05)
+
+  def test_overshoot_trims_the_sum(self, monkeypatch):
+    mod, state = self._curve_decision(monkeypatch, v=25.0, kappa=0.002,
+                                      delta_err=-0.40 / self._G, torque=0.05)
+    assert state['target_frac'] * 12.0 == pytest.approx(0.55, abs=0.05)
+    assert state['target_frac'] > 0.0 and state['action'] == 'ramp'
+
+  def test_large_overshoot_crosses_zero_under_guard(self, monkeypatch):
+    """ff +0.95 with P -1.50: the demand is -0.55 Nm. The guard (committed
+    right) holds the first decision at 0; once the demand's sign has persisted
+    GUARD_PERSIST_S the next decision goes negative."""
+    mod, state = self._curve_decision(monkeypatch, v=25.0, kappa=0.002,
+                                      delta_err=-1.50 / self._G, torque=0.0)
+    assert state['target_frac'] == 0.0 and state['guard'].suppressed == 1
+    lac = self._last_lac
+    for _ in range(3):                                     # the demand's sign persists
+      _call_update(lac, 0.002, v_ego=25.0)
+    state['tick_count'] = 999
+    _call_update(lac, 0.002, v_ego=25.0)
+    assert state['ff_nm'] == pytest.approx(0.95)
+    assert state['target_frac'] * 12.0 == pytest.approx(-0.55, abs=0.05)   # the sum, not P alone
+
+  def test_ff_uses_true_speed_not_gain_floor(self, monkeypatch):
+    """At 1 m/s (gain reference floored to 2.78) a 0.05 1/m turn is a_ref 0.05,
+    not 0.39: the feed-forward reads the true speed and stays 0."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(fake_sm, 1.0, 0.05)
+    _call_update(lac, 0.05, v_ego=1.0, active=False)
+    _call_update(lac, 0.05, v_ego=1.0, active=True)
+    assert state['a_ref'] == pytest.approx(0.05)
+    assert state['ff_nm'] == 0.0
+
+  def test_ff_low_speed_turn_bounded(self, monkeypatch):
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(fake_sm, 5.0, 0.05)
+    _call_update(lac, 0.05, v_ego=5.0, active=False)
+    _call_update(lac, 0.05, v_ego=5.0, active=True)
+    assert state['a_ref'] == pytest.approx(1.25)
+    assert state['ff_nm'] == pytest.approx(0.95)
+
+  def test_ff_capped_and_step_limited_on_kappa_spike(self, monkeypatch):
+    """A raw-model spike (lane change) of 0.003 at 30 m/s is a_ref 2.7: the FF
+    saturates at CF_MAX_NM and the decision still moves at most STEP_MAX."""
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
+    _set_measured(fake_sm, 30.0, 0.003)
+    _call_update(lac, 0.003, v_ego=30.0, active=False)
+    _call_update(lac, 0.003, v_ego=30.0, active=True)
+    state.update(torque=0.0, target_frac=0.0, ramp_frames=0, action='idle', tick_count=999)
+    _call_update(lac, 0.003, v_ego=30.0)
+    assert state['ff_nm'] == 2.0
+    assert abs(state['target_frac']) <= 0.05 + 1e-9        # STEP_MAX at/above 28 m/s
+
+  def test_s_curve_ff_reversal_passes_guard_then_takes_up(self, monkeypatch):
+    """Steady right curve carried by the FF, then the mirror-image left curve:
+    the demand flips sign, the guard holds 0 until the new sign has persisted,
+    the ramp crosses zero and the take-up fires once."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
+    _set_measured(fake_sm, 25.0, 0.002)
+    for _ in range(124):          # settle on the right curve; the flip lands 2 livePose ticks before a decision
+      _call_update(lac, 0.002, v_ego=25.0, gap_deg=77.6)
+    assert state['torque'] > 0.05 and state['takeup'].fires == 0
+    _set_measured(fake_sm, 25.0, -0.002)
+    gap = 77.6
+    for _ in range(300):
+      _call_update(lac, -0.002, v_ego=25.0, gap_deg=gap)
+      if state['takeup'].state == 'taking_up':
+        gap = 65.0                                         # the servo reaches the left contact
+    assert state['guard'].suppressed >= 1
+    assert state['takeup'].fires == 1 and state['takeup'].timeouts == 0
+    assert state['torque'] < -0.05
+
+  def test_guard_judges_the_full_demand_in_a_curve(self, monkeypatch):
+    """ff +0.95 with P -0.40 is a positive demand: the guard stays committed
+    right although the error alone is negative."""
+    mod, state = self._curve_decision(monkeypatch, v=25.0, kappa=0.002,
+                                      delta_err=-0.40 / self._G, torque=0.05)
+    assert state['guard'].side == +1 and state['guard'].suppressed == 0
 
 
   def test_guard_uncommitted_after_reengage(self, monkeypatch):
@@ -1567,7 +1695,7 @@ class TestDirectTracking:
     _call_update(lac, 0.001, v_ego=25.0)
     assert set(pay[-1]) == {
       'desired', 'measured', 'err', 'delta_err', 'target_frac', 'ramp_step', 'ramp_frames', 'action',
-      'torque', 'output', 'vEgo', 'active', 'sb_state', 'sb_trips',
+      'torque', 'output', 'vEgo', 'active', 'ff_nm', 'a_ref', 'sb_state', 'sb_trips',
       'sb_block', 'angle', 'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right',
       'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn'}
 
@@ -1847,7 +1975,17 @@ class TestSlopeBias:
     _call_update(lac, 0.0, v_ego=self.V, active=True)
     assert state['slope'] and state['sl_bias'] == b
 
-  def test_guard_judges_the_biased_demand(self, monkeypatch):
+  def test_bias_frozen_above_a_ref_gate(self, monkeypatch):
+    """A gentle bend above SL_AY_MAX (kappa 4e-4 at 25 m/s = 0.25 m/s^2) does
+    not charge the bias although |kappa| < SL_KAPPA_DES; below the gate
+    (2e-4 = 0.125 m/s^2) learning runs."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    self._run(lac, fake_sm, 1, desired=4e-4, kappa_meas=4e-4)
+    assert state['sl_learn'] is False
+    self._run(lac, fake_sm, 1, desired=2e-4, kappa_meas=2e-4)
+    assert state['sl_learn'] is True
+
+  def test_guard_judges_the_full_demand(self, monkeypatch):
     """Final review, Important 1: the noise guard must observe the same
     demand it judges. With a left bias (-0.1 Nm) and the guard committed right
     after a correction, a steady small positive error (P +0.05 Nm) asks for

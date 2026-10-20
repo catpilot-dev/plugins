@@ -7,9 +7,12 @@ LATERAL_CONTROLLER.md (current law at the top, dated history below).
 
 The law, per livePose tick (20 Hz) and per CAN tick (100 Hz):
   delta_err = atan(kappa_ref*L) - atan(kappa_meas*L)        front-wheel angle (rad)
-  P_nm      = T_CAP_SLOPE_BASE * kappa_scale * v^2 * delta_err  (+ sl_bias)
-Every CONTROL_HORIZON_S/2 a decision takes P through t_cap, the noise guard,
-STEP_MAX and the stall-breakaway block, and the torque ramps to it over the next half horizon; the free-play take-up
+  P_nm      = T_CAP_SLOPE_BASE * kappa_scale * v^2 * delta_err
+  a_ref     = v_true^2 * kappa_ref                          reference lateral accel
+  ff_nm     = curve_ff_nm(a_ref)                            steady curve torque
+  demand    = ff_nm + P_nm (+ sl_bias)
+Every CONTROL_HORIZON_S/2 a decision takes the demand through t_cap, the noise
+guard, STEP_MAX and the stall-breakaway block, and the torque ramps to it over the next half horizon; the free-play take-up
 closes the servo lash on each change of push direction.
 
 Lateral acceleration is bounded by speedlimitd through v, never by draining
@@ -76,6 +79,12 @@ def gain_reference_speed(v_true):
   """Speed the torque parameters (gains and caps) reference; identity above V_GAIN_FLOOR."""
   return max(float(v_true), V_GAIN_FLOOR)
 
+
+def curve_ff_nm(a_ref):
+  """Steady curve torque (Nm) for a reference lateral accel a_ref (m/s^2, + = right)."""
+  mag = max(abs(float(a_ref)) - CF_AY0, 0.0)
+  return float(np.clip(CF_GAIN * np.sign(a_ref) * mag, -CF_MAX_NM, CF_MAX_NM))
+
 # Controller timing horizon (s): the decision cadence and the ramp spread are
 # each half of it. Fixed, independent of lat_delay: a 0.95 s horizon stretched
 # the cadence to ~500 ms of added lag (route 4d8).
@@ -92,6 +101,18 @@ SL_BIAS_MAX_NM = 0.25      # route 4ea: roads with roll >= 2.3 deg need 0.20-0.2
 SL_MIN_V = 40 / 3.6        # learn only above 40 km/h (m/s)
 SL_KAPPA_DES = 1e-3        # straight: |kappa_ref| below this (1/m)
 SL_KAPPA_MEAS = 1.5e-3     # and |kappa_meas| below this (1/m)
+SL_AY_MAX = 0.15           # and |a_ref| below this (m/s^2): gentle bends charged the bias on route 4ec
+
+# Curve feed-forward (docs/superpowers/specs/2026-10-20-bmw-curve-feedforward-
+# and-audit-design.md). Above ~0.3 m/s^2 a curve needs steady torque this
+# hydraulic rack's stiction does not supply (440 steady windows on 4e9-4ec:
+# ~1.5 Nm per m/s^2 beyond ~0.25); P alone paid for it with a standing error
+# (4ec seg 22: the car drifted 0.8 m to the outside of a 1 m/s^2 bend). The
+# feed-forward supplies ~55 % of the measured need on purpose: P closes the
+# rest and never has to remove feed-forward torque.
+CF_AY0 = 0.3               # m/s^2 deadband: below it stiction holds the angle at zero torque
+CF_GAIN = 1.0              # Nm per m/s^2 beyond the deadband (measured need ~1.5)
+CF_MAX_NM = 2.0            # cap (Nm); t_cap and STEER_MAX still apply
 
 # Direct Tracking (docs/superpowers/specs/2026-10-18-bmw-direct-tracking-
 # design.md) is the only law: no rest state, sign-guarded reversals, free-play
@@ -114,11 +135,14 @@ def on_lat_controller_init(result, lac, CP):
   Front-wheel-angle error (rear-axle bicycle model, L = CP.wheelbase):
     delta_err = atan(kappa_ref*L) - atan(kappa_meas*L),  kappa_meas = yaw rate / v_true
 
-  Decision, every CONTROL_HORIZON_S/2 while active, on the full error:
-    P_nm   = T_CAP_SLOPE_BASE * kappa_scale(|kappa_ref|) * v^2 * delta_err  (+ sl_bias)
-    target = P, clipped to t_cap, sign changes gated by the noise guard, moved
-             at most STEP_MAX from the current torque, zeroed on a same-side
-             push during a stall-breakaway block.
+  Demand, every livePose tick, on the full error:
+    P_nm   = T_CAP_SLOPE_BASE * kappa_scale(|kappa_ref|) * v^2 * delta_err
+    ff_nm  = curve_ff_nm(v_true^2 * kappa_ref)
+    demand = ff_nm + P_nm (+ sl_bias)
+  Decision, every CONTROL_HORIZON_S/2 while active:
+    target = demand, clipped to t_cap, sign changes gated by the noise guard,
+             moved at most STEP_MAX from the current torque, zeroed on a
+             same-side push during a stall-breakaway block.
   The torque ramps to the target over the next half horizon, one CAN tick at
   a time; the free-play take-up (bmw/takeup.py) owns the torque while it
   crosses the servo lash on a change of push direction. Sub-breakaway targets
@@ -213,6 +237,9 @@ def on_lat_controller_init(result, lac, CP):
     'takeup': FreePlayTakeUp(_learner, CCP.STEER_MAX),   # lash take-up
     'tu_resume': 'init',     # decision label under 'take_up', restored when it ends
     'tu_demand': 0.0,        # last decision's target before STEP_MAX (take-up size gate)
+    'a_ref': 0.0,            # reference lateral accel v_true^2 * kappa_ref (m/s^2)
+    'ff_nm': 0.0,            # curve feed-forward (Nm)
+    'demand_nm': 0.0,        # ff_nm + P_nm (+ sl_bias): what the decision targets
     'slope': False,          # SlopeCompensation latched at the engagement edge
     'sl_bias': 0.0,          # learned straight-road torque (Nm); kept across engagements, never persisted
     'sl_learn': False,       # learn gate open this livePose tick (telemetry)
@@ -372,29 +399,34 @@ def on_lat_controller_init(result, lac, CP):
       kappa_scale = float(np.interp(abs(state['desired']),
                                     T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP))
 
+      # Curve feed-forward on the reference lateral accel, from the TRUE speed
+      # (the gain reference floor would invent 0.39 m/s^2 at walking pace).
+      a_ref = v_true * v_true * state['desired']
+      state['a_ref'] = a_ref
+      state['ff_nm'] = curve_ff_nm(a_ref)
+      _p_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
+
       # Slope bias learning (see SL_TAU_S): integrate the P term alone on
       # straights. The gate never looks at the error's sign.
       state['sl_learn'] = bool(
         state['slope'] and active and not getattr(CS, 'steeringPressed', False)
         and v_true > SL_MIN_V
         and abs(state['desired']) < SL_KAPPA_DES and abs(state['measured']) < SL_KAPPA_MEAS
+        and abs(a_ref) < SL_AY_MAX
         and state['takeup'].state != 'taking_up'
         and state['sb_block'] == 0 and state['sb_state'] != 2)   # 1 = armed only: harmless
       if state['sl_learn']:
-        _p_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
         state['sl_bias'] = float(np.clip(state['sl_bias'] + (_p_nm / SL_TAU_S) * DT_LIVEPOSE,
                                          -SL_BIAS_MAX_NM, SL_BIAS_MAX_NM))
 
-      # The noise guard judges reversal persistence on the 20 Hz error sign,
-      # not the cadence target (Direct spec §3). With the slope bias latched it
-      # observes the biased demand (P + sl_bias, as an error) — the sign that
-      # allow() later judges; on delta_err alone a steady small error against
-      # the bias would hold the target at 0 and drop the bias.
-      if state['slope']:
-        state['guard'].observe(delta_err + state['sl_bias']
-                               / (T_CAP_SLOPE_BASE * kappa_scale * v * v))
-      else:
-        state['guard'].observe(delta_err)
+      # The demand the decision targets.
+      state['demand_nm'] = state['ff_nm'] + _p_nm + (state['sl_bias'] if state['slope'] else 0.0)
+
+      # The noise guard judges reversal persistence on the 20 Hz sign of the
+      # whole demand, as an error-equivalent (Direct spec §3): on delta_err
+      # alone a steady small error against the feed-forward or the bias would
+      # hold the target at 0 and drop them.
+      state['guard'].observe(state['demand_nm'] / (T_CAP_SLOPE_BASE * kappa_scale * v * v))
 
       state['tick_count'] += 1
       # Expire transient action labels once their ramp completes, so telemetry
@@ -405,15 +437,10 @@ def on_lat_controller_init(result, lac, CP):
       if active and state['tick_count'] >= action_cadence_ticks:
         state['tick_count'] = 0
 
-        # Plant-inversion target: the steady-state aligning torque for
-        # delta_err, on the FULL error — no on-target band, a sub-friction
-        # target is in effect a hold (Direct spec §2).
-        #   tau_Nm = T_CAP_SLOPE_BASE * kappa_scale * v^2 * delta_err
+        # The demand of this livePose tick, on the FULL error — no on-target
+        # band, a sub-friction target is in effect a hold (Direct spec §2).
         _tu_demand = None   # the decision's demand before the step cap (take-up size gate)
-        target_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
-        if state['slope']:
-          target_nm += state['sl_bias']
-        target_frac = target_nm / CCP.STEER_MAX
+        target_frac = state['demand_nm'] / CCP.STEER_MAX
         state['action'] = 'ramp'
         # Authority cap, v^2*|delta_ref|-scaled and clipped at STEER_MAX:
         # straights stay near T_CAP_BASE_NM, tight turns can reach the panda
@@ -565,6 +592,8 @@ def on_lat_controller_init(result, lac, CP):
           'output': float(output),
           'vEgo': float(CS.vEgo),
           'active': active,
+          'ff_nm': float(state['ff_nm']),                       # curve feed-forward (Nm)
+          'a_ref': float(state['a_ref']),                       # reference lateral accel (m/s^2)
           'sb_state': int(state['sb_state']),                 # stall/breakaway v2: 0=idle, 1=armed, 2=episode
           'sb_trips': int(state['sb_trips']),                 # cumulative trips this drive
           'sb_block': int(state['sb_block']),                 # same-side push suppression ticks left
