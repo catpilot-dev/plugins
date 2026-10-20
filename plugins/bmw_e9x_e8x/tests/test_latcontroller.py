@@ -48,10 +48,6 @@ _LK_REGISTER = 'plugins.lane_keeping.register'
 @pytest.fixture(autouse=True)
 def mock_deps(monkeypatch):
   install_all_mocks(monkeypatch)
-  # The controller persists learned DirectContacts on the disengage edge;
-  # keep every test off the real plugin data dir (and let tests assert on it).
-  import config
-  monkeypatch.setattr(config, 'write_plugin_param', MagicMock())
   # The controller patches lac.update only with lane_keeping loaded (ruling R10).
   monkeypatch.setitem(sys.modules, _LK_REGISTER, SimpleNamespace(HOOK_READY=True))
 
@@ -78,12 +74,12 @@ class FakeSubMaster:
     return self.lp
 
 
-def _make_controller(monkeypatch, wheelbase=2.66, stall_v2=None, contacts=None, slope=None):
+def _make_controller(monkeypatch, wheelbase=2.66, stall_v2=None, slope=None):
   """Load bmw.latcontroller and construct a controller instance wired to a
   FakeSubMaster. Returns (lac, fake_sm, mod, state).
 
   stall_v2 / slope: if not None, StallBreakaway / SlopeCompensation read as
-  '1' (True) or '0' (False); contacts is returned verbatim for DirectContacts.
+  '1' (True) or '0' (False).
   Patched on the `config` module BEFORE on_lat_controller_init runs (the
   controller does `from config import read_plugin_param` at function scope and
   reads StallBreakaway once, at construction). The stub dispatches on the param
@@ -94,13 +90,11 @@ def _make_controller(monkeypatch, wheelbase=2.66, stall_v2=None, contacts=None, 
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
 
   import bmw.latcontroller as mod
-  if stall_v2 is not None or contacts is not None or slope is not None:
+  if stall_v2 is not None or slope is not None:
     import config
     def _param_stub(plugin_id, key, default=''):
       if key == 'StallBreakaway' and stall_v2 is not None:
         return '1' if stall_v2 else '0'
-      if key == 'DirectContacts' and contacts is not None:
-        return contacts
       if key == 'SlopeCompensation' and slope is not None:
         return '1' if slope else '0'
       return default
@@ -113,6 +107,12 @@ def _make_controller(monkeypatch, wheelbase=2.66, stall_v2=None, contacts=None, 
 
   state = _closure_state(lac.update)
   return lac, fake_sm, mod, state
+
+
+def _seed_learner(state, c_right, c_left):
+  """Give the controller's contact learner its two contacts, as a drive's
+  learning would (no persistence: every drive starts unknown)."""
+  state['learner']._val = {0: c_right, 1: c_left}
 
 
 def _closure_state(update_fn):
@@ -1460,8 +1460,8 @@ class TestLowSpeedGainFloor:
 
 class TestDirectTracking:
 
-  def _engaged(self, monkeypatch, v=25.0, contacts=None):
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, contacts=contacts)
+  def _engaged(self, monkeypatch, v=25.0):
+    lac, fake_sm, mod, state = _make_controller(monkeypatch)
     _set_measured(fake_sm, v, 0.0)
     _call_update(lac, 0.0, v_ego=v, active=False)
     _call_update(lac, 0.0, v_ego=v, active=True)
@@ -1653,18 +1653,36 @@ class TestDirectTracking:
     assert state['sb_state'] == 0
     assert mod.SB_SETTLED_RAD == 0.001
 
-  # ---- Task 4: free-play take-up, contact learning/persistence, telemetry ----
-  # Seeded contacts (route 4e5): gap 77.6 deg under right torque, 65.0 under left.
-  _CONTACTS = '77.60,65.00'
+  # ---- free-play take-up, contact learning, telemetry ----
+  # Learned contacts (route 4e5): gap 77.6 deg under right torque, 65.0 under left.
 
   def _start_takeup(self, monkeypatch):
     """Seated left (gap 65), torque at 0, a right ramp in flight: this tick
     crosses zero toward the unseated right flank."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
     state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20,
                  action='ramp', tick_count=0)
     out = _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0)
     return lac, fake_sm, mod, state, out
+
+  def test_takeup_waits_for_learned_contacts(self, monkeypatch):
+    """No persistence: a drive starts with unknown contacts and the take-up
+    stays inert until the learner has both sides; then the same reversal
+    fires. The seed/parse/format/fresh API is gone with the persistence."""
+    import inspect, bmw.takeup as takeup
+    assert 'seed' not in inspect.signature(takeup.ContactLearner.__init__).parameters
+    assert not hasattr(takeup.ContactLearner, 'fresh')
+    assert not hasattr(takeup, 'parse_contacts') and not hasattr(takeup, 'format_contacts')
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    assert state['learner'].contacts() is None
+    state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20, action='ramp', tick_count=0)
+    _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0)
+    assert state['takeup'].fires == 0 and state['action'] != 'take_up'
+    _seed_learner(state, 77.6, 65.0)
+    state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20, action='ramp', tick_count=0)
+    _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0)
+    assert state['takeup'].fires == 1 and state['action'] == 'take_up'
 
   def test_takeup_overrides_torque_on_reversal(self, monkeypatch):
     from bmw.takeup import TAKEUP_NM
@@ -1713,29 +1731,13 @@ class TestDirectTracking:
   def test_shed_to_zero_does_not_fire(self, monkeypatch):
     """Shedding to a zero target (e.g. a guard-suppressed reversal) can land a
     float epsilon past zero; that is not a push toward the new side."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
     state.update(torque=0.01, target_frac=0.0, ramp_step=-(0.01 + 1e-12), ramp_frames=1,
                  tick_count=0)
     _call_update(lac, 0.0, v_ego=25.0, gap_deg=77.6)       # seated right
     assert state['takeup'].fires == 0
     assert state['torque'] == pytest.approx(0.0, abs=1e-9)
-
-  def test_contacts_seeded_from_param(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
-    assert state['learner'].contacts() == pytest.approx((77.6, 65.0))
-    assert not state['learner'].fresh()
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts='junk')
-    assert state['learner'].contacts() is None
-
-  def test_contacts_seed_read_failure_is_none(self, monkeypatch):
-    import config
-    def _boom(plugin_id, key, default=''):
-      if key == 'DirectContacts':
-        raise OSError('eMMC')
-      return default
-    monkeypatch.setattr(config, 'read_plugin_param', _boom)
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    assert state['learner'].contacts() is None
 
   def test_learner_observes_every_tick_in_both_modes(self, monkeypatch):
     lac, fake_sm, mod, state = self._engaged(monkeypatch)
@@ -1762,39 +1764,6 @@ class TestDirectTracking:
     out = _call_update(lac, 0.002, v_ego=25.0, gap_deg=77.6)
     assert state['torque'] == pytest.approx(0.002)
     assert out[0] == pytest.approx(-0.002)
-
-  def _make_fresh(self, state):
-    from bmw.takeup import LEARN_MIN_SAMPLES, LEARN_HOLD_S
-    for gap, tq in ((77.6, +0.8), (65.0, -0.8)):     # one held push per side (R12)
-      for _ in range(round(LEARN_HOLD_S / 0.01) - 1 + LEARN_MIN_SAMPLES):
-        state['learner'].observe(gap, tq, 0.0, True)
-    assert state['learner'].fresh()
-
-  def test_contacts_persisted_on_disengage_when_fresh(self, monkeypatch):
-    import config
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    self._make_fresh(state)
-    _call_update(lac, 0.0, v_ego=25.0)
-    config.write_plugin_param.assert_not_called()          # engaged: no write
-    _call_update(lac, 0.0, v_ego=25.0, active=False)
-    config.write_plugin_param.assert_called_once_with('bmw_e9x_e8x', 'DirectContacts', '77.60,65.00')
-    _call_update(lac, 0.0, v_ego=25.0, active=False)
-    config.write_plugin_param.assert_called_once()          # edge only
-
-  def test_contacts_not_persisted_when_not_fresh(self, monkeypatch):
-    import config
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
-    _call_update(lac, 0.0, v_ego=25.0, active=False)
-    config.write_plugin_param.assert_not_called()          # seed only: nothing new learned
-
-  def test_contacts_write_failure_never_affects_control(self, monkeypatch):
-    import config
-    config.write_plugin_param.side_effect = OSError('eMMC full')
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    self._make_fresh(state)
-    out = _call_update(lac, 0.0, v_ego=25.0, active=False)
-    assert out[0] == 0.0
-    config.write_plugin_param.assert_called_once()
 
   def test_telemetry_has_direct_fields(self, monkeypatch):
     from bmw.takeup import TAKEUP_NM
@@ -1842,7 +1811,8 @@ class TestDirectTracking:
   def test_shed_to_zero_snaps_exactly_then_reversal_fires(self, monkeypatch):
     """Review fix 1: a shed to a 0 target ends at exactly 0.0, so the genuine
     reversal that follows still crosses zero and fires the take-up."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
     self._shed_left_to_zero(lac, state)
     assert state['ramp_frames'] == 0 and state['torque'] == 0.0
     assert state['takeup'].fires == 0
@@ -1870,7 +1840,8 @@ class TestDirectTracking:
   def test_small_reversal_target_does_not_fire(self, monkeypatch):
     """Ruling R9: a 0.012 Nm reversal target is not a real reversal — plain
     ramp, no take-up."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
     state.update(torque=0.0, target_frac=0.001, ramp_step=+0.0001, ramp_frames=10,
                  action='ramp', tick_count=0)
     _call_update(lac, 0.0, v_ego=25.0, gap_deg=65.0)
@@ -1897,7 +1868,8 @@ class TestDirectTracking:
     (0.078 Nm from -0.055) hands over at the take-up level, not ramping down
     off the closed flank; the next decision steps up from it."""
     from bmw.takeup import TAKEUP_NM
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
     g = state['guard']
     g.side, g._opp = -1, 10
     state.update(torque=-0.055, target_frac=-0.055, ramp_frames=0, action='idle',
@@ -1920,7 +1892,8 @@ class TestDirectTracking:
     the STEP_MAX-capped crossing lands under TAKEUP_NM (0.0065 frac at
     -0.055) and the next decision is already past zero. The gate sizes the
     reversal on the pre-cap demand, so the take-up still fires once."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
     g = state['guard']
     g.side, g._opp = -1, 10                    # opposite sign already persisted
     state.update(torque=torque0, target_frac=torque0, ramp_frames=0, action='idle',
@@ -1933,7 +1906,8 @@ class TestDirectTracking:
 
   def test_takeup_fault_falls_back_to_the_ramp(self, monkeypatch):
     """A take-up exception on the 100 Hz path drops to the plain ramp."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
     def _boom(*a, **k):
       raise RuntimeError('takeup fault')
     monkeypatch.setattr(state['takeup'], 'step', _boom)
@@ -1943,7 +1917,8 @@ class TestDirectTracking:
     assert state['torque'] == pytest.approx(0.002) and state['action'] == 'ramp'
 
   def test_no_takeup_fires_while_pressed(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, contacts=self._CONTACTS)
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _seed_learner(state, 77.6, 65.0)
     state.update(torque=0.0, target_frac=0.04, ramp_step=+0.002, ramp_frames=20,
                  action='ramp', tick_count=0)
     _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0, pressed=True)

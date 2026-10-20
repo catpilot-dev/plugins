@@ -6,7 +6,9 @@ The servo drives the column through ~12-13 deg of lash (route 4e5, re-printed
 gears: servo-column gap ~ +77.6..77.8 deg under right torque, ~65 deg under
 left torque; contacts stable within +/-1 deg inside a drive).  ContactLearner
 estimates the two contact gaps online from samples taken while a firm torque
-presses the gear against one flank and the wheel is stationary.
+presses the gear against one flank and the wheel is stationary. Contacts are
+learned afresh each drive: the servo's zero moves at every power-up, so a
+persisted seed was ~47 deg off on route 4e9 and relearned within 3 segments.
 
 Sign convention: controller torque + = right.  c_right is the gap under right
 torque, c_left the gap under left torque.
@@ -31,22 +33,6 @@ def _width_ok(c_right, c_left):
   return CONTACT_WIDTH_RANGE[0] <= abs(c_right - c_left) <= CONTACT_WIDTH_RANGE[1]
 
 
-def parse_contacts(text):
-  """Parse "c_right,c_left"; None if malformed or width out of range."""
-  try:
-    a, b = text.strip().split(',')
-    c = (float(a), float(b))
-  except (ValueError, AttributeError):
-    return None
-  if not all(x == x and abs(x) != float('inf') for x in c) or not _width_ok(*c):
-    return None
-  return c
-
-
-def format_contacts(c):
-  return f"{c[0]:.2f},{c[1]:.2f}"
-
-
 class ContactLearner:
   """Median of the first LEARN_MIN_SAMPLES per side, then EMA (tau LEARN_TAU_S).
 
@@ -55,8 +41,7 @@ class ContactLearner:
   column (steeringRateDeg) is still, so the rate gate alone admits mid-gap
   gaps as contacts."""
 
-  def __init__(self, seed=None, dt=0.01):
-    self._seed = seed
+  def __init__(self, dt=0.01):
     self._alpha = dt / LEARN_TAU_S
     self._hold_need = round(LEARN_HOLD_S / dt)
     self._hold_sign = 0
@@ -84,18 +69,11 @@ class ContactLearner:
       self._val[s] += self._alpha * (gap_deg - self._val[s])
 
   def contacts(self):
-    vals = []
-    for s in (0, 1):
-      v = self._val[s]
-      if v is None and self._seed is not None:
-        v = self._seed[s]
-      if v is None:
-        return None
-      vals.append(v)
-    return tuple(vals) if _width_ok(*vals) else None
-
-  def fresh(self):
-    return self._val[0] is not None and self._val[1] is not None
+    """(c_right, c_left) once both sides are learned this drive, else None."""
+    if self._val[0] is None or self._val[1] is None:
+      return None
+    c = (self._val[0], self._val[1])
+    return c if _width_ok(*c) else None
 
   # Value equality, as SignGuard (twin-lockstep test diffs every state key).
   __hash__ = None

@@ -341,7 +341,7 @@ def on_lat_controller_init(result, lac, CP):
   from cereal import log
   from cereal import messaging
   from bmw.values import CarControllerParams as CCP
-  from bmw.takeup import SignGuard, ContactLearner, FreePlayTakeUp, parse_contacts, format_contacts
+  from bmw.takeup import SignGuard, ContactLearner, FreePlayTakeUp
 
   # Ruling R10: Direct needs the Arc reference. Without lane_keeping the stock
   # lateral controller stays in place.
@@ -386,14 +386,6 @@ def on_lat_controller_init(result, lac, CP):
   # the user can A/B by disengaging and re-engaging. Default OFF — only '1'
   # enables; a failed read (incl. the import above failing, which leaves
   # read_plugin_param unbound) is off.
-  # DirectContacts: the servo-column contacts learned last drive ("c_right,
-  # c_left", written on the disengage edge), seeding the learner until it has
-  # its own samples. Own try: a bad seed must not default the switches above.
-  # Missing, malformed or unreadable -> no seed (take-up waits for learning).
-  try:
-    _contacts_seed = parse_contacts(read_plugin_param('bmw_e9x_e8x', 'DirectContacts', ''))
-  except Exception:
-    _contacts_seed = None
 
   # Decision cadence & CAN-rate spreading — both subscribe to model_action_t
   # per tick, sized to one half of the model's action horizon so exactly two
@@ -527,7 +519,7 @@ def on_lat_controller_init(result, lac, CP):
   L = float(CP.wheelbase)
 
   _sm = messaging.SubMaster(['livePose'])
-  _learner = ContactLearner(seed=_contacts_seed)
+  _learner = ContactLearner()
 
   state = {
     'torque': 0.0,             # current commanded torque fraction (advances by ramp_step each CAN tick)
@@ -580,17 +572,6 @@ def on_lat_controller_init(result, lac, CP):
         state['slope'] = False
       state['guard'].reset()
     elif not active:
-      if state['was_active']:
-        # Disengage edge: persist the contacts this drive learned as the next
-        # drive's seed. Rare event, so the file write is acceptable here; it
-        # is wrapped whole (incl. the import) — persistence never affects control.
-        try:
-          _c = state['learner'].contacts()
-          if state['learner'].fresh() and _c is not None:
-            from config import write_plugin_param
-            write_plugin_param('bmw_e9x_e8x', 'DirectContacts', format_contacts(_c))
-        except Exception:
-          pass
       state['slope'] = False
       # Inactive: the law does not run on the state. Torque, target and ramp
       # are zeroed so the next engagement ramps from 0 under STEP_MAX on its

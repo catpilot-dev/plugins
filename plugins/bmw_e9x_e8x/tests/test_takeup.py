@@ -5,8 +5,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from bmw.takeup import (ContactLearner, parse_contacts, format_contacts, LEARN_MIN_SAMPLES,
-                        LEARN_HOLD_S)
+from bmw.takeup import ContactLearner, LEARN_MIN_SAMPLES, LEARN_HOLD_S
 
 # Ticks (dt 0.01) of a side's hold dropped before its samples count (R12).
 HOLD = round(LEARN_HOLD_S / 0.01) - 1
@@ -23,7 +22,6 @@ def test_learns_both_sides_by_median():
   assert L.contacts() is None            # one side only
   feed(L, 65.0, -0.8, HOLD + LEARN_MIN_SAMPLES)
   assert L.contacts() == pytest.approx((77.6, 65.0))
-  assert L.fresh()
 
 
 def test_ignores_small_torque_moving_wheel_and_not_ok():
@@ -58,23 +56,12 @@ def test_not_ok_resets_the_sign_hold():
   assert L._buf[0] == [77.6]
 
 
-def test_seed_used_until_fresh_and_then_replaced():
-  L = ContactLearner(seed=(77.0, 64.0))
-  assert L.contacts() == (77.0, 64.0) and not L.fresh()
-  feed(L, 78.0, +0.8, HOLD + LEARN_MIN_SAMPLES); feed(L, 65.0, -0.8, HOLD + LEARN_MIN_SAMPLES)
-  assert L.contacts() == pytest.approx((78.0, 65.0))
-
 
 def test_dead_gap_signal_gives_no_contacts():      # Review Focus 2
   L = ContactLearner()
   feed(L, 0.0, +0.8, 500); feed(L, 0.0, -0.8, 500)
   assert L.contacts() is None                       # width 0 < CONTACT_WIDTH_RANGE[0]
 
-
-def test_parse_format_roundtrip_and_rejects():
-  assert parse_contacts(format_contacts((77.6, 65.0))) == pytest.approx((77.6, 65.0))
-  assert parse_contacts('') is None and parse_contacts('x,y') is None
-  assert parse_contacts('70.0,69.0') is None        # width 1 deg
 
 
 from bmw.takeup import SignGuard, FreePlayTakeUp, TAKEUP_NM, TAKEUP_TIMEOUT_S
@@ -115,9 +102,14 @@ def test_guard_value_equality():
     hash(a)
 
 
+def _learned(c_right=77.6, c_left=65.0):
+  """A learner that already knows both contacts (a drive's learning done)."""
+  L = ContactLearner(); L._val = {0: c_right, 1: c_left}
+  return L
+
+
 def _tu():
-  L = ContactLearner(seed=(77.6, 65.0))
-  return FreePlayTakeUp(L, steer_max_nm=12.0)
+  return FreePlayTakeUp(_learned(), steer_max_nm=12.0)
 
 
 def test_takeup_fires_at_zero_crossing_toward_unseated_side():
@@ -198,9 +190,9 @@ def test_blocked_or_unknown_contacts_never_fire():
 
 
 def test_learner_and_takeup_value_equality():
-  """Value semantics, as SignGuard: the controller's twin-lockstep test
-  (TestOverrideObservers.test_no_behavior_change) diffs every state key."""
-  a, b = ContactLearner(seed=(77.6, 65.0)), ContactLearner(seed=(77.6, 65.0))
+  """Value semantics, as SignGuard: controller state snapshots compare
+  learners by content."""
+  a, b = _learned(), _learned()
   assert a == b
   a.observe(77.6, +0.8, 0.0, True)
   assert a != b
