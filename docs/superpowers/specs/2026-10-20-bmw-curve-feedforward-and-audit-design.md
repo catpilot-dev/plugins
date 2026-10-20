@@ -1,6 +1,6 @@
 # BMW lateral: curve feed-forward, and a lateral-stack audit (design)
 
-Status: draft for user review, 2026-10-20. Builds on
+Status: Part A implemented 2026-10-20 (plan docs/superpowers/plans/2026-10-20-bmw-curve-feedforward.md); Part B merged at 2df1b63. Builds on
 `2026-10-18-bmw-direct-tracking-design.md` and `2026-10-19-bmw-slope-bias-design.md`.
 
 Evidence routes: 4e9, 4ea, 4eb, 4ec (114 min Direct-active; scratchpad
