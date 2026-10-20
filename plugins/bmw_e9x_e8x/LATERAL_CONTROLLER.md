@@ -1255,7 +1255,7 @@ Published each livePose tick. The exact field set is pinned by
 | `target_frac` | the decision's target torque fraction (−1..1), after guard, STEP_MAX and caps |
 | `ramp_step` | per-CAN-tick torque increment |
 | `ramp_frames` | CAN frames remaining in the current ramp |
-| `action` | `ramp` / `relax_dwell` / `take_up` / `idle` (§8) |
+| `action` | `ramp` / `take_up` / `idle` (§8) |
 | `torque` | commanded torque fraction (−1..1) |
 | `output` | clipped torque fraction returned to controlsd (0 while inactive) |
 | `vEgo` | CS.vEgo |
