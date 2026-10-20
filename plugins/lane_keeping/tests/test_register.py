@@ -50,24 +50,6 @@ def test_passthrough_returns_input_curvature():
   assert out == 0.0123
 
 
-def test_load_config_defaults(data_dir):
-  cfg = register._load_config()
-  assert cfg.driver_side == 'left'
-  assert cfg.gap_min == 0.6 and cfg.gap_max == 1.0
-  assert cfg.t_preview == 1.5
-  assert cfg.lp_max == 9999.0     # inert by default (post-3ea rollback)
-
-
-def test_load_config_overrides(data_dir):
-  (data_dir / 'LaneKeepDriverSide').write_text('right')
-  (data_dir / 'LaneKeepGapMin').write_text('0.5')
-  (data_dir / 'LaneKeepLpMax').write_text('30')
-  cfg = register._load_config()
-  assert cfg.driver_side == 'right'
-  assert cfg.gap_min == 0.5
-  assert cfg.lp_max == 30.0
-
-
 def test_hook_survives_pub_failure(data_dir, monkeypatch):
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
   # force telemetry publish to raise — the control path must still return the reference
@@ -79,49 +61,19 @@ def test_hook_survives_pub_failure(data_dir, monkeypatch):
   assert out == pytest.approx(0.01)   # no plan: the low-passed model curvature
 
 
+def test_hook_accepts_lat_delay(data_dir, monkeypatch):
+  """controlsd passes lat_delay; the hook keeps the parameter and ignores it."""
+  monkeypatch.setattr(register, '_publish', lambda telem: None)
+  mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
+  assert register.on_curvature_correction(0.0, mv, 25.0, False, lat_delay=0.55) == 0.0
+
+
 def test_load_config_kappa_filter_tau(data_dir):
   cfg = register._load_config()
   assert cfg.kappa_filter_tau == 0.15         # default
   (data_dir / 'LaneKeepKappaFilterTau').write_text('0.45')
   cfg2 = register._load_config()
   assert cfg2.kappa_filter_tau == 0.45
-
-
-def test_load_config_predictive_params(data_dir):
-  cfg = register._load_config()
-  assert cfg.pred_delay_mult == 1.5
-  assert cfg.gap_hard_lo == 0.3 and cfg.gap_hard_hi == 1.5
-  (data_dir / 'LaneKeepPredDelayMult').write_text('3.0')
-  (data_dir / 'LaneKeepGapHardLo').write_text('0.4')
-  cfg2 = register._load_config()
-  assert cfg2.pred_delay_mult == 3.0
-  assert cfg2.gap_hard_lo == 0.4
-
-
-def test_hook_passes_lat_delay_through(data_dir, monkeypatch):
-  monkeypatch.setattr(register, '_PLUGIN_DIR', str(data_dir.parent))
-  seen = {}
-  class FakeAnchor:
-    cfg = type('C', (), {'enable': True})()
-    def update(self, curvature, model_v2, v_ego, lane_changing, lat_delay=None):
-      seen['lat_delay'] = lat_delay
-      return curvature, {}
-  register._anchor = FakeAnchor()
-  monkeypatch.setattr(register, '_publish', lambda telem: None)
-  mv = SimpleNamespace(laneLines=[], laneLineProbs=[])
-  register.on_curvature_correction(0.0, mv, 25.0, False, lat_delay=0.55)
-  assert seen['lat_delay'] == 0.55
-
-
-def test_load_config_ac_params(data_dir):
-  cfg = register._load_config()
-  assert cfg.dc_tau == 20.0 and cfg.ac_deadband == 0.10
-  assert cfg.ac_deadband_hi == 0.10   # flat taper by default (post-3ea rollback)
-  (data_dir / 'LaneKeepDcTau').write_text('30')
-  (data_dir / 'LaneKeepAcDeadbandHi').write_text('0.07')
-  cfg = register._load_config()
-  assert cfg.dc_tau == 30.0
-  assert cfg.ac_deadband_hi == 0.07
 
 
 def test_load_config_arc_params(data_dir):
@@ -141,6 +93,6 @@ def test_reference_is_always_arc_and_never_position_corrected(data_dir, monkeypa
   (data_dir / 'LaneKeepArcSmooth').write_text('0')
   for _ in range(150):
     register.on_curvature_correction(0.0, SimpleNamespace(laneLines=[], laneLineProbs=[]), 20.0, False, 0.9)
-  assert register._anchor.cfg.enable is False
-  assert register._anchor.cfg.arc_smooth is True
+  assert register._anchor.cfg.arc_horizon == 0.0
   assert not hasattr(register, '_direct_tracking_on')
+  assert not hasattr(register._anchor.cfg, 'enable')

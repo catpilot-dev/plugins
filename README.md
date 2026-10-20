@@ -14,7 +14,7 @@ device.
 |--------|----------------------|
 | `bmw_e9x_e8x` | Makes BMW E9x/E8x cars (E82/E90 family) drivable with catpilot: cruise control, steering, lane changes — no factory driver-assist needed |
 | `speedlimitd` | Watches the speed limit for you — from offline OpenStreetMap data (optional toggle) and what the camera sees (lane count, road type) — and slows the car for sharp curves and highway ramps |
-| `lane_keeping` | Calms the slow left-right sway ("ping-pong") inside the lane, so the car holds its line more steadily |
+| `lane_keeping` | Smooths the model's curvature reference (an arc through its planned path ahead) for the vehicle's lateral controller |
 
 ### On the screen
 
@@ -38,11 +38,11 @@ device.
 
 - **Settings → Plugins** — one toggle per plugin.
 - Feature-level switches live in their own panels: for example, the
-  **Driving** panel has the "Lane Keeping" toggle, and the **Software**
+  **Driving** panel has the BMW steering toggles, and the **Software**
   panel hosts the model selector.
 - A few plugins are marked *enforced* because the car depends on them
-  (for example `lane_keeping` on BMW) — for those, use their feature
-  toggle instead of disabling the whole plugin.
+  (for example `lane_keeping` on BMW, whose lateral controller tracks its
+  reference) — those stay on.
 
 ## Updating
 

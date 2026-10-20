@@ -1,20 +1,15 @@
 {
   "id": "lane_keeping",
-  "name": "Driver-Side Lane Keeping",
+  "name": "Lateral Reference Conditioner",
   "version": "0.11.1",
   "type": "hook",
   "author": "catpilot",
-  "description": "Driver-side lane keeping: stabilizes the wheel-to-line gap by damping wander around the model's chosen line (AC damper); conditions the model curvature reference.",
+  "description": "Lateral reference conditioner: an arc through the model's planned path ahead, low-passed, for the vehicle's lateral controller.",
   "min_openpilot": "0.10.0",
   "max_openpilot": "0.11.99",
   "conflicts": [],
   "dependencies": [],
-  "params": {
-    "LaneKeepDriverSide": {
-      "default": "left",
-      "description": "Which ego lane line to anchor to: left or right"
-    }
-  },
+  "params": {},
   "hooks": {
     "controls.curvature_correction": {
       "module": "register",

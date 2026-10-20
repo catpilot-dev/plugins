@@ -1,8 +1,7 @@
 """Lateral reference conditioner — hook entry, config loading, telemetry.
 
-Registers on controls.curvature_correction (controls process). Always serves
-the Arc reference (the BMW controller is the Direct law unconditionally); the
-lane-line position correction is never applied.
+Registers on controls.curvature_correction (controls process). See anchor.py
+for the law and DESIGN.md for the design.
 """
 import importlib.util
 import os
@@ -44,34 +43,9 @@ def _load_config():
     v = _read_param(key)
     return float(v) if v else dflt
 
-  def sget(key, dflt):
-    v = _read_param(key)
-    return v if v else dflt
-
   return AnchorConfig(
-    enable=False,
-    driver_side=sget('LaneKeepDriverSide', d.driver_side),
-    half_width=fget('LaneKeepHalfWidth', d.half_width),
-    gap_min=fget('LaneKeepGapMin', d.gap_min),
-    gap_max=fget('LaneKeepGapMax', d.gap_max),
-    t_preview=fget('LaneKeepTPreview', d.t_preview),
-    lp_max=fget('LaneKeepLpMax', d.lp_max),
-    excess_max=fget('LaneKeepExcessMax', d.excess_max),
-    kappa_bias_max=fget('LaneKeepKappaBiasMax', d.kappa_bias_max),
-    kappa_rate_max=fget('LaneKeepKappaRateMax', d.kappa_rate_max),
-    filter_tau=fget('LaneKeepFilterTau', d.filter_tau),
     kappa_filter_tau=fget('LaneKeepKappaFilterTau', d.kappa_filter_tau),
-    arc_smooth=True,
     arc_horizon=fget('LaneKeepArcHorizon', d.arc_horizon),
-    prob_on=fget('LaneKeepProbOn', d.prob_on),
-    prob_fade=fget('LaneKeepProbFade', d.prob_fade),
-    dc_tau=fget('LaneKeepDcTau', d.dc_tau),
-    ac_deadband=fget('LaneKeepAcDeadband', d.ac_deadband),
-    ac_deadband_hi=fget('LaneKeepAcDeadbandHi', d.ac_deadband_hi),
-    pred_delay_mult=fget('LaneKeepPredDelayMult', d.pred_delay_mult),
-    gap_hard_lo=fget('LaneKeepGapHardLo', d.gap_hard_lo),
-    gap_hard_hi=fget('LaneKeepGapHardHi', d.gap_hard_hi),
-    asym_gap=fget('LaneKeepAsymGap', d.asym_gap),
   )
 
 
@@ -92,7 +66,7 @@ def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay
   if _anchor is None:
     LaneAnchor = _anchor_module().LaneAnchor
     _anchor = LaneAnchor(_load_config())
-  new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing, lat_delay)
+  new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing)   # lat_delay: hook signature only
   try:
     _publish(telem)
   except Exception:
