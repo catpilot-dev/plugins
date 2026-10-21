@@ -44,7 +44,7 @@ ramp are 0, so every engagement ramps from 0.
 |---|---|---|
 | `CONTROL_HORIZON_S` | 0.65 s | cadence and ramp spread are each half of it |
 | `T_CAP_BASE_NM`, `T_CAP_SLOPE_BASE` | 2.0 Nm, 1.0 | `t_cap = min(STEER_MAX, BASE + SLOPE·kappa_scale·v²·|delta_ref|)` |
-| `T_CAP_SCALE_KAPPA` / `_BP` | [1e-3, 1e-2, 2e-2] → [1.0, 2.5, 3.0] | gain scale on `|kappa_ref|` |
+| `T_CAP_SCALE_KAPPA` / `_BP` | [1e-3, 1e-2, 2e-2] → [1.25, 2.5, 3.0] | gain scale on `|kappa_ref|` (straight 1.25 since 2026-10-21, trial) |
 | `V_GAIN_FLOOR` | 2.778 m/s | gain reference speed floor |
 | `CF_AY0`, `CF_GAIN`, `CF_MAX_NM` | 0.3 m/s², 1.0 Nm per m/s², 2.0 Nm | curve feed-forward deadband, gain, cap |
 | `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
@@ -973,6 +973,19 @@ gone; the current law above is authoritative.
 > learning stops above 0.15 m/s² of `a_ref`. Straights are unchanged (replay
 > against 2df1b63 bit-identical). Rollback: `CF_GAIN = 0` is a law no drive has
 > run; the driven baseline is `dev` @ 2df1b63.
+
+---
+
+> **2026-10-21 — straight gain 1.0 → 1.25 (trial, route 4ed).** Measured near-centre
+> rack stiction: breakaway from rest at a median 0.45 Nm (p10 0.18, p90 0.93; 1,973
+> events on 4e9–4ed, the same at 31–126 km/h); 1.0 Nm at 5–20° and 2.3 Nm in turns
+> ≥ 20° (the older "2–2.75 Nm knee" is the turn value). In gentle bends P had to
+> reach ~0.45 Nm before the wheel moved — a curvature error of ~4e-4 at 72 km/h —
+> and the car drifted 0.3–0.7 m to the outside (4ed's left hug in right bends,
+> with the slope bias cancelling most of P). The error needed scales with 1/gain.
+> A lower feed-forward deadband was replayed and rejected: steady gentle bends
+> already track, and +0.1 Nm stays inside the stiction band. 1.5 rang
+> near-straight on route 326 under the pre-Direct controller.
 
 ---
 

@@ -1500,6 +1500,17 @@ class TestDirectTracking:
     assert state['action'] == 'ramp' and state['target_frac'] > 0.0
     assert abs(out[0]) < 0.004                                      # one ramp frame of one STEP_MAX
 
+  def test_straight_gain_is_1_25(self, monkeypatch):
+    """Near straight (|kappa_ref| < 1e-3) the P gain is T_CAP_SLOPE_BASE * 1.25 (route 4ed:
+    the 0.45 Nm near-centre stiction band let gentle-bend errors sit at ~4e-4 before the rack
+    moved; the error needed to break free scales with 1/gain)."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
+    _set_measured(fake_sm, 25.0, 0.0)
+    state.update(torque=0.0, target_frac=0.0, ramp_frames=0, action='idle', tick_count=999)
+    _call_update(lac, 0.0001, v_ego=25.0)             # delta_err = atan(0.0001 * 2.66), straight
+    p_nm = 1.25 * 625.0 * math.atan(0.0001 * 2.66)    # 0.208 Nm, inside STEP_MAX and t_cap
+    assert state['target_frac'] * 12.0 == pytest.approx(p_nm, rel=1e-6)
+
   def test_sub_band_error_is_tracked(self, monkeypatch):   # the 4e5 arc-only case
     lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state['tick_count'] = 999
@@ -1588,9 +1599,9 @@ class TestDirectTracking:
     assert state['delta_err'] == pytest.approx(delta_err)
     return mod, state
 
-  # v=25, kappa_ref 0.002: kappa_scale 1.1667, gain G = 729.17 Nm/rad, a_ref 1.25 -> ff 0.95 Nm,
+  # v=25, kappa_ref 0.002: kappa_scale 1.3889, gain G = 868.06 Nm/rad, a_ref 1.25 -> ff 0.95 Nm,
   # step_max 0.0615 frac, t_cap ~0.49 frac.
-  _G = 1.0 * (1.0 + (0.001 / 0.009) * 1.5) * 625.0
+  _G = 1.0 * (1.25 + (0.001 / 0.009) * 1.25) * 625.0
 
   def test_decision_is_ff_plus_p(self, monkeypatch):
     mod, state = self._curve_decision(monkeypatch, v=25.0, kappa=0.002,
@@ -2047,8 +2058,8 @@ class TestSlopeBias:
     return lac, fake_sm, mod, state
 
   def _p_nm(self, kappa_meas, v=V):
-    # T_CAP_SLOPE_BASE 1.0 x kappa_scale 1.0 (straight) x v^2 x delta_err
-    return v * v * (0.0 - math.atan(kappa_meas * self.L))
+    # T_CAP_SLOPE_BASE 1.0 x kappa_scale 1.25 (straight) x v^2 x delta_err
+    return 1.25 * v * v * (0.0 - math.atan(kappa_meas * self.L))
 
   def _run(self, lac, fake_sm, n, desired=0.0, kappa_meas=0.0, v=V, **kw):
     _set_measured(fake_sm, v, kappa_meas)

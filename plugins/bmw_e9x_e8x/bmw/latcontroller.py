@@ -196,12 +196,15 @@ def on_lat_controller_init(result, lac, CP):
   # Plant-inversion gain, linear tire regime: tau_Nm = T_CAP_SLOPE * v^2 * delta
   # drives both the target and the authority cap
   #   t_cap = min(STEER_MAX, T_CAP_BASE_NM + T_CAP_SLOPE_BASE*kappa_scale*v^2*|delta_ref|).
-  # kappa_scale raises the gain from 1.0 on straights (1.5 rang near-straight,
-  # route 326) to 3.0 at |kappa_ref| >= 0.02, where the planner must be chased.
+  # kappa_scale raises the gain from 1.25 on straights to 3.0 at |kappa_ref| >=
+  # 0.02, where the planner must be chased. Straight 1.25 (trial, route 4ed):
+  # near centre the rack breaks free at ~0.45 Nm, so gentle-bend errors sat at
+  # ~4e-4 before it moved; the error needed scales with 1/gain. 1.5 rang
+  # near-straight on route 326 (pre-Direct controller).
   T_CAP_BASE_NM = 2.0
   T_CAP_SLOPE_BASE = 1.0
   T_CAP_SCALE_KAPPA = [0.001, 0.01, 0.02]        # |kappa_ref| breakpoints (1/m)
-  T_CAP_SCALE_BP    = [1.0, 2.5, 3.0]           # scale factor on T_CAP_SLOPE_BASE
+  T_CAP_SCALE_BP    = [1.25, 2.5, 3.0]          # scale factor on T_CAP_SLOPE_BASE
 
   # Per-decision torque step cap (frac): human-style gradual steering, 1.2 Nm
   # per decision up to 54 km/h (~4 Nm/s) tapering to 0.6 Nm at 100 km/h, where
