@@ -52,7 +52,7 @@ ramp are 0, so every engagement ramps from 0.
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
 | `SB_*` | see module scope | stall-breakaway v2 (`StallBreakaway` switch, default off) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
-| `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
+| `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.3 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
 
 **Switches** (Driving panel, param files under `bmw_e9x_e8x/data/`):
 `StallBreakaway` (read at drive start) and `SlopeCompensation` (read at each
@@ -986,6 +986,18 @@ gone; the current law above is authoritative.
 > A lower feed-forward deadband was replayed and rejected: steady gentle bends
 > already track, and +0.1 Nm stays inside the stiction band. 1.5 rang
 > near-straight on route 326 under the pre-Direct controller.
+
+---
+
+> **2026-10-21 — take-up torque 0.35 → 0.3 Nm (route 4ee).** The lash sweep was
+> audible. Inside the lash the servo speed is near-binary in torque: it does not
+> move below ~0.15 Nm, sometimes creeps at 0.15–0.2, and from 0.2 Nm up to 1 Nm
+> runs at ~200–235°/s, the motor's voltage-limited top speed (k_bemf 2561 mV/(rev/s),
+> ratio 7.62). 0.3 keeps a margin over the ~0.2 Nm detent; the sweep is only
+> slightly slower (~208 vs ~235°/s). The same constant is the reversal-size gate,
+> so 0.30–0.35 Nm reversals now take up too. Take-ups are ~1/4 of all lash
+> crossings (8.2/min on 4ee, 5.5 on 4ed); ramp reversals cross at the same speed.
+> The lash keeps widening: 13.7° on 4e9 → 17.4° on 4ee.
 
 ---
 

@@ -15,7 +15,10 @@ torque, c_left the gap under left torque.
 """
 import statistics
 
-TAKEUP_NM = 0.35
+# Inside the lash the servo runs at its top speed (~210 deg/s) for any torque
+# >= 0.2 Nm and does not move below ~0.15; 0.3 clears the detent with margin
+# and sweeps slightly slower than 0.35 did (audible on route 4ee).
+TAKEUP_NM = 0.3
 CONTACT_TOL_DEG = 1.5
 GUARD_PERSIST_S = 0.15
 ANGLE_QUANTUM_DEG = 0.04395
