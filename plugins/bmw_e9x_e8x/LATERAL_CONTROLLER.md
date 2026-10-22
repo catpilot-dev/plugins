@@ -52,7 +52,7 @@ ramp are 0, so every engagement ramps from 0.
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
 | `SB_*` | see module scope | stall-breakaway v2 (`StallBreakaway` switch, default off) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
-| `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.3 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
+| `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
 
 **Switches** (Driving panel, param files under `bmw_e9x_e8x/data/`):
 `StallBreakaway` (read at drive start) and `SlopeCompensation` (read at each
@@ -998,6 +998,18 @@ gone; the current law above is authoritative.
 > so 0.30–0.35 Nm reversals now take up too. Take-ups are ~1/4 of all lash
 > crossings (8.2/min on 4ee, 5.5 on 4ed); ramp reversals cross at the same speed.
 > The lash keeps widening: 13.7° on 4e9 → 17.4° on 4ee.
+
+> **2026-10-22 — take-up torque back to 0.35 Nm (route 4ef).** 0.3 Nm was not
+> audibly different (user) and not measurably slower: p50 206°/s at 0.29–0.31 Nm,
+> the same top speed. It was less reliable: the servo moved on 86 % of mid-lash
+> ticks (100 % at 0.34–0.36), take-ups over 100 ms rose 15 → 25 %, and three timed
+> out stalled 1.5–2° short of the right contact (none on 4ee). The torque does not
+> set the sweep speed, so it is not the noise lever; a firmware speed cap in torque
+> mode is. Lash 17.1 → 18.0° within the drive. Also on 4ef: `StallBreakaway` was
+> switched on mid-drive, which does nothing until the next controlsd start (the
+> param is read once at init) — `sb_trips` stayed 0 and the shadow detector found
+> no would-be trips after the toggle; the quieter stretch that followed was the
+> eastbound highway, calmer in 4ee too.
 
 ---
 

@@ -119,13 +119,14 @@ def test_takeup_fires_at_zero_crossing_toward_unseated_side():
   assert out == pytest.approx(TAKEUP_NM / 12.0) and t.state == 'taking_up' and t.fires == 1
 
 
-def test_takeup_torque_is_0_3_nm():
-  """Route 4ee: the lash sweep was audible. The servo crosses the lash at its
-  top speed for any torque >= 0.2 Nm; 0.3 keeps a margin over the ~0.2 Nm
-  detent while sweeping a little slower than 0.35. A 0.3 Nm reversal fires."""
+def test_takeup_torque_is_0_35_nm():
+  """Route 4ef: 0.3 Nm was no quieter (the sweep runs at the motor's top speed
+  for any torque >= 0.2 Nm) and stalled 1.5-2 deg short of the contact three
+  times (0.35: none on 4ee). 0.35 stays; a 0.3 Nm reversal no longer fires."""
   t = _tu()
-  out = t.step(0.0, +0.002, 0.3 / 12.0, 65.0, 0.0, False)
-  assert out == pytest.approx(0.3 / 12.0) and t.fires == 1
+  assert t.step(0.0, +0.002, 0.3 / 12.0, 65.0, 0.0, False) is None and t.fires == 0
+  out = t.step(0.0, +0.002, 0.35 / 12.0, 65.0, 0.0, False)
+  assert out == pytest.approx(0.35 / 12.0) and t.fires == 1
 
 
 def test_no_takeup_when_already_seated_or_still_shedding():
