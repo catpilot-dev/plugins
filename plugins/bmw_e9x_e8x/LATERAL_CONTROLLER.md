@@ -32,7 +32,7 @@ measured curve (the current torque is held through a reference dip, within
 `t_cap`); the noise guard (a sign change of the demand commands 0 until the new
 sign has persisted `GUARD_PERSIST_S`);
 `STEP_MAX` toward the target (×`UNWIND_STEP_GAIN` when shedding in the LKA
-regime); a same-side push during a stall-breakaway block is zeroed. The torque ramps to the target over the next 300 ms, one CAN tick
+regime). The torque ramps to the target over the next 300 ms, one CAN tick
 at a time. The free-play take-up (`bmw/takeup.py`) commands `TAKEUP_NM` across
 the servo lash on a change of push direction once the contacts are learned,
 then hands back to the ramp. Inactive: no decision runs; torque, target and
@@ -50,13 +50,11 @@ ramp are 0, so every engagement ramps from 0.
 | `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
 | `STEP_MAX_V` / `_BP` | [15, 28] m/s → [0.10, 0.05] frac | per-decision step cap |
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
-| `SB_*` | see module scope | stall-breakaway v2 (`StallBreakaway` switch, default off) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
 | `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
 
 **Switches** (Driving panel, param files under `bmw_e9x_e8x/data/`):
-`StallBreakaway` (read at drive start) and `SlopeCompensation` (read at each
-engagement). Both default off.
+`SlopeCompensation` (read at each engagement), default off.
 
 **Verification.** Unit tests in `tests/test_latcontroller.py` and
 `tests/test_takeup.py`; a differential replay against the previous build is the
@@ -1011,6 +1009,11 @@ gone; the current law above is authoritative.
 > no would-be trips after the toggle; the quieter stretch that followed was the
 > eastbound highway, calmer in 4ee too.
 
+> **2026-10-23 — stall/breakaway v2 REMOVED.** Param `StallBreakaway` was 0 on
+> the car since 2026-10-19; shadow evaluation (routes 4ee-4f7, 0 live trips)
+> showed the would-be trips were ordinary turn-ins, so the mechanism is deleted.
+> Rack breakaway physics notes above still stand.
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -1287,10 +1290,6 @@ Fire only when **the plant has actually overshot** `(κ_des - κ_meas) · κ_mea
 | `take_up` | the free-play take-up owns the torque while it crosses the servo lash |
 | `idle` | between decisions once a transient label's ramp completed, so telemetry occupancy counts are honest |
 
-Stall/breakaway v2 adds no label: a trip writes `target_frac` / `ramp_step` /
-`ramp_frames` directly, so the shed appears as `sb_trips` incrementing plus
-`target_frac → 0`; its own state is `sb_state` (§9).
-
 ---
 
 ## 9. Telemetry (plugin_bus topic `bmw_lat_control`, 20 Hz)
@@ -1315,9 +1314,6 @@ Published each livePose tick. The exact field set is pinned by
 | `ff_nm` | curve feed-forward (Nm) |
 | `a_ref` | reference lateral accel `v_true² · kappa_ref` (m/s²) |
 | `relax_ticks` | consecutive overshoot-side ticks while deep in a curve (dwell counter) |
-| `sb_state` | stall/breakaway v2: `0` idle, `1` armed, `2` breakaway episode |
-| `sb_trips` | cumulative trips this drive (budget on ordinary driving ≈ 0) |
-| `sb_block` | same-side push-suppression ticks left after a trip |
 | `angle` | steering wheel angle (deg, + = LEFT) |
 | `servo_gap` | column − servo angle (deg): slack / windup |
 | `steer_rate` | steering rate (deg/s) |
@@ -1356,6 +1352,7 @@ These were tried, deployed, and reverted. Each appears here so future maintainer
 | 2-degree open-loop push budget (`BUDGET_DEG`, `AngleBudget` toggle: after one push moved the wheel 2° in the commanded direction, stop increasing torque and shed it unthrottled) | Deployed default-off, A/B'd on route 3f4, **refuted**. It clamped ~10 episodes/min at ordinary-steering torque (median 1.09 Nm at first spend, far below the 2.0–2.75 Nm rack breakaway it was chasing) and raised matched-curve tracking error **+44%**. Root cause is structural, not a bad threshold: the per-decision displacement distributions of ordinary steering and of the route 3f2 seg 10 windup release **overlap**, so no `BUDGET_DEG` is both invisible and protective. Deleted entirely 2026-08-14 (constant, param, `angle_budget` bus topic, panel toggle, `ui.state_tick` heartbeat, telemetry keys, tests, `replay_push_budget.py`). Do not re-propose a displacement-based bound; whatever replaces it must discriminate on rack **state**, not degrees moved. | commit 7afd501 | 2026-08-14 (this commit) |
 | Stall/breakaway **v1** — arming on "torque above the pure-P base law while the rack is frozen" | Killed by replay before any code shipped. Through the entire frozen phase of route 3f2 seg 10 the commanded torque tracks the base-P law within **±0.02 frac** (surplus peak +0.019): the stall inflates `delta_err`, which inflates the base law in lockstep with the windup. **Every κ-derived signal lags the rack by the vehicle response, so all of them are stale exactly at release** — the decisive surplus only appears mid-swing, after `κ_meas` catches up. Zero snaps on the motivating event. Replaced by the displacement trip (v2, dated note in the header), which needs no κ-space quantity at release at all: the stall context already proves the windup, so the signature is wheel travel past the breakaway point plus sweep rate. Do not re-propose any arming predicate built on a κ-space error. See `.superpowers/sdd/2026-08-12-angle-based-breakaway/stall-breakaway-v2-design.md`. | never deployed | 2026-08-14 |
 | Online breakaway-torque estimator + angular-rate edge detector (`bmw/rack_motion.py`: `RackMotion`, `BreakawayEstimator`) | Never deployed — killed by offline validation on route 3f2. Rate thresholding produced 1-2 tick false-motion blips at exactly the low rates that mattered; a debounce did not fix it. The estimator's own observations had a median torque of 0.041 frac — the controller's own median push, not a breakaway signature — so it measured "torque present when the wheel happens to move" and collapsed to its clamp floor. Replaced by the fixed 2-degree open-loop push budget (no online learning, no rate threshold) — see the 2026-08-12 entry above. Its `ANGLE_LSB_DEG = 0.0879` angle quantum was also wrong, exactly 2× too coarse — inferred by counting 169 distinct observed values over one segment, when the confirmed quantum is `0.04395`° (observed level gaps are integer multiples of it, and this same file's own `MOTION_CONFIRM_TICKS` comment already used 0.04395 for the true quantum without ever reconciling the two). `BUDGET_DEG` in the push budget uses the confirmed 0.04395° value (45 quanta of headroom). (The push budget that replaced it was itself retired 2026-08-14 — next row. The 0.04395° quantum finding survives both.) | commits 5bb33b4..dd3d2a2 | 2026-08-12 (this commit) |
+| Stall/breakaway **v2** — displacement + sweep-rate trip on a released stall (`StallBreakaway`, `SB_*`: shed the push, block same-side re-pushes) | Deployed default-off 2026-08-15. 0 live trips; shadow evaluation on routes 4ee-4f7 showed the would-be trips were ordinary turn-ins, not windup releases. Param 0 on the car since 2026-10-19. | 2026-08-15 history entry | removed 2026-10-23 |
 
 ---
 
@@ -1409,19 +1406,12 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   thread. Git history around commits fbb899b / 7afd501 has the working
   implementation.
 
-### To toggle `StallBreakaway` (stall/breakaway v2 displacement trip, 2026-08-15 entry):
-- **Default OFF**, `'1'` enables.
-- **Not hot**, same as above: read once at controller construction, so it
-  applies at the **next drive start**. There is deliberately no bus topic, no
-  heartbeat; the Driving-panel "Stall Breakaway" toggle writes the param.
-- Enable: `echo -n 1 > /data/plugins-runtime/bmw_e9x_e8x/data/StallBreakaway`.
-  Disable: write anything else, or delete the file.
-- **Verify a drive picked it up**: with the param on the machine arms from the
-  first engaged tick, so `sb_state` excursions to 1 show up early and often.
-- **The A/B is telemetry, not feel**: the question is "did a windup release
-  get caught", so compare `sb_trips` (expect ≈ 0 per ordinary drive) and the
-  angle traces around any trip — not straight-line smoothness.
-- **Rollback**: delete the param and restart the drive.
+### ~~To toggle `StallBreakaway` (stall/breakaway v2 displacement trip)~~ — GONE 2026-10-23
+- Stall/breakaway v2 was **removed** (see the 2026-10-23 dated note and the
+  §11 row). There is no `StallBreakaway` param, no "Stall Breakaway" toggle
+  and no `sb_*` telemetry any more.
+- A leftover `StallBreakaway` param file on a device is inert; delete it at
+  your convenience (`rm /data/plugins-runtime/bmw_e9x_e8x/data/StallBreakaway`).
 
 ### Slope Compensation (`SlopeCompensation`, 2026-10-19 entry):
 - **Why**: Direct is P-only, so the steady torque a straight needs against a
@@ -1434,8 +1424,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 - **Gate** (situation only, never the error's sign; see the hold-bias failure,
   37e34b7): latched at engagement, active, not pressed, v > 40 km/h,
   |κ_des| < 1e-3, |κ_meas| < 1.5e-3 and |a_ref| < 0.15 m/s² (gentle bends charged
-  the bias on route 4ec), no take-up in flight, no stall-breakaway
-  block or episode (`sb_state` 2; the armed state 1 does not close it).
+  the bias on route 4ec), no take-up in flight.
 - **Constants**: `SL_TAU_S` 20 s, `SL_BIAS_MAX_NM` 0.25 (well below rack
   breakaway, ~0.5 Nm), `SL_MIN_V` 40 km/h. Was 0.15 (≈2× the 4e9 need): on
   route 4ea it pinned the bias 20% of the time on roads with roll ≥ 2.3°,
@@ -1460,12 +1449,11 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 
 | section | where | content |
 |---|---|---|
-| Module constants | top of file | `SB_*`, `V_GAIN_FLOOR`, LKA band, `CONTROL_HORIZON_S`, `SL_*`, `CF_*` + `curve_ff_nm`, the lane_keeping readiness check (R10) |
-| `on_lat_controller_init` | module | R10 guard, `StallBreakaway` read, cadence/gain/step/dwell constants, the state dict, `update` closure |
+| Module constants | top of file | `V_GAIN_FLOOR`, LKA band, `CONTROL_HORIZON_S`, `SL_*`, `CF_*` + `curve_ff_nm`, the lane_keeping readiness check (R10) |
+| `on_lat_controller_init` | module | R10 guard, `config.read_plugin_param` import, cadence/gain/step/dwell constants, the state dict, `update` closure |
 | Engagement edge | top of `update()` | `SlopeCompensation` latch, guard reset; inactive zeroes torque/target/ramp |
-| Stall/breakaway v2 | `update()`, before the livePose branch | ring / arm / breakaway / trip, shed-rate enforcement |
 | livePose tick | `update()` | reference, speeds, `delta_err`, `kappa_scale`, `a_ref`/`ff_nm`, slope-bias learning, `demand_nm`, guard observe, relax-dwell |
-| Decision | `update()`, every `action_cadence_ticks` while active | demand → `t_cap` → dwell bridge → guard → `STEP_MAX` → sb block |
+| Decision | `update()`, every `action_cadence_ticks` while active | demand → `t_cap` → dwell bridge → guard → `STEP_MAX` |
 | Contact learning, take-up | `update()`, every CAN tick | `ContactLearner.observe`, `FreePlayTakeUp.step`, handover |
 | Ramp and telemetry | end of `update()` | per-frame ramp step, zero snap, `bmw_lat_control` payload (§9) |
 

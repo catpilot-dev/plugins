@@ -132,16 +132,6 @@ def _write_param(key, value):
     f.write(value)
 
 
-def _set_stall_breakaway(state):
-  """Persist the StallBreakaway kill-switch (param file only).
-
-  Restart-scoped by design: controlsd is onroad-only, so latcontroller reads
-  this at every drive start and there is no bus topic or heartbeat to keep in
-  sync — flipping it while parked is the whole A/B procedure.
-  """
-  _write_param('StallBreakaway', '1' if state else '0')
-
-
 def _set_slope_compensation(state):
   """Persist the SlopeCompensation switch (param file only).
 
@@ -166,17 +156,7 @@ def on_vehicle_settings(items, CP):
   ))
 
   # Default-OFF polarity (`== '1'`), deliberately the opposite of the
-  # TemperatureOverlay row above — this arms a safety net, so an absent param
-  # file must read as off.
-  items.append(toggle_item(
-    "Stall Breakaway",
-    "Shed steering torque when a stalled steering rack breaks away and sweeps "
-    "more than 2 degrees at speed. Applies at the next drive.",
-    _read_param('StallBreakaway') == '1',
-    callback=_set_stall_breakaway,
-  ))
-
-  # Default-OFF polarity (`== '1'`), same as Stall Breakaway.
+  # TemperatureOverlay row above: an absent param file must read as off.
   items.append(toggle_item(
     "Slope Compensation",
     "Learn the small steady torque the car needs to drive straight (road "

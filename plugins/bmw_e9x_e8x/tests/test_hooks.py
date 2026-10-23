@@ -175,14 +175,14 @@ class TestVehicleSettingsRows:
     row list rather than a not-in check so the retired row cannot return
     under any title.
 
-    'Stall Breakaway' (2026-08-15) is a DIFFERENT mechanism and is listed
-    here deliberately: the refuted one bounded torque on degrees moved, this
-    one trips on rack state, which is what the retirement note requires of
-    any replacement. The retired row's own title stays pinned out below."""
+    'Stall Breakaway' (2026-08-15) was retired the same way on 2026-10-23:
+    its shadow trips on routes 4ee-4f7 were ordinary turn-ins. Both retired
+    titles stay pinned out below."""
     titles = [r.title for r in self._rows(monkeypatch, param_dir)]
-    assert titles == ['Temperature Overlay', 'Stall Breakaway', 'Slope Compensation',
+    assert titles == ['Temperature Overlay', 'Slope Compensation',
                       'Resume Button Repurposed']
     assert 'Steering Push Budget' not in titles
+    assert 'Stall Breakaway' not in titles
 
   def test_non_bmw_gets_no_rows(self, mock_deps, monkeypatch, param_dir):
     import register
@@ -196,10 +196,10 @@ class TestVehicleSettingsRows:
 
   def test_temperature_overlay_row_reflects_the_param(self, mock_deps, monkeypatch, param_dir):
     """Default-ON polarity (`!= '0'`): absent file and '1' both read as on,
-    only an explicit '0' reads as off. The adjacent Stall Breakaway row uses
-    the opposite (`== '1'`) predicate, so this pins that the two did not get
-    mixed up — copying this row's predicate onto that one would silently arm
-    a safety net on fresh installs."""
+    only an explicit '0' reads as off. The adjacent Slope Compensation row
+    uses the opposite (`== '1'`) predicate, so this pins that the two did not
+    get mixed up — copying this row's predicate onto that one would silently
+    enable it on fresh installs."""
     assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is True
     (param_dir / 'TemperatureOverlay').write_text('0')
     assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is False
@@ -223,42 +223,6 @@ class TestVehicleSettingsRows:
     assert (param_dir / 'TemperatureOverlay').read_text() == '1'
     assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is True
 
-  def test_stall_breakaway_defaults_off(self, mock_deps, monkeypatch, param_dir):
-    """No param file: the row must be OFF. Guards the `== '1'` predicate —
-    the adjacent TemperatureOverlay row uses `!= '0'` (default-ON), and
-    copying that here would silently arm the mechanism on fresh installs,
-    contradicting latcontroller's own default-OFF read."""
-    assert self._row(monkeypatch, param_dir, 'Stall Breakaway').initial_state is False
-
-  def test_stall_breakaway_reflects_existing_param(self, mock_deps, monkeypatch, param_dir):
-    """'1' is the only enabling value, matching latcontroller's
-    `read_plugin_param(...) == '1'`; anything else reads as off."""
-    (param_dir / 'StallBreakaway').write_text('1')
-    assert self._row(monkeypatch, param_dir, 'Stall Breakaway').initial_state is True
-    (param_dir / 'StallBreakaway').write_text('0')
-    assert self._row(monkeypatch, param_dir, 'Stall Breakaway').initial_state is False
-
-  def test_stall_breakaway_callback_writes_the_param(self, mock_deps, monkeypatch, param_dir):
-    """The param FILE is the only channel to controlsd — there is no bus
-    topic or heartbeat for this toggle, so a callback that does not persist
-    leaves the UI looking right and changes nothing at the next drive."""
-    row = self._row(monkeypatch, param_dir, 'Stall Breakaway')
-
-    row.callback(True)
-    assert (param_dir / 'StallBreakaway').read_text() == '1'
-    assert self._row(monkeypatch, param_dir, 'Stall Breakaway').initial_state is True
-
-    row.callback(False)
-    assert (param_dir / 'StallBreakaway').read_text() == '0'
-    assert self._row(monkeypatch, param_dir, 'Stall Breakaway').initial_state is False
-
-  def test_stall_breakaway_absent_for_non_bmw(self, mock_deps, monkeypatch, param_dir):
-    """This is a BMW rack behaviour; the hook runs for every brand's Driving
-    panel, so the brand guard must keep the row off other cars."""
-    import register
-    items = register.on_vehicle_settings([], SimpleNamespace(brand='toyota'))
-    assert [r for r in items if getattr(r, 'title', None) == 'Stall Breakaway'] == []
-
   def test_slope_compensation_row_state_and_callback(self, mock_deps, monkeypatch, param_dir):
     """Default-OFF (`== '1'`), persisted to the param file latcontroller
     reads at each engagement."""
@@ -273,10 +237,6 @@ class TestVehicleSettingsRows:
     assert (param_dir / 'SlopeCompensation').read_text() == '1'
     row.callback(False)
     assert (param_dir / 'SlopeCompensation').read_text() == '0'
-
-  def test_slope_compensation_row_follows_stall_breakaway(self, mock_deps, monkeypatch, param_dir):
-    titles = [r.title for r in self._rows(monkeypatch, param_dir)]
-    assert titles.index('Slope Compensation') == titles.index('Stall Breakaway') + 1
 
   def test_slope_compensation_absent_for_non_bmw(self, mock_deps, monkeypatch, param_dir):
     import register

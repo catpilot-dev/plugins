@@ -18,10 +18,6 @@
       "default": true,
       "description": "Show coolant and oil temperature on the onroad HUD"
     },
-    "StallBreakaway": {
-      "default": false,
-      "description": "Shed steering torque when a stalled rack breaks away and sweeps more than 2 degrees at speed. Write 1 to enable. Read at drive start."
-    },
     "SlopeCompensation": {
       "default": false,
       "description": "Learn and apply the steady straight-road torque (road slope, alignment). Write 1 to enable. Read at each engagement."

@@ -3,8 +3,8 @@
 
 The controller tracks the commanded curvature with Direct Tracking as its only
 law: no rest state or hold band, the P target on the full error every decision,
-sign-guarded reversals with free-play take-up, stall-breakaway v2, the LKA-regime unwind boost, Slope
-Compensation. It never drains torque to respect an a_y ceiling (speedlimitd
+sign-guarded reversals with free-play take-up, the LKA-regime unwind boost,
+Slope Compensation. It never drains torque to respect an a_y ceiling (speedlimitd
 owns a_y through v); the P-law reversing on overshoot IS the correction.
 
 Harness notes:
@@ -73,27 +73,24 @@ class FakeSubMaster:
     return self.lp
 
 
-def _make_controller(monkeypatch, wheelbase=2.66, stall_v2=None, slope=None):
+def _make_controller(monkeypatch, wheelbase=2.66, slope=None):
   """Load bmw.latcontroller and construct a controller instance wired to a
   FakeSubMaster. Returns (lac, fake_sm, mod, state).
 
-  stall_v2 / slope: if not None, StallBreakaway / SlopeCompensation read as
-  '1' (True) or '0' (False).
+  slope: if not None, SlopeCompensation reads as '1' (True) or '0' (False).
   Patched on the `config` module BEFORE on_lat_controller_init runs (the
   controller does `from config import read_plugin_param` at function scope and
-  reads StallBreakaway once, at construction). The stub dispatches on the param
-  KEY; a kwarg left None falls through to the production default ('').
+  reads SlopeCompensation at each engagement edge). The stub dispatches on the
+  param KEY; a kwarg left None falls through to the production default ('').
   """
   import cereal.messaging as messaging
   fake_sm = FakeSubMaster([])
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
 
   import bmw.latcontroller as mod
-  if stall_v2 is not None or slope is not None:
+  if slope is not None:
     import config
     def _param_stub(plugin_id, key, default=''):
-      if key == 'StallBreakaway' and stall_v2 is not None:
-        return '1' if stall_v2 else '0'
       if key == 'SlopeCompensation' and slope is not None:
         return '1' if slope else '0'
       return default
@@ -706,625 +703,32 @@ class TestSteeringAngleGuard:
 
 
 # ============================================================
-# Stall/breakaway v2 — displacement trip (2026-08-15, routes 3f2 + 3f4
-# replay-validated). A stalled rack that releases sweeps the wheel far past
-# what the model is asking for while the controller still pushes on a stale
-# kappa-space error (every kappa-derived signal lags the rack at release).
-#
-#   ARM       action=='ramp' and the 0.4 s angle ring spans < 2 quanta
-#   BREAKAWAY >= 3 quanta of advance inside 0.2 s; latches sb_brk_angle and
-#             sb_dir (the OBSERVED motion direction over that window)
-#   TRIP      all of: |kappa_des| <= SB_TRIP_KAPPA_MAX;
-#             the wheel has travelled >= SB_TRIP_DISP_DEG past the breakaway
-#             point IN THE BREAKAWAY DIRECTION; and it is sweeping at
-#             >= SB_TRIP_RATE_DPS -> shed to 0 over SB_SHED_FRAMES + block
-#             same-side pushes
-#
-# Everything is measured against the wheel's own breakaway state, so there is
-# no absolute angle or curvature convention in the machine at all — which is
-# why there is no target derivation, no offset estimator and no readiness
-# gate to test here. The three trip discriminators each have a pin:
-#   - deep-curve gate      -> test_deep_curve_no_trip
-#   - displacement direction -> test_wrong_direction_no_trip
-#   - rate gate            -> test_slow_crossing_no_trip
-#
-# Harness: one _call_update is one CAN tick AND one livePose tick, so tick
-# counts map straight onto the SB_* constants.
+# Retired mechanisms. The driver-override observers and stall/breakaway v2
+# (StallBreakaway, removed 2026-10-23: its shadow trips on 4ee-4f7 were
+# ordinary turn-ins) must not leave state, telemetry or constants behind.
 # ============================================================
 
-_SB_Q = 0.04395         # == ANGLE_QUANTUM_DEG
-_SB_V = 20.0
-# Mild curve, like the route 3f2 seg 10 lurch (kappa_des -0.0035): inside
-# SB_TRIP_KAPPA_MAX, so the deep-curve gate is open.
-_SB_KAPPA_DES = -0.004
-# Under-tracking on the same side.
-_SB_KAPPA_MEAS = -0.002
-_SB_A0 = 5.0            # arbitrary start angle — only deltas from it matter
-
-
-def _sb_make(monkeypatch, *, enabled=True, kappa_meas=_SB_KAPPA_MEAS):
-  """Controller with the stall/breakaway feature on (or at its default)."""
-  lac, sm, mod, state = _make_controller(
-    monkeypatch, stall_v2=True if enabled else None)
-  _set_measured(sm, _SB_V, kappa_meas)
-  return lac, sm, mod, state
-
-
-def _sb_tick(lac, angle, action='ramp', kappa_des=_SB_KAPPA_DES):
-  """One CAN+livePose tick at `angle`, with the decision action forced.
-
-  tick_count is pinned to 0 every tick so no cadence decision ever runs
-  during the choreography: the state machine reads state['action'] BEFORE
-  the livePose branch, so forcing it here is what makes the arm/episode
-  conditions deterministic, and suppressing the decision keeps the trip's
-  own target_frac / ramp_step / ramp_frames writes observable.
-  """
-  state = _closure_state(lac.update)
-  state['action'] = action
-  state['tick_count'] = 0
-  _call_update(lac, kappa_des, v_ego=_SB_V, steering_angle_deg=angle)
-
-
-def _sb_arm(lac, a0=_SB_A0, ticks=45, kappa_des=_SB_KAPPA_DES):
-  """Hold the angle frozen at a0 while ramping -> ARM (sb_state 1).
-
-  The ring is SB_FROZEN_TICKS + 1 long, so it takes 41 ticks to fill; 45
-  gives margin and exercises "stays armed while still frozen".
-  """
-  for _ in range(ticks):
-    _sb_tick(lac, a0, kappa_des=kappa_des)
-
-
-class TestStallBreakawayV2:
-  """Displacement + rate trip.
-
-  Choreography arithmetic, once, for every test below. After arming, the
-  angle advances a fixed number of quanta per tick from _SB_A0:
-
-    step(n quanta) = n * 0.04395 deg/tick  ->  n * 4.395 deg/s
-
-  Breakaway lands on the first moving tick k = 1 (one step already clears
-  SB_MOVE_QUANTA = 3 quanta for n >= 3), latching
-  sb_brk_angle = _SB_A0 + step and sb_dir = +1.0.
-
-  The two trip quantities then evolve as (k counted from the arm end):
-    displacement = (k - 1) * step                    >= SB_TRIP_DISP_DEG (2.0)
-    rate         = min(k, 20) * step / 0.2 s         >= SB_TRIP_RATE_DPS (30)
-  The rate is measured over a FIXED 0.2 s window, so while the window still
-  contains frozen samples (k < 20) it reads the average over that window,
-  not the instantaneous step — which is why the rate conjunct is the one
-  that binds in the fast case even though displacement clears much earlier.
-  """
-  # 7 quanta/tick = 0.30765 deg/tick = 30.765 deg/s: past SB_TRIP_RATE_DPS.
-  FAST_STEP = 7 * _SB_Q
-  # 5 quanta/tick = 0.21975 deg/tick = 21.975 deg/s: short of it (and short
-  # of the 25 the rate sweep also rejected).
-  SLOW_STEP = 5 * _SB_Q
-  # Fast case: displacement clears 2.0 deg at k = 8 ((8-1)*0.30765 = 2.15),
-  # the rate window fills at k = 20 (20*0.30765/0.2 = 30.765 >= 30) while
-  # k = 19 reads only 29.23 -> the trip lands exactly on k = 20.
-  TRIP_K = 20
-
-  def test_default_off_inert(self, monkeypatch):
-    """No StallBreakaway param (production default): the machine never runs,
-    even with the full trip choreography played out."""
-    lac, sm, mod, state = _sb_make(monkeypatch, enabled=False)
-    _sb_arm(lac)
-    assert state['sb_state'] == 0
-    for k in range(1, self.TRIP_K + 5):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
-    assert state['sb_state'] == 0
-    assert state['sb_trips'] == 0
-    assert state['sb_block'] == 0
-
-  def test_arm_requires_frozen_ramp(self, monkeypatch):
-    """A frozen angle arms only while the controller is actually pushing
-    (action == 'ramp'). Frozen while holding is just a car going straight."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    assert state['sb_state'] == 1
-
-    lac2, sm2, mod2, state2 = _sb_make(monkeypatch)
-    for _ in range(45):
-      _sb_tick(lac2, _SB_A0, action='idle')
-    assert state2['sb_state'] == 0
-
-  def test_breakaway_and_trip(self, monkeypatch):
-    """The motivating event, in miniature: the stalled rack releases and
-    sweeps 2 deg past where it broke free, fast, in a mild curve.
-
-    See the class docstring for the arithmetic: displacement clears at
-    k = 8, the 0.2 s rate window reaches 30.765 deg/s at k = 20 (k = 19 is
-    29.23), so the trip lands on k = 20 — which pins the rate boundary to a
-    single tick.
-
-    Torque is NEGATIVE: sb_dir = +1.0 is leftward wheel motion, and torque
-    is opposite in sign to angle, so the push driving it is < 0.
-    """
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    assert state['sb_state'] == 1
-
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
-    assert state['sb_state'] == 2                      # breakaway
-    assert state['sb_dir'] == 1.0                      # moved in +angle
-    assert state['sb_brk_angle'] == pytest.approx(_SB_A0 + self.FAST_STEP)
-
-    state['torque'] = -0.3                             # standing left push at release
-    for k in range(2, self.TRIP_K):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
-      assert state['sb_trips'] == 0
-    # Displacement was satisfied long before the rate window filled.
-    assert (self.TRIP_K - 2) * self.FAST_STEP > mod.SB_TRIP_DISP_DEG
-    assert (self.TRIP_K - 1) * self.FAST_STEP / 0.2 < mod.SB_TRIP_RATE_DPS
-
-    _sb_tick(lac, _SB_A0 + self.TRIP_K * self.FAST_STEP)
-    assert mod.SB_MOVE_TICKS * self.FAST_STEP / 0.2 >= mod.SB_TRIP_RATE_DPS
-    assert state['sb_trips'] == 1
-    assert state['sb_state'] == 0                      # one trip per episode
-    assert state['target_frac'] == 0.0
-    assert state['ramp_step'] == pytest.approx(0.3 / mod.SB_SHED_FRAMES)
-    # One shed frame is consumed by the same tick's ramp application at the
-    # bottom of update(), so SB_SHED_FRAMES - 1 remain when we look.
-    assert state['ramp_frames'] == mod.SB_SHED_FRAMES - 1
-    assert state['torque'] == pytest.approx(-0.3 + 0.3 / mod.SB_SHED_FRAMES)
-    assert state['sb_block'] == mod.SB_BLOCK_TICKS
-
-  def test_slow_crossing_no_trip(self, monkeypatch):
-    """THE RATE-GATE PIN. Same release shape at 5 quanta/tick = 21.975 deg/s:
-    displacement clears comfortably, but ordinary post-stick corrections live
-    down here (the 3f4 sweep put >= 25 at 0.31 trips/min and >= 30 at 0.153),
-    so it must not trip. Note 21.975 would have passed a 20 deg/s gate."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    for k in range(1, 61):
-      _sb_tick(lac, _SB_A0 + k * self.SLOW_STEP)
-    # Displacement is satisfied many times over...
-    assert 59 * self.SLOW_STEP > mod.SB_TRIP_DISP_DEG
-    assert state['sb_state'] == 2                      # episode still live
-    # ...and the rate never reaches the gate, even with a full window.
-    assert mod.SB_MOVE_TICKS * self.SLOW_STEP / 0.2 < mod.SB_TRIP_RATE_DPS
-    assert state['sb_trips'] == 0
-
-  def test_deep_curve_no_trip(self, monkeypatch):
-    """THE DEEP-CURVE PIN. Identical fast release, but |kappa_des| = 0.012 is
-    past SB_TRIP_KAPPA_MAX: self-aligning torque at that loading arrests the
-    release on its own (hairpins tracked fine and dominated the false trips
-    before this gate), and shedding there would be the give-up-mid-turn
-    failure mode this controller has re-earned three times."""
-    deep = 0.012
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    assert deep > mod.SB_TRIP_KAPPA_MAX
-    _sb_arm(lac, kappa_des=deep)
-    assert state['sb_state'] == 1
-    for k in range(1, self.TRIP_K + 6):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP, kappa_des=deep)
-    assert state['sb_state'] == 2                      # episode live, just no trip
-    assert state['sb_trips'] == 0
-
-  def test_tiny_torque_no_trip(self, monkeypatch):
-    """THE MIN-TORQUE PIN (2026-08-16, drives 3fa/3fb). Identical fast
-    release choreography, but the standing push at the crossing is 0.05 frac
-    — there is no windup worth shedding, so the trip is pointless. 8 of the 9
-    benign on-car trips were exactly this: corner-exit unwinds carrying
-    0.007-0.088 frac, versus 0.293 on the 3f2 real event."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
-    assert state['sb_state'] == 2
-
-    state['torque'] = -0.05                            # below SB_TRIP_MIN_TORQUE
-    assert abs(state['torque']) < mod.SB_TRIP_MIN_TORQUE
-    for k in range(2, self.TRIP_K + 1):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
-
-    # Everything else about the crossing was trip-ready (this is the exact
-    # tick test_breakaway_and_trip trips on).
-    assert state['sb_state'] == 2                      # episode live, just no trip
-    assert state['sb_trips'] == 0
-    assert state['sb_block'] == 0
-
-  def test_arm_in_deep_curve_no_trip_after_decay(self, monkeypatch):
-    """THE ARM-LATCH PIN (2026-08-16). The hairpin-exit case from 3fb
-    t=1569: the machine arms mid-corner at |kappa_des| = 0.019, then the
-    corner-exit decay carries kappa_des under SB_TRIP_KAPPA_MAX (0.0096)
-    while the wheel is still at -43 deg and unwinding. The INSTANTANEOUS
-    gate is wide open by the crossing tick; only the curvature latched at
-    ARM keeps this benign unwind from reading as a release."""
-    deep, shallow = 0.02, 0.005
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    assert deep > mod.SB_TRIP_KAPPA_MAX
-    assert shallow < mod.SB_TRIP_KAPPA_MAX
-
-    _sb_arm(lac, kappa_des=deep)
-    assert state['sb_state'] == 1
-    assert state['sb_arm_kappa'] == pytest.approx(deep)
-
-    # Corner exit: kappa_des decays under the gate, and the release plays out
-    # in full — fast, in-direction, with real torque standing.
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP, kappa_des=shallow)
-    assert state['sb_state'] == 2
-    state['torque'] = -0.3
-    assert abs(state['torque']) >= mod.SB_TRIP_MIN_TORQUE
-    for k in range(2, self.TRIP_K + 1):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP, kappa_des=shallow)
-
-    # The instantaneous gate passes; the latch is what holds.
-    assert abs(state['desired']) <= mod.SB_TRIP_KAPPA_MAX
-    assert state['sb_arm_kappa'] > mod.SB_TRIP_KAPPA_MAX
-    assert state['sb_trips'] == 0
-
-  def test_arm_kappa_relatches_on_rearm(self, monkeypatch):
-    """The latch must not STICK across episodes. After a deep-curve arm
-    expires, a fresh arm in a mild curve latches the new value and the same
-    crossing DOES trip — otherwise one hairpin would disable the mechanism
-    for the rest of the drive."""
-    deep = 0.02
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac, kappa_des=deep)
-    assert state['sb_arm_kappa'] == pytest.approx(deep)
-
-    # The deep arm ends the way arms ordinarily do: the action leaves ramp.
-    # Two ticks, because the machine runs BEFORE the livePose branch that
-    # writes state['desired'] — so the curvature it reads is always one tick
-    # old, and the second tick is what lets `mild` reach it. (Same one-tick
-    # staleness the instantaneous gate has always had; it errs toward NOT
-    # tripping, so it needs no correction — only respecting.)
-    mild = 0.001
-    _sb_tick(lac, _SB_A0, action='idle', kappa_des=deep)
-    assert state['sb_state'] == 0
-    _sb_tick(lac, _SB_A0, action='idle', kappa_des=mild)
-
-    # Fresh arm in a mild curve -> the latch takes the NEW curvature.
-    _sb_arm(lac, ticks=45, kappa_des=mild)
-    assert state['sb_state'] == 1
-    assert state['sb_arm_kappa'] == pytest.approx(mild)
-
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP, kappa_des=mild)
-    assert state['sb_state'] == 2
-    state['torque'] = -0.3
-    for k in range(2, self.TRIP_K + 1):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP, kappa_des=mild)
-    assert state['sb_trips'] == 1
-
-  def test_wrong_direction_no_trip(self, monkeypatch):
-    """THE DIRECTION PIN. The rack breaks away one way, then travels the
-    OTHER way. Displacement is signed by sb_dir — the direction the wheel
-    actually broke free in, observed rather than assumed — so travel back
-    the other way never accumulates toward the trip, however fast it is."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
-    assert state['sb_state'] == 2
-    assert state['sb_dir'] == 1.0
-    brk = state['sb_brk_angle']
-
-    for k in range(1, 41):
-      _sb_tick(lac, brk - k * self.FAST_STEP)
-    last = brk - 40 * self.FAST_STEP
-    # Plenty of travel, plenty fast — but the wrong way.
-    assert abs(last - brk) > mod.SB_TRIP_DISP_DEG
-    assert mod.SB_MOVE_TICKS * self.FAST_STEP / 0.2 >= mod.SB_TRIP_RATE_DPS
-    assert (last - brk) * state['sb_dir'] < 0.0
-    assert state['sb_state'] == 2
-    assert state['sb_trips'] == 0
-
-  def test_block_suppresses_same_side_only(self, monkeypatch):
-    """THE SIGN PIN for the post-trip block. sb_dir = +1.0 means the wheel
-    broke away moving LEFT in angle space; torque is opposite in sign to
-    angle, so the push driving that motion is target_frac < 0. That push must
-    be zeroed while sb_block runs; a RIGHT push (opposite-side correction)
-    must pass through untouched — the controller may stop pushing, never give
-    up correcting.
-
-    Expected magnitudes come from the STEP_MAX schedule at v=20 (see
-    TestStepMaxSpeedSchedule): |target_frac| = 0.0807692.
-    """
-    lac, sm, mod, state = _make_controller(monkeypatch, stall_v2=True)
-    state['sb_block'] = 10
-    state['sb_dir'] = 1.0
-    _decide_from_zero(lac, sm, state, v=20.0, desired=-0.02)   # LEFT push
-    assert state['action'] == 'ramp'
-    assert state['sb_block'] > 0
-    assert state['target_frac'] == 0.0
-
-    lac2, sm2, mod2, state2 = _make_controller(monkeypatch, stall_v2=True)
-    state2['sb_block'] = 10
-    state2['sb_dir'] = 1.0
-    _decide_from_zero(lac2, sm2, state2, v=20.0, desired=0.02)  # RIGHT push
-    assert state2['action'] == 'ramp'
-    assert state2['sb_block'] > 0
-    assert state2['target_frac'] == pytest.approx(0.0807692307, abs=1e-9)
-
-  def test_shed_rate_enforced_through_decisions(self, monkeypatch):
-    """Review Important 1: a cadence decision landing inside the shed window
-    recomputes ramp_step over spread_frames, stretching the 100 ms drain to
-    ~400 ms — 6x slower, on the one action the trip exists to perform (the
-    3f2 event peaked 0.30 s AFTER the trip point). While the block is up, a
-    too-slow same-side drain must be re-asserted at the shed rate."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
-    state['torque'] = -0.3
-    for k in range(2, self.TRIP_K + 1):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
-    assert state['sb_trips'] == 1
-    assert state['sb_block'] > 0
-    torque = state['torque']
-    assert torque < 0.0
-
-    # A cadence decision lands: same destination (0), 4x the frames.
-    state['target_frac'] = 0.0
-    state['ramp_step'] = -torque / 40.0
-    state['ramp_frames'] = 40
-
-    _sb_tick(lac, _SB_A0 + (self.TRIP_K + 1) * self.FAST_STEP)
-    assert state['ramp_step'] == pytest.approx(-torque / mod.SB_SHED_FRAMES)
-    assert state['ramp_frames'] == mod.SB_SHED_FRAMES - 1   # one frame applied
-    assert state['target_frac'] == 0.0
-
-    # An opposite-side (counter-steer) ramp is NOT re-asserted: it already
-    # drains the same-side torque at least as fast, and the block must never
-    # interfere with correcting the other way.
-    state['ramp_step'] = -torque          # big, opposite to torque
-    state['ramp_frames'] = 5
-    _sb_tick(lac, _SB_A0 + (self.TRIP_K + 2) * self.FAST_STEP)
-    assert state['ramp_step'] == pytest.approx(-torque)
-    assert state['ramp_frames'] == 4
-
-  def test_episode_timeout_rearms_clean(self, monkeypatch):
-    """No trip within SB_EPISODE_TICKS: the episode closes and a fresh
-    freeze arms again. The wheel moves once (breakaway) then stalls again —
-    displacement stops at one step and after 20 ticks its rate is 0."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    stalled = _SB_A0 + self.FAST_STEP
-    _sb_tick(lac, stalled)
-    assert state['sb_state'] == 2
-
-    for _ in range(mod.SB_EPISODE_TICKS - 1):
-      _sb_tick(lac, stalled)
-      assert state['sb_state'] == 2
-    _sb_tick(lac, stalled)                     # the SB_EPISODE_TICKS'th decrement
-    assert state['sb_state'] == 0
-    assert state['sb_trips'] == 0
-
-    _sb_tick(lac, stalled)                     # ring is uniform -> re-arms
-    assert state['sb_state'] == 1
-
-  def test_telemetry_keys(self, monkeypatch):
-    """Four keys, and the absolute-target machinery's keys must be GONE —
-    a stale sb_off/sb_ready in the payload would advertise an estimator this
-    build does not have."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    payloads = []
-    state['lat_pub'] = SimpleNamespace(send=payloads.append)
-    _sb_tick(lac, _SB_A0)
-    assert payloads
-    p = payloads[-1]
-    assert isinstance(p['sb_state'], int)
-    assert isinstance(p['sb_trips'], int)
-    assert isinstance(p['sb_block'], int)
-    assert 'sb_off' not in p
-    assert 'sb_ready' not in p
-
+class TestRetiredMechanisms:
   def test_no_ov_keys_in_state_or_payload(self, monkeypatch):
     """The driver-override observers are gone: nothing in the state or the
     telemetry starts with ov_."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
+    lac, sm, mod, state = _make_controller(monkeypatch)
     pay = []
     state['lat_pub'] = SimpleNamespace(send=pay.append)
-    _sb_tick(lac, _SB_A0)
+    _call_update(lac, 0.001, v_ego=20.0)
     assert not [k for k in state if k.startswith('ov_')]
     assert not [k for k in pay[-1] if k.startswith('ov_')]
     assert not hasattr(mod, 'OV_EOD_RATE_DPS')
 
-  def test_sb_block_zeroes_ff_push(self, monkeypatch):
-    """A right curve carried by the FF (ff +0.95, P 0) during a post-trip block:
-    with sb_dir -1.0 (the wheel broke away moving right, so a right push is
-    same-side) the decision is zeroed; with sb_dir +1.0 it passes."""
-    for sb_dir, zeroed in ((-1.0, True), (1.0, False)):
-      lac, sm, mod, state = _make_controller(monkeypatch, stall_v2=True)
-      _set_measured(sm, 25.0, 0.002)
-      _call_update(lac, 0.002, v_ego=25.0, active=False)
-      _call_update(lac, 0.002, v_ego=25.0, active=True)
-      state.update(torque=0.0, target_frac=0.0, ramp_frames=0, action='idle',
-                   sb_block=10, sb_dir=sb_dir, tick_count=999)
-      _call_update(lac, 0.002, v_ego=25.0)
-      assert state['ff_nm'] == pytest.approx(0.95)
-      assert (state['target_frac'] == 0.0) is zeroed
-
-  def test_relax_dwell_no_trip(self, monkeypatch):
-    """The dwell gate: while relax_dwell is bridging a kappa_des dip the trip
-    is suppressed — certified doctrine, and it costs nothing. The follow-up
-    tick proves the setup was otherwise fully trip-ready."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
-    assert state['sb_state'] == 2
-    state['torque'] = -0.3               # windup worth shedding (SB_TRIP_MIN_TORQUE)
-    for k in range(2, self.TRIP_K):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
-
-    _sb_tick(lac, _SB_A0 + self.TRIP_K * self.FAST_STEP, action='relax_dwell')
-    assert state['sb_trips'] == 0
-    assert state['sb_state'] == 2          # episode still live, not consumed
-
-    _sb_tick(lac, _SB_A0 + (self.TRIP_K + 1) * self.FAST_STEP)
-    assert state['sb_trips'] == 1
-
-  def test_block_does_not_zero_a_relax_dwell_hold(self, monkeypatch):
-    """Review Minor: the block zeroes PUSHES. By the time it runs, the
-    relax-dwell bridge may have replaced target_frac with a HOLD of the
-    current torque — zeroing that is the give-up-mid-turn failure mode the
-    dwell exists to prevent, so the block is gated on action == 'ramp'."""
-    lac, sm, mod, state = _make_controller(monkeypatch, stall_v2=True)
-    v = 9.0
-    _set_measured(sm, v, 0.012)          # deep curve -> dwell can arm
-    state['torque'] = -0.3               # standing left push
-    state['target_frac'] = -0.3
-    state['ramp_frames'] = 0
-    state['action'] = 'idle'
-    state['sb_block'] = 10
-    state['sb_dir'] = 1.0                # a left push is the "same side"
-    state['relax_ticks'] = 1             # already dwelling
-    state['tick_count'] = 999
-    # Overshoot-side kappa_des dip: same side as kappa_meas (the dwell aborts
-    # on S-curve sign flips) but smaller, so delta_err opposes delta_des.
-    _call_update(lac, 0.001, v_ego=v)
-    assert state['action'] == 'relax_dwell'
-    assert state['target_frac'] != 0.0   # the curve hold survived the block
-
-  def test_disengage_clears(self, monkeypatch):
-    """active=False mid-episode drops the whole machine: ring, state and the
-    post-trip block. Nothing survives a disengagement into the next drive
-    segment, where the angle history would be meaningless."""
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
-    assert state['sb_state'] == 2
-    assert len(state['sb_ring']) > 0
-    state['sb_block'] = 20
-
-    _call_update(lac, _SB_KAPPA_DES, v_ego=_SB_V, active=False,
-                 steering_angle_deg=_SB_A0 + self.FAST_STEP)
-    assert state['sb_state'] == 0
-    assert state['sb_block'] == 0
-    assert len(state['sb_ring']) == 0
-
-  # ---- Action-half safety (review findings (b) and (c), 2026-08-15) ----
-  # The trip discrimination above decides WHETHER a release happened; these
-  # three pin what the machine is allowed to DO about it. The invariant they
-  # share is the standing SAFETY ARCHITECTURE law: the controller may stop
-  # pushing, it must never give up correcting.
-
-  def test_rebound_snap_back_no_trip(self, monkeypatch):
-    """FINDING (b) PIN — the rate conjunct must be SIGNED.
-
-    With an unsigned rate the trip doubled as a REBOUND detector: a slow
-    drift out (below the gate, so it never trips on the way out) followed by
-    a fast snap BACK toward the breakaway point reads as a fast crossing
-    while displacement is still decaying through the 2 deg mark. The wheel is
-    travelling the WRONG way — the opposite of a release — so it must not
-    trip.
-
-    Reviewer's repro, reproduced tick-for-tick:
-      39 outbound ticks at 5 quanta   -> 21.975 deg/s (sub-gate), displacement
-                                         reaches 8.3505 deg, no trip
-      then 20 return ticks at 7 quanta -> the 0.2 s window now holds pure
-                                         return motion: |rate| = 30.765 >= 30,
-                                         and displacement has decayed to
-                                         exactly 2.1975 deg, still >= 2.0
-    Both pre-fix conjuncts are satisfied on that single tick (j = 20 is the
-    only one where they overlap — j = 19 reads 28.1 deg/s, j = 21 is at
-    displacement 1.890), which is why the assertions below check it exactly.
-    """
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    for k in range(1, 40):
-      _sb_tick(lac, _SB_A0 + k * self.SLOW_STEP)
-    assert state['sb_state'] == 2
-    assert state['sb_dir'] == 1.0
-    assert state['sb_trips'] == 0                 # sub-gate on the way out
-    brk = state['sb_brk_angle']
-    out = _SB_A0 + 39 * self.SLOW_STEP
-    assert (out - brk) > mod.SB_TRIP_DISP_DEG
-
-    for j in range(1, 26):
-      _sb_tick(lac, out - j * self.FAST_STEP)
-      assert state['sb_trips'] == 0
-
-    # The pre-fix trip tick, spelled out: displacement still past the
-    # threshold, unsigned window rate past the gate — and the motion pointing
-    # back toward the breakaway point, which is what now rejects it.
-    at20 = out - 20 * self.FAST_STEP
-    win20 = at20 - out                            # 20 ticks earlier
-    assert (at20 - brk) >= mod.SB_TRIP_DISP_DEG
-    assert abs(win20) / (mod.SB_MOVE_TICKS * 0.01) >= mod.SB_TRIP_RATE_DPS
-    assert win20 * state['sb_dir'] < 0.0          # travelling the wrong way
-    assert state['sb_state'] == 2                 # episode was live throughout
-
-  def test_trip_with_standing_counter_steer_sheds_nothing(self, monkeypatch):
-    """FINDING (c) PIN — the shed must not drain a counter-steer.
-
-    If the standing torque at the trip tick is already OPPOSITE-side, the
-    controller is counter-steering the release: exactly what it should be
-    doing, and there is no same-side surplus to dump. Draining it would
-    contradict the invariant the block itself asserts. The event is still
-    recorded — it happened, and telemetry must show it — but nothing is
-    drained and no block is armed.
-    """
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
-    assert state['sb_dir'] == 1.0
-    for k in range(2, self.TRIP_K):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
-    assert state['sb_trips'] == 0
-
-    # Standing torque is counter-steer (positive against sb_dir = +1), with a
-    # distinctive in-flight ramp so any tampering is visible.
-    state['torque'] = 0.3
-    state['target_frac'] = 0.5
-    state['ramp_step'] = 0.02
-    state['ramp_frames'] = 3
-    assert state['torque'] * (-state['sb_dir']) < 0.0
-
-    _sb_tick(lac, _SB_A0 + self.TRIP_K * self.FAST_STEP)
-
-    # The event is recorded...
-    assert state['sb_trips'] == 1
-    assert state['sb_state'] == 0
-    # ...but nothing was shed and no block armed.
-    assert state['target_frac'] == pytest.approx(0.5)
-    assert state['ramp_step'] == pytest.approx(0.02)
-    assert state['ramp_frames'] == 2               # only the normal ramp tick
-    assert state['torque'] == pytest.approx(0.32)  # still counter-steering
-    assert state['sb_block'] == 0
-
-  def test_enforcement_never_drains_counter_steer(self, monkeypatch):
-    """FINDING (c) PIN, second half — the shed-rate enforcement must yield.
-
-    The enforcement's `_draining` test has a DIRECTION conjunct and a
-    MAGNITUDE conjunct. A counter-steer ramp passes the first but fails the
-    second, because a correction spread over the normal ~40-frame cadence
-    ramp steps far slower than |torque|/SB_SHED_FRAMES. Pre-fix it was
-    therefore misclassified as "not draining" and overwritten — and the
-    overwrite set target_frac = 0, destroying the correction's DESTINATION,
-    not just its rate.
-
-    Reviewer's numbers: standing torque -0.27 with a fresh +0.20 counter-steer
-    gives ramp_step +0.01175 against a 0.027 drain bar.
-    """
-    lac, sm, mod, state = _sb_make(monkeypatch)
-    _sb_arm(lac)
-    _sb_tick(lac, _SB_A0 + self.FAST_STEP)
-    state['torque'] = -0.3
-    for k in range(2, self.TRIP_K + 1):
-      _sb_tick(lac, _SB_A0 + k * self.FAST_STEP)
-    assert state['sb_trips'] == 1
-    assert state['sb_block'] > 0
-    torque = state['torque']
-    assert torque < 0.0                            # same-side shed in progress
-
-    # A counter-steer decision lands mid-shed.
-    counter = 0.20
-    step = (counter - torque) / 40.0
-    state['target_frac'] = counter
-    state['ramp_step'] = step
-    state['ramp_frames'] = 40
-    # It is gentler than the shed bar — the exact misclassification.
-    assert abs(step) < abs(torque) / mod.SB_SHED_FRAMES
-
-    for i in range(3):
-      _sb_tick(lac, _SB_A0 + (self.TRIP_K + 1 + i) * self.FAST_STEP)
-      # The torque gate is still open (torque has not yet crossed zero), so
-      # the ONLY thing standing the enforcement down is the counter-steer
-      # test — which makes this a clean pin.
-      assert state['torque'] * (-state['sb_dir']) > 0.0
-      assert state['sb_block'] > 0
-      assert state['target_frac'] == pytest.approx(counter)
-      assert state['ramp_step'] == pytest.approx(step)
+  def test_no_sb_keys_in_state_or_payload(self, monkeypatch):
+    """Stall/breakaway v2 is gone: no sb_ state or telemetry, no SB_ constants."""
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    pay = []
+    state['lat_pub'] = SimpleNamespace(send=pay.append)
+    _call_update(lac, 0.001, v_ego=20.0)
+    assert not [k for k in state if k.startswith('sb_')]
+    assert not [k for k in pay[-1] if k.startswith('sb_')]
+    assert not [n for n in dir(mod) if n.startswith('SB_')]
 
 
 # ============================================================
@@ -1714,19 +1118,6 @@ class TestDirectTracking:
     _call_update(lac, 0.0, v_ego=25.0, active=True)
     assert state['guard'].side == 0
 
-  def test_sb_episode_ends_when_settled(self, monkeypatch):
-    """A stall-breakaway episode (sb_state 2) ends once |δ_err| <= SB_SETTLED_RAD."""
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, stall_v2=True)
-    _set_measured(fake_sm, 25.0, 0.0)
-    _call_update(lac, 0.0, v_ego=25.0, active=False)
-    _call_update(lac, 0.0, v_ego=25.0, active=True)
-    assert state['delta_err'] == pytest.approx(0.0)       # on target
-    state.update(sb_state=2, sb_episode_ticks=100, action='ramp',
-                 torque=0.0, ramp_frames=0)
-    _call_update(lac, 0.0, v_ego=25.0)
-    assert state['sb_state'] == 0
-    assert mod.SB_SETTLED_RAD == 0.001
-
   # ---- free-play take-up, contact learning, telemetry ----
   # Learned contacts (route 4e5): gap 77.6 deg under right torque, 65.0 under left.
 
@@ -1787,19 +1178,6 @@ class TestDirectTracking:
     out = _call_update(lac, 0.002, v_ego=25.0, active=False, gap_deg=65.0)
     assert out[0] == 0.0
     assert state['takeup'].state != 'taking_up'
-    assert state['action'] != 'take_up'
-
-  def test_sb_block_mid_takeup_resets_and_sheds(self, monkeypatch):
-    """A stall-breakaway block arriving mid-take-up ends it; the sb shed then
-    owns the torque (sb_dir -1 = rightward motion, so the right take-up torque
-    is the same-side push the shed-rate enforcement drains)."""
-    from bmw.takeup import TAKEUP_NM
-    lac, fake_sm, mod, state, _ = self._start_takeup(monkeypatch)
-    tu = TAKEUP_NM / 12.0
-    state.update(sb_block=5, sb_dir=-1.0, tick_count=0)
-    _call_update(lac, 0.002, v_ego=25.0, gap_deg=70.0)     # mid-gap, contact not reached
-    assert state['takeup'].state != 'taking_up' and state['takeup'].fires == 1
-    assert state['torque'] == pytest.approx(tu * (1.0 - 1.0 / mod.SB_SHED_FRAMES))
     assert state['action'] != 'take_up'
 
   def test_shed_to_zero_does_not_fire(self, monkeypatch):
@@ -1863,9 +1241,8 @@ class TestDirectTracking:
     _call_update(lac, 0.001, v_ego=25.0)
     assert set(pay[-1]) == {
       'desired', 'measured', 'err', 'delta_err', 'target_frac', 'ramp_step', 'ramp_frames', 'action',
-      'torque', 'output', 'vEgo', 'active', 'ff_nm', 'a_ref', 'relax_ticks', 'sb_state', 'sb_trips',
-      'sb_block', 'angle', 'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right',
-      'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn'}
+      'torque', 'output', 'vEgo', 'active', 'ff_nm', 'a_ref', 'relax_ticks', 'angle',
+      'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right', 'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn'}
 
   def test_telemetry_has_steering_signals(self, monkeypatch):
     """Steering-side signals ride the plugin bus with the controller state:
@@ -2049,9 +1426,8 @@ class TestSlopeBias:
   L = 2.66
 
 
-  def _engaged(self, monkeypatch, slope=True, v=V, stall_v2=None):
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, slope=slope,
-                                                stall_v2=stall_v2)
+  def _engaged(self, monkeypatch, slope=True, v=V):
+    lac, fake_sm, mod, state = _make_controller(monkeypatch, slope=slope)
     _set_measured(fake_sm, v, 0.0)
     _call_update(lac, 0.0, v_ego=v, active=False)
     _call_update(lac, 0.0, v_ego=v, active=True)
@@ -2112,22 +1488,13 @@ class TestSlopeBias:
     self._run(lac, fake_sm, 100, kappa_meas=kappa_meas, pressed=True)
     assert state['sl_bias'] == 0.03
 
-  @pytest.mark.parametrize('blocker', ['takeup', 'sb_block', 'sb_episode'])
-  def test_takeup_and_sb_close_gate(self, monkeypatch, blocker):
-    """A take-up in flight, a stall-breakaway block, or an active breakaway
-    episode (sb_state 2; state 1 is only 'armed') closes the gate."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, stall_v2=True)
+  def test_takeup_closes_gate(self, monkeypatch):
+    """A take-up in flight closes the gate."""
+    lac, fake_sm, mod, state = self._engaged(monkeypatch)
     self._run(lac, fake_sm, 1, kappa_meas=1.2e-3)   # straight, a clear error
     state['sl_bias'] = 0.03
-    if blocker == 'sb_episode':
-      state.update(sb_state=2, sb_episode_ticks=10000, sb_brk_angle=0.0, sb_dir=1.0, action='ramp')
     for _ in range(20):
-      if blocker == 'takeup':
-        state['takeup'].state = 'taking_up'
-      elif blocker == 'sb_block':
-        state['sb_block'] = 5
-      else:
-        assert state['sb_state'] == 2
+      state['takeup'].state = 'taking_up'
       fake_sm.updated = {'livePose': True}
       _call_update(lac, 0.0, v_ego=self.V)
       assert state['sl_bias'] == 0.03 and state['sl_learn'] is False

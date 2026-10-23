@@ -13,8 +13,8 @@ The law, per livePose tick (20 Hz) and per CAN tick (100 Hz):
   demand    = ff_nm + P_nm (+ sl_bias)
 Every CONTROL_HORIZON_S/2 a decision takes the demand through t_cap, relax-dwell
 (a deep measured curve holds its torque through a reference dip), the noise
-guard, STEP_MAX and the stall-breakaway block, and the torque ramps to it over the next half horizon; the free-play take-up
-closes the servo lash on each change of push direction.
+guard and STEP_MAX, and the torque ramps to it over the next half horizon; the
+free-play take-up closes the servo lash on each change of push direction.
 
 Lateral acceleration is bounded by speedlimitd through v, never by draining
 torque here: this controller tracks the commanded curvature and never gives
@@ -27,7 +27,6 @@ module instance would carry its own state dict.
 """
 import os
 import sys
-from collections import deque
 
 # The plugin root must be importable for `from bmw.values import ...` whatever
 # the load order (this file lives in bmw/).
@@ -36,30 +35,6 @@ if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
 import numpy as np
-
-# Stall/breakaway v2 (StallBreakaway switch; route 3f2 seg 10 is the event).
-# A stalled rack that releases sweeps the wheel far past the command while the
-# controller still pushes on a stale error. The machine ARMs on a frozen wheel
-# while ramping, notes the BREAKAWAY (where and which way it moved) and TRIPs
-# when the wheel has travelled SB_TRIP_DISP_DEG past that point, in that
-# direction, at >= SB_TRIP_RATE_DPS, outside a deep curve: it sheds the push
-# and blocks same-side re-pushes for SB_BLOCK_TICKS. Everything is a
-# difference of angle samples, so no absolute angle or curvature sign is used.
-ANGLE_QUANTUM_DEG = 0.04395   # steerAngleDeg LSB
-SB_FROZEN_TICKS = 40          # 0.4 s @100 Hz, span < 2 quanta = frozen (arm)
-SB_MOVE_TICKS = 20            # 0.2 s window: breakaway + rate measurement
-SB_MOVE_QUANTA = 3            # >= 3 quanta advance = breakaway (creep is 1-2)
-SB_EPISODE_TICKS = 200        # 2 s max episode after breakaway
-SB_TRIP_DISP_DEG = 2.0        # wheel travel past the breakaway point (user ruling)
-SB_TRIP_RATE_DPS = 30.0       # sweep speed over the 0.2 s window: ordinary corrections
-                              # stay below 30 deg/s on 3f4, the 3f2 release ran 31-70
-SB_TRIP_KAPPA_MAX = 0.010     # |kappa_ref| above this: SAT self-arrests a release, stay out
-SB_TRIP_MIN_TORQUE = 0.12     # frac (~1.4 Nm): a release without windup has nothing to shed
-                              # (8 of 9 benign trips on 3fa/3fb were corner-exit unwinds at
-                              # 0.007-0.088; the 3f2 event carried 0.293)
-SB_SHED_FRAMES = 10           # drain torque -> 0 over 100 ms on trip
-SB_BLOCK_TICKS = 50           # 0.5 s same-side push suppression after trip
-SB_SETTLED_RAD = 0.001        # episode ends once |delta_err| is within the error noise floor (rad)
 
 # Gain reference speed floor (m/s). The torque law references max(v_true, floor)
 # so the v^2 gain stops collapsing at low speed; 10 km/h leaves walking-pace
@@ -145,8 +120,7 @@ def on_lat_controller_init(result, lac, CP):
   Decision, every CONTROL_HORIZON_S/2 while active:
     target = demand, clipped to t_cap, bridged by relax-dwell in a deep
              measured curve, sign changes gated by the noise guard, moved at
-             most STEP_MAX from the current torque, zeroed on a same-side push
-             during a stall-breakaway block.
+             most STEP_MAX from the current torque.
   The torque ramps to the target over the next half horizon, one CAN tick at
   a time; the free-play take-up (bmw/takeup.py) owns the torque while it
   crosses the servo lash on a change of push direction. Sub-breakaway targets
@@ -172,19 +146,16 @@ def on_lat_controller_init(result, lac, CP):
       pass
     return result
 
-  # Plugin params are read once here, never per tick: a file read on
-  # controlsd's 100 Hz thread can cost a control frame under eMMC contention,
-  # and controlsd is onroad-only, so every drive re-reads them. The import is
-  # at function scope so a missing config.py (install.sh copies it in a later
-  # step) defaults the switch instead of failing the hook module. StallBreakaway
-  # defaults off; '1' enables, at the next drive start.
+  # Plugin params are never read per tick: a file read on controlsd's 100 Hz
+  # thread can cost a control frame under eMMC contention. The import is at
+  # function scope so a missing config.py (install.sh copies it in a later
+  # step) defaults the switch instead of failing the hook module.
   try:
     from config import read_plugin_param
-    _stall_v2_on = read_plugin_param('bmw_e9x_e8x', 'StallBreakaway', '') == '1'
   except Exception:
-    _stall_v2_on = False
-  # SlopeCompensation is read at each engagement edge in update() instead (a
-  # rare event, not a per-tick read), so the user can A/B by re-engaging.
+    pass
+  # SlopeCompensation is read at each engagement edge in update() (a rare
+  # event, not a per-tick read), so the user can A/B by re-engaging.
   # Default off; a failed read (incl. read_plugin_param unbound) is off.
 
   # Decision cadence (livePose ticks) and CAN-rate ramp spread: both are half
@@ -237,15 +208,6 @@ def on_lat_controller_init(result, lac, CP):
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
     'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
-    # Stall/breakaway v2 (see the SB_* constants at module scope).
-    'sb_ring': deque(maxlen=SB_FROZEN_TICKS + 1),  # 100 Hz steerAngleDeg, active only
-    'sb_state': 0,          # 0=idle, 1=armed(stall), 2=breakaway episode
-    'sb_brk_angle': 0.0,    # steerAngleDeg at breakaway (displacement reference)
-    'sb_dir': 0.0,          # +1/-1: breakaway MOTION direction (self-referenced)
-    'sb_arm_kappa': 0.0,    # |kappa_ref| LATCHED at ARM (internal, not telemetry)
-    'sb_episode_ticks': 0,  # countdown in state 2
-    'sb_block': 0,          # same-side push suppression countdown after a trip
-    'sb_trips': 0,          # cumulative (telemetry)
     # Direct Tracking.
     'was_active': False,     # previous tick's `active`, for the engagement edge
     'guard': SignGuard(),    # noise guard on P-target sign reversals
@@ -286,96 +248,9 @@ def on_lat_controller_init(result, lac, CP):
     state['was_active'] = active
 
     # steeringAngleDeg carries a constant alignment offset (~-1.58 deg): the
-    # stall/breakaway machine reads deltas only, so it never needs to know it.
+    # take-up reads angle deltas only, so it never needs to know it.
     # getattr: CS is a stub in some test paths.
     _angle = float(getattr(CS, 'steeringAngleDeg', 0.0))
-
-    # ---- Stall/breakaway v2 state machine (100 Hz) -----------------------
-    # Runs before the livePose branch; a same-tick cadence decision can
-    # overwrite a trip's shed, which the shed-rate enforcement below undoes —
-    # unless that decision is a counter-steer, which always wins.
-    if active:
-      state['sb_ring'].append(_angle)
-    else:
-      state['sb_ring'].clear(); state['sb_state'] = 0; state['sb_block'] = 0
-    if state['sb_block'] > 0:
-      state['sb_block'] -= 1
-      # Shed-rate enforcement: a cadence decision inside the shed window
-      # recomputes ramp_step over spread_frames, stretching the 100 ms drain
-      # ~6x, and the 3f2 event peaked 0.30 s after the trip — drain rate is
-      # the point. While the standing torque is still a same-side push and the
-      # ramp is not draining at least that fast, re-assert the fast drain.
-      # Torque is opposite in sign to angle, so the push behind the sb_dir
-      # motion has torque * (-sb_dir) > 0. A ramp headed to the opposite side
-      # is a counter-steer: it may stop pushing, it must never be zeroed.
-      _to_counter = state['target_frac'] * (-state['sb_dir']) < 0.0
-      if state['torque'] * (-state['sb_dir']) > 0.0 and not _to_counter:
-        _drain = abs(state['torque']) / SB_SHED_FRAMES
-        _draining = (state['ramp_frames'] > 0
-                     and state['ramp_step'] * state['torque'] < 0.0
-                     and abs(state['ramp_step']) >= _drain)
-        if not _draining:
-          state['target_frac'] = 0.0
-          state['ramp_step'] = -state['torque'] / SB_SHED_FRAMES
-          state['ramp_frames'] = SB_SHED_FRAMES
-    if _stall_v2_on and active:
-      ring = state['sb_ring']
-      if state['sb_state'] == 0:
-        # ARM: a full 0.4 s ring inside 2 quanta while pushing = the rack is
-        # not following. Common and harmless on its own (926 arms/85 min on
-        # 3f4); arming does nothing but latch the in-corner curvature, so a
-        # corner-exit decay cannot sneak the episode under the deep-curve gate.
-        if state['action'] == 'ramp' and len(ring) == ring.maxlen \
-           and (max(ring) - min(ring)) < 2 * ANGLE_QUANTUM_DEG:
-          state['sb_state'] = 1
-          state['sb_arm_kappa'] = abs(state['desired'])
-      elif state['sb_state'] == 1:
-        if state['action'] != 'ramp':
-          state['sb_state'] = 0
-        elif len(ring) > SB_MOVE_TICKS \
-             and abs(ring[-1] - ring[-1 - SB_MOVE_TICKS]) >= SB_MOVE_QUANTA * ANGLE_QUANTUM_DEG:
-          # BREAKAWAY: the stalled rack moved. Latch where, and which way —
-          # observed, not derived from any sign convention.
-          state['sb_state'] = 2
-          state['sb_episode_ticks'] = SB_EPISODE_TICKS
-          state['sb_brk_angle'] = ring[-1]
-          state['sb_dir'] = 1.0 if ring[-1] >= ring[-1 - SB_MOVE_TICKS] else -1.0
-      elif state['sb_state'] == 2:
-        state['sb_episode_ticks'] -= 1
-        # Rate signed by the breakaway direction: positive means advancing the
-        # way it broke free, the only motion a release produces (an unsigned
-        # rate tripped on a fast snap BACK toward the breakaway point).
-        _rate = (ring[-1] - ring[-1 - SB_MOVE_TICKS]) * state['sb_dir'] / (SB_MOVE_TICKS * DT_CAN_TICK) \
-                if len(ring) > SB_MOVE_TICKS else 0.0
-        # The episode also ends once the error has settled (last livePose value).
-        if state['sb_episode_ticks'] <= 0 or abs(state['delta_err']) <= SB_SETTLED_RAD:
-          state['sb_state'] = 0
-        # The curvature gate is applied both instantaneous and latched-at-arm:
-        # on 3fb kappa_ref decayed 0.019 -> 0.0096 during a hairpin exit and a
-        # plain unwind read as a release. SB_TRIP_MIN_TORQUE: no windup, nothing
-        # to shed.
-        elif state['action'] != 'relax_dwell' \
-             and abs(state['torque']) >= SB_TRIP_MIN_TORQUE \
-             and abs(state['desired']) <= SB_TRIP_KAPPA_MAX \
-             and state['sb_arm_kappa'] <= SB_TRIP_KAPPA_MAX \
-             and (ring[-1] - state['sb_brk_angle']) * state['sb_dir'] >= SB_TRIP_DISP_DEG \
-             and _rate >= SB_TRIP_RATE_DPS:
-          # TRIP: shed the push to 0 over SB_SHED_FRAMES (same-side decrease
-          # with the wheel already moving that way) and block same-side
-          # re-pushes so the stale-error P law cannot rebuild the surplus. The
-          # shed is sign-gated: standing counter-steer (or zero torque) is kept
-          # — the surplus to dump is same-side torque — and the trip is still
-          # recorded (sb_trips) because it happened.
-          if state['torque'] * (-state['sb_dir']) > 0.0:
-            state['target_frac'] = 0.0
-            state['ramp_step'] = -state['torque'] / SB_SHED_FRAMES
-            state['ramp_frames'] = SB_SHED_FRAMES
-            state['sb_block'] = SB_BLOCK_TICKS
-          state['sb_trips'] += 1
-          state['sb_state'] = 0
-    else:
-      state['sb_state'] = 0
-
 
     _sm.update(0)
     lp = _sm['livePose']
@@ -430,8 +305,7 @@ def on_lat_controller_init(result, lac, CP):
         and v_true > SL_MIN_V
         and abs(state['desired']) < SL_KAPPA_DES and abs(state['measured']) < SL_KAPPA_MEAS
         and abs(a_ref) < SL_AY_MAX
-        and state['takeup'].state != 'taking_up'
-        and state['sb_block'] == 0 and state['sb_state'] != 2)   # 1 = armed only: harmless
+        and state['takeup'].state != 'taking_up')
       if state['sl_learn']:
         state['sl_bias'] = float(np.clip(state['sl_bias'] + (_p_nm / SL_TAU_S) * DT_LIVEPOSE,
                                          -SL_BIAS_MAX_NM, SL_BIAS_MAX_NM))
@@ -518,15 +392,6 @@ def on_lat_controller_init(result, lac, CP):
                                       [UNWIND_STEP_GAIN, 1.0]))
         step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
         target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
-        # Post-trip block: no same-side re-push while a release settles;
-        # counter-steer passes (the controller may stop pushing, never give up
-        # correcting). sb_dir is the wheel's motion in angle space (+ = left)
-        # and torque is opposite in sign to angle, so the push behind it is
-        # target_frac * (-sb_dir) > 0. Gated on 'ramp': a relax-dwell hold of
-        # the current torque is not a push and must not be zeroed.
-        if state['action'] == 'ramp' and state['sb_block'] > 0 \
-           and target_frac * (-state['sb_dir']) > 0.0:
-          target_frac = 0.0
 
         state['target_frac'] = target_frac
         state['tu_demand'] = target_frac if _tu_demand is None else _tu_demand
@@ -551,9 +416,6 @@ def on_lat_controller_init(result, lac, CP):
     _ramp_held = False
     tu = state['takeup']
     _pressed = bool(getattr(CS, 'steeringPressed', False))
-    # A stall-breakaway block owns the torque (its shed): end the take-up.
-    if tu.state == 'taking_up' and state['sb_block'] > 0:
-      tu.reset()
     # Driver override: end the take-up and resume the held ramp (as on
     # handover) — driver-driven SZL motion must not confirm a contact and
     # hand over against the driver. No new take-up fires while pressed.
@@ -572,7 +434,7 @@ def on_lat_controller_init(result, lac, CP):
     # never out of lateral.
     try:
       _tu_frac = tu.step(state['torque'], _heading, state['target_frac'], _gap, _angle,
-                         blocked=state['sb_block'] > 0 or _pressed,
+                         blocked=_pressed,
                          demand_frac=state['tu_demand'])
     except Exception:
       tu.reset()
@@ -642,9 +504,6 @@ def on_lat_controller_init(result, lac, CP):
           'ff_nm': float(state['ff_nm']),                       # curve feed-forward (Nm)
           'a_ref': float(state['a_ref']),                       # reference lateral accel (m/s^2)
           'relax_ticks': int(state['relax_ticks']),
-          'sb_state': int(state['sb_state']),                 # stall/breakaway v2: 0=idle, 1=armed, 2=episode
-          'sb_trips': int(state['sb_trips']),                 # cumulative trips this drive
-          'sb_block': int(state['sb_block']),                 # same-side push suppression ticks left
           # Steering-side signals for drive analysis.
           'angle': float(getattr(CS, 'steeringAngleDeg', 0.0)),            # wheel angle, deg, + = LEFT (BMW)
           'servo_gap': float(getattr(CS, 'steeringAngleOffsetDeg', 0.0)),  # column - servo angle, deg: slack/windup
