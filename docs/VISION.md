@@ -53,8 +53,8 @@ These files enable plugin discovery and hook dispatch:
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `selfdrive/plugins/hooks.py` | ~20 | HookRegistry: register callbacks, dispatch with fail-safe |
-| `selfdrive/plugins/registry.py` + `manifest.py` | ~10 (core) | Scan `plugins/`, parse plugin.json, lazy-load hook callbacks |
+| `openpilot/selfdrive/plugins/hooks.py` | ~20 | HookRegistry: register callbacks, dispatch with fail-safe |
+| `openpilot/selfdrive/plugins/registry.py` + `manifest.py` | ~10 (core) | Scan `plugins/`, parse plugin.json, lazy-load hook callbacks |
 
 Zero overhead when no plugins installed — `hooks.run()` returns the default
 value immediately if no callbacks are registered (~50ns).
@@ -66,22 +66,22 @@ These are the minimal touch points in upstream code:
 
 | File | Hook(s) | Lines added |
 |------|---------|-------------|
-| `selfdrive/controls/controlsd.py` | `controls.lat_controller_init`, `controls.curvature_correction`, `controls.post_actuators` | 6 |
-| `selfdrive/controls/lib/longitudinal_planner.py` | `planner.v_cruise`, `planner.accel_limits` | 4 |
-| `selfdrive/controls/lib/desire_helper.py` | `desire.post_update` | 2 |
-| `selfdrive/controls/plannerd.py` | `planner.subscriptions` | 2 |
-| `selfdrive/car/card.py` | `car.cruise_initialized` | 2 |
-| `selfdrive/locationd/torqued.py` | `torqued.allowed_cars` | 2 |
-| `selfdrive/ui/onroad/augmented_road_view.py` | `ui.render_overlay` | 2 |
-| `selfdrive/ui/onroad/hud_renderer.py` | `ui.onroad_exp_button`, `ui.hud_set_speed_override`, `ui.hud_speed_color` | 6 |
-| `selfdrive/ui/ui_state.py` | `ui.state_subscriptions`, `ui.state_tick` | 4 |
-| `selfdrive/ui/layouts/sidebar.py` | `ui.connectivity_check` | 2 |
-| `selfdrive/ui/layouts/settings/settings.py` | `ui.network_settings_extend`, `ui.settings_extend` | 4 |
-| `selfdrive/ui/layouts/settings/software.py` | `ui.software_settings_extend` | 2 |
-| `selfdrive/ui/layouts/main.py` | `ui.main_extend` | 2 |
-| `selfdrive/ui/layouts/home.py` | `ui.home_extend` | 2 |
-| `system/ui/lib/application.py` | `ui.pre_end_drawing`, `ui.post_end_drawing` | 4 |
-| `selfdrive/plugins/plugind.py` | `device.health_check` (dispatched by the framework itself) | — |
+| `openpilot/selfdrive/controls/controlsd.py` | `controls.lat_controller_init`, `controls.curvature_correction`, `controls.post_actuators` | 6 |
+| `openpilot/selfdrive/controls/lib/longitudinal_planner.py` | `planner.v_cruise` | 2 |
+| `openpilot/selfdrive/controls/lib/desire_helper.py` | `desire.post_update` | 2 |
+| `openpilot/selfdrive/controls/plannerd.py` | `planner.subscriptions` | 2 |
+| `openpilot/selfdrive/car/card.py` | `car.cruise_initialized` | 2 |
+| `openpilot/selfdrive/locationd/torqued.py` | `torqued.allowed_cars` | 2 |
+| `openpilot/selfdrive/ui/onroad/augmented_road_view.py` | `ui.render_overlay` | 2 |
+| `openpilot/selfdrive/ui/onroad/hud_renderer.py` | `ui.onroad_exp_button`, `ui.hud_set_speed_override`, `ui.hud_speed_color` | 6 |
+| `openpilot/selfdrive/ui/ui_state.py` | `ui.state_subscriptions`, `ui.state_tick` | 4 |
+| `openpilot/selfdrive/ui/layouts/sidebar.py` | `ui.connectivity_check` | 2 |
+| `openpilot/selfdrive/ui/layouts/settings/settings.py` | `ui.network_settings_extend`, `ui.settings_extend` | 4 |
+| `openpilot/selfdrive/ui/layouts/settings/software.py` | `ui.software_settings_extend` | 2 |
+| `openpilot/selfdrive/ui/layouts/main.py` | `ui.main_extend` | 2 |
+| `openpilot/selfdrive/ui/layouts/home.py` | `ui.home_extend` | 2 |
+| `openpilot/system/ui/lib/application.py` | `ui.pre_end_drawing`, `ui.post_end_drawing` | 4 |
+| `openpilot/selfdrive/plugins/plugind.py` | `device.health_check` (dispatched by the framework itself) | — |
 | `cereal/custom.capnp` | (schema definitions, injected at boot by builder.py) | ~50 |
 | `cereal/services.py` | (service registration, injected at boot) | ~5 |
 
