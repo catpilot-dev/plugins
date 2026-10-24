@@ -5,6 +5,10 @@
 # Three operations:
 #   1. Overlay overlays/selfdrive/ → openpilot tree (framework + UI modules)
 #   2. Overlay overlays/cereal/ → openpilot tree (schema extensions)
+#
+# openpilot >= 0.11.2 keeps its sources under <root>/openpilot/ (cereal, selfdrive,
+# system, ...); older trees have them at <root>/. $OP_PKG points at whichever
+# layout is present and every tree path below goes through it.
 #   3. Copy each plugins/*/ → /data/plugins-runtime/ (runtime plugin packages)
 #
 # Usage:
@@ -50,22 +54,27 @@ done
 
 # Detect openpilot root
 if [[ -z "$OPENPILOT_ROOT" ]]; then
-  if [[ -d /data/openpilot/selfdrive ]]; then
+  if [[ -d /data/openpilot/openpilot/selfdrive ]] || [[ -d /data/openpilot/selfdrive ]]; then
     OPENPILOT_ROOT="/data/openpilot"
-  elif [[ -n "${OPENPILOT_ROOT:-}" ]]; then
-    : # already set via env
-  elif [[ -d "$HOME/openpilot/selfdrive" ]]; then
+  elif [[ -d "$HOME/openpilot/openpilot/selfdrive" ]] || [[ -d "$HOME/openpilot/selfdrive" ]]; then
     OPENPILOT_ROOT="$HOME/openpilot"
   else
     err "Cannot find openpilot. Use --target /path/to/openpilot"
   fi
 fi
 
-if [[ ! -d "$OPENPILOT_ROOT/selfdrive" ]]; then
-  err "Not a valid openpilot tree: $OPENPILOT_ROOT (missing selfdrive/)"
+# Source package root: <root>/openpilot (0.11.2+) or <root> (older layout)
+if [[ -d "$OPENPILOT_ROOT/openpilot/selfdrive" ]]; then
+  OP_PKG="$OPENPILOT_ROOT/openpilot"
+  OP_PKG_REL="openpilot/"   # prefix for repo-relative paths (git checkout, manifests)
+elif [[ -d "$OPENPILOT_ROOT/selfdrive" ]]; then
+  OP_PKG="$OPENPILOT_ROOT"
+  OP_PKG_REL=""
+else
+  err "Not a valid openpilot tree: $OPENPILOT_ROOT (missing openpilot/selfdrive/ or selfdrive/)"
 fi
 
-log "openpilot root: $OPENPILOT_ROOT"
+log "openpilot root: $OPENPILOT_ROOT (sources: ${OP_PKG_REL:-./})"
 log "plugins dest:   $PLUGINS_DEST"
 $DRY_RUN && log "DRY RUN — no files will be written"
 
@@ -106,9 +115,9 @@ verify_hooks() {
   local hooks_import="from openpilot.selfdrive.plugins.hooks import hooks"
 
   for file in \
-    "$OPENPILOT_ROOT/selfdrive/controls/controlsd.py" \
-    "$OPENPILOT_ROOT/selfdrive/controls/lib/longitudinal_planner.py" \
-    "$OPENPILOT_ROOT/system/manager/manager.py"; do
+    "$OP_PKG/selfdrive/controls/controlsd.py" \
+    "$OP_PKG/selfdrive/controls/lib/longitudinal_planner.py" \
+    "$OP_PKG/system/manager/manager.py"; do
     if [[ -f "$file" ]]; then
       if ! grep -q "selfdrive.plugins" "$file" 2>/dev/null; then
         warn "Hook call site missing in: ${file#$OPENPILOT_ROOT/}"
@@ -137,9 +146,9 @@ verify_hooks
 overlay_ui() {
   local src="$SCRIPT_DIR/overlays/selfdrive/ui"
   if [[ ! -d "$src" ]]; then return; fi
-  local dst="$OPENPILOT_ROOT/selfdrive/ui"
+  local dst="$OP_PKG/selfdrive/ui"
 
-  log "Overlaying UI: selfdrive/ui/"
+  log "Overlaying UI: ${OP_PKG_REL}selfdrive/ui/"
 
   if $DRY_RUN; then
     find "$src" -type f -name '*.py' | while read -r f; do
@@ -159,7 +168,7 @@ overlay_ui() {
 
 # --- 2. Overlay cereal schema + inject plugin schemas/services ---
 overlay_cereal() {
-  local cereal_dir="$OPENPILOT_ROOT/cereal"
+  local cereal_dir="$OP_PKG/cereal"
 
   $DRY_RUN && return
 
@@ -360,7 +369,7 @@ restore_removed_overlays() {
   for overlay_dir in "$SCRIPT_DIR/overlays/selfdrive"; do
     if [[ -d "$overlay_dir" ]]; then
       find "$overlay_dir" -type f -name '*.py' | while read -r f; do
-        echo "selfdrive/${f#$overlay_dir/}" >> "$new_manifest"
+        echo "${OP_PKG_REL}selfdrive/${f#$overlay_dir/}" >> "$new_manifest"
       done
     fi
   done
@@ -397,10 +406,10 @@ fi
 # Clear stale .pyc caches for all overlaid directories
 if ! $DRY_RUN; then
   for dir in \
-    "$OPENPILOT_ROOT/selfdrive/plugins" \
-    "$OPENPILOT_ROOT/selfdrive/ui" \
+    "$OP_PKG/selfdrive/plugins" \
+    "$OP_PKG/selfdrive/ui" \
     "$OPENPILOT_ROOT/opendbc_repo/opendbc/car" \
-    "$OPENPILOT_ROOT/cereal" \
+    "$OP_PKG/cereal" \
     "$PLUGINS_DEST"; do
     find "$dir" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
   done

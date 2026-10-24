@@ -296,8 +296,11 @@ def main():
 
   custom_capnp = os.path.join(cereal_dir, "custom.capnp")
   log_capnp = os.path.join(cereal_dir, "log.capnp")
-  # car.capnp lives in opendbc, derive path relative to cereal dir
-  car_capnp = os.path.join(cereal_dir, "..", "opendbc_repo", "opendbc", "car", "car.capnp")
+  # car.capnp lives in the opendbc submodule at the repo root: <root>/openpilot/cereal (0.11.2+)
+  # or <root>/cereal (older layout) -> <root>/opendbc_repo/opendbc/car/car.capnp
+  car_capnp = next((p for p in (os.path.join(cereal_dir, up, "opendbc_repo", "opendbc", "car", "car.capnp")
+                              for up in ("..", os.path.join("..", ".."))) if os.path.isfile(p)),
+                   os.path.join(cereal_dir, "..", "..", "opendbc_repo", "opendbc", "car", "car.capnp"))
 
   changes = 0
   # Clean up schemas from disabled plugins first (custom.capnp + log.capnp)

@@ -12,7 +12,9 @@ OPENPILOT_DIR="${1:-/data/openpilot}"
 echo "[c3_compat] Applying AGNOS 12.8 patches to $OPENPILOT_DIR"
 
 # 1. Amplifier: add tici config (removed in v0.10.3 which dropped C3 support)
-AMP_FILE="$OPENPILOT_DIR/openpilot/system/hardware/tici/amplifier.py"
+#    0.11.2: file moved to common/hardware/comma/ and CONFIGS{} became a single CONFIG list;
+#    the pattern below no longer matches there and must be re-derived on the device.
+AMP_FILE="$OPENPILOT_DIR/openpilot/common/hardware/comma/amplifier.py"
 if [ -f "$AMP_FILE" ] && ! grep -q '"tici"' "$AMP_FILE"; then
   python3 - "$AMP_FILE" << 'PYEOF'
 import sys
@@ -393,7 +395,9 @@ fi
 
 # 9. Pandad: skip firmware flashing for F4 panda (BMW plugin handles firmware)
 #    Without this, pandad would try to flash non-existent panda.bin.signed
-PANDAD_FILE="$OPENPILOT_DIR/selfdrive/pandad/pandad.py"
+#    0.11.2: pandad.py was restructured (flash_panda() via PandaDFU, Panda.list() loop); the
+#    patterns below no longer match there and must be re-derived on the device.
+PANDAD_FILE="$OPENPILOT_DIR/openpilot/selfdrive/pandad/pandad.py"
 if [ -f "$PANDAD_FILE" ] && ! grep -q 'c3_compat' "$PANDAD_FILE"; then
   python3 - "$PANDAD_FILE" << 'PYEOF'
 import sys
@@ -457,7 +461,7 @@ old_launch = '''    first_run = False
 
     # run pandad with all connected serials as arguments
     os.environ['MANAGER_DAEMON'] = 'pandad'
-    process = subprocess.Popen(["./pandad", panda_serial], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
+    process = subprocess.Popen(["./pandad", panda_serial], cwd=os.path.join(BASEDIR, "openpilot/selfdrive/pandad"))
     process.wait()'''
 new_launch = '''    first_run = False
 
@@ -468,7 +472,7 @@ new_launch = '''    first_run = False
     os.environ['MANAGER_DAEMON'] = 'pandad'
     # c3_compat: skip C++ firmware check for F4 panda
     os.environ["BOARDD_SKIP_FW_CHECK"] = "1"
-    process = subprocess.Popen(["./pandad", panda_serial], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
+    process = subprocess.Popen(["./pandad", panda_serial], cwd=os.path.join(BASEDIR, "openpilot/selfdrive/pandad"))
     process.wait()
 
     # c3_compat: crash backoff for pandad crashes
@@ -567,7 +571,9 @@ find "$OPENPILOT_DIR/panda/python" -name '__pycache__' -type d -exec rm -rf {} +
 #     AGNOS 12.8 modem fails AT+CCHO (ISD-R open) with Unknown error.
 #     configure_modem() crashes hardwared which blocks onroad/offroad transitions.
 #     Wrap the get_sim_lpa() call in a try/except so modem init succeeds.
-HW_FILE="$OPENPILOT_DIR/openpilot/system/hardware/tici/hardware.py"
+#    0.11.2: file moved to common/hardware/comma/; the eSIM prime block is gone from it
+#    (eSIM handling moved to the UI), so this section is expected to SKIP there.
+HW_FILE="$OPENPILOT_DIR/openpilot/common/hardware/comma/hardware.py"
 if [ -f "$HW_FILE" ] && ! grep -q 'c3_compat.*lpa' "$HW_FILE"; then
   python3 - "$HW_FILE" << 'PYEOF'
 import sys
