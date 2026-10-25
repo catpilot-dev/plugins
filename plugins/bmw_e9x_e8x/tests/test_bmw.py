@@ -1663,3 +1663,136 @@ class TestCanParserDeclarations:
     pt = self._pt_messages(monkeypatch)
     for name in ('TurnSignals', 'DynamicCruiseControlStatus', 'CruiseControlStatus', 'CruiseControlStalk'):
       assert math.isnan(pt[name]), name
+
+
+# ============================================================
+# Driver-spin hold (servo torque path)
+# ============================================================
+
+def _make_servo_cc(monkeypatch):
+  """A servo + DCC CarController, steer frames recorded instead of packed
+  (the stalk packer stub only knows 0x194). Returns (controller, module, sent)."""
+  import bmw.carcontroller as mod
+  importlib.reload(mod)
+  from bmw.values import BmwFlags
+  CP = MagicMock()
+  CP.flags = BmwFlags.STEPPER_SERVO_CAN | BmwFlags.DYNAMIC_CRUISE_CONTROL
+  CP.minEnableSpeed = 30 / 3.6
+  sent = []
+  monkeypatch.setattr(mod.bmwcan, 'create_steer_command',
+                      lambda frame, mode, steer_tq=0, steer_delta=0: sent.append((mode, steer_tq)) or ('steer', mode, steer_tq))
+  return mod.CarController({0: 'bmw_e9x_e8x'}, CP), mod, sent
+
+
+class TestSpinHold:
+  """Route 4f8 s0 t 47 s: the driver unwound a right turn at 160 deg/s (column)
+  while the controller ramped 0.75 -> 2.6 Nm the same way. Above its no-load
+  speed the servo reported 0..1 Nm, the panda's TorqueMotorLimited check
+  rejected 17 frames (one rejection zeroes its rate base, so the cascade only
+  ends when the command falls below 0.25 Nm), the servo soft-offed after 50 ms
+  and steerFaultTemporary followed. The hold keeps the command at or below the
+  servo's reported torque while the wheel spins along it faster than
+  SPIN_HOLD_ON_DPS, so the panda never sees an error above 1 Nm.
+
+  Replay over routes 4f1-4ff (2.8 h engaged): 150/100 fires 147 frames, turns
+  the 4f8 burst's 27 model violations into 0; 180/120 misses it; 120/80 fires
+  three times as often for nothing more.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _setup(self, monkeypatch, last_nm):
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, mod, sent = _make_servo_cc(monkeypatch)
+    cc.apply_torque_last = last_nm
+    cs = make_stalk_carstate(szl_counter=0)
+    cs.out.steeringRateDeg = 0.0
+    cs.out.steeringPressed = False
+    ctrl = make_stalk_carcontrol(accel=0.0, v_target=24.0)
+    ctrl.latActive = True
+    self._t = 0
+    return cc, mod, sent, cs, ctrl
+
+  def _step(self, cc, mod, cs, ctrl, demand_nm, rate_dps, reported_nm):
+    cs.out.steeringRateDeg = rate_dps
+    cs.out.steeringTorqueEps = reported_nm
+    ctrl.actuators.torque = demand_nm / mod.CarControllerParams.STEER_MAX
+    self._t += 10_000_000
+    out, _ = cc.update(ctrl, cs, self._t)
+    return out.torqueOutputCan
+
+  def test_threshold_sits_above_the_servo_no_load_speed(self, monkeypatch):
+    # ~210 deg/s at the actuator through the 17:25 printed gears = ~143 deg/s at
+    # the column: a faster wheel can only be the driver (or the road), never us.
+    _, mod, _, _, _ = self._setup(monkeypatch, 0.0)
+    assert mod.SPIN_HOLD_ON_DPS > 210 * 17 / 25
+    assert mod.SPIN_HOLD_OFF_DPS < mod.SPIN_HOLD_ON_DPS
+
+  def test_holds_at_the_reported_torque(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch, 1.9)
+    out = self._step(cc, mod, cs, ctrl, demand_nm=2.5, rate_dps=+160, reported_nm=0.5)
+    assert out == pytest.approx(0.5)
+    assert sent[-1] == (mod.SteeringModes.TorqueControl, pytest.approx(0.5))
+    assert cc.spin_hold and cc.spin_hold_frames == 1
+
+  def test_drop_is_instant(self, monkeypatch):
+    # The panda allows any decrease; waiting for STEER_DELTA_DOWN would leave
+    # the command 1 Nm above a collapsed report for ten frames — the cascade.
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 2.0)
+    assert self._step(cc, mod, cs, ctrl, 2.5, +160, 0.0) == pytest.approx(0.0)
+
+  def test_only_along_the_command(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
+    # wheel spinning against the command: the servo is braking it, torque is real
+    assert self._step(cc, mod, cs, ctrl, 2.5, -160, 0.5) == pytest.approx(2.0)
+    assert not cc.spin_hold
+
+  def test_below_threshold_is_the_normal_limiter(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
+    assert self._step(cc, mod, cs, ctrl, 2.5, +140, 0.5) == pytest.approx(2.0)
+
+  def test_hysteresis_and_release_ramp(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
+    assert self._step(cc, mod, cs, ctrl, 2.5, +160, 0.5) == pytest.approx(0.5)   # enters above ON
+    assert self._step(cc, mod, cs, ctrl, 2.5, +120, 0.5) == pytest.approx(0.5)   # stays between OFF and ON
+    assert self._step(cc, mod, cs, ctrl, 2.5, +90, 0.5) == pytest.approx(0.6)    # releases below OFF, ramps up
+    assert self._step(cc, mod, cs, ctrl, 2.5, 0, 0.5) == pytest.approx(0.7)      # STEER_DELTA_UP per frame, no jump
+    assert cc.spin_hold_frames == 2
+
+  def test_never_raises_the_command(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
+    assert self._step(cc, mod, cs, ctrl, 2.5, +160, 3.0) == pytest.approx(2.0)
+    assert cc.spin_hold   # gated on, but a report above the command changes nothing
+
+  def test_opposite_sign_report_holds_at_zero(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
+    assert self._step(cc, mod, cs, ctrl, 2.5, +160, -0.5) == pytest.approx(0.0)
+
+  def test_negative_direction_mirrors(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, -1.9)
+    assert self._step(cc, mod, cs, ctrl, -2.5, -160, -0.5) == pytest.approx(-0.5)
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, -1.9)
+    assert self._step(cc, mod, cs, ctrl, -2.5, +160, -0.5) == pytest.approx(-2.0)
+
+  def test_steering_pressed_is_not_required(self, monkeypatch):
+    # steeringPressed here is the voice button or the gas pedal, not a hand on
+    # the wheel; the 4f8 episode only had it set because the driver was on the
+    # gas. A coasting turn exit must be caught too.
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
+    cs.out.steeringPressed = False
+    cs.out.gasPressed = False
+    assert self._step(cc, mod, cs, ctrl, 2.5, +160, 0.5) == pytest.approx(0.5)
+
+  def test_state_clears_when_lateral_is_off(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
+    self._step(cc, mod, cs, ctrl, 2.5, +160, 0.5)
+    assert cc.spin_hold
+    ctrl.latActive = False
+    self._step(cc, mod, cs, ctrl, 2.5, +160, 0.5)
+    assert not cc.spin_hold

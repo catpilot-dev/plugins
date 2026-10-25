@@ -64,6 +64,21 @@ MINUS5_ASSERT_FRAMES = 2      # transmitted frames, then release
 MINUS1_YIELD_KMH = 1.0
 PENDING_TIMEOUT = 0.5         # s — forget what was sent, or an unresponsive DCC silences us for good
 
+# Driver-spin hold — DESIGN.md: "Driver-spin hold". Above its no-load speed
+# (~210 deg/s at the actuator = ~143 deg/s at the column through the 17:25
+# gears) the servo's voltage limit collapses its output: STEERING_STATUS
+# reports ~0 Nm and the panda rejects any command more than 1 Nm above it
+# (TorqueMotorLimited). One rejection resets the panda's rate base to zero, so
+# every following frame above 0.25 Nm is rejected too, the servo soft-offs
+# after 50 ms without a valid frame and selfdrived raises steerFaultTemporary
+# (route 4f8 s0, 17 rejected frames while the driver unwound a turn at
+# 160 deg/s). While the wheel spins along the command faster than the servo
+# can follow, the command is held at or below what the servo reports; nothing
+# is given up, the servo could not add torque at that speed anyway. Column
+# deg/s; hysteresis against the SZL rate hovering at the threshold.
+SPIN_HOLD_ON_DPS = 150.0
+SPIN_HOLD_OFF_DPS = 100.0
+
 
 def minus5_landing_kmh(setpoint_kmh):
   """Where a minus5 will actually put the setpoint, in the same units as
@@ -97,6 +112,9 @@ class CarController(CarControllerBase):
     self.cruise_cancel = False
     self.cruise_enabled_prev = False
     self.apply_torque_last = 0
+    # Driver-spin hold state (see SPIN_HOLD_ON_DPS); frames counted for tests/telemetry.
+    self.spin_hold = False
+    self.spin_hold_frames = 0
     self.last_cruise_rx_timestamp = 0
     self.last_cruise_tx_timestamp = 0
     self.rx_cruise_stalk_counter_last = -1
@@ -142,6 +160,29 @@ class CarController(CarControllerBase):
       self.cruise_bus = CanBus.F_CAN
 
     self.packer = CANPacker(dbc_name[Bus.pt])
+
+  def _spin_hold(self, apply_torque, CS):
+    """Cap the rate-limited command at the servo's reported torque while the
+    driver spins the wheel along it faster than SPIN_HOLD_ON_DPS.
+
+    The drop is instant (the panda allows any decrease); the rise afterwards
+    goes through the normal STEER_DELTA_UP limiter because apply_torque_last
+    takes the held value. The hold only ever lowers: a report above the
+    command leaves it alone, a report of the opposite sign (or none) holds at
+    zero. steeringPressed is deliberately not required — on this car it means
+    the voice button or the gas pedal, not a hand on the wheel, while a column
+    rate above the servo's own no-load speed can only be the driver.
+    """
+    rate = CS.out.steeringRateDeg
+    along = apply_torque * rate > 0
+    threshold = SPIN_HOLD_OFF_DPS if self.spin_hold else SPIN_HOLD_ON_DPS
+    self.spin_hold = along and abs(rate) > threshold
+    if not self.spin_hold:
+      return apply_torque
+    self.spin_hold_frames += 1
+    sign = 1.0 if apply_torque > 0 else -1.0
+    ceiling = max(sign * CS.out.steeringTorqueEps, 0.0)
+    return sign * min(abs(apply_torque), ceiling)
 
   def update(self, CC, CS, now_nanos):
 
@@ -379,12 +420,15 @@ class CarController(CarControllerBase):
         apply_torque = apply_dist_to_meas_limits(new_steer, self.apply_torque_last, CS.out.steeringTorqueEps,
                                            CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
                                            CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
+        apply_torque = self._spin_hold(apply_torque, CS)
         self.apply_torque_last = apply_torque
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, apply_torque))
       elif not CS.cruise_stalk_cancel and not CS.out.brakePressed and not CS.out.gasPressed and self.apply_torque_last != 0:
+        self.spin_hold = False
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.SoftOff, self.apply_torque_last))
         self.apply_torque_last = CS.out.steeringTorqueEps
       else:
+        self.spin_hold = False
         self.apply_torque_last = 0
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.Off))
 

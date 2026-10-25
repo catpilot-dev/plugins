@@ -230,10 +230,26 @@ class StalkCANPacker:
     return (404, dat, bus)
 
 
+def apply_dist_to_meas_limits(val, val_last, val_meas, STEER_DELTA_UP, STEER_DELTA_DOWN, STEER_ERROR_MAX, STEER_MAX):
+  """Verbatim port of opendbc.car.lateral.apply_dist_to_meas_limits (pinned
+  b3bd79a6) so the servo torque path can be stepped for real: clamp to the
+  measurement band, then slow any increase in magnitude to STEER_DELTA_UP."""
+  clip = lambda x, lo, hi: min(max(x, lo), hi)
+  max_lim = min(max(val_meas + STEER_ERROR_MAX, STEER_ERROR_MAX), STEER_MAX)
+  min_lim = max(min(val_meas - STEER_ERROR_MAX, -STEER_ERROR_MAX), -STEER_MAX)
+  val = clip(val, min_lim, max_lim)
+  if val_last > 0:
+    val = clip(val, max(val_last - STEER_DELTA_DOWN, -STEER_DELTA_UP), val_last + STEER_DELTA_UP)
+  else:
+    val = clip(val, val_last - STEER_DELTA_UP, min(val_last + STEER_DELTA_DOWN, STEER_DELTA_UP))
+  return float(val)
+
+
 def make_carcontroller_mocks() -> dict:
   """make_opendbc_mocks() plus the real stubs bmw.carcontroller needs."""
   mods = make_opendbc_mocks()
   mods['opendbc.car.interfaces'].CarControllerBase = CarControllerBase
+  mods['opendbc.car.lateral'].apply_dist_to_meas_limits = apply_dist_to_meas_limits
   mods['opendbc.car'].DT_CTRL = 0.01
   conv = mods['opendbc.car.common.conversions'].Conversions
   conv.MS_TO_KPH = 3.6

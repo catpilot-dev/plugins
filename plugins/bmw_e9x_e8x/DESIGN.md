@@ -934,6 +934,52 @@ by `apply_dist_to_meas_limits` against the measured EPS torque
 disengage it issues `SoftOff` then `Off` frames. `bmwcan.SteeringModes` also
 defines an `AngleControl` mode, but only torque control is used.
 
+### Driver-spin hold (2026-10-25)
+
+**Failure it removes.** The servo is a voltage-mode FOC actuator with a
+no-load speed of ~210 deg/s at its output, ~143 deg/s at the column through
+the 17:25 printed gears. When the driver spins the wheel *along* the command
+faster than that, the voltage limit collapses the motor's output and
+`STEERING_STATUS` reports 0–1 Nm while the controller keeps ramping. The panda
+(`TorqueMotorLimited`, `max_torque_error` 1 Nm over a 6-sample window of the
+reported torque) rejects the first frame more than 1 Nm above the report, and
+a rejection resets its `desired_torque_last` to zero, so every following frame
+above `max_rate_up` (0.25 Nm) is rejected too: the cascade ends only when the
+command falls below 0.25 Nm. Five missing frames (50 ms) soft-off the servo
+and `steerFaultTemporary` follows. Route 4f8 s0 t 47 s: unwinding a right
+turn at 160 deg/s (column) while the law ramped 0.75 → 2.6 Nm, 17 rejected
+frames, 120 ms soft-off. The hands-off variant of the same cascade (the
+firmware speed cap holding the report 1 Nm under the command at working
+torque, routes 4f4/4f7) was fixed in the servo firmware (gate at
+`|cmd| <= 0.75 Nm`, 78ea367); this is the remaining class, and it cannot be
+fixed in firmware because the limit is the motor's back-EMF.
+
+**Mechanism** (`CarController._spin_hold`). After the normal
+`apply_dist_to_meas_limits` rate limiter, while `steeringRateDeg` has the
+command's sign and exceeds `SPIN_HOLD_ON_DPS` (150 deg/s column, released
+below `SPIN_HOLD_OFF_DPS` 100), the command is capped at
+`max(sign · steeringTorqueEps, 0)`: at or below what the servo itself reports.
+The drop is instant (the panda allows any decrease); the rise afterwards runs
+through the normal `STEER_DELTA_UP` limiter because `apply_torque_last` takes
+the held value. The hold only lowers — a report above the command changes
+nothing. Nothing is given up: at that speed the servo could not add torque.
+
+**Decisions.** `steeringPressed` is *not* required: on this car it is the
+voice button or the gas pedal (there is no column torque sensor), the 4f8
+episode only had it set because the driver was accelerating, and a column
+rate above the servo's no-load speed is by itself proof of an external hand.
+Threshold 150 sits above the 143 deg/s the servo can reach on its own.
+Replay over routes 4f1–4ff (2.8 h engaged, scratch `hold_replay.py`, panda
+model calibrated to the logged src-193 rejections: 93/93 on 4f7 s0, 51/51 on
+4f7 s13): 150/100 holds for 147 frames in total, turns the 4f8 burst's 27
+model violations into 0; 180/120 fires 23 frames and misses it; 120/80 fires
+405 frames for nothing more.
+
+**Verify on the car.** `carOutput.actuatorsOutput.torqueOutputCan` below
+`carControl.actuators.torque × 12` while `|steeringRateDeg| > 150` marks a
+hold; the test is zero `steerFaultTemporary` and zero src-193 bursts outside
+startup/stop on drives with fast hand steering.
+
 ## Panda safety (`safety/bmw.h`)
 
 Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
