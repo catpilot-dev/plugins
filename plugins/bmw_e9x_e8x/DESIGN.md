@@ -226,10 +226,20 @@ purpose and the driver finishes the stop.
 Three things to keep straight:
 
 - **`v_target` is not the driver's set speed.** It is `long_plan.vTarget`, the
-  MPC trajectory speed at `action_t` (~0.5 s ahead), and it sits close to vEgo
+  plan speed at `action_t` (~0.75 s ahead), and it sits close to vEgo
   (median +1.1 km/h, p10 −2.1, p90 +3.7). The driver's set speed is
   `CS.out.vCruise`. Staying under it remains the planner's job — it caps
-  `v_target` at `v_cruise` — exactly as before.
+  `v_target` at `v_cruise` — exactly as before. Since openpilot 0.11.2 the
+  MPC only follows leads (a fake fast lead when there is none) and cruise is
+  a separate `aTarget` candidate, so the planner also caps `v_target` at the
+  speed `aTarget`'s own slope reaches over `action_t`: **`v_target` never
+  implies more acceleration than `accel`**, so the accel-side gap stays where
+  the cruise-obstacle MPC used to put it. On the decel side it may be a
+  **destination** rather than a trajectory point — a set speed stepped below
+  vEgo (stalk, speedlimitd cap) lands `v_target` there at once while `accel`
+  ramps to upstream's −0.5 m/s² cruise floor, and the `min` below takes it,
+  so DCC brakes at its own response to the gap, not at −0.5. With a lead
+  binding, both still come from one MPC trajectory.
 - **The new target is min'd against the old one**, so this law can only ever
   ask for a *deeper* setpoint than the pre-2026-09 code, never a shallower one.
 - **The accel side is untouched.** Outside a braking episode

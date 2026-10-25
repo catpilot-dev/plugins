@@ -90,11 +90,17 @@ _register_interfaces()
 def on_post_actuators(default, actuators, CS, long_plan):
   """Hook callback: inject vTarget from longitudinal planner into actuators.speed.
 
-  long_plan.vTarget is the trajectory speed at action_t (longitudinalActuatorDelay
-  + DT_MDL), time-aligned with long_plan.aTarget. Both come from the same
-  get_accel_from_plan call in the planner. Using vTarget (instead of speeds[0],
+  long_plan.vTarget is the plan speed at action_t (longitudinalActuatorDelay
+  + DT_MDL), time-aligned with long_plan.aTarget. Since openpilot 0.11.2 the
+  MPC only follows leads and cruise is a separate aTarget candidate, so the
+  planner publishes min(MPC speed at action_t, v_cruise, speed that aTarget's
+  own slope reaches over action_t). Contract: vTarget never implies more
+  acceleration than aTarget; it may imply more deceleration, because a set
+  speed below vEgo (stalk, speedlimitd cap) is a destination, which is what the
+  decel-side setpoint law wants. When a lead binds, vTarget and aTarget still
+  come from the same MPC trajectory. Using vTarget (instead of speeds[0],
   which is the MPC's filtered initial state and can drift above v_ego after
-  sustained +accel intent) makes carcontroller's v_error gate consistent with
+  sustained +accel intent) keeps carcontroller's v_error gate consistent with
   the slope encoded in aTarget.
   """
   actuators.speed = long_plan.vTarget
