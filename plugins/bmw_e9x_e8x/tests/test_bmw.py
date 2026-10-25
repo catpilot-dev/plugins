@@ -1605,3 +1605,61 @@ class TestTempsPayload:
     from bmw.carstate import temps_payload
     pt = self._cp({'EngineData': {'TEMP_ENG': 88.4, 'TEMP_EOI': 95.6}})
     assert temps_payload(pt, None, servo=False) == {'coolant': 88, 'oil': 96}
+
+
+# ============================================================
+# CAN parser message declarations (route 501, 2026-10-25)
+# ============================================================
+
+class TestCanParserDeclarations:
+  """The opendbc CANParser learns a lazily added (vl[]) message's rate ONCE, from
+  the first >= 3 frames spanning > 1 s, and times it out at ten periods of that
+  guess for the rest of the drive. Status_contact_handbrake (0x34F) is a 0.2 Hz
+  heartbeat plus a frame per handbrake change: three change frames at ignition
+  taught the parser 3.2 Hz, every 5 s heartbeat gap then timed out, canValid
+  was false 38 % of route 501 and selfdrived raised canError ("Unknown Vehicle
+  Variant": no-entry + immediate disable). Slow or event-driven PT-CAN messages
+  must be declared with their nominal rate (or nan), never left to vl[]."""
+
+  @pytest.fixture(autouse=True)
+  def _cereal(self, monkeypatch):
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _pt_messages(self, monkeypatch):
+    from types import SimpleNamespace
+    # The opendbc stub's CarStateBase is a MagicMock instance; subclassing it
+    # turns CarState into a Mock and loses the staticmethod. Give the stub a
+    # real base class and reload carstate so CarState is a real class here.
+    monkeypatch.setattr(sys.modules['opendbc.car.interfaces'], 'CarStateBase', type('CarStateBase', (), {}), raising=False)
+    import bmw.carstate as cs
+    importlib.reload(cs)
+    calls = []
+
+    class Recorder:
+      def __init__(self, dbc, messages, bus):
+        calls.append((dbc, list(messages), bus))
+
+    monkeypatch.setattr(cs, 'CANParser', Recorder)
+    monkeypatch.setattr(cs, 'DBC', {'BMW_E90': {cs.Bus.pt: 'pt.dbc', cs.Bus.body: 'fcan.dbc', cs.Bus.alt: 'servo.dbc'}})
+    cs.CarState.get_can_parsers(SimpleNamespace(carFingerprint='BMW_E90'))
+    pt = [c for c in calls if c[0] == 'pt.dbc']
+    assert len(pt) == 1
+    return dict(pt[0][1])
+
+  def test_slow_event_driven_messages_declared_with_nominal_rate(self, monkeypatch):
+    import math
+    pt = self._pt_messages(monkeypatch)
+    # 5 s heartbeat + change events: declared 0.2 Hz -> 50 s timeout, never learned from a change burst
+    assert pt['Status_contact_handbrake'] == pytest.approx(0.2)
+    # 1 Hz idle + bursts while a button is held: declared 1 Hz -> 10 s timeout
+    assert pt['SteeringButtons'] == 1
+    # no declared rate may be 0: 0 means "learn it", the failure mode above
+    for name, freq in pt.items():
+      assert math.isnan(freq) or freq > 0, name
+
+  def test_cruise_messages_keep_no_timeout(self, monkeypatch):
+    import math
+    pt = self._pt_messages(monkeypatch)
+    for name in ('TurnSignals', 'DynamicCruiseControlStatus', 'CruiseControlStatus', 'CruiseControlStalk'):
+      assert math.isnan(pt[name]), name

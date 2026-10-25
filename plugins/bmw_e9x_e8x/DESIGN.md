@@ -120,6 +120,19 @@ is removed first.
 messages (with a `nan` timeout) so a slow-to-wake ECU can't cause `canValid`
 failures from an unsubscribed message accessed later.
 
+Every other message is added lazily on its first `vl[]` access, and the
+opendbc `CANParser` then **learns its rate once** (first ≥ 3 frames spanning
+> 1 s) and times it out at ten periods of that guess for the rest of the drive.
+Event-driven messages break this: `Status_contact_handbrake` (0x34F) is a 0.2 Hz
+heartbeat plus a frame per handbrake change, and on route 501 (2026-10-25) three
+change frames at ignition taught the parser 3.2 Hz → every 5 s gap timed out →
+`canValid` false 38 % of the drive → `canError` → the misleadingly worded
+"Unknown Vehicle Variant" alert (no-entry + immediate disable) every 5 s.
+Since 2026-10-25 the slow/event-driven messages (`Status_contact_handbrake`
+0.2 Hz, `SteeringButtons` 1 Hz) are declared with their nominal rate; a replay
+of route 501 segment 0 through the real parser drops from 38 % invalid ticks to
+startup-only. Rule: anything below ~5 Hz or sent on change gets declared.
+
 ### CarState notes (`carstate.py`)
 
 - Speed/yaw/temps/cruise are parsed from the plugin's own `bmw_e9x_e8x.dbc`.

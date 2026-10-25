@@ -341,11 +341,24 @@ class CarState(CarStateBase):
     # Fingerprinting may misclassify cruise type if the ECU is slow to wake;
     # subscribing to both prevents canValid failures from unsubscribed messages
     # being lazily accessed via vl[] in update().
+    #
+    # A message first touched through vl[] gets its rate LEARNED by the parser,
+    # once, from the first >= 3 frames spanning > 1 s; the timeout is then ten
+    # periods of that guess for the rest of the drive. Fine for the periodic
+    # messages, wrong for anything event-driven: Status_contact_handbrake is a
+    # 0.2 Hz heartbeat plus a frame per handbrake change, and three change
+    # frames at ignition taught the parser 3.2 Hz (route 501, 2026-10-25) --
+    # every 5 s heartbeat gap then timed out, canValid dropped 38 % of the
+    # drive and selfdrived raised canError ("Unknown Vehicle Variant", a
+    # no-entry + immediate disable). Declare the slow/event-driven messages
+    # with their nominal rate so nothing is guessed.
     pt_messages = [
       ("TurnSignals", float('nan')),
       ("DynamicCruiseControlStatus", float('nan')),
       ("CruiseControlStatus", float('nan')),
       ("CruiseControlStalk", float('nan')),
+      ("Status_contact_handbrake", 0.2),   # 5 s heartbeat + change events -> 50 s timeout
+      ("SteeringButtons", 1),              # 1 Hz idle + bursts while pressed -> 10 s timeout
     ]
     fcan_messages = [
       ("CruiseControlStalk", float('nan')),
