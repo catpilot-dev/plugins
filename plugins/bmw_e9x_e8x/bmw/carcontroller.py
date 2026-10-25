@@ -79,6 +79,17 @@ PENDING_TIMEOUT = 0.5         # s — forget what was sent, or an unresponsive D
 SPIN_HOLD_ON_DPS = 150.0
 SPIN_HOLD_OFF_DPS = 100.0
 
+# Servo re-arm after soft-off — DESIGN.md: "Servo re-arm after soft-off". The
+# servo latches its soft-off (CONTROL_STATUS bit2) once it has missed the
+# command stream and ignores TorqueControl until it receives an Off. Without
+# a re-arm the only exit was the 10-frame steerFaultTemporary debounce
+# dropping latActive, then SoftOff frames waiting for the servo's 2 Nm/s decay
+# to reach zero before the Off: 990 ms of dead steering on route 4f7 s0,
+# 110 ms per event on 4f7 s13. The logged Off -> bit-clear lag is under one
+# frame; the holdoff only covers the status round trip and must stay below
+# the 10-frame debounce so a latch an Off cannot clear still faults.
+REARM_HOLDOFF_FRAMES = 5
+
 
 def minus5_landing_kmh(setpoint_kmh):
   """Where a minus5 will actually put the setpoint, in the same units as
@@ -115,6 +126,9 @@ class CarController(CarControllerBase):
     # Driver-spin hold state (see SPIN_HOLD_ON_DPS); frames counted for tests/telemetry.
     self.spin_hold = False
     self.spin_hold_frames = 0
+    # Servo re-arm state (see REARM_HOLDOFF_FRAMES); re-arms counted for tests/telemetry.
+    self.rearm_holdoff = 0
+    self.servo_rearms = 0
     self.last_cruise_rx_timestamp = 0
     self.last_cruise_tx_timestamp = 0
     self.rx_cruise_stalk_counter_last = -1
@@ -183,6 +197,29 @@ class CarController(CarControllerBase):
     sign = 1.0 if apply_torque > 0 else -1.0
     ceiling = max(sign * CS.out.steeringTorqueEps, 0.0)
     return sign * min(abs(apply_torque), ceiling)
+
+  def _servo_rearm(self, CS):
+    """True on the one frame an Off is sent to clear the servo's soft-off latch
+    while lateral is active.
+
+    Mode 0 carries zero torque and the panda never checks it. The torque ramp
+    restarts from zero: the panda's rate base is zero after the violation that
+    starved the servo, so anything above max_rate_up (0.25 Nm) would be
+    rejected again and the servo starved again. For REARM_HOLDOFF_FRAMES after
+    the Off the bit is not re-read (the status lags the Off by up to a frame);
+    if it is still set after that, another Off goes out, and the carstate
+    debounce (10 frames) faults as before if the latch never clears.
+    """
+    if self.rearm_holdoff > 0:
+      self.rearm_holdoff -= 1
+      return False
+    if not CS.servo_soft_off:
+      return False
+    self.rearm_holdoff = REARM_HOLDOFF_FRAMES
+    self.servo_rearms += 1
+    self.apply_torque_last = 0
+    self.spin_hold = False
+    return True
 
   def update(self, CC, CS, now_nanos):
 
@@ -416,19 +453,24 @@ class CarController(CarControllerBase):
 
     if self.flags & BmwFlags.STEPPER_SERVO_CAN:
       if CC.enabled and CC.latActive:
-        new_steer = actuators.torque * CarControllerParams.STEER_MAX
-        apply_torque = apply_dist_to_meas_limits(new_steer, self.apply_torque_last, CS.out.steeringTorqueEps,
-                                           CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
-                                           CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
-        apply_torque = self._spin_hold(apply_torque, CS)
-        self.apply_torque_last = apply_torque
-        can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, apply_torque))
+        if self._servo_rearm(CS):
+          can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.Off))
+        else:
+          new_steer = actuators.torque * CarControllerParams.STEER_MAX
+          apply_torque = apply_dist_to_meas_limits(new_steer, self.apply_torque_last, CS.out.steeringTorqueEps,
+                                             CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
+                                             CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
+          apply_torque = self._spin_hold(apply_torque, CS)
+          self.apply_torque_last = apply_torque
+          can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, apply_torque))
       elif not CS.cruise_stalk_cancel and not CS.out.brakePressed and not CS.out.gasPressed and self.apply_torque_last != 0:
         self.spin_hold = False
+        self.rearm_holdoff = 0
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.SoftOff, self.apply_torque_last))
         self.apply_torque_last = CS.out.steeringTorqueEps
       else:
         self.spin_hold = False
+        self.rearm_holdoff = 0
         self.apply_torque_last = 0
         can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.Off))
 

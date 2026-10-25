@@ -980,6 +980,52 @@ model violations into 0; 180/120 fires 23 frames and misses it; 120/80 fires
 hold; the test is zero `steerFaultTemporary` and zero src-193 bursts outside
 startup/stop on drives with fast hand steering.
 
+### Servo re-arm after soft-off (2026-10-26)
+
+**The latch.** When the servo misses the command stream for 5 frames
+(`CAN_rx_validate_tick`, firmware `main.c`) it enters `SOFT_TORQUE_OFF`: it
+ramps its output to zero at 2 Nm/s, sets `CONTROL_STATUS` bit2, and from then
+on ignores every `TorqueControl` frame. Only an `Off` frame clears the latch
+(`StepperCtrl_setMotionMode` resets `enableSoftOff` in `STEPCTRL_OFF` alone;
+`Msg.h`: "Command Off after SoftOff to re-enable control"). The controller used
+to keep sending `TorqueControl` into the dead servo. Its only exit was the
+carstate debounce: 10 frames of the bit raise `steerFaultTemporary`, selfdrived
+drops `latActive`, the `SoftOff` branch sends frames carrying the *reported*
+torque and waits for it to reach exactly zero before the `Off` goes out, and
+the reported torque is the servo's own 2 Nm/s decay. Logged dead steering:
+990 ms on route 4f7 s0 (93 rejected frames, 12 `SoftOff` frames), 110 ms per
+event on 4f7 s13 (three events). The logged `Off` → bit-clear lag is under one
+10 ms frame in every case.
+
+**Mechanism** (`CarController._servo_rearm`, `CarState.servo_soft_off`).
+Carstate exposes the raw bit (no debounce). While lateral is active and the bit
+is set, the controller sends one `Off` frame instead of the torque frame, sets
+`apply_torque_last` to zero and clears the spin hold; the next frame resumes
+`TorqueControl` ramping from zero through the normal `STEER_DELTA_UP` limiter.
+Zero is not a choice: the panda's rate base is zero after the violation that
+starved the servo, so a resumed command above 0.25 Nm would be rejected and
+the servo starved again. For `REARM_HOLDOFF_FRAMES` (5) after the `Off` the
+bit is not re-read while the status catches up; still set afterwards, another
+`Off` goes out. The holdoff stays below the 10-frame debounce, so a latch an
+`Off` cannot clear still surfaces as `steerFaultTemporary` exactly as before.
+The `SoftOff`/`Off` branches reset the holdoff and never re-arm: a soft-off
+we commanded is cleared by our own `Off`.
+
+**What it buys.** The recovery drops from the fault debounce plus the servo's
+decay (110–990 ms) to about two frames plus the ramp, with no
+`steerFaultTemporary` and no alert. It also covers a quick disengage/re-engage
+that lands on a servo still latched by our own `SoftOff` (previously dead
+until the next fault). The panda always passes mode 0 (`safety/bmw.h`), and
+mode 0 carries zero torque, so the re-arm frame can never be rejected.
+
+**Verify on the car.** A re-arm is one `carOutput.actuatorsOutput.torqueOutputCan`
+frame at exactly 0 while `carControl.latActive` is true, followed by a ramp
+from 0.1 Nm; `can` src 1 0x22E with mode 0 while engaged. Expect
+`steerFaultTemporary` to stay zero even on a drive that produces a src-193
+burst, and the servo soft-off bit (`CONTROL_STATUS` bit2; the field is the
+upper nibble of 0x22F byte 1, so frame byte 1 bit 6) to last at most 3 status
+frames.
+
 ## Panda safety (`safety/bmw.h`)
 
 Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s

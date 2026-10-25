@@ -99,6 +99,10 @@ class CarState(CarStateBase):
     self.resume_button_hold_frames = 0
     self.resume_press_engaged = False  # Was cruise engaged when resume button was first pressed?
     self.steer_fault_counter = 0  # Debounce: consecutive frames with raw fault bits set
+    # Servo CONTROL_STATUS bit2, raw (no debounce): the servo has soft-offed and
+    # ignores TorqueControl until it receives an Off. The carcontroller re-arms
+    # on it (DESIGN.md: "Servo re-arm after soft-off").
+    self.servo_soft_off = False
     self.steer_angle_offset = self._load_steer_angle_offset()
     self._offset_sub = None
 
@@ -231,8 +235,8 @@ class CarState(CarStateBase):
     if self.CP.flags & BmwFlags.STEPPER_SERVO_CAN:
       ret.steeringTorqueEps = cp_aux.vl['STEERING_STATUS']['STEERING_TORQUE']
       ret.steeringAngleOffsetDeg = ret.steeringAngleDeg - cp_aux.vl['STEERING_STATUS']['STEERING_ANGLE']
-      raw_fault = (int(cp_aux.vl['STEERING_STATUS']['DEBUG_STATES']) & 0xE0) != 0 or \
-                  (int(cp_aux.vl['STEERING_STATUS']['CONTROL_STATUS']) & 0x4) != 0
+      self.servo_soft_off = (int(cp_aux.vl['STEERING_STATUS']['CONTROL_STATUS']) & 0x4) != 0
+      raw_fault = (int(cp_aux.vl['STEERING_STATUS']['DEBUG_STATES']) & 0xE0) != 0 or self.servo_soft_off
       self.steer_fault_counter = self.steer_fault_counter + 1 if raw_fault else 0
       ret.steerFaultTemporary = self.steer_fault_counter >= 10
 

@@ -277,7 +277,7 @@ def make_stalk_carstate(szl_counter, v_ego=24.0, setpoint=24.5, human_pressing=F
                               speed=setpoint, speedCluster=setpoint))
   return _Bag(out=out, is_metric=True, cruise_stalk_counter=szl_counter,
               cruise_stalk_resume=human_pressing, cruise_stalk_cancel=False,
-              cruise_stalk_speed=0)
+              cruise_stalk_speed=0, servo_soft_off=False)
 
 
 def make_stalk_carcontrol(accel, v_target, enabled=True):

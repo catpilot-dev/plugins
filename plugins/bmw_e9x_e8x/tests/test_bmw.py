@@ -1796,3 +1796,145 @@ class TestSpinHold:
     ctrl.latActive = False
     self._step(cc, mod, cs, ctrl, 2.5, +160, 0.5)
     assert not cc.spin_hold
+
+
+class TestServoRearm:
+  """The servo latches its soft-off: once CAN_rx_validate_tick has missed the
+  command stream (5 frames) it sets CONTROL_STATUS bit2 and ignores every
+  TorqueControl frame until it receives an Off (firmware Msg.h: "Command Off
+  after SoftOff to re-enable control"; StepperCtrl_setMotionMode clears
+  enableSoftOff only in STEPCTRL_OFF). Until now the controller kept sending
+  TorqueControl into the dead servo and the only way out was the 10-frame
+  steerFaultTemporary debounce dropping latActive, then SoftOff frames that
+  wait for the servo's own 2 Nm/s decay to reach zero before the Off goes out:
+  990 ms of dead steering on route 4f7 s0, 110 ms per event on 4f7 s13. The
+  logged Off -> bit-clear lag is under one 10 ms frame.
+
+  The re-arm: while lateral is active and the status shows the soft-off bit,
+  send one Off frame (mode 0 carries zero torque and is always passed by the
+  panda), restart the torque ramp from zero (the panda's rate base is zero
+  after the violation that caused the soft-off, so anything above 0.25 Nm would
+  be rejected again) and hold off re-checking the bit for a few frames while
+  the status catches up.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _setup(self, monkeypatch, last_nm=2.0):
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, mod, sent = _make_servo_cc(monkeypatch)
+    cc.apply_torque_last = last_nm
+    cs = make_stalk_carstate(szl_counter=0)
+    cs.out.steeringRateDeg = 0.0
+    ctrl = make_stalk_carcontrol(accel=0.0, v_target=24.0)
+    ctrl.latActive = True
+    self._t = 0
+    return cc, mod, sent, cs, ctrl
+
+  def _step(self, cc, mod, sent, cs, ctrl, soft_off, demand_nm=2.5, reported_nm=0.0):
+    cs.servo_soft_off = soft_off
+    cs.out.steeringTorqueEps = reported_nm
+    ctrl.actuators.torque = demand_nm / mod.CarControllerParams.STEER_MAX
+    self._t += 10_000_000
+    out, _ = cc.update(ctrl, cs, self._t)
+    return sent[-1], out.torqueOutputCan
+
+  def test_soft_off_bit_sends_one_off_frame(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    frame, out = self._step(cc, mod, sent, cs, ctrl, soft_off=True)
+    assert frame == (mod.SteeringModes.Off, 0)
+    assert mod.SteeringModes.Off.value == 0      # the mode the panda never checks
+    assert out == 0                              # visible in carOutput as the re-arm marker
+    assert cc.servo_rearms == 1
+
+  def test_torque_resumes_from_zero_within_the_panda_rate(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    self._step(cc, mod, sent, cs, ctrl, soft_off=True)
+    frame, out = self._step(cc, mod, sent, cs, ctrl, soft_off=False)
+    assert frame == (mod.SteeringModes.TorqueControl, pytest.approx(0.1))
+    assert out == pytest.approx(0.1)
+    # panda rate base is 0 after the violation: every step must stay under
+    # max_rate_up (2 units x 0.125 Nm) or the cascade starts again
+    assert mod.CarControllerParams.STEER_DELTA_UP <= 0.25
+    frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=False)
+    assert frame == (mod.SteeringModes.TorqueControl, pytest.approx(0.2))
+
+  def test_holdoff_lets_the_status_catch_up(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    self._step(cc, mod, sent, cs, ctrl, soft_off=True)
+    for i in range(mod.REARM_HOLDOFF_FRAMES):
+      # the bit still reads set while the Off propagates: keep commanding torque
+      frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=True)
+      assert frame == (mod.SteeringModes.TorqueControl, pytest.approx(0.1 * (i + 1)))
+    assert cc.servo_rearms == 1
+    # still latched after the holdoff: send Off again
+    frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=True)
+    assert frame == (mod.SteeringModes.Off, 0)
+    assert cc.servo_rearms == 2
+
+  def test_holdoff_is_shorter_than_the_fault_debounce(self, monkeypatch):
+    # a latch the re-arm cannot clear must still surface as steerFaultTemporary
+    # (carstate: 10 consecutive raw-fault frames), so the second Off goes out
+    # before that, not instead of it
+    _, mod, _, _, _ = self._setup(monkeypatch)
+    assert 1 <= mod.REARM_HOLDOFF_FRAMES < 10
+
+  def test_holdoff_expires_quietly_once_the_bit_cleared(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    self._step(cc, mod, sent, cs, ctrl, soft_off=True)
+    for _ in range(mod.REARM_HOLDOFF_FRAMES + 2):
+      frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=False)
+      assert frame[0] == mod.SteeringModes.TorqueControl
+    assert cc.servo_rearms == 1
+
+  def test_no_soft_off_is_the_normal_path(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    frame, out = self._step(cc, mod, sent, cs, ctrl, soft_off=False)
+    assert frame == (mod.SteeringModes.TorqueControl, pytest.approx(2.1))
+    assert cc.servo_rearms == 0
+
+  def test_not_while_lateral_is_off(self, monkeypatch):
+    # we commanded the SoftOff ourselves: the normal SoftOff -> Off exit clears it
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    ctrl.latActive = False
+    frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=True, reported_nm=0.0)
+    assert frame == (mod.SteeringModes.SoftOff, pytest.approx(2.0))
+    frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=True, reported_nm=0.0)
+    assert frame == (mod.SteeringModes.Off, 0)
+    assert cc.servo_rearms == 0
+
+  def test_quick_reengage_into_a_latched_servo(self, monkeypatch):
+    # disengage for one frame (SoftOff latches the servo), re-engage before the
+    # Off went out: without the re-arm the servo stays dead until the next
+    # steerFaultTemporary
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    ctrl.latActive = False
+    frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=False, reported_nm=1.5)
+    assert frame[0] == mod.SteeringModes.SoftOff
+    ctrl.latActive = True
+    frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=True, reported_nm=1.0)
+    assert frame == (mod.SteeringModes.Off, 0)
+    frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=False, reported_nm=0.0)
+    assert frame == (mod.SteeringModes.TorqueControl, pytest.approx(0.1))
+
+  def test_rearm_resets_the_spin_hold(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    cc.spin_hold = True
+    self._step(cc, mod, sent, cs, ctrl, soft_off=True)
+    assert not cc.spin_hold
+
+  def test_disengage_resets_the_holdoff(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
+    self._step(cc, mod, sent, cs, ctrl, soft_off=True)          # Off, holdoff armed
+    ctrl.latActive = False
+    self._step(cc, mod, sent, cs, ctrl, soft_off=False)         # Off (apply_torque_last is 0)
+    ctrl.latActive = True
+    frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=True)
+    assert frame == (mod.SteeringModes.Off, 0)                  # no stale holdoff
+    assert cc.servo_rearms == 2
