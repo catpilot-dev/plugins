@@ -46,7 +46,7 @@ ramp are 0, so every engagement ramps from 0.
 | `T_CAP_BASE_NM`, `T_CAP_SLOPE_BASE` | 2.0 Nm, 1.0 | `t_cap = min(STEER_MAX, BASE + SLOPE·kappa_scale·v²·|delta_ref|)` |
 | `T_CAP_SCALE_KAPPA` / `_BP` | [1e-3, 1e-2, 2e-2] → [1.25, 2.5, 3.0] | gain scale on `|kappa_ref|` (straight 1.25 since 2026-10-21, trial) |
 | `V_GAIN_FLOOR` | 2.778 m/s | gain reference speed floor |
-| `CF_AY0`, `CF_GAIN`, `CF_MAX_NM` | 0.3 m/s², 1.0 Nm per m/s², 2.0 Nm | curve feed-forward deadband, gain, cap |
+| `CF_AY0`, `CF_GAIN`, `CF_MAX_NM` | 0.2 m/s², 1.4 Nm per m/s², 2.0 Nm | curve feed-forward deadband, gain, cap (raised 2026-11-01) |
 | `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
 | `STEP_MAX_V` / `_BP` | [15, 28] m/s → [0.10, 0.05] frac | per-decision step cap |
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
@@ -1013,6 +1013,20 @@ gone; the current law above is authoritative.
 > the car since 2026-10-19; shadow evaluation (routes 4ee-4f7, 0 live trips)
 > showed the would-be trips were ordinary turn-ins, so the mechanism is deleted.
 > Rack breakaway physics notes above still stand.
+
+> **2026-11-01 — curve feed-forward 1.0 / 0.3 → 1.4 Nm per m/s² / 0.2 m/s² (route 50f).**
+> First drive on the clamped (v21) column gear: lash 21° → 3.4°, straights
+> smooth. The user felt slight understeer on mild curves (seg 6: 1.6e-3 asked at
+> 0.58 m/s², 1.06e-3 reached after ~4 s, ~0.9 m toward the outer line) and a
+> remaining wheel swing in lane changes (4 direction changes per change, the
+> reference itself reversing ±1.7e-3 with the car ~0.7 s behind it). Not the
+> gears: the servo sat on its contact through the curve, and the steady torque
+> need is unchanged (50f 1.43 Nm per m/s² − 0.16, 4f7 1.38 − 0.22). The old FF gave
+> 0.28 of the ~0.7 Nm a 0.6 m/s² curve needs, so torque waited on P's standing
+> error (~0.3 Nm/s build). The new FF gives ~80 % and still stays under the need at
+> every a_ref; the deadband stays above `SL_AY_MAX` (0.15). Verify next drive:
+> mild-curve measured/desired and outward drift, lane-change direction changes,
+> straights not worse.
 
 ---
 

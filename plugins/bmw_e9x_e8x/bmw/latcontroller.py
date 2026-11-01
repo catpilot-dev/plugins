@@ -85,11 +85,16 @@ SL_AY_MAX = 0.15           # and |a_ref| below this (m/s^2): gentle bends charge
 # hydraulic rack's stiction does not supply (440 steady windows on 4e9-4ec:
 # ~1.5 Nm per m/s^2 beyond ~0.25); P alone paid for it with a standing error
 # (4ec seg 22: the car drifted 0.8 m to the outside of a 1 m/s^2 bend). The
-# feed-forward supplies ~55 % of the measured need on purpose: P closes the
-# rest and rarely has to remove feed-forward torque (replay 4e9-4ec: 14 % of
-# steady windows, by at most 0.8 Nm).
-CF_AY0 = 0.3               # m/s^2 deadband: below it stiction holds the angle at zero torque
-CF_GAIN = 1.0              # Nm per m/s^2 beyond the deadband (measured need ~1.5)
+# feed-forward stays below the measured need on purpose: P closes the rest
+# and rarely has to remove feed-forward torque (replay 4e9-4ec: 14 % of
+# steady windows, by at most 0.8 Nm). Raised 2026-11-01 (route 50f, lash
+# 21 -> 3.4 deg after the clamped column gear): the measured steady need is
+# 1.43 Nm per m/s^2 - 0.16 (4f7: 1.38 - 0.22); the old 1.0 / 0.3 supplied ~45 %
+# at 0.6 m/s^2, so mild curves and lane changes waited on P's standing error
+# (car at ~0.7 s lag, 0.6-0.9 m outward on mild curves). 1.4 / 0.2 gives ~80 %
+# and stays under the need at every a_ref.
+CF_AY0 = 0.2               # m/s^2 deadband: below it stiction holds the angle at zero torque; above SL_AY_MAX
+CF_GAIN = 1.4              # Nm per m/s^2 beyond the deadband (measured need ~1.4)
 CF_MAX_NM = 2.0            # cap (Nm); t_cap and STEER_MAX still apply
 
 # Direct Tracking (docs/superpowers/specs/2026-10-18-bmw-direct-tracking-
