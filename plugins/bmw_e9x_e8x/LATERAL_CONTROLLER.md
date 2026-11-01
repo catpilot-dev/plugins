@@ -31,8 +31,8 @@ need, and P closes the rest); clip to `t_cap`; relax-dwell bridge in a deep
 measured curve (the current torque is held through a reference dip, within
 `t_cap`); the noise guard (a sign change of the demand commands 0 until the new
 sign has persisted `GUARD_PERSIST_S`);
-`STEP_MAX` toward the target (×`UNWIND_STEP_GAIN` when shedding in the LKA
-regime). The torque ramps to the target over the next 300 ms, one CAN tick
+`STEP_MAX` toward the target (flat 0.10 while the model runs a lane change;
+×`UNWIND_STEP_GAIN` when shedding in the LKA regime). The torque ramps to the target over the next 300 ms, one CAN tick
 at a time. The free-play take-up (`bmw/takeup.py`) commands `TAKEUP_NM` across
 the servo lash on a change of push direction once the contacts are learned,
 then hands back to the ramp. Inactive: no decision runs; torque, target and
@@ -49,6 +49,7 @@ ramp are 0, so every engagement ramps from 0.
 | `CF_AY0`, `CF_GAIN`, `CF_MAX_NM` | 0.2 m/s², 1.4 Nm per m/s², 2.0 Nm | curve feed-forward deadband, gain, cap (raised 2026-11-01) |
 | `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
 | `STEP_MAX_V` / `_BP` | [15, 28] m/s → [0.10, 0.05] frac | per-decision step cap |
+| `LANE_CHANGE_STATES` | laneChangeStarting, laneChangeFinishing | `drivingModelData.meta` states with the flat 0.10 step cap (2026-11-02) |
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
 | `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
@@ -1027,6 +1028,22 @@ gone; the current law above is authoritative.
 > every a_ref; the deadband stays above `SL_AY_MAX` (0.15). Verify next drive:
 > mild-curve measured/desired and outward drift, lane-change direction changes,
 > straights not worse.
+
+> **2026-11-02 — flat 0.10 step cap during lane changes (routes 50f/510).**
+> Route 510 confirmed the FF raise (0.6-0.9 m/s² curves: measured/desired 0.81 →
+> 0.91, outward drift 1.35 → 0.36 m) but lane changes felt unchanged. The car's
+> yaw lags the reference 0.85 s against the model's 0.65 s lookahead. The chain
+> (first-lobe 50 % rise after the reference): demand +0.00 s, step-capped target
+> +0.35, torque +0.35..0.55, wheel = torque (no slack since v21), yaw +0.3 later
+> (vehicle). The controller's share is mostly `STEP_MAX`: at 77-87 km/h the taper
+> allows 0.7-0.8 Nm per decision, the cap binds ~30 % of each lane change, and
+> torque peaks at 2.5-2.7 Nm against a 4.3-5.6 Nm demand. The late car overshoots
+> its lateral offset and the model adds correcting lobes to the reference (510
+> 15:44: desired − + − +) = the wheel swing. While `drivingModelData.meta.
+> laneChangeState` is Starting or Finishing the cap is now the flat
+> `STEP_MAX_BP[0]` (1.2 Nm per decision, ≈4 Nm/s, as below 54 km/h); the taper
+> stays everywhere else. Verify next drive: lane-change direction changes (4),
+> yaw lag (0.85 s), post-change offset.
 
 ---
 
