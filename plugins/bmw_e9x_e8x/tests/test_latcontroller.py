@@ -834,13 +834,28 @@ class TestLowSpeedGainFloor:
 
 def test_curve_ff_zero_inside_deadband():
   from bmw.latcontroller import curve_ff_nm
-  assert curve_ff_nm(0.29) == 0.0 == curve_ff_nm(-0.29) == curve_ff_nm(0.0)
+  assert curve_ff_nm(0.19) == 0.0 == curve_ff_nm(-0.19) == curve_ff_nm(0.0)
+
+
+def test_curve_ff_deadband_above_slope_learning_gate():
+  # Slope Compensation learns only below SL_AY_MAX; the feed-forward must stay
+  # zero there or the bias would integrate against it on gentle bends.
+  from bmw.latcontroller import CF_AY0, SL_AY_MAX
+  assert CF_AY0 > SL_AY_MAX
 
 
 def test_curve_ff_sign_and_gain():
   from bmw.latcontroller import curve_ff_nm
-  assert curve_ff_nm(1.3) == pytest.approx(1.0)
-  assert curve_ff_nm(-1.3) == pytest.approx(-1.0)
+  assert curve_ff_nm(1.2) == pytest.approx(1.4)
+  assert curve_ff_nm(-1.2) == pytest.approx(-1.4)
+
+
+def test_curve_ff_below_measured_need():
+  # Route 50f / 4f7 steady windows: need ~= 1.38-1.43 Nm per m/s^2 - 0.16..0.22.
+  # The feed-forward must never exceed it, so P is never asked to remove FF torque.
+  from bmw.latcontroller import curve_ff_nm
+  for a in (0.3, 0.6, 1.0, 1.4):
+    assert curve_ff_nm(a) < 1.38 * a - 0.16
 
 
 def test_curve_ff_cap():
@@ -1003,35 +1018,35 @@ class TestDirectTracking:
     assert state['delta_err'] == pytest.approx(delta_err)
     return mod, state
 
-  # v=25, kappa_ref 0.002: kappa_scale 1.3889, gain G = 868.06 Nm/rad, a_ref 1.25 -> ff 0.95 Nm,
+  # v=25, kappa_ref 0.002: kappa_scale 1.3889, gain G = 868.06 Nm/rad, a_ref 1.25 -> ff 1.47 Nm,
   # step_max 0.0615 frac, t_cap ~0.49 frac.
   _G = 1.0 * (1.25 + (0.001 / 0.009) * 1.25) * 625.0
 
   def test_decision_is_ff_plus_p(self, monkeypatch):
     mod, state = self._curve_decision(monkeypatch, v=25.0, kappa=0.002,
                                       delta_err=0.60 / self._G, torque=0.125)
-    assert state['ff_nm'] == pytest.approx(0.95)
-    assert state['target_frac'] * 12.0 == pytest.approx(1.55, abs=0.05)
+    assert state['ff_nm'] == pytest.approx(1.47)
+    assert state['target_frac'] * 12.0 == pytest.approx(2.07, abs=0.05)
 
   def test_overshoot_trims_the_sum(self, monkeypatch):
     mod, state = self._curve_decision(monkeypatch, v=25.0, kappa=0.002,
                                       delta_err=-0.40 / self._G, torque=0.05)
-    assert state['target_frac'] * 12.0 == pytest.approx(0.55, abs=0.05)
+    assert state['target_frac'] * 12.0 == pytest.approx(1.07, abs=0.05)
     assert state['target_frac'] > 0.0 and state['action'] == 'ramp'
 
   def test_large_overshoot_crosses_zero_under_guard(self, monkeypatch):
-    """ff +0.95 with P -1.50: the demand is -0.55 Nm. The guard (committed
+    """ff +1.47 with P -2.02: the demand is -0.55 Nm. The guard (committed
     right) holds the first decision at 0; once the demand's sign has persisted
     GUARD_PERSIST_S the next decision goes negative."""
     mod, state = self._curve_decision(monkeypatch, v=25.0, kappa=0.002,
-                                      delta_err=-1.50 / self._G, torque=0.0)
+                                      delta_err=-2.02 / self._G, torque=0.0)
     assert state['target_frac'] == 0.0 and state['guard'].suppressed == 1
     lac = self._last_lac
     for _ in range(3):                                     # the demand's sign persists
       _call_update(lac, 0.002, v_ego=25.0)
     state['tick_count'] = 999
     _call_update(lac, 0.002, v_ego=25.0)
-    assert state['ff_nm'] == pytest.approx(0.95)
+    assert state['ff_nm'] == pytest.approx(1.47)
     assert state['target_frac'] * 12.0 == pytest.approx(-0.55, abs=0.05)   # the sum, not P alone
 
   def test_ff_uses_true_speed_not_gain_floor(self, monkeypatch):
@@ -1050,7 +1065,7 @@ class TestDirectTracking:
     _call_update(lac, 0.05, v_ego=5.0, active=False)
     _call_update(lac, 0.05, v_ego=5.0, active=True)
     assert state['a_ref'] == pytest.approx(1.25)
-    assert state['ff_nm'] == pytest.approx(0.95)
+    assert state['ff_nm'] == pytest.approx(1.47)
 
   def test_ff_capped_and_step_limited_on_kappa_spike(self, monkeypatch):
     """A raw-model spike (lane change) of 0.003 at 30 m/s is a_ref 2.7: the FF
