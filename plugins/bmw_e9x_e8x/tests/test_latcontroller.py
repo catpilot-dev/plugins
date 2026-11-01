@@ -52,25 +52,27 @@ def mock_deps(monkeypatch):
 
 
 class FakeSubMaster:
-  """Controllable stand-in for cereal.messaging.SubMaster(['livePose']).
+  """Controllable stand-in for cereal.messaging.SubMaster(['livePose', 'drivingModelData']).
 
-  Real SubMaster exposes livePose via __getitem__, plus .updated/.seen
+  Real SubMaster exposes each service via __getitem__, plus .updated/.seen
   dicts keyed by service name. Tests drive lp.angularVelocityDevice.z
-  (yaw rate) and lp.velocityDevice.x (v_ego) directly.
+  (yaw rate) and lp.velocityDevice.x (v_ego) directly, and
+  dmd.meta.laneChangeState (a capnp enum, compared by name) for lane changes.
   """
   def __init__(self, services):
     self.lp = SimpleNamespace(
       angularVelocityDevice=SimpleNamespace(z=0.0),
       velocityDevice=SimpleNamespace(x=20.0),
     )
-    self.updated = {'livePose': True}
-    self.seen = {'livePose': True}
+    self.dmd = SimpleNamespace(meta=SimpleNamespace(laneChangeState='off'))
+    self.updated = {'livePose': True, 'drivingModelData': True}
+    self.seen = {'livePose': True, 'drivingModelData': True}
 
   def update(self, timeout):
     pass
 
   def __getitem__(self, key):
-    return self.lp
+    return self.dmd if key == 'drivingModelData' else self.lp
 
 
 def _make_controller(monkeypatch, wheelbase=2.66, slope=None):
@@ -644,6 +646,46 @@ class TestStepMaxSpeedSchedule:
       _decide_from_zero(lac, sm, state, v=v, desired=self.DESIRED)
       steps.append(abs(state['target_frac']))
     assert steps[0] > steps[1] > steps[2]
+
+
+class TestLaneChangeStepCap:
+  """While the model runs a lane change (laneChangeStarting / Finishing) the
+  step cap is the flat STEP_MAX_BP[0] = 0.10 at every speed (routes 50f/510:
+  at 77-87 km/h the 0.05-0.07 schedule held LC torque at 2.5-2.7 Nm against a
+  4.3-5.6 Nm demand, the car lagged the plan and the model added correcting
+  lobes). Same derivation as TestStepMaxSpeedSchedule: desired -0.02 saturates
+  P, so the decision's target IS the step cap.
+  """
+
+  DESIRED = -0.02
+
+  def _step(self, monkeypatch, v, lcs, seen=True):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    sm.dmd.meta.laneChangeState = lcs
+    sm.seen['drivingModelData'] = seen
+    _decide_from_zero(lac, sm, state, v=v, desired=self.DESIRED)
+    assert state['action'] == 'ramp'
+    return state['target_frac']
+
+  @pytest.mark.parametrize('lcs', ['laneChangeStarting', 'laneChangeFinishing'])
+  def test_flat_cap_at_highway_speed_during_a_lane_change(self, monkeypatch, lcs):
+    assert self._step(monkeypatch, 28.0, lcs) == pytest.approx(-0.10, abs=1e-9)
+
+  def test_flat_cap_inside_the_schedule_ramp(self, monkeypatch):
+    assert self._step(monkeypatch, 20.0, 'laneChangeStarting') == pytest.approx(-0.10, abs=1e-9)
+
+  @pytest.mark.parametrize('lcs', ['off', 'preLaneChange'])
+  def test_schedule_outside_a_lane_change(self, monkeypatch, lcs):
+    """preLaneChange is the blinker before the model commits: no change yet."""
+    assert self._step(monkeypatch, 28.0, lcs) == pytest.approx(-0.05, abs=1e-9)
+
+  def test_never_above_the_low_speed_cap(self, monkeypatch):
+    """The lane-change cap only lifts the high-speed taper; it never exceeds
+    the 0.10 already allowed below 15 m/s."""
+    assert self._step(monkeypatch, 10.0, 'laneChangeStarting') == pytest.approx(-0.10, abs=1e-9)
+
+  def test_schedule_before_the_model_is_seen(self, monkeypatch):
+    assert self._step(monkeypatch, 28.0, 'laneChangeStarting', seen=False) == pytest.approx(-0.05, abs=1e-9)
 
 
 class TestControllerHorizonDecoupled:

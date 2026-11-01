@@ -187,6 +187,12 @@ def on_lat_controller_init(result, lac, CP):
   # lane margin is consumed faster (routes 385 seg 27, 39b seg 18).
   STEP_MAX_V  = [15.0, 28.0]     # vEgo breakpoints (m/s)
   STEP_MAX_BP = [0.10, 0.05]     # per-decision torque step cap (frac)
+  # During a lane change the cap is the flat low-speed value at every speed:
+  # the manoeuvre is planned and the model commits to it, and on the taper the
+  # torque trailed the demand (routes 50f/510 at 77-87 km/h: 2.5-2.7 Nm built
+  # against 4.3-5.6 Nm, the car ran ~0.2 s behind the plan and the model added
+  # correcting lobes = the wheel swing). Never above STEP_MAX_BP[0].
+  LANE_CHANGE_STATES = ('laneChangeStarting', 'laneChangeFinishing')
 
   # Relax-dwell: in a measured deep curve an overshoot-side error must persist
   # this long before the decision may command below the current torque. It
@@ -199,7 +205,7 @@ def on_lat_controller_init(result, lac, CP):
   # Rear-axle bicycle-model wheelbase (m), for kappa <-> delta conversion.
   L = float(CP.wheelbase)
 
-  _sm = messaging.SubMaster(['livePose'])
+  _sm = messaging.SubMaster(['livePose', 'drivingModelData'])
   _learner = ContactLearner()
 
   state = {
@@ -386,6 +392,9 @@ def on_lat_controller_init(result, lac, CP):
         # the plant respond one cadence, re-measure and step again (route 385
         # seg 27: single 8.3 Nm decisions drove 150 deg/s wheel bursts).
         step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
+        if (_sm.seen['drivingModelData']
+            and str(_sm['drivingModelData'].meta.laneChangeState) in LANE_CHANGE_STATES):
+          step_max = STEP_MAX_BP[0]
         # Fast unwind in the LKA regime, only while the step moves torque
         # toward zero: releasing carries no abrupt-application hazard below
         # 30 km/h (SAT cannot fling the freed wheel, stiction holds it) and a
