@@ -106,10 +106,74 @@ def dl_env(tmp_path, monkeypatch):
                  'verified_on': ['0.11.2'], 'baseline_for': ['0.11.2']}],
     'dm': [],
   }))
+  data = json.loads((tmp_path / 'catalog.json').read_text())
+  for pid, verified in (('pop_supercombo_37727', []), ('pop_verified', ['0.11.2'])):
+    data['driving'].append({
+      'id': pid, 'name': 'Pop', 'date': '2026-10-01', 'source': 'converted',
+      'converted_from': {'commit': 'a' * 40, 'vision': 'v.onnx', 'policy': 'p.onnx'},
+      'files': [{'name': 'driving_supercombo.onnx', 'url': 'https://example.invalid/pop.onnx',
+                 'sha256': hashlib.sha256(b'pop-bytes').hexdigest(), 'size': 9}],
+      'verified_on': verified})
+  (tmp_path / 'catalog.json').write_text(json.dumps(data))
   (tmp_path / 'models' / 'driving').mkdir(parents=True)
   (tmp_path / 'models' / 'dm').mkdir(parents=True)
   monkeypatch.setattr(md, 'BASE_DATA_DIR', tmp_path)
   return tmp_path, cat
+
+
+def fake_http(monkeypatch, body):
+  class Resp:
+    headers = {}
+    def raise_for_status(self): pass
+    def iter_content(self, chunk_size=None): yield body
+  monkeypatch.setattr(md.requests, 'get', lambda *a, **k: Resp())
+
+
+class TestDirectDownload:
+  def test_unlocked_download_finds_untested_catalog_entry(self, dl_env, monkeypatch, capsys):
+    _, cat = dl_env; cat.UNLOCK_MARKER.write_text('')
+    fake_http(monkeypatch, b'pop-bytes')
+    assert md.download_model(md.ModelType.DRIVING, 'pop_supercombo_37727') == 0
+    d = dl_env[0] / 'models' / 'driving' / 'pop_supercombo_37727'
+    info = json.loads((d / 'model_info.json').read_text())
+    assert info['source'] == 'converted' and info['sha256'] == hashlib.sha256(b'pop-bytes').hexdigest()
+    assert info['converted_from']['commit'] and info['commit'] == 'a' * 40
+    assert (d / 'driving_supercombo.onnx').read_bytes() == b'pop-bytes'
+    assert not list(d.glob('*.part'))
+
+  def test_locked_download_still_refuses_untested_entry(self, dl_env, capsys):
+    assert md.download_model(md.ModelType.DRIVING, 'pop_supercombo_37727') == 1
+    assert 'not a tested model' in capsys.readouterr().out
+
+  def test_verified_converted_entry_downloads_without_unlock(self, dl_env, monkeypatch):
+    fake_http(monkeypatch, b'pop-bytes')
+    assert md.download_model(md.ModelType.DRIVING, 'pop_verified') == 0
+
+  def test_sha256_mismatch_refuses_and_leaves_no_file(self, dl_env, monkeypatch, capsys):
+    fake_http(monkeypatch, b'tampered!')
+    assert md.download_model(md.ModelType.DRIVING, 'pop_verified') == 1
+    d = dl_env[0] / 'models' / 'driving' / 'pop_verified'
+    assert not (d / 'driving_supercombo.onnx').exists() and not list(d.glob('*.part'))
+    assert 'sha256 mismatch' in capsys.readouterr().out
+
+  def test_size_mismatch_refuses(self, dl_env, monkeypatch, capsys):
+    fake_http(monkeypatch, b'short')
+    assert md.download_model(md.ModelType.DRIVING, 'pop_verified') == 1
+    d = dl_env[0] / 'models' / 'driving' / 'pop_verified'
+    assert not (d / 'driving_supercombo.onnx').exists() and not list(d.glob('*.part'))
+    assert 'size mismatch' in capsys.readouterr().out
+
+  def test_interrupted_download_leaves_no_model(self, dl_env, monkeypatch):
+    def boom(*a, **k): raise ConnectionError('cut')
+    monkeypatch.setattr(md.requests, 'get', boom)
+    assert md.download_model(md.ModelType.DRIVING, 'pop_verified') == 1
+    d = dl_env[0] / 'models' / 'driving' / 'pop_verified'
+    assert not (d / 'driving_supercombo.onnx').exists()
+
+  def test_check_updates_offers_verified_converted_entry(self, dl_env, capsys):
+    md.check_updates()
+    ids = {m['id'] for m in json.loads(capsys.readouterr().out)['driving']}
+    assert 'pop_verified' in ids and 'pop_supercombo_37727' not in ids
 
 
 class TestCheckUpdates:
@@ -119,12 +183,12 @@ class TestCheckUpdates:
     # 'stock_0.11.2' is a shipped entry: download_model always refuses it (no
     # commit/files, it's imported from disk by import_stock, not downloaded),
     # so it must never be offered even though it is verified and uninstalled.
-    assert [m['id'] for m in out['driving']] == ['good_model']
-    assert out['total'] == 1
+    assert [m['id'] for m in out['driving']] == ['good_model', 'pop_verified']
+    assert out['total'] == 2
     assert out['version'] == '0.11.2'
     # verified_total still counts the shipped entry: it answers "does this
     # openpilot version have any tested models at all".
-    assert out['verified_total'] == 2
+    assert out['verified_total'] == 3
 
   def test_shipped_entry_never_offered_even_when_never_installed(self, dl_env, capsys):
     # A device that has swapped models away from stock never has the shipped
@@ -137,12 +201,13 @@ class TestCheckUpdates:
   def test_skips_installed(self, dl_env, capsys):
     tmp_path, _ = dl_env
     (tmp_path / 'models' / 'driving' / 'good_model').mkdir()
+    (tmp_path / 'models' / 'driving' / 'pop_verified').mkdir()
     md.check_updates()
     out = json.loads(capsys.readouterr().out)
     # good_model is now installed and stock_0.11.2 is shipped (never offered):
     # nothing left to offer, but verified_total still counts both.
     assert out['driving'] == []
-    assert out['verified_total'] == 2
+    assert out['verified_total'] == 3
 
   def test_entries_carry_type(self, dl_env, capsys):
     md.check_updates()
@@ -171,13 +236,15 @@ class TestDownloadGate:
     # Gate passes, then the registry lookup fails — proving the gate was not
     # what stopped it.
     assert md.download_model(md.ModelType.DRIVING, 'mystery_model', allow_untested=True) == 1
-    assert 'not a tested model' not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert 'not a tested model' not in out and 'not found' in out
 
   def test_unlock_marker_bypasses_the_gate(self, dl_env, capsys):
     _, cat = dl_env
     cat.UNLOCK_MARKER.write_text('')
     assert md.download_model(md.ModelType.DRIVING, 'mystery_model') == 1
-    assert 'not a tested model' not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert 'not a tested model' not in out and 'not found' in out
 
   def test_verified_model_downloads_from_catalog_metadata(self, dl_env, monkeypatch, capsys):
     calls = []
@@ -198,7 +265,7 @@ class TestCompatibilityHeuristicSuperseded:
     data = json.loads(cat.CATALOG_FILE.read_text())
     data['driving'].append({
       'id': 'old_but_catalogued', 'name': 'Old But Catalogued', 'date': '2025-01-01',
-      'commit': 'd' * 40, 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
+      'commit': 'd' * 40, 'files': ['driving_supercombo.onnx'],
       'verified_on': ['0.11.2'],
     })
     cat.CATALOG_FILE.write_text(json.dumps(data))
@@ -206,7 +273,7 @@ class TestCompatibilityHeuristicSuperseded:
     calls = []
     monkeypatch.setattr(md, 'download_file', lambda url, dest, desc=None: calls.append(url))
     assert md.download_model(md.ModelType.DRIVING, 'old_but_catalogued') == 0
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert all(('d' * 40) in url for url in calls)
 
   def test_registry_path_still_blocks_pre_desire_pulse_noninteractive(self, dl_env, monkeypatch, capsys):

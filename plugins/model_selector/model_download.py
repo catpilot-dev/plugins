@@ -8,6 +8,7 @@ Handles two separate model types:
 Model registry: /data/models/model_registry.json
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -128,6 +129,36 @@ def download_file(url: str, dest: Path, desc: str = None):
     print(f"    Done: {dest.name} ({file_size_mb:.1f}MB)")
 
 
+def download_direct(url: str, dest: Path, sha256: str, size: int) -> None:
+    """Stream url to dest, verifying size and sha256 before it becomes visible.
+
+    Bytes land in '<dest>.part' and are renamed onto dest only once verified, so
+    a half-written or tampered model never lists as complete. On any failure the
+    .part file is removed.
+    """
+    print(f"  Downloading {dest.name}...")
+    part = dest.with_name(dest.name + '.part')
+    try:
+        response = requests.get(url, stream=True, timeout=600)
+        response.raise_for_status()
+        digest = hashlib.sha256()
+        written = 0
+        with open(part, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+                digest.update(chunk)
+                written += len(chunk)
+        if written != size:
+            raise ValueError(f'size mismatch for {dest.name}')
+        if digest.hexdigest() != sha256:
+            raise ValueError(f'sha256 mismatch for {dest.name}')
+        part.replace(dest)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    print(f"    Done: {dest.name} ({written / 1024 / 1024:.1f}MB)")
+
+
 def check_model_compatibility(model_info: dict, model_type: ModelType) -> tuple[bool, str]:
     """Check if model is compatible with current openpilot version
 
@@ -185,7 +216,10 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
         type_name = "Driver Monitoring Model"
         default_dir_name = "models/dm"
 
-    entry = next((e for e in catalog.verified_entries(model_type) if e['id'] == model_id), None)
+    if allow_untested or catalog.unlocked():
+        entry = catalog.entry(model_type, model_id)
+    else:
+        entry = next((e for e in catalog.verified_entries(model_type) if e['id'] == model_id), None)
 
     if entry is None and not (allow_untested or catalog.unlocked()):
         version = catalog.openpilot_version() or 'unknown'
@@ -205,7 +239,7 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
         print(f"❌ {type_name} '{model_id}' not found in registry")
         print(f"\nAvailable {type_name.lower()}s:")
         for mid, info in registry.items():
-            print(f"  {mid}: {info['name']} ({info['commit']})")
+            print(f"  {mid}: {info['name']} ({info.get('commit')})")
         return 1
 
     # Check compatibility — but only for the registry (maintainer) path.
@@ -239,7 +273,12 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
     print("=" * 70)
     print(f"Downloading: {model_info['name']} ({type_name})")
     print("=" * 70)
-    print(f"Commit: {model_info['commit']}")
+    commit = model_info.get('commit') or model_info.get('converted_from', {}).get('commit', '')
+    converted = model_info.get('converted_from')
+    if converted:
+        print(f"Source: converted from {commit} ({converted.get('vision')}/{converted.get('policy')})")
+    else:
+        print(f"Commit: {commit}")
     print(f"Date: {model_info['date']}")
     print(f"PR: {model_info.get('pr', 'N/A')}")
     print(f"Description: {description}")
@@ -247,7 +286,7 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
     print()
 
     # Download ONNX files from GitHub
-    base_url = f"https://raw.githubusercontent.com/commaai/openpilot/{model_info['commit']}/selfdrive/modeld/models"
+    base_url = f"https://raw.githubusercontent.com/commaai/openpilot/{commit}/selfdrive/modeld/models"
 
     all_files = model_info['files']
 
@@ -257,29 +296,36 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
     print()
 
     failed_files = []
-    for filename in all_files:
-        url = f"{base_url}/{filename}"
+    for item in all_files:
+        filename = item['name'] if isinstance(item, dict) else item
         dest = output_dir / filename
 
         try:
-            download_file(url, dest, filename)
+            if isinstance(item, dict):
+                download_direct(item['url'], dest, item['sha256'], item['size'])
+            else:
+                download_file(f"{base_url}/{filename}", dest, filename)
         except Exception as e:
             print(f"    ❌ Failed: {e}")
+            dest.with_name(dest.name + '.part').unlink(missing_ok=True)
             failed_files.append(filename)
 
     # Create model_info.json with type information
     info_file = output_dir / 'model_info.json'
     info_data = {
         'name': model_info['name'],
-        'version': model_info['commit'],
-        'commit': model_info['commit'],
+        'version': commit,
+        'commit': commit,
         'date': model_info['date'],
         'pr': model_info.get('pr', ''),
         'description': description,
-        'source': 'comma.ai',
+        'source': model_info.get('source', 'comma.ai'),
+        'converted_from': converted,
         'type': model_type.value,
         'downloaded_date': datetime.now().isoformat(),
     }
+    if all_files and isinstance(all_files[0], dict):
+        info_data['sha256'] = all_files[0]['sha256']
 
     with open(info_file, 'w') as f:
         json.dump(info_data, f, indent=2)
