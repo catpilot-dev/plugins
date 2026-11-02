@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Download openpilot models from GitHub at specific commits
+Download openpilot models from GitHub at specific commits, or from a catalog URL
 Handles two separate model types:
-- Driving Models: driving_vision.onnx + driving_policy.onnx → /data/models/driving/
+- Driving Models: driving_supercombo.onnx → /data/models/driving/
 - Driver Monitoring (DM) Models: dmonitoring_model.onnx → /data/models/dm/
 
 Model registry: /data/models/model_registry.json
@@ -374,7 +374,7 @@ def list_available(model_type: ModelType = None):
 
     if model_type is None or model_type == ModelType.DRIVING:
         print("[DRIVING MODELS]")
-        print("For lateral/longitudinal control (driving_vision.onnx + driving_policy.onnx)")
+        print("For lateral/longitudinal control (driving_supercombo.onnx)")
         print()
         for model_id, info in driving_models.items():
             # Check compatibility

@@ -1,3 +1,7 @@
+# tools/legacy_policy_swap.py and tools/tests, PC only (never on the device).
+# The plugin suite skips tools/tests when onnx/onnxruntime are missing or unusable, so run them in their own venv:
+#   python -m venv .venv-lps && .venv-lps/bin/pip install -r tools/requirements-legacy-policy-swap.txt pytest
+#   .venv-lps/bin/python -m pytest tools/tests -q
 onnx>=1.19
 onnxruntime>=1.20
 numpy

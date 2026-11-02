@@ -33,7 +33,7 @@ class ModelSwapper:
     Architecture:
     - Primary: ONNX files (portable, from GitHub)
     - Cache: PKL files (device-specific, compiled once)
-    - Active: real file copies in selfdrive/modeld/models/
+    - Active: real file copies in openpilot/selfdrive/modeld/models/
 
     Two independent model systems:
     - Driving models: /data/models/driving/ (driving_supercombo.onnx)
@@ -381,7 +381,7 @@ class ModelSwapper:
         if pkl_compatible:
             available_pkl = self._compiled_files(source_dir)
 
-        # STEP 3: Copy ONNX and PKL files to selfdrive/modeld/models/
+        # STEP 3: Copy ONNX and PKL files to openpilot/selfdrive/modeld/models/
         copied_files = []
 
         # Copy ONNX files (always required)

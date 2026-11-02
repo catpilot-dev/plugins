@@ -67,7 +67,8 @@ def fetch_commits(per_page: int = 100) -> list:
             )
             resp.raise_for_status()
             for commit in resp.json():
-                # First file to claim a sha wins; the two driving files agree.
+                # First file to claim a sha wins: a commit touching both the
+                # driving and the DM file is reported once, as driving.
                 seen.setdefault(commit['sha'], dict(commit, _watch_type=model_type))
     return list(seen.values())
 

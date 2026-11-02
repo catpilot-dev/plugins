@@ -45,7 +45,10 @@ Models are openpilot's own model files, pulled at a specific **GitHub commit**:
   `files` item carries a direct `url`, `sha256` and `size`. Bytes are streamed to
   `<name>.part` and renamed onto the final name only after the size and sha256
   match, so a failed or interrupted download never leaves a half-written model
-  (the `.part` file is removed).
+  (the `.part` file is removed). `model_info.json` is written last, and
+  `check_updates` counts a directory as installed only once it exists, so a
+  download killed by a reboot or power cut (which leaves the `.part` file
+  behind) is offered again.
 
 ## Storage layout on device
 
@@ -77,9 +80,9 @@ that directory belong to the build and are never touched.
 
 `ModelSwapper.swap_model(model_id)` (`model_swapper.py`):
 
-1. **Cache the outgoing model's PKLs.** Copy any compiled `*pkl*` from
-   `ACTIVE_DIR` back into the current model's storage dir (idempotent — see PKL
-   caching).
+1. **Cache the outgoing model's PKL.** Copy this type's compiled artefact from
+   `ACTIVE_DIR` back into the current model's storage dir (idempotent, skipped
+   under drift — see PKL caching).
 2. **Validate the incoming model.** Its required ONNX files must exist in
    `/data/models/<type>/<id>/`, else `ValueError`.
 3. **Copy ONNX into `ACTIVE_DIR`** (overwriting), then delete only this model
@@ -110,7 +113,9 @@ avoid recompiling every time you switch back:
   written fresh PKLs into `ACTIVE_DIR`, they're copied back into the active
   model's storage dir and the building tinygrad commit is recorded in
   `.tinygrad_commit`. The copy only takes files not already cached, so repeated
-  calls are safe.
+  calls are safe. Nothing is cached while the active file has drifted
+  (`active_file_matches` is False): that pkl was compiled from another model's
+  file and would otherwise be copied back under this model's name later.
 - On a later swap **to** that model, step 3 above reuses the cached PKLs only if
   `.tinygrad_commit` matches the current tinygrad — instant, no compile.
   A tinygrad upgrade changes the commit, so stale PKLs are skipped and the model
@@ -138,8 +143,9 @@ Interaction flow:
 
 - **SELECT** → `MultiOptionDialog` of installed models → `ModelActionDialog`
   (3 buttons: **Delete** / **Cancel** / **Activate**). Activate runs the swap +
-  reboot dialog above; Delete removes the model dir (blocked for the active
-  model).
+  reboot dialog above; it is enabled for tested models other than the active
+  one, and for the active one while its file has drifted (`activation_allowed`).
+  Delete removes the model dir (blocked for the active model).
 - **CHECK** → spawns `model_download.py check-updates` as a subprocess (via
   `/usr/local/venv/bin/python`). This is a local diff against
   `compatible_models.json` — no GitHub call, no network needed — that parses
@@ -158,18 +164,18 @@ date heuristics it replaced (`MIN_MODEL_DATE`, the revert-name filter) are gone.
 
 - **Catalog** — `compatible_models.json`, at the plugin root so every deploy
   overwrites it. `data/` is preserved across reinstalls and would freeze a
-  catalog placed there. Entries carry `verified_on: ["0.11.1", …]`; one entry per
+  catalog placed there. Entries carry `verified_on: ["0.11.2", …]`; one entry per
   type per version also carries `baseline_for`, marking the known-good fallback.
-- **Version** — read from `/data/openpilot/common/version.h`, falling back to
+- **Version** — read from `/data/openpilot/openpilot/common/version.h`, falling back to
   `manifest.OPENPILOT_VERSION`.
 - **Shipped models** — the ONNX a release ships is verified by definition. Its
   entry carries `source: "shipped"`, `sha256` and `size`, and no `commit`; see
   Stock import by shipped hash below.
 - **Fail closed** — a missing or corrupt catalog yields zero verified models.
-- **Unlock** — `<PLUGINS_RUNTIME_DIR>/model_selector/data/.unlocked` (or
-  `download --unlocked`) lets a maintainer install and activate untested models.
-  It has no UI surface and survives reinstalls, since `data/` is preserved. See
-  Unlock is CLI-only below.
+- **Unlock** — `<PLUGINS_RUNTIME_DIR>/model_selector/data/.unlocked` lets a
+  maintainer install and activate untested models from the CLI; the `download
+  --unlocked` flag covers the install only. It has no UI surface and survives
+  reinstalls, since `data/` is preserved. See Unlock is CLI-only below.
 
 Enforced at three call sites so no path is ungated: `check_updates` (what is
 offered), `download_model` (what is fetched), `swap_model` (what is activated).
@@ -186,8 +192,13 @@ dir is built under a `_`-prefixed temp name and renamed, so an interrupted copy
 never presents as a complete model. Whenever the stock dir exists, a **stale
 tracker** — one that is missing or names a directory lacking the model's ONNX,
 such as a legacy split `driving_vision`/`driving_policy` model from 0.11.1 — is
-rewritten to name it. Legacy split models are not loadable on 0.11.2; they stay
-on disk, ignored, until deleted by hand.
+rewritten to name it. So is a tracker naming a model with no recorded sha256
+(model_info.json or catalog) while the active file is provably stock: a 0.11.1
+DM directory has the same `dmonitoring_model.onnx` name, cannot be checked
+against the running file, and stock is what runs. A tracker naming a model with
+a recorded hash is left alone; a mismatch there is drift (below). Legacy split
+models are not loadable on 0.11.2; they are hidden from SELECT, so they stay on
+disk until deleted over ssh.
 
 ### Converted models and the release asset
 
@@ -197,7 +208,7 @@ POP driving model (`pop_supercombo_37727`, PR #37727) is the first. It was built
 by `tools/legacy_policy_swap.py`, which transplants POP's policy **and its
 retrained hidden-state summarizer** into the stock 0.11.2 supercombo — a policy
 swap alone is not enough, because the policy reads the summarizer's hidden state.
-The stock vision and everything else stay as shipped. The entry records
+The stock vision backbone and everything else stay as shipped. The entry records
 `converted_from` (POP's commit and the vision/policy checkpoints) as provenance.
 
 The converted ONNX is a GitHub release asset (`models-0.11.2` on
@@ -212,18 +223,21 @@ Something outside the plugin (a git reset, the updater) can put a different
 file at `ACTIVE_DIR` than the one the tracker names. `device.health_check`
 (`on_health_check`) compares the active file's sha256 with the selected model's
 expected hash (`active_file_matches`) for each type and writes the result to
-`/data/models/.drift` (atomically, `write_drift`). The Software panel runs in
-another process and only reads that file (`read_drift`); a missing or malformed
-file means no drift. When a type has drifted, the row appends
-` — active file differs, re-activate`; activating the model again restores it.
+`/data/models/.drift` (atomically, and only when it changes, `write_drift`). The
+Software panel runs in another process and only reads that file (`read_drift`);
+a missing or malformed file means no drift. When a type has drifted, the row
+appends ` — active file differs, re-activate`; Activate stays enabled for the
+active model while it has drifted, and activating it again restores it.
 
 ### Unlock is CLI-only
 
 The UI never offers or activates an untested model. `check_updates` lists only
 verified models, `swap_model` refuses anything else, and the panel has no unlock
-toggle. A maintainer touches `data/.unlocked` (or passes `--unlocked`) and drives
-`model_download.py download --type driving <id> --unlocked` and
-`model_swapper.py --type driving swap <id>` from a shell, then reboots. Once the
+toggle. A maintainer touches `data/.unlocked` and drives
+`model_download.py download --type driving <id>` and
+`model_swapper.py --type driving swap <id>` from a shell, then reboots.
+`--unlocked` is a `download` flag only (it installs without the marker); `swap`
+has no such flag and honours the marker file alone. Once the
 test drive passes, the entry's `verified_on` is updated, the catalog deployed and
 the marker removed.
 
@@ -282,7 +296,7 @@ Settings → Plugins toggle. The moving parts are file locations:
 | `.drift` | `/data/models/.drift` | `model_swapper.py` | Per-type active-file drift, written by the health check, read by the panel |
 | `active_<type>_model` | JSON `{id, name, tinygrad}` | `/data/models/` | Which model is active per type |
 | `CATALOG_FILE` | `<plugin root>/compatible_models.json` | `catalog.py` | The curated compatibility gate |
-| `VERSION_H` | `/data/openpilot/common/version.h` | `catalog.py` | Running openpilot version (source of truth) |
+| `VERSION_H` | `/data/openpilot/openpilot/common/version.h` | `catalog.py` | Running openpilot version (source of truth) |
 | `UNLOCK_MARKER` | `<PLUGINS_RUNTIME_DIR>/model_selector/data/.unlocked` | `catalog.py` | Maintainer unlock for untested models |
 | `_LFS_BATCH_URLS` | GitHub, then GitLab | `model_download.py` | LFS resolve order |
 | `PYTHON_BIN` | `/usr/local/venv/bin/python` | `ui.py` | Interpreter for the download subprocess |

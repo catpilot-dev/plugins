@@ -6,7 +6,9 @@ models.
 This version targets **catpilot 0.11.2 onwards**. openpilot 0.11.2 loads a
 single combined driving model (`driving_supercombo.onnx`), so driving models
 saved on 0.11.1, which were split into separate vision and policy files, are not
-loadable here; they stay on disk, ignored, until you delete them.
+loadable here. They stay on disk but are hidden from **SELECT**, so the panel
+cannot delete them either; remove them over ssh (they live under
+`/data/models/driving/`).
 
 ## What it does
 
@@ -61,9 +63,14 @@ it puts the previous model back, so nothing changes until you actually reboot.
   the model name, the model file openpilot will actually load is not the one you
   selected (an update or a git reset put another file back). Select the model and
   tap **Activate** again, then reboot.
-- **After a catpilot update, a model you were using may become untested.**
-  It keeps running — nothing changes under you — but the panel flags it and
-  offers to switch you back to the model your release ships.
+- **After a catpilot update, the model your release ships is what runs.** An
+  update puts the release's own model file back. If the panel cannot check the
+  model you had selected against that file (a model saved on 0.11.1, for
+  example), it shows the release's model after the first boot. A model it can
+  check shows *active file differs, re-activate* instead: activate it again and
+  reboot to bring it back. A model that has not been tested on the new version
+  is flagged *untested*, and the panel offers to switch you to the release's
+  model.
 
 ## Turning it on and off
 

@@ -16,8 +16,10 @@ differs in a same-architecture policy plus a retrained hidden-state summarizer h
 head to its internal policy summarizer, POP does not). A POP supercombo is therefore the stock 0.11.2 file with the policy
 weights replaced and the summarizer head transplanted (weights in place, biases as new dedicated initializers because the
 stock file shares them). Correction 2026-11-02: the spike's first file replaced only the policy and ran it on CD210's
-features; execution caught it. Verified exact (policy half equals POP's own policy; vision half and queue states bit-identical to stock) and
-compiles through the stock tinygrad path unchanged.
+features; execution caught it. Verified exact (policy half equals POP's own policy; vision half equals POP's own vision,
+which is bit-identical to stock except `hidden_state`; `next_state_feat_q` differs from stock by design because it queues
+that hidden state, and every other queue state is bit-identical to stock) and compiles through the stock tinygrad path
+unchanged.
 
 ## Goals
 
