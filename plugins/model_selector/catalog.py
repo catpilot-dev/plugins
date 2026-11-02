@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 
 CATALOG_FILE = Path(__file__).resolve().parent / 'compatible_models.json'
-VERSION_H = Path(os.getenv('OPENPILOT_DIR', '/data/openpilot')) / 'common' / 'version.h'
+VERSION_H = Path(os.getenv('OPENPILOT_DIR', '/data/openpilot')) / 'openpilot' / 'common' / 'version.h'
 UNLOCK_MARKER = (Path(os.getenv('PLUGINS_RUNTIME_DIR', '/data/plugins-runtime'))
                  / 'model_selector' / 'data' / '.unlocked')
 

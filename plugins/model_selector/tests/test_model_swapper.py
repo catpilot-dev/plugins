@@ -1,4 +1,5 @@
 """Tests for model_selector plugin — ModelType, configs, listing, ONNX validation, PKL compat."""
+import hashlib
 import json
 import shutil
 import pytest
@@ -36,26 +37,19 @@ class TestModelType:
 class TestModelConfigs:
   def test_driving_config(self, ModelSwapper, ModelType):
     cfg = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
-    assert 'driving_vision.onnx' in cfg['onnx_files']
-    assert 'driving_policy.onnx' in cfg['onnx_files']
-    assert len(cfg['onnx_files']) == 2
+    assert cfg['onnx_files'] == ['driving_supercombo.onnx']
+    assert cfg['compiled_file'] == 'driving_tinygrad.pkl'
+    assert 'pkl_patterns' not in cfg and 'required_pkl_stems' not in cfg
     assert cfg['active_file'] == 'active_driving_model'
 
   def test_dm_config(self, ModelSwapper, ModelType):
     cfg = ModelSwapper.MODEL_CONFIGS[ModelType.DM]
-    assert 'dmonitoring_model.onnx' in cfg['onnx_files']
-    assert len(cfg['onnx_files']) == 1
+    assert cfg['onnx_files'] == ['dmonitoring_model.onnx']
+    assert cfg['compiled_file'] == 'dmonitoring_model_tinygrad.pkl'
     assert cfg['active_file'] == 'active_dm_model'
 
-  def test_pkl_patterns_match_onnx(self, ModelSwapper, ModelType):
-    """Each ONNX file should have a corresponding tinygrad PKL pattern."""
-    for mt in ModelType:
-      cfg = ModelSwapper.MODEL_CONFIGS[mt]
-      for onnx in cfg['onnx_files']:
-        base = onnx.replace('.onnx', '')
-        stem = f"{base}_tinygrad.pkl"
-        assert stem in cfg['required_pkl_stems'], f"Missing required PKL stem for {onnx}"
-        assert cfg['pkl_patterns'] == ['*pkl*'], "pkl_patterns should be ['*pkl*']"
+  def test_active_dir_is_the_nested_openpilot_package(self, ModelSwapper):
+    assert ModelSwapper.ACTIVE_DIR.parts[-4:] == ('openpilot', 'selfdrive', 'modeld', 'models')
 
 
 class TestListModels:
@@ -66,8 +60,7 @@ class TestListModels:
       swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
       swapper.models_dir = tmp_path / 'models' / 'driving'
       swapper.onnx_files = swapper.config['onnx_files']
-      swapper.pkl_patterns = swapper.config['pkl_patterns']
-      swapper.required_pkl_stems = swapper.config['required_pkl_stems']
+      swapper.compiled_file = swapper.config['compiled_file']
       models = swapper.list_models()
     assert models == []
 
@@ -80,16 +73,14 @@ class TestListModels:
     info = {'id': 'test_model_abc123', 'name': 'Test Model', 'date': '2025-12-15'}
     (model_dir / 'model_info.json').write_text(json.dumps(info))
     # Create ONNX files
-    (model_dir / 'driving_vision.onnx').write_bytes(b'\x00')
-    (model_dir / 'driving_policy.onnx').write_bytes(b'\x00')
+    (model_dir / 'driving_supercombo.onnx').write_bytes(b'\x00')
 
     swapper = ModelSwapper.__new__(ModelSwapper)
     swapper.model_type = ModelType.DRIVING
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_patterns = swapper.config['pkl_patterns']
-    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
+    swapper.compiled_file = swapper.config['compiled_file']
 
     models = swapper.list_models()
     assert len(models) == 1
@@ -109,8 +100,7 @@ class TestListModels:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_patterns = swapper.config['pkl_patterns']
-    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
+    swapper.compiled_file = swapper.config['compiled_file']
 
     models = swapper.list_models()
     assert len(models) == 0
@@ -128,8 +118,7 @@ class TestListModels:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_patterns = swapper.config['pkl_patterns']
-    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
+    swapper.compiled_file = swapper.config['compiled_file']
 
     models = swapper.list_models()
     dates = [m['date'] for m in models]
@@ -146,8 +135,7 @@ class TestResolveModelId:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_patterns = swapper.config['pkl_patterns']
-    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
+    swapper.compiled_file = swapper.config['compiled_file']
 
     assert swapper.resolve_model_id('my_model') == 'my_model'
 
@@ -160,8 +148,7 @@ class TestResolveModelId:
     swapper.config = ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]
     swapper.models_dir = models_dir
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_patterns = swapper.config['pkl_patterns']
-    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
+    swapper.compiled_file = swapper.config['compiled_file']
 
     assert swapper.resolve_model_id('nonexistent') == 'nonexistent'
 
@@ -181,8 +168,7 @@ class TestSwapModelValidation:
     swapper.models_dir = models_dir
     swapper.active_model_file = models_dir.parent / 'active_driving_model'
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_patterns = swapper.config['pkl_patterns']
-    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
+    swapper.compiled_file = swapper.config['compiled_file']
 
     with pytest.raises(ValueError, match="not found"):
       swapper.swap_model('nonexistent')
@@ -194,7 +180,7 @@ class TestSwapModelValidation:
     models_dir = tmp_path / 'models' / 'driving'
     model_dir = models_dir / 'incomplete_model'
     model_dir.mkdir(parents=True)
-    # Only create one ONNX file
+    # Only a legacy split-model file, no supercombo
     (model_dir / 'driving_vision.onnx').write_bytes(b'\x00')
 
     swapper = ModelSwapper.__new__(ModelSwapper)
@@ -203,8 +189,7 @@ class TestSwapModelValidation:
     swapper.models_dir = models_dir
     swapper.active_model_file = models_dir.parent / 'active_driving_model'
     swapper.onnx_files = swapper.config['onnx_files']
-    swapper.pkl_patterns = swapper.config['pkl_patterns']
-    swapper.required_pkl_stems = swapper.config['required_pkl_stems']
+    swapper.compiled_file = swapper.config['compiled_file']
 
     with patch.object(swapper, 'get_active_model', return_value='unknown'), \
          pytest.raises(ValueError, match="missing required ONNX"):
@@ -213,10 +198,11 @@ class TestSwapModelValidation:
 
 CATALOG_FIXTURE = {
   'driving': [{'id': 'good_model', 'name': 'Good', 'date': '2025-10-20',
-               'commit': 'c' * 40, 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
-               'verified_on': ['0.11.1']},
-              {'id': 'stock_0.11.1', 'name': 'Release default', 'date': '2026-05-18',
-               'source': 'shipped', 'verified_on': ['0.11.1'], 'baseline_for': ['0.11.1']}],
+               'commit': 'c' * 40, 'files': ['driving_supercombo.onnx'],
+               'verified_on': ['0.11.2']},
+              {'id': 'stock_0.11.2', 'name': 'Release default', 'date': '2026-10-14',
+               'source': 'shipped', 'sha256': hashlib.sha256(b'shipped-onnx').hexdigest(), 'size': 12,
+               'verified_on': ['0.11.2'], 'baseline_for': ['0.11.2']}],
   'dm': [],
 }
 
@@ -238,8 +224,7 @@ def _build_swapper(swapper_mod, tmp_path, monkeypatch):
   sw.models_dir = models_dir
   sw.active_model_file = models_dir.parent / 'active_driving_model'
   sw.onnx_files = sw.config['onnx_files']
-  sw.pkl_patterns = sw.config['pkl_patterns']
-  sw.required_pkl_stems = sw.config['required_pkl_stems']
+  sw.compiled_file = sw.config['compiled_file']
   sw.display_name = sw.config['display_name']
   monkeypatch.setattr(swapper_mod.ModelSwapper, 'ACTIVE_DIR', active)
   return sw
@@ -249,7 +234,7 @@ def _point_catalog_at(tmp_path, monkeypatch, data):
   """Redirect the catalog module at a temp catalog, version.h and marker."""
   import plugins.model_selector.catalog as cat
   version_h = tmp_path / 'version.h'
-  version_h.write_text('#define COMMA_VERSION "0.11.1"\n')
+  version_h.write_text('#define COMMA_VERSION "0.11.2"\n')
   monkeypatch.setattr(cat, 'VERSION_H', version_h)
   monkeypatch.setattr(cat, 'CATALOG_FILE', tmp_path / 'catalog.json')
   monkeypatch.setattr(cat, 'UNLOCK_MARKER', tmp_path / '.unlocked')
@@ -303,6 +288,47 @@ class TestCatalogGate:
     sw.swap_model('good_model')
     assert sw.get_active_model() == 'good_model'
 
+  def test_swap_leaves_other_compiled_files_alone(self, gated):
+    sw, cat, _ = gated
+    cat.UNLOCK_MARKER.write_text('')
+    self._install(sw, 'good_model')
+    others = ['big_driving_tinygrad.pkl', 'big_driving_warp_1928x1208_tinygrad.pkl',
+              'driving_warp_1928x1208_tinygrad.pkl', 'dm_warp_1928x1208_tinygrad.pkl',
+              'dmonitoring_model_tinygrad.pkl', 'dmonitoring_model.onnx']
+    for f in others:
+      (sw.ACTIVE_DIR / f).write_bytes(b'x')
+    (sw.ACTIVE_DIR / 'driving_tinygrad.pkl').write_bytes(b'stale')
+    sw.swap_model('good_model')  # driving_tinygrad.pkl absent or stale: both must work
+    assert not (sw.ACTIVE_DIR / 'driving_tinygrad.pkl').exists()
+    assert all((sw.ACTIVE_DIR / f).exists() for f in others)
+    assert (sw.ACTIVE_DIR / 'driving_supercombo.onnx').read_bytes() == b'onnx'
+
+  def test_swap_succeeds_when_nothing_was_compiled_yet(self, gated):
+    sw, cat, _ = gated
+    cat.UNLOCK_MARKER.write_text('')
+    self._install(sw, 'good_model')
+    assert sw.swap_model('good_model')['requires_reboot'] is True
+
+  def test_cache_copies_only_the_models_own_artifact(self, gated):
+    sw, _, _ = gated
+    d = self._install(sw, 'good_model')
+    for f in ['driving_tinygrad.pkl', 'big_driving_tinygrad.pkl', 'driving_warp_1928x1208_tinygrad.pkl']:
+      (sw.ACTIVE_DIR / f).write_bytes(b'c')
+    assert sw.cache_compiled_pkl('good_model') == 1
+    assert (d / 'driving_tinygrad.pkl').exists()
+    assert not (d / 'big_driving_tinygrad.pkl').exists()
+
+  def test_legacy_split_dir_cannot_be_activated_even_unlocked(self, gated):
+    sw, cat, _ = gated
+    cat.UNLOCK_MARKER.write_text('')
+    d = sw.models_dir / 'pop_model_37727'
+    d.mkdir()
+    (d / 'driving_vision.onnx').write_bytes(b'v'); (d / 'driving_policy.onnx').write_bytes(b'p')
+    (d / 'model_info.json').write_text(json.dumps({'name': 'POP', 'date': '2026-03-24'}))
+    with pytest.raises(ValueError, match='missing required ONNX'):
+      sw.swap_model('pop_model_37727')
+    assert all(not m['has_onnx'] for m in sw.list_models() if m['id'] == 'pop_model_37727')
+
 
 class TestImportStock:
   @pytest.fixture
@@ -315,8 +341,8 @@ class TestImportStock:
 
   def test_imports_when_no_tracker(self, stocked):
     assert stocked.import_stock() is True
-    dest = stocked.models_dir / 'stock_0.11.1'
-    assert (dest / 'driving_vision.onnx').read_bytes() == b'shipped-onnx'
+    dest = stocked.models_dir / 'stock_0.11.2'
+    assert (dest / 'driving_supercombo.onnx').read_bytes() == b'shipped-onnx'
     assert json.loads((dest / 'model_info.json').read_text())['source'] == 'shipped'
 
   def test_is_idempotent(self, stocked):
@@ -326,16 +352,16 @@ class TestImportStock:
   def test_skips_when_tracker_exists(self, stocked):
     stocked.active_model_file.write_text(json.dumps({'id': 'something_else'}))
     assert stocked.import_stock() is False
-    assert not (stocked.models_dir / 'stock_0.11.1').exists()
+    assert not (stocked.models_dir / 'stock_0.11.2').exists()
 
   def test_skips_when_active_dir_incomplete(self, stocked):
-    (stocked.ACTIVE_DIR / 'driving_policy.onnx').unlink()
+    (stocked.ACTIVE_DIR / 'driving_supercombo.onnx').unlink()
     assert stocked.import_stock() is False
 
   def test_imported_stock_is_listed_and_verified(self, stocked):
     stocked.import_stock()
     by_id = {m['id']: m for m in stocked.list_models()}
-    assert by_id['stock_0.11.1']['verified'] is True
+    assert by_id['stock_0.11.2']['verified'] is True
 
   def test_failed_copy_does_not_leave_an_orphaned_temp_dir(self, stocked, monkeypatch):
     # Simulate a failure partway through the build (e.g. disk full). The temp
@@ -348,14 +374,14 @@ class TestImportStock:
 
     leftovers = [p for p in stocked.models_dir.iterdir() if p.name.startswith('_')]
     assert leftovers == [], f"orphaned temp dir(s) left behind: {leftovers}"
-    assert not (stocked.models_dir / 'stock_0.11.1').exists()
+    assert not (stocked.models_dir / 'stock_0.11.2').exists()
 
   def test_successful_import_still_lands_atomically(self, stocked):
     # The build happens under a _-prefixed temp name and only becomes the
     # real model dir via an atomic rename — no _-prefixed leftovers after a
     # successful import either.
     assert stocked.import_stock() is True
-    dest = stocked.models_dir / 'stock_0.11.1'
+    dest = stocked.models_dir / 'stock_0.11.2'
     assert dest.is_dir()
     leftovers = [p for p in stocked.models_dir.iterdir() if p.name.startswith('_')]
     assert leftovers == []
@@ -366,7 +392,7 @@ class TestImportStock:
     # race on. We can't easily run two real processes in a unit test, but we
     # can assert the mechanism (pid-qualified name) that prevents the race.
     import os
-    tmp_name = f"_stock_0.11.1.{os.getpid()}.tmp"
+    tmp_name = f"_stock_0.11.2.{os.getpid()}.tmp"
     assert not (stocked.models_dir / tmp_name).exists()
     assert stocked.import_stock() is True
     # The pid-qualified temp path must never survive as itself post-rename.

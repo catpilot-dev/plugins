@@ -67,6 +67,10 @@ class TestOpenpilotVersion:
     catalog_env.VERSION_H.write_text('garbage with no quotes\n')
     assert catalog_env.openpilot_version() == ''
 
+  def test_default_version_h_is_in_the_nested_package(self):
+    import plugins.model_selector.catalog as mod
+    assert mod.VERSION_H.parts[-3:] == ('openpilot', 'common', 'version.h')
+
 
 class TestLoadCatalog:
   def test_missing_file_fails_closed(self, catalog_env):

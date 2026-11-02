@@ -3,6 +3,7 @@
 Covers add_model_from_pr's dedup path, which referenced an undefined
 `registry` name (a latent NameError) until it was loaded explicitly.
 """
+import hashlib
 import importlib
 from unittest.mock import patch, MagicMock
 
@@ -91,17 +92,18 @@ def dl_env(tmp_path, monkeypatch):
   """Point catalog + install dirs at tmp_path for the download/check paths."""
   import plugins.model_selector.catalog as cat
   version_h = tmp_path / 'version.h'
-  version_h.write_text('#define COMMA_VERSION "0.11.1"\n')
+  version_h.write_text('#define COMMA_VERSION "0.11.2"\n')
   monkeypatch.setattr(cat, 'VERSION_H', version_h)
   monkeypatch.setattr(cat, 'CATALOG_FILE', tmp_path / 'catalog.json')
   monkeypatch.setattr(cat, 'UNLOCK_MARKER', tmp_path / '.unlocked')
   (tmp_path / 'catalog.json').write_text(json.dumps({
     'driving': [{'id': 'good_model', 'name': 'Good', 'date': '2025-10-20',
                  'commit': 'c' * 40,
-                 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
-                 'verified_on': ['0.11.1']},
-                {'id': 'stock_0.11.1', 'name': 'Release default', 'date': '2026-05-18',
-                 'source': 'shipped', 'verified_on': ['0.11.1'], 'baseline_for': ['0.11.1']}],
+                 'files': ['driving_supercombo.onnx'],
+                 'verified_on': ['0.11.2']},
+                {'id': 'stock_0.11.2', 'name': 'Release default', 'date': '2026-10-14',
+                 'source': 'shipped', 'sha256': hashlib.sha256(b'shipped-onnx').hexdigest(), 'size': 12,
+                 'verified_on': ['0.11.2'], 'baseline_for': ['0.11.2']}],
     'dm': [],
   }))
   (tmp_path / 'models' / 'driving').mkdir(parents=True)
@@ -114,12 +116,12 @@ class TestCheckUpdates:
   def test_offers_verified_uninstalled(self, dl_env, capsys):
     md.check_updates()
     out = json.loads(capsys.readouterr().out)
-    # 'stock_0.11.1' is a shipped entry: download_model always refuses it (no
+    # 'stock_0.11.2' is a shipped entry: download_model always refuses it (no
     # commit/files, it's imported from disk by import_stock, not downloaded),
     # so it must never be offered even though it is verified and uninstalled.
     assert [m['id'] for m in out['driving']] == ['good_model']
     assert out['total'] == 1
-    assert out['version'] == '0.11.1'
+    assert out['version'] == '0.11.2'
     # verified_total still counts the shipped entry: it answers "does this
     # openpilot version have any tested models at all".
     assert out['verified_total'] == 2
@@ -130,14 +132,14 @@ class TestCheckUpdates:
     # no swap has ever happened) — it must not show up as "available" forever.
     md.check_updates()
     out = json.loads(capsys.readouterr().out)
-    assert 'stock_0.11.1' not in {m['id'] for m in out['driving']}
+    assert 'stock_0.11.2' not in {m['id'] for m in out['driving']}
 
   def test_skips_installed(self, dl_env, capsys):
     tmp_path, _ = dl_env
     (tmp_path / 'models' / 'driving' / 'good_model').mkdir()
     md.check_updates()
     out = json.loads(capsys.readouterr().out)
-    # good_model is now installed and stock_0.11.1 is shipped (never offered):
+    # good_model is now installed and stock_0.11.2 is shipped (never offered):
     # nothing left to offer, but verified_total still counts both.
     assert out['driving'] == []
     assert out['verified_total'] == 2
@@ -162,7 +164,7 @@ class TestDownloadGate:
     assert 'not a tested model' in capsys.readouterr().out
 
   def test_refuses_shipped_entry(self, dl_env, capsys):
-    assert md.download_model(md.ModelType.DRIVING, 'stock_0.11.1') == 1
+    assert md.download_model(md.ModelType.DRIVING, 'stock_0.11.2') == 1
     assert 'imported from disk' in capsys.readouterr().out
 
   def test_allow_untested_bypasses_the_gate(self, dl_env, capsys):
@@ -181,7 +183,7 @@ class TestDownloadGate:
     calls = []
     monkeypatch.setattr(md, 'download_file', lambda url, dest, desc=None: calls.append(url))
     assert md.download_model(md.ModelType.DRIVING, 'good_model') == 0
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert all(('c' * 40) in url for url in calls)
 
 
@@ -197,7 +199,7 @@ class TestCompatibilityHeuristicSuperseded:
     data['driving'].append({
       'id': 'old_but_catalogued', 'name': 'Old But Catalogued', 'date': '2025-01-01',
       'commit': 'd' * 40, 'files': ['driving_vision.onnx', 'driving_policy.onnx'],
-      'verified_on': ['0.11.1'],
+      'verified_on': ['0.11.2'],
     })
     cat.CATALOG_FILE.write_text(json.dumps(data))
 

@@ -28,18 +28,18 @@ from model_download import _github_headers, scan_upstream_models  # noqa: E402
 
 MARKER = 'upstream-commit:'
 WATCH_REPO = 'commaai/openpilot'
-MODEL_PATH = 'selfdrive/modeld/models'
+MODEL_PATH = 'openpilot/selfdrive/modeld/models'
 MAINTAINER = '@OxygenLiu'
 
-# The ONNX files THIS fork actually loads, per model type. The watcher follows
-# these files rather than the directory: a commit that touches the directory
-# without touching one of them is a refactor, a path move, or a model built for
-# an interface this fork cannot load — upstream has since replaced
-# driving_vision/driving_policy with a single driving_supercombo.onnx. Watching
-# the directory reported all of those as installable candidates.
+# The ONNX files THIS fork actually loads, per model type: since 0.11.2 that is
+# the single driving_supercombo.onnx. The watcher follows these files rather
+# than the directory: a commit that touches the directory without touching one
+# of them is a refactor, a path move, or a model built for an interface this
+# fork cannot load. Watching the directory reported all of those as installable
+# candidates.
 # Kept in step with ModelSwapper.MODEL_CONFIGS by a test.
 WATCH_FILES = {
-    'driving': ['driving_vision.onnx', 'driving_policy.onnx'],
+    'driving': ['driving_supercombo.onnx'],
     'dm': ['dmonitoring_model.onnx'],
 }
 

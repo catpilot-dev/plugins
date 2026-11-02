@@ -15,7 +15,7 @@ _spec.loader.exec_module(mw)
 def _cand(**over):
   c = {'id': 'nice_model_37727', 'name': 'Nice Model', 'commit': 'a' * 40,
        'date': '2025-12-01', 'pr': '(#37727)', 'type': 'driving',
-       'files': ['driving_vision.onnx', 'driving_policy.onnx'],
+       'files': ['driving_supercombo.onnx'],
        'upstream_reverted': None}
   c.update(over)
   return c
@@ -224,9 +224,9 @@ class TestMainCatalogFailClosed:
 class TestWatchFiles:
   """The watcher must follow the ONNX files THIS fork actually loads.
 
-  Upstream has since replaced driving_vision/driving_policy with a single
-  driving_supercombo.onnx. Watching the directory reported every refactor and
-  every supercombo-era model as a candidate; watching the files does not.
+  Since 0.11.2 that is the single driving_supercombo.onnx. Watching the
+  directory reported every refactor and every model built for another interface
+  as a candidate; watching the files does not.
   """
 
   def test_watch_files_match_the_forks_expected_onnx(self):
@@ -253,9 +253,8 @@ class TestFetchCommitsPerFile:
     seen = self._capture(monkeypatch, lambda path: [])
     mw.fetch_commits()
     assert seen == [
-      'selfdrive/modeld/models/driving_vision.onnx',
-      'selfdrive/modeld/models/driving_policy.onnx',
-      'selfdrive/modeld/models/dmonitoring_model.onnx',
+      'openpilot/selfdrive/modeld/models/driving_supercombo.onnx',
+      'openpilot/selfdrive/modeld/models/dmonitoring_model.onnx',
     ]
 
   def test_dedups_a_commit_touching_two_watched_files(self, monkeypatch):
@@ -268,7 +267,7 @@ class TestFetchCommitsPerFile:
   def test_annotates_driving_type_from_the_file_touched(self, monkeypatch):
     commit = {'sha': 'a' * 40, 'commit': {'message': 'Nice Model (#1)',
                                           'committer': {'date': '2025-12-01T00:00:00Z'}}}
-    self._capture(monkeypatch, lambda path: [commit] if 'driving_vision' in path else [])
+    self._capture(monkeypatch, lambda path: [commit] if 'driving_supercombo' in path else [])
     assert mw.fetch_commits()[0]['_watch_type'] == 'driving'
 
   def test_annotates_dm_type_from_the_file_touched(self, monkeypatch):
@@ -286,7 +285,7 @@ class TestApplyWatchTypes:
     mw.apply_watch_types(scan, {'a' * 40: 'driving'})
     cand = scan['candidates'][0]
     assert cand['type'] == 'driving'
-    assert cand['files'] == ['driving_vision.onnx', 'driving_policy.onnx']
+    assert cand['files'] == ['driving_supercombo.onnx']
 
   def test_leaves_a_candidate_alone_when_no_evidence(self):
     scan = {'candidates': [_cand()], 'reverted': {}}
@@ -313,8 +312,7 @@ class TestCatalogMatchingBySha:
 class TestFileStatusFilter:
   """Touching a path is not changing a model.
 
-  A commit that REMOVES driving_vision.onnx (upstream's move to a single
-  supercombo model) or RENAMES files under the models dir still shows up in a
+  A commit that REMOVES driving_supercombo.onnx or RENAMES files under the models dir still shows up in a
   path-filtered commit query. Only an add or a modify of a file this fork loads
   is a model this fork could actually install.
   """
@@ -323,27 +321,25 @@ class TestFileStatusFilter:
     def fake_get(url, params=None, headers=None, timeout=None):
       sha = url.rstrip('/').split('/')[-1]
       return _FakeResponse({'files': [
-        {'filename': f'selfdrive/modeld/models/{name}', 'status': status}
+        {'filename': f'openpilot/selfdrive/modeld/models/{name}', 'status': status}
         for name, status in by_sha.get(sha, [])
       ]})
     monkeypatch.setattr(mw.requests, 'get', fake_get)
 
   def test_keeps_a_commit_that_modifies_a_watched_file(self, monkeypatch):
-    self._files(monkeypatch, {'a' * 40: [('driving_vision.onnx', 'modified'),
-                                         ('driving_policy.onnx', 'modified')]})
+    self._files(monkeypatch, {'a' * 40: [('driving_supercombo.onnx', 'modified')]})
     assert [c['id'] for c in mw.filter_by_file_status([_cand()])] == ['nice_model_37727']
 
   def test_drops_a_commit_that_only_removes_a_watched_file(self, monkeypatch):
-    self._files(monkeypatch, {'a' * 40: [('driving_vision.onnx', 'removed'),
-                                         ('driving_supercombo.onnx', 'added')]})
+    self._files(monkeypatch, {'a' * 40: [('driving_supercombo.onnx', 'removed')]})
     assert mw.filter_by_file_status([_cand()]) == []
 
   def test_drops_a_commit_that_only_renames(self, monkeypatch):
-    self._files(monkeypatch, {'a' * 40: [('driving_vision.onnx', 'renamed')]})
+    self._files(monkeypatch, {'a' * 40: [('driving_supercombo.onnx', 'renamed')]})
     assert mw.filter_by_file_status([_cand()]) == []
 
   def test_drops_a_commit_with_no_watched_file_change(self, monkeypatch):
-    self._files(monkeypatch, {'a' * 40: [('driving_supercombo.onnx', 'modified')]})
+    self._files(monkeypatch, {'a' * 40: [('driving_vision.onnx', 'modified')]})
     assert mw.filter_by_file_status([_cand()]) == []
 
   def test_judges_a_dm_candidate_on_the_dm_file(self, monkeypatch):
@@ -352,7 +348,7 @@ class TestFileStatusFilter:
     assert [c['id'] for c in mw.filter_by_file_status([dm])] == ['nice_model_37727']
 
   def test_a_dm_candidate_is_not_kept_by_a_driving_file_change(self, monkeypatch):
-    self._files(monkeypatch, {'b' * 40: [('driving_vision.onnx', 'modified')]})
+    self._files(monkeypatch, {'b' * 40: [('driving_supercombo.onnx', 'modified')]})
     dm = _cand(commit='b' * 40, type='dm', files=['dmonitoring_model.onnx'])
     assert mw.filter_by_file_status([dm]) == []
 
@@ -366,21 +362,21 @@ class TestDropNonModelCandidates:
       sha = url.rstrip('/').split('/')[-1]
       calls.append(sha)
       return _FakeResponse({'files': [
-        {'filename': f'selfdrive/modeld/models/{name}', 'status': status}
+        {'filename': f'openpilot/selfdrive/modeld/models/{name}', 'status': status}
         for name, status in by_sha.get(sha, [])
       ]})
     monkeypatch.setattr(mw.requests, 'get', fake_get)
 
   def test_checks_only_the_candidates_about_to_be_filed(self, monkeypatch):
     calls = []
-    self._files(monkeypatch, {'a' * 40: [('driving_vision.onnx', 'modified')]}, calls)
+    self._files(monkeypatch, {'a' * 40: [('driving_supercombo.onnx', 'modified')]}, calls)
     planned = [{'kind': 'candidate', 'sha': 'a' * 40}]
     candidates = [_cand(), _cand(commit='z' * 40, id='other_1')]
     mw.drop_non_model_candidates(planned, candidates)
     assert calls == ['a' * 40], "must not spend a call on the unplanned candidate"
 
   def test_drops_a_planned_candidate_whose_file_was_only_removed(self, monkeypatch):
-    self._files(monkeypatch, {'a' * 40: [('driving_vision.onnx', 'removed')]}, [])
+    self._files(monkeypatch, {'a' * 40: [('driving_supercombo.onnx', 'removed')]}, [])
     planned = [{'kind': 'candidate', 'sha': 'a' * 40}]
     assert mw.drop_non_model_candidates(planned, [_cand()]) == []
 
