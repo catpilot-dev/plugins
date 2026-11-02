@@ -564,6 +564,24 @@ class TestDriftFile:
     mod.write_drift({'driving': False})
     assert not mod.drift_file().with_name('.drift.tmp').exists()
 
+  def test_unchanged_state_is_not_rewritten(self, mod, monkeypatch):
+    # The health check publishes every ~5 s; flash must not see a write each time.
+    mod.write_drift({'driving': False, 'dm': False})
+    calls = []
+    real = mod.os.replace
+    monkeypatch.setattr(mod.os, 'replace', lambda a, b: calls.append(b) or real(a, b))
+    mod.write_drift({'driving': False, 'dm': False})
+    assert calls == []
+    assert not mod.drift_file().with_name('.drift.tmp').exists()
+
+  def test_changed_state_is_written(self, mod, monkeypatch):
+    mod.write_drift({'driving': False, 'dm': False})
+    calls = []
+    real = mod.os.replace
+    monkeypatch.setattr(mod.os, 'replace', lambda a, b: calls.append(b) or real(a, b))
+    mod.write_drift({'driving': True, 'dm': False})
+    assert len(calls) == 1 and mod.read_drift() == {'driving': True, 'dm': False}
+
 
 class TestActivationAllowed:
   """The panel's Activate button: tested models only; the active one only when its file drifted."""
@@ -581,3 +599,4 @@ class TestActivationAllowed:
   @pytest.mark.parametrize('is_active,drifted', [(False, False), (True, False), (True, True)])
   def test_untested_model_never_activates(self, swapper_mod, model, is_active, drifted):
     assert swapper_mod.activation_allowed(model, is_active=is_active, drifted=drifted) is False
+

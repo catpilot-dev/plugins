@@ -585,7 +585,12 @@ def drift_file() -> Path:
 
 
 def write_drift(states: dict[str, bool]) -> None:
-    """Atomically publish {model_type: drifted} for the UI process."""
+    """Atomically publish {model_type: drifted} for the UI process.
+
+    The health check calls this every ~5 s; an unchanged state is not rewritten.
+    """
+    if read_drift() == states:
+        return
     path = drift_file()
     tmp = path.with_name(path.name + '.tmp')
     tmp.write_text(json.dumps(states))
