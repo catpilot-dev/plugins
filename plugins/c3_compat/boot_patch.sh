@@ -700,4 +700,333 @@ else:
 PYEOF
 fi
 
+# ---------------------------------------------------------------------------
+# 15-17. comma three hardware support that is compiled, not scripted. Upstream
+#     removed it with the comma three; catpilot carried it in-repo until the
+#     openpilot 0.11.2 rebase. The sources ship with this plugin under src/ and
+#     are copied in before scons runs; the hooks below are text patches on the
+#     stock files, guarded by their c3_compat markers like every other section.
+C3_COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+C3_SRC="$C3_COMPAT_DIR/src"
+
+# 15. camerad: AR0231 image sensor (the comma three's cameras). 0.11.2 ships only
+#     the comma 3X / four sensors (OS04C10, OX03C10); without this camerad finds
+#     no sensor. SensorInfo is unchanged since the driver last built upstream.
+CAMERAD="$OPENPILOT_DIR/openpilot/system/camerad"
+if [ -d "$CAMERAD/sensors" ] && [ -f "$C3_SRC/camerad/ar0231.cc" ]; then
+  for f in ar0231.cc ar0231_registers.h; do
+    if ! cmp -s "$C3_SRC/camerad/$f" "$CAMERAD/sensors/$f"; then
+      cp "$C3_SRC/camerad/$f" "$CAMERAD/sensors/$f"
+      echo "[c3_compat] Installed camerad/sensors/$f"
+    fi
+  done
+  python3 - "$CAMERAD" << 'PYEOF'
+import sys, os
+d = sys.argv[1]
+
+def patch(rel, pairs, marker='c3_compat'):
+    path = os.path.join(d, rel)
+    with open(path) as f:
+        s = f.read()
+    if marker in s:
+        return
+    n = 0
+    for old, new in pairs:
+        if old in s:
+            s = s.replace(old, new, 1); n += 1
+    if n == len(pairs):
+        with open(path, 'w') as f:
+            f.write(s)
+        print(f"[c3_compat] Patched camerad/{rel} for AR0231")
+    else:
+        print(f"[c3_compat] WARNING camerad/{rel}: {n}/{len(pairs)} anchors found, left untouched")
+
+patch('SConscript', [(
+    "'cameras/cdm.cc', 'sensors/ox03c10.cc', 'sensors/os04c10.cc'])",
+    "'cameras/cdm.cc', 'sensors/ar0231.cc',  # c3_compat: comma three sensor\n"
+    "                           'sensors/ox03c10.cc', 'sensors/os04c10.cc'])",
+)])
+patch('sensors/sensor.h', [(
+    '#include "system/camerad/sensors/os04c10_registers.h"\n',
+    '#include "system/camerad/sensors/os04c10_registers.h"\n'
+    '#include "system/camerad/sensors/ar0231_registers.h"  // c3_compat: comma three sensor\n',
+), (
+    'class OX03C10 : public SensorInfo {\n',
+    'class AR0231 : public SensorInfo {  // c3_compat: comma three sensor\n'
+    'public:\n'
+    '  AR0231();\n'
+    '  std::vector<i2c_random_wr_payload> getExposureRegisters(int exposure_time, int new_exp_g, bool dc_gain_enabled) const override;\n'
+    '  float getExposureScore(float desired_ev, int exp_t, int exp_g_idx, float exp_gain, int gain_idx) const override;\n'
+    '  int getSlaveAddress(int port) const override;\n'
+    '};\n'
+    '\n'
+    'class OX03C10 : public SensorInfo {\n',
+)])
+patch('cameras/spectra.cc', [(
+    '  if (!init_sensor_lambda(new OS04C10) &&\n      !init_sensor_lambda(new OX03C10)) {',
+    '  if (!init_sensor_lambda(new AR0231) &&   // c3_compat: comma three sensor first\n'
+    '      !init_sensor_lambda(new OS04C10) &&\n      !init_sensor_lambda(new OX03C10)) {',
+)])
+patch('cameras/camera_common.cc', [(
+    '  vipc_server->create_buffers_with_sizes(stream_type, VIPC_BUFFER_COUNT, out_img_width, out_img_height, cam->yuv_size, cam->stride, cam->uv_offset);',
+    '  // c3_compat: VENUS_BUFFER_SIZE is too small for the HW encoder on wide frames (>1344px); use the encoder-aligned size\n'
+    '  size_t nv12_size = (out_img_width <= 1344 ? 2900 : 2346) * cam->stride;\n'
+    '  vipc_server->create_buffers_with_sizes(stream_type, VIPC_BUFFER_COUNT, out_img_width, out_img_height, nv12_size, cam->stride, cam->uv_offset);',
+)])
+patch('cameras/camera_qcom2.cc', [(
+    '  float target_grey_fraction = 0.125;',
+    '  float target_grey_fraction = 0.3;  // c3_compat: AR0231 exposure target',
+), (
+    '    std::make_pair((Rect){96, 400, 1734, 524}, 567.0),  // wide',
+    '    std::make_pair((Rect){96, 250, 1734, 524}, 567.0),  // wide (c3_compat: AR0231 framing)',
+)])
+PYEOF
+fi
+
+# 16. pandad: USB transport. 0.11.2's native pandad is SPI-only (PandaSpiHandle);
+#     the comma three's F4 panda is USB-only (and §10 blocks SPI). Adds a
+#     PandaCommsHandle base, a libusb PandaUsbHandle (src/pandad/panda_usb.cc),
+#     USB-first connect with SPI fallback, USB+SPI discovery, and -lusb-1.0.
+PANDAD_DIR="$OPENPILOT_DIR/openpilot/selfdrive/pandad"
+if [ -f "$PANDAD_DIR/panda_comms.h" ] && [ -f "$C3_SRC/pandad/panda_usb.cc" ]; then
+  if ! cmp -s "$C3_SRC/pandad/panda_usb.cc" "$PANDAD_DIR/panda_usb.cc"; then
+    cp "$C3_SRC/pandad/panda_usb.cc" "$PANDAD_DIR/panda_usb.cc"
+    echo "[c3_compat] Installed pandad/panda_usb.cc"
+  fi
+  python3 - "$PANDAD_DIR" << 'PYEOF'
+import sys, os
+d = sys.argv[1]
+
+def patch(rel, pairs, marker='c3_compat'):
+    path = os.path.join(d, rel)
+    with open(path) as f:
+        s = f.read()
+    if marker in s:
+        return
+    n = 0
+    for old, new in pairs:
+        if old in s:
+            s = s.replace(old, new, 1); n += 1
+    if n == len(pairs):
+        with open(path, 'w') as f:
+            f.write(s)
+        print(f"[c3_compat] Patched pandad/{rel} for USB")
+    else:
+        print(f"[c3_compat] WARNING pandad/{rel}: {n}/{len(pairs)} anchors found, left untouched")
+
+patch('panda_comms.h', [(
+    '#include <vector>\n',
+    '#include <vector>\n\n#include <libusb-1.0/libusb.h>  // c3_compat\n',
+), (
+    'class PandaSpiHandle {\n'
+    'public:\n'
+    '  std::string hw_serial;\n'
+    '  std::atomic<bool> connected = true;\n'
+    '  std::atomic<bool> comms_healthy = true;\n'
+    '\n'
+    '  PandaSpiHandle(std::string serial);\n'
+    '  ~PandaSpiHandle();\n'
+    '\n'
+    '  int control_write(uint8_t request, uint16_t param1, uint16_t param2, unsigned int timeout=TIMEOUT);\n'
+    '  int control_read(uint8_t request, uint16_t param1, uint16_t param2, unsigned char *data, uint16_t length, unsigned int timeout=TIMEOUT);\n'
+    '  int bulk_write(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT);\n'
+    '  int bulk_read(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT);\n'
+    '  void cleanup();\n'
+    '\n'
+    '  static std::vector<std::string> list();\n',
+    '// c3_compat: transport base so Panda can hold USB (comma three F4) or SPI\n'
+    'class PandaCommsHandle {\n'
+    'public:\n'
+    '  PandaCommsHandle() = default;\n'
+    '  virtual ~PandaCommsHandle() = default;\n'
+    '\n'
+    '  std::string hw_serial;\n'
+    '  std::atomic<bool> connected = true;\n'
+    '  std::atomic<bool> comms_healthy = true;\n'
+    '\n'
+    '  virtual int control_write(uint8_t request, uint16_t param1, uint16_t param2, unsigned int timeout=TIMEOUT) = 0;\n'
+    '  virtual int control_read(uint8_t request, uint16_t param1, uint16_t param2, unsigned char *data, uint16_t length, unsigned int timeout=TIMEOUT) = 0;\n'
+    '  virtual int bulk_write(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) = 0;\n'
+    '  virtual int bulk_read(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) = 0;\n'
+    '  virtual void cleanup() = 0;\n'
+    '};\n'
+    '\n'
+    '// c3_compat: libusb transport (src/pandad/panda_usb.cc)\n'
+    'class PandaUsbHandle : public PandaCommsHandle {\n'
+    'public:\n'
+    '  PandaUsbHandle(std::string serial);\n'
+    '  ~PandaUsbHandle();\n'
+    '  int control_write(uint8_t request, uint16_t param1, uint16_t param2, unsigned int timeout=TIMEOUT) override;\n'
+    '  int control_read(uint8_t request, uint16_t param1, uint16_t param2, unsigned char *data, uint16_t length, unsigned int timeout=TIMEOUT) override;\n'
+    '  int bulk_write(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) override;\n'
+    '  int bulk_read(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) override;\n'
+    '  void cleanup() override;\n'
+    '\n'
+    '  static std::vector<std::string> list();\n'
+    '\n'
+    'private:\n'
+    '  libusb_context *ctx = NULL;\n'
+    '  libusb_device_handle *dev_handle = NULL;\n'
+    '  std::recursive_mutex hw_lock;\n'
+    '  void handle_usb_issue(int err, const char func[]);\n'
+    '};\n'
+    '\n'
+    'class PandaSpiHandle : public PandaCommsHandle {\n'
+    'public:\n'
+    '  PandaSpiHandle(std::string serial);\n'
+    '  ~PandaSpiHandle();\n'
+    '\n'
+    '  int control_write(uint8_t request, uint16_t param1, uint16_t param2, unsigned int timeout=TIMEOUT) override;\n'
+    '  int control_read(uint8_t request, uint16_t param1, uint16_t param2, unsigned char *data, uint16_t length, unsigned int timeout=TIMEOUT) override;\n'
+    '  int bulk_write(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) override;\n'
+    '  int bulk_read(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) override;\n'
+    '  void cleanup() override;\n'
+    '\n'
+    '  static std::vector<std::string> list();\n',
+)])
+patch('panda.h', [(
+    '  std::unique_ptr<PandaSpiHandle> handle;',
+    '  std::unique_ptr<PandaCommsHandle> handle;  // c3_compat: USB (comma three) or SPI',
+)])
+patch('panda.cc', [(
+    '#include <vector>\n',
+    '#include <vector>\n#include <algorithm>  // c3_compat\n',
+), (
+    '  handle = std::make_unique<PandaSpiHandle>(serial);\n'
+    '  LOGW("connected to %s over SPI", serial.c_str());\n',
+    '  // c3_compat: the comma three\'s F4 panda is USB-only — try USB first, then SPI\n'
+    '  try {\n'
+    '    handle = std::make_unique<PandaUsbHandle>(serial);\n'
+    '    LOGW("connected to %s over USB", serial.c_str());\n'
+    '  } catch (std::exception &e) {\n'
+    '    handle = std::make_unique<PandaSpiHandle>(serial);\n'
+    '    LOGW("connected to %s over SPI", serial.c_str());\n'
+    '  }\n',
+), (
+    '  return PandaSpiHandle::list();\n',
+    '  // c3_compat: USB pandas first, then SPI\n'
+    '  std::vector<std::string> serials = PandaUsbHandle::list();\n'
+    '  for (const auto &s : PandaSpiHandle::list()) {\n'
+    '    if (std::find(serials.begin(), serials.end(), s) == serials.end()) {\n'
+    '      serials.push_back(s);\n'
+    '    }\n'
+    '  }\n'
+    '  return serials;\n',
+)])
+patch('SConscript', [(
+    "  libs = [common, messaging, 'pthread']\n"
+    "  panda = env.Library('panda', ['panda.cc', 'spi.cc'])",
+    "  libs = ['usb-1.0', common, messaging, 'pthread']  # c3_compat: USB transport\n"
+    "  panda = env.Library('panda', ['panda.cc', 'panda_usb.cc', 'spi.cc'])",
+)])
+PYEOF
+  # SConstruct links only libraries that a vendored package provides: libusb is the
+  # comma-deps-libusb wheel (uv.lock), so it joins the package list (include + lib dirs)
+  SCONSTRUCT="$OPENPILOT_DIR/SConstruct"
+  if [ -f "$SCONSTRUCT" ] && ! grep -q "c3_compat: libusb" "$SCONSTRUCT"; then
+    python3 - "$SCONSTRUCT" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    s = f.read()
+old = "pkg_names = ['acados', 'capnproto', 'ffmpeg', 'json11', 'ncurses', 'zeromq', 'zstd']\n"
+new = "pkg_names = ['acados', 'capnproto', 'ffmpeg', 'json11', 'ncurses', 'zeromq', 'zstd', 'libusb']  # c3_compat: libusb for pandad USB\n"
+if old in s:
+    with open(path, 'w') as f:
+        f.write(s.replace(old, new, 1))
+    print("[c3_compat] Patched SConstruct: libusb vendored package")
+else:
+    print("[c3_compat] WARNING SConstruct: pkg_names anchor not found, left untouched")
+PYEOF
+  fi
+fi
+
+# 17. loggerd: wait for the Venus hardware encoder. On AGNOS 12.8 the VIDC
+#     device node exists before its firmware is loaded; the stock constructor
+#     asserts on the first failed ioctl and encoderd crash-loops at boot.
+V4L_ENC="$OPENPILOT_DIR/openpilot/system/loggerd/encoder/v4l_encoder.cc"
+if [ -f "$V4L_ENC" ] && ! grep -q 'c3_compat' "$V4L_ENC"; then
+  python3 - "$V4L_ENC" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    s = f.read()
+old = """  fd = HANDLE_EINTR(open("/dev/v4l/by-path/platform-aa00000.qcom_vidc-video-index1", O_RDWR|O_NONBLOCK));
+  assert(fd >= 0);
+
+  struct v4l2_capability cap;
+  util::safe_ioctl(fd, VIDIOC_QUERYCAP, &cap, "VIDIOC_QUERYCAP failed");
+  LOGD("opened encoder device %s %s = %d", cap.driver, cap.card, fd);
+  assert(strcmp((const char *)cap.driver, "msm_vidc_driver") == 0);
+  assert(strcmp((const char *)cap.card, "msm_vidc_venc") == 0);
+"""
+new = """  // c3_compat: wait for the Venus firmware — on AGNOS 12.8 the VIDC node exists before the
+  // firmware is loaded and early ioctls fail; retry with backoff (~15 s) instead of asserting
+  const char *dev_path = "/dev/v4l/by-path/platform-aa00000.qcom_vidc-video-index1";
+  struct v4l2_capability cap;
+  for (int attempt = 0;; ++attempt) {
+    fd = HANDLE_EINTR(open(dev_path, O_RDWR|O_NONBLOCK));
+    if (fd >= 0) {
+      if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0 &&
+          strcmp((const char *)cap.driver, "msm_vidc_driver") == 0 &&
+          strcmp((const char *)cap.card, "msm_vidc_venc") == 0) {
+        break;  // Venus ready
+      }
+      close(fd);
+      fd = -1;
+    }
+    if (attempt >= 30) {
+      LOGE("Venus encoder not ready after %d attempts, giving up", attempt);
+      assert(false);
+    }
+    LOGW("Venus encoder not ready (attempt %d), retrying in 500ms...", attempt);
+    usleep(500000);
+  }
+  LOGD("opened encoder device %s %s = %d", cap.driver, cap.card, fd);
+"""
+inc_old = '#include <cassert>\n'
+inc_new = '#include <cassert>\n#include <unistd.h>  // c3_compat: close/usleep\n'
+if old in s and inc_old in s:
+    s = s.replace(old, new, 1).replace(inc_old, inc_new, 1)
+    with open(path, 'w') as f:
+        f.write(s)
+    print("[c3_compat] Patched loggerd v4l_encoder.cc: wait for the Venus encoder")
+else:
+    print("[c3_compat] WARNING loggerd v4l_encoder.cc: anchors not found, left untouched")
+PYEOF
+fi
+
+# 18. Kernel UAPI headers for camerad / loggerd. openpilot 0.11.2 includes the
+#     Qualcomm camera and video headers from the system (#37993): media/cam_*.h,
+#     media/msm_camsensor_sdk.h, media/msm_media_info.h, and the VIDC control
+#     IDs in linux/v4l2-controls.h. AGNOS 16+ ships them in /usr/include; AGNOS
+#     12.8 has only the stock Ubuntu v4l2-controls.h and no media/ at all. These
+#     are the comma three kernel's own headers (the 0.11.1 third_party/linux/
+#     include set camerad built against there), installed under
+#     /usr/local/include, which the compiler searches before /usr/include, so
+#     the qcom v4l2-controls.h shadows the stock one and no build-system change
+#     is needed. Verified: the 0.11.2 camerad/loggerd sources pass clang
+#     -fsyntax-only against this set.
+HDR_SRC="$C3_SRC/linux_include"
+HDR_DST="/usr/local/include"
+if [ -d "$HDR_SRC" ]; then
+  _hdr_changed=0
+  for sub in media linux; do
+    [ -d "$HDR_SRC/$sub" ] || continue
+    for f in "$HDR_SRC/$sub"/*.h; do
+      cmp -s "$f" "$HDR_DST/$sub/$(basename "$f")" || _hdr_changed=1
+    done
+  done
+  if [ $_hdr_changed -eq 1 ]; then
+    sudo mount -o remount,rw / 2>/dev/null
+    for sub in media linux; do
+      [ -d "$HDR_SRC/$sub" ] || continue
+      sudo mkdir -p "$HDR_DST/$sub"
+      sudo cp "$HDR_SRC/$sub"/*.h "$HDR_DST/$sub/"
+    done
+    sudo mount -o remount,ro / 2>/dev/null || true
+    echo "[c3_compat] Installed kernel UAPI headers (media/, linux/v4l2-controls.h) to $HDR_DST"
+  fi
+fi
+
 echo "[c3_compat] Boot patches applied successfully"

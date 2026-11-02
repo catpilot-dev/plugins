@@ -23,6 +23,8 @@ overlay swap and before the plugin install / scons build:
 launch_chffrplus.sh
   └─ source /data/plugins-runtime/c3_compat/boot_patch.sh "$DIR"   # unless .disabled present
        ├─ patch the openpilot tree (panda, pandad, spi, dfu, multilang, hardware)
+       ├─ copy src/ (AR0231 sensor, pandad USB transport) into the tree + hook them in
+       ├─ install the comma three kernel UAPI headers under /usr/local/include
        ├─ venv_sync.py --runtime-only --native-deps   (sync AGNOS 12.8 venv to uv.lock)
        ├─ install msgfmt stub + DRM raylib into the venv
        ├─ stop/mask Weston, install weston-ready stub, strip Wayland env
@@ -174,33 +176,55 @@ the panda library and pandad about F4:
   `PandaSpiUnavailable` (two anchors: the `spidev.SpiDev()` open of ≤ 0.11.1 and
   the raw `open(DEV_PATH)` of 0.11.2), and `dfu.py`'s `spi_list()` handler is
   broadened to `except Exception`, so the Python panda code cleanly falls back to
-  USB. **The 0.11.2 native `pandad` has no USB path at all** — see below.
+  USB. The 0.11.2 native `pandad` gets its USB transport from §16.
 - **§13** — clears `panda/python/__pycache__` so the patched sources take effect.
 
-### Not covered by boot patches on openpilot 0.11.2 (C++ that lived in the catpilot repo)
+### Compiled comma-three support (boot §15–18, `src/`)
 
-Three pieces of comma-three support were never boot patches: they were in-repo
-C++ in catpilot commit `7a4e44e1f`, which the 0.11.2 rebase dropped (the plan
-assumed this plugin carried them). Until they are ported, 0.11.2 does not run on
-a comma three:
+Three pieces of comma-three support were never boot patches: upstream removed
+them with the comma three and catpilot carried them as in-repo C++ (commit
+`7a4e44e1f`) until the openpilot 0.11.2 rebase dropped that commit. Since
+0.11.2 they live here: the plugin ships the sources under `src/` and boot copies
+them into the tree before scons runs, with the hooks applied as text patches on
+the stock files (guarded by `c3_compat` markers like every other section).
 
-- **camerad AR0231** — the comma three's sensor. `sensors/ar0231.cc` +
-  `ar0231_registers.h` (new files), a probe entry in `spectra.cc::openSensor`,
-  the `SConscript` source list, the class declaration in `sensor.h`, the encoder-
-  aligned NV12 buffer size in `camera_common.cc`, and the exposure tuning in
-  `camera_qcom2.cc`. `SensorInfo` is unchanged between 0.11.1 and 0.11.2 and
-  every anchor is present at the tag.
-- **native pandad over USB** — 0.11.2's `selfdrive/pandad` is SPI-only
-  (`PandaSpiHandle` only; `Panda::list()` = SPI list). `7a4e44e1f` added
-  `panda_comms.cc` (`PandaUsbHandle` on libusb) behind a `PandaCommsHandle`
-  base, USB-first connect with SPI fallback, and `-lusb-1.0`. The header and
-  `spi.cc` were rewritten upstream since, so this is a re-port, not a hunk.
-- **loggerd v4l_encoder** — retry loop until the Venus encoder answers
-  `VIDIOC_QUERYCAP` (boot-time race on AGNOS 12.8). Anchor present at the tag.
+- **§15 camerad AR0231** — the comma three's image sensor; 0.11.2 ships only
+  the 3X/four sensors (OS04C10, OX03C10). `src/camerad/ar0231.cc` +
+  `ar0231_registers.h` are copied into `system/camerad/sensors/`; hooks: the
+  `SConscript` source list, the class declaration in `sensor.h`, AR0231 first in
+  `spectra.cc::openSensor`, the encoder-aligned NV12 buffer size in
+  `camera_common.cc` (Venus needs more than `VENUS_BUFFER_SIZE` above 1344 px),
+  and the AR0231 exposure target / wide-camera AE rectangle in `camera_qcom2.cc`.
+  `SensorInfo` is unchanged since the driver last built upstream.
+- **§16 pandad over USB** — 0.11.2's native `pandad` is SPI-only
+  (`PandaSpiHandle`; `Panda::list()` is the SPI list) and §10 blocks SPI.
+  `src/pandad/panda_usb.cc` is a libusb `PandaUsbHandle`; `panda_comms.h` gains
+  a `PandaCommsHandle` base that both transports implement, `Panda` holds the
+  base, connects USB first and falls back to SPI, and lists USB then SPI pandas.
+  SConstruct links only libraries a vendored package provides, so `libusb` joins
+  `pkg_names` (the comma-deps-libusb wheel from uv.lock supplies include + lib
+  dirs) and the pandad `SConscript` adds `panda_usb.cc` and `usb-1.0`.
+- **§17 loggerd v4l_encoder** — on AGNOS 12.8 the VIDC device node exists
+  before the Venus firmware is loaded; the stock constructor asserts on the
+  first failed `VIDIOC_QUERYCAP` and encoderd crash-loops at boot. The open is
+  retried every 500 ms for ~15 s instead.
+- **§18 kernel UAPI headers** — 0.11.2 takes the Qualcomm camera/video headers
+  from the system (#37993): `media/cam_*.h`, `media/msm_camsensor_sdk.h`,
+  `media/msm_media_info.h` and the VIDC control IDs in `linux/v4l2-controls.h`.
+  AGNOS 16+ has them in `/usr/include`; AGNOS 12.8 has none of `media/` and the
+  stock Ubuntu `v4l2-controls.h`. `src/linux_include/` carries the comma three
+  kernel's own set (the 0.11.1 `third_party/linux/include` files camerad built
+  against there), installed under `/usr/local/include`, which the compiler
+  searches before `/usr/include`, so no build-system change is needed.
 
-Build-system items that *are* handled here: the comma-deps-* wheels (venv_sync
-installs them from uv.lock; its git-sourced native-deps step stands down when
-the lock ships them), and the wheel's `capnpc` first on PATH (§6).
+Verified off-device: the patched `pandad` builds and links on x86 against the
+0.11.2 tree; `spectra.cc`, `camera_qcom2.cc`, `camera_common.cc`, `ar0231.cc`
+and `v4l_encoder.cc` pass `clang++ -fsyntax-only` with the §18 header set
+(camerad itself only builds for `comma_arm64`). The device build is the gate.
+
+Build-system items also handled: the comma-deps-* wheels (venv_sync installs
+them from uv.lock and stands its git-sourced native-deps step down when the
+lock ships them), and the capnproto wheel's `capnpc` first on PATH (§6).
 
 ### Modem / eSIM (boot §14)
 
@@ -246,9 +270,13 @@ c3_compat/
   venv_sync.py     # uv.lock → AGNOS 12.8 venv synchronizer (+ native deps)
   compat.py        # device.health_check hook + startup logging
   watchdog.sh      # on-demand vitals/dmesg snapshotter → /data/crash_diag/
-  raylib_drm/      # DRM-backend raylib .so + package (Git LFS)
+  raylib_drm/      # DRM-backend raylib .so + package (Git LFS; openpilot <= 0.11.1)
+  src/camerad/     # AR0231 sensor driver (ar0231.cc, ar0231_registers.h) -> system/camerad/sensors/
+  src/pandad/      # panda_usb.cc: libusb PandaUsbHandle -> selfdrive/pandad/
+  src/linux_include/  # comma three kernel UAPI headers (media/, linux/v4l2-controls.h) -> /usr/local/include
   __init__.py      # UI_BORDER_SIZE constant
   tests/test_compat.py
+  tests/test_venv_sync.py
 ```
 
 ## Params / caches
