@@ -2,7 +2,7 @@
 from opendbc.car import structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car import get_safety_config
-from bmw.values import CanBus, BmwFlags
+from bmw.values import CanBus, BmwFlags, BmwSafetyFlags, CruiseSettings
 from opendbc.car.interfaces import CarInterfaceBase
 from bmw.carcontroller import CarController
 from bmw.carstate import CarState
@@ -76,23 +76,30 @@ class CarInterface(CarInterfaceBase):
       ret.steerRatio = 18.5
 
     if ret.flags & BmwFlags.DYNAMIC_CRUISE_CONTROL:
-      ret.minEnableSpeed = 30. * CV.KPH_TO_MS
+      ret.minEnableSpeed = CruiseSettings.MIN_ENABLE_SPEED_KPH * CV.KPH_TO_MS
     if ret.flags & BmwFlags.NORMAL_CRUISE_CONTROL:
-      ret.minEnableSpeed = 30. * CV.KPH_TO_MS
+      ret.minEnableSpeed = CruiseSettings.MIN_ENABLE_SPEED_KPH * CV.KPH_TO_MS
 
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.bmw)]
+    # Without a servo the panda neither RX-checks its status nor allows steering
+    # commands, so longitudinal-only engagement still works.
     ret.safetyConfigs[0].safetyParam = 0
+    if ret.flags & BmwFlags.STEPPER_SERVO_CAN:
+      ret.safetyConfigs[0].safetyParam |= BmwSafetyFlags.STEPPER_SERVO.value
 
     ret.steerControlType = structs.CarParams.SteerControlType.torque
     # BMW-specific: lagd never converges for our curvature/front-wheel-angle
     # controller (lagd correlates on latcontrol_torque telemetry that our
     # plant-inversion path doesn't produce), so liveDelay.lateralDelay is
     # permanently pinned at initial_lag = steerActuatorDelay + 0.2 (lagd.py:181).
-    # 0.4 → liveDelay = 0.6 s. This propagates to (a) modeld's lat_action_t ≈
-    # 0.65 s — model samples κ_des at a further-ahead point, providing indirect
-    # smoothing of vision-only wobble — and (b) register.py's model_action_t,
-    # which subscribes to lat_delay so the model_action_t horizon stays aligned with
-    # where the model targets κ.
+    # 0.4 → liveDelay = 0.6 s → modeld's lat_action_t ≈ 0.65 s. Route 4d9
+    # (2026-10-12) tried 0.7 to match the measured straight-line loop delay
+    # (target → yaw 0.90-1.0 s, routes 4d4/4d5) and was "hardly driveable":
+    # the model's own corrections overshot, ~2x the sway-band oscillation.
+    # That 0.9-1.0 s is mostly rack stiction on small corrections, not a pure
+    # delay, so do not feed it to the model. The BMW controller's own timing
+    # does not follow lat_delay (latcontroller CONTROL_HORIZON_S = 0.65);
+    # lane_keeping's arc look-ahead is scheduled by speed and curvature, not by it.
     ret.steerActuatorDelay = 0.4
     ret.steerLimitTimer = 0.4
 

@@ -4,9 +4,32 @@ Provides opendbc and cereal stubs so tests run without openpilot installed.
 Key: @dataclass subclasses need REAL base classes (not MagicMock) because
 the dataclass decorator iterates __mro__ which MagicMock doesn't support.
 """
+import os
+import sys
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from unittest.mock import MagicMock
+
+# bmw.latcontroller does `from config import read_plugin_param` inside
+# on_lat_controller_init (function scope, review fix Important 2 — every
+# other config.read_plugin_param consumer in this repo imports it at call
+# time, not module scope, so a missing config.py just defaults the param off
+# instead of failing the whole hook module's import) — on device the shared
+# plugins/ dir (config.py, services.py, ...) is already on sys.path;
+# replicate that here or the import raises ModuleNotFoundError the first
+# time a test constructs a controller (and tests that monkeypatch
+# config.read_plugin_param need the real `config` module importable at all).
+# Lives here (not in test_latcontroller.py) because both test_latcontroller.py
+# AND test_hooks.py import bmw.latcontroller, and both already import this
+# module — a fix that lived in only one of them left the other broken when
+# run in isolation (review fix, Minor 10). Same fix, same reason, as
+# speedlimitd/tests/test_speedlimitd.py's _PLUGINS_DIR insert.
+_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PLUGIN_DIR not in sys.path:
+  sys.path.insert(0, _PLUGIN_DIR)
+_PLUGINS_DIR = os.path.dirname(_PLUGIN_DIR)
+if _PLUGINS_DIR not in sys.path:
+  sys.path.insert(0, _PLUGINS_DIR)
 
 
 # ============================================================
@@ -162,3 +185,103 @@ def install_all_mocks(monkeypatch):
     monkeypatch.setitem(__import__('sys').modules, mod_name, mod_mock)
   for mod_name, mod_mock in make_cereal_mocks().items():
     monkeypatch.setitem(__import__('sys').modules, mod_name, mod_mock)
+
+
+# ============================================================
+# CarController scaffolding
+# ============================================================
+# bmw.carcontroller is the one module whose behaviour is a *state machine over
+# time* (the 0x194 counter-overwrite burst), so unlike the rest of the suite it
+# has to be exercised by really constructing the controller and stepping it,
+# not by re-implementing the rule in the test. That needs a handful of real
+# stubs rather than MagicMocks: a MagicMock base class swallows the instance
+# attributes __init__ sets, and MagicMock conversion factors poison the speed
+# arithmetic.
+
+class CarControllerBase:
+  """Real stand-in — CarController.__init__ calls super().__init__ and the
+  subclass then sets instance attributes that a MagicMock base would shadow."""
+  def __init__(self, dbc_name, CP):
+    self.CP = CP
+    self.frame = 0
+
+
+class StalkCANPacker:
+  """Packs CruiseControlStalk (0x194) to the real DBC layout so tests can read
+  the counter straight off the emitted frame. Only 0x194 is needed — the
+  StepperServoCAN path is off unless BmwFlags.STEPPER_SERVO_CAN is set."""
+  _ACTION_BIT = {'plus1': 0, 'plus5': 1, 'minus1': 2, 'minus5': 3,
+                 'cancel': 4, 'resume': 6, 'cancel_lever_up': 7}
+
+  def __init__(self, dbc_name): pass
+
+  def make_can_msg(self, name, bus, values):
+    assert name == 'CruiseControlStalk', f"unexpected message {name}"
+    actions = 0
+    for key, bit in self._ACTION_BIT.items():
+      if values.get(key):
+        actions |= 1 << bit
+    dat = bytes([
+      values.get('Checksum_0x194', 0) & 0xFF,
+      ((values.get('requests_0xF', 0) & 0xF) << 4) | (values.get('Counter_0x194', 0) & 0xF),
+      actions,
+      values.get('setMe_0xFC', 0) & 0xFF,
+    ])
+    return (404, dat, bus)
+
+
+def apply_dist_to_meas_limits(val, val_last, val_meas, STEER_DELTA_UP, STEER_DELTA_DOWN, STEER_ERROR_MAX, STEER_MAX):
+  """Verbatim port of opendbc.car.lateral.apply_dist_to_meas_limits (pinned
+  b3bd79a6) so the servo torque path can be stepped for real: clamp to the
+  measurement band, then slow any increase in magnitude to STEER_DELTA_UP."""
+  clip = lambda x, lo, hi: min(max(x, lo), hi)
+  max_lim = min(max(val_meas + STEER_ERROR_MAX, STEER_ERROR_MAX), STEER_MAX)
+  min_lim = max(min(val_meas - STEER_ERROR_MAX, -STEER_ERROR_MAX), -STEER_MAX)
+  val = clip(val, min_lim, max_lim)
+  if val_last > 0:
+    val = clip(val, max(val_last - STEER_DELTA_DOWN, -STEER_DELTA_UP), val_last + STEER_DELTA_UP)
+  else:
+    val = clip(val, val_last - STEER_DELTA_UP, min(val_last + STEER_DELTA_DOWN, STEER_DELTA_UP))
+  return float(val)
+
+
+def make_carcontroller_mocks() -> dict:
+  """make_opendbc_mocks() plus the real stubs bmw.carcontroller needs."""
+  mods = make_opendbc_mocks()
+  mods['opendbc.car.interfaces'].CarControllerBase = CarControllerBase
+  mods['opendbc.car.lateral'].apply_dist_to_meas_limits = apply_dist_to_meas_limits
+  mods['opendbc.car'].DT_CTRL = 0.01
+  conv = mods['opendbc.car.common.conversions'].Conversions
+  conv.MS_TO_KPH = 3.6
+  conv.MS_TO_MPH = 2.23694
+  conv.KPH_TO_MS = 1 / 3.6
+  conv.MPH_TO_MS = 0.44704
+  mods['opendbc.can'].CANPacker = StalkCANPacker
+  return mods
+
+
+class _Bag:
+  """Attribute bag for CarState/CarControl stand-ins."""
+  def __init__(self, **kw): self.__dict__.update(kw)
+
+
+def make_stalk_carstate(szl_counter, v_ego=24.0, setpoint=24.5, human_pressing=False,
+                       dcc_enabled=True, available=True, v_cruise=None):
+  # vCruise is the driver's set speed in km/h (card.py: v_cruise_helper
+  # .v_cruise_kph), not m/s like the rest of these. Defaults to the setpoint,
+  # i.e. nothing borrowed yet.
+  out = _Bag(vEgo=v_ego, vEgoCluster=v_ego, gasPressed=False, brakePressed=False,
+             steeringTorqueEps=0.0,
+             vCruise=setpoint * 3.6 if v_cruise is None else v_cruise,
+             cruiseState=_Bag(enabled=dcc_enabled, available=available,
+                              speed=setpoint, speedCluster=setpoint))
+  return _Bag(out=out, is_metric=True, cruise_stalk_counter=szl_counter,
+              cruise_stalk_resume=human_pressing, cruise_stalk_cancel=False,
+              cruise_stalk_speed=0, servo_soft_off=False)
+
+
+def make_stalk_carcontrol(accel, v_target, enabled=True):
+  return _Bag(enabled=enabled, latActive=False,
+              actuators=_Bag(speed=v_target, accel=accel,
+                             as_builder=lambda: _Bag(speed=0.0, torque=0.0,
+                                                     torqueOutputCan=0.0)))

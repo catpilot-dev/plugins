@@ -28,6 +28,54 @@ def toggle_speed_limit_confirm():
     pass
 
 
+def should_button_enable(buttonEvents, *, dcc_engaged, dcc_engaged_prev,
+                        v_ego, min_enable_speed, lka_available):
+  """Should openpilot engage this frame?  (CarStateBase.update_button_enable)
+
+  Two sources, because this car has two engagement regimes:
+
+  1. DCC rising edge — the normal path. Despite the base method's name this
+     never looked at buttonEvents: openpilot follows DCC in, so ANY gesture
+     that brings DCC up (plus, minus, and resume) engages openpilot.
+
+  2. The stalk itself, but only below minEnableSpeed. DCC cannot engage under
+     30 km/h, so source 1 never fires down there and openpilot could not
+     engage at all — no LKA, at any speed the driver would actually want it
+     for. The release edge of accelCruise/decelCruise is the engage gesture,
+     matching the panda's stalk latch (bmw.h, mask 0x0F). resume is excluded
+     on both sides (user ruling 2026-08-20): it is not an engage gesture here
+     and is already overloaded three ways (long press = gapAdjustCruise, short
+     press while DCC engaged = speed-limit confirm, short press otherwise =
+     resumeCruise).
+
+  Source 2 is gated on v_ego AND on DCC being off, so a setpoint adjustment
+  never reads as an engage request, and on lka_available: without a stepper
+  servo there is no LKA to engage into (lka_mode.py). Kept as a free function so it is testable
+  without constructing a CarState (CarStateBase is mocked in the plugin suite).
+  """
+  if dcc_engaged and not dcc_engaged_prev:
+    return True
+
+  if lka_available and not dcc_engaged and v_ego < min_enable_speed:
+    for b in buttonEvents:
+      if b.type in (ButtonType.accelCruise, ButtonType.decelCruise) and not b.pressed:
+        return True
+
+  return False
+
+
+def temps_payload(cp_PT, cp_aux, servo):
+  """bmw_temps plugin-bus payload (deg C): engine coolant and oil, plus the
+  stepper servo's board temperature (STEERING_STATUS) when a servo is fitted."""
+  out = {
+    'coolant': round(cp_PT.vl["EngineData"]["TEMP_ENG"]),
+    'oil': round(cp_PT.vl["EngineData"]["TEMP_EOI"]),
+  }
+  if servo:
+    out['servo'] = round(cp_aux.vl['STEERING_STATUS']['TEMPERATURE'])
+  return out
+
+
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
@@ -51,6 +99,10 @@ class CarState(CarStateBase):
     self.resume_button_hold_frames = 0
     self.resume_press_engaged = False  # Was cruise engaged when resume button was first pressed?
     self.steer_fault_counter = 0  # Debounce: consecutive frames with raw fault bits set
+    # Servo CONTROL_STATUS bit2, raw (no debounce): the servo has soft-offed and
+    # ignores TorqueControl until it receives an Off. The carcontroller re-arms
+    # on it (DESIGN.md: "Servo re-arm after soft-off").
+    self.servo_soft_off = False
     self.steer_angle_offset = self._load_steer_angle_offset()
     self._offset_sub = None
 
@@ -176,18 +228,15 @@ class CarState(CarStateBase):
         if not hasattr(self, '_temp_pub'):
           from openpilot.selfdrive.plugins.plugin_bus import PluginPub
           self._temp_pub = PluginPub('bmw_temps')
-        self._temp_pub.send({
-          'coolant': round(cp_PT.vl["EngineData"]["TEMP_ENG"]),
-          'oil': round(cp_PT.vl["EngineData"]["TEMP_EOI"]),
-        })
+        self._temp_pub.send(temps_payload(cp_PT, cp_aux, bool(self.CP.flags & BmwFlags.STEPPER_SERVO_CAN)))
       except Exception:
         pass
 
     if self.CP.flags & BmwFlags.STEPPER_SERVO_CAN:
       ret.steeringTorqueEps = cp_aux.vl['STEERING_STATUS']['STEERING_TORQUE']
       ret.steeringAngleOffsetDeg = ret.steeringAngleDeg - cp_aux.vl['STEERING_STATUS']['STEERING_ANGLE']
-      raw_fault = (int(cp_aux.vl['STEERING_STATUS']['DEBUG_STATES']) & 0xE0) != 0 or \
-                  (int(cp_aux.vl['STEERING_STATUS']['CONTROL_STATUS']) & 0x4) != 0
+      self.servo_soft_off = (int(cp_aux.vl['STEERING_STATUS']['CONTROL_STATUS']) & 0x4) != 0
+      raw_fault = (int(cp_aux.vl['STEERING_STATUS']['DEBUG_STATES']) & 0xE0) != 0 or self.servo_soft_off
       self.steer_fault_counter = self.steer_fault_counter + 1 if raw_fault else 0
       ret.steerFaultTemporary = self.steer_fault_counter >= 10
 
@@ -244,9 +293,12 @@ class CarState(CarStateBase):
     return ret
 
   def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
-    if self.cruise_state_enabled and not self.out.cruiseState.enabled:
-      return True
-    return False
+    return should_button_enable(buttonEvents,
+                                dcc_engaged=self.cruise_state_enabled,
+                                dcc_engaged_prev=self.out.cruiseState.enabled,
+                                v_ego=self.out.vEgo,
+                                min_enable_speed=self.CP.minEnableSpeed,
+                                lka_available=bool(self.CP.flags & BmwFlags.STEPPER_SERVO_CAN))
 
   @staticmethod
   def _load_steer_angle_offset():
@@ -293,11 +345,24 @@ class CarState(CarStateBase):
     # Fingerprinting may misclassify cruise type if the ECU is slow to wake;
     # subscribing to both prevents canValid failures from unsubscribed messages
     # being lazily accessed via vl[] in update().
+    #
+    # A message first touched through vl[] gets its rate LEARNED by the parser,
+    # once, from the first >= 3 frames spanning > 1 s; the timeout is then ten
+    # periods of that guess for the rest of the drive. Fine for the periodic
+    # messages, wrong for anything event-driven: Status_contact_handbrake is a
+    # 0.2 Hz heartbeat plus a frame per handbrake change, and three change
+    # frames at ignition taught the parser 3.2 Hz (route 501, 2026-10-25) --
+    # every 5 s heartbeat gap then timed out, canValid dropped 38 % of the
+    # drive and selfdrived raised canError ("Unknown Vehicle Variant", a
+    # no-entry + immediate disable). Declare the slow/event-driven messages
+    # with their nominal rate so nothing is guessed.
     pt_messages = [
       ("TurnSignals", float('nan')),
       ("DynamicCruiseControlStatus", float('nan')),
       ("CruiseControlStatus", float('nan')),
       ("CruiseControlStalk", float('nan')),
+      ("Status_contact_handbrake", 0.2),   # 5 s heartbeat + change events -> 50 s timeout
+      ("SteeringButtons", 1),              # 1 Hz idle + bursts while pressed -> 10 s timeout
     ]
     fcan_messages = [
       ("CruiseControlStalk", float('nan')),
