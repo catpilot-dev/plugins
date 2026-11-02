@@ -374,12 +374,39 @@ class TestImportStock:
     stocked.import_stock()
     assert json.loads(stocked.active_model_file.read_text())['id'] == 'stock_0.11.2'
 
-  def test_tracker_naming_a_loadable_model_is_kept(self, stocked):
+  def test_tracker_naming_a_model_with_a_recorded_hash_is_kept(self, stocked):
+    # Stock runs under it, but that is drift (the panel says re-activate), not staleness.
     good = stocked.models_dir / 'good_model'; good.mkdir()
     (good / 'driving_supercombo.onnx').write_bytes(b'onnx')
+    (good / 'model_info.json').write_text(json.dumps({'name': 'Good', 'sha256': hashlib.sha256(b'onnx').hexdigest()}))
     stocked.active_model_file.write_text(json.dumps({'id': 'good_model'}))
     stocked.import_stock()
     assert json.loads(stocked.active_model_file.read_text())['id'] == 'good_model'
+
+  def _carry_over_unhashed(self, stocked):
+    # A 0.11.1-era dir: the same ONNX filename, no recorded sha256, no catalog entry.
+    old = stocked.models_dir / 'le_mans_gt3'; old.mkdir()
+    (old / 'driving_supercombo.onnx').write_bytes(b'old-model')
+    (old / 'model_info.json').write_text(json.dumps({'name': 'Le Mans GT3', 'date': '2025-11-01'}))
+    stocked.active_model_file.write_text(json.dumps({'id': 'le_mans_gt3', 'name': 'Le Mans GT3'}))
+
+  def test_unhashed_tracker_is_rewritten_when_active_is_stock(self, stocked):
+    self._carry_over_unhashed(stocked)
+    assert stocked.import_stock() is True
+    assert json.loads(stocked.active_model_file.read_text())['id'] == 'stock_0.11.2'
+
+  def test_unhashed_tracker_is_rewritten_when_stock_dir_already_exists(self, stocked):
+    assert stocked.import_stock() is True
+    self._carry_over_unhashed(stocked)
+    assert stocked.import_stock() is False
+    assert json.loads(stocked.active_model_file.read_text())['id'] == 'stock_0.11.2'
+
+  def test_unhashed_tracker_is_kept_when_active_is_not_stock(self, stocked):
+    assert stocked.import_stock() is True
+    self._carry_over_unhashed(stocked)
+    (stocked.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'old-model')
+    stocked.import_stock()
+    assert json.loads(stocked.active_model_file.read_text())['id'] == 'le_mans_gt3'
 
   def test_existing_stock_dir_still_repairs_stale_tracker(self, stocked):
     assert stocked.import_stock() is True

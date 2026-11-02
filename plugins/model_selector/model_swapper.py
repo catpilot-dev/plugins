@@ -200,20 +200,35 @@ class ModelSwapper:
         except OSError:
             return False
 
+    def _tracker_id(self) -> str | None:
+        """The id the active tracker names, or None if it is missing or unreadable."""
+        try:
+            return json.loads(self.active_model_file.read_text()).get('id') or None
+        except (OSError, ValueError, AttributeError):
+            return None
+
     def _tracker_is_stale(self) -> bool:
         """True when the tracker is missing or names a model dir lacking any of onnx_files.
 
         A tracker naming a legacy split-model directory is stale: the git tree's
         stock file is what actually runs, so the tracker must not claim otherwise.
         """
-        try:
-            model_id = json.loads(self.active_model_file.read_text()).get('id')
-        except (OSError, ValueError, AttributeError):
-            return True
+        model_id = self._tracker_id()
         if not model_id:
             return True
         model_dir = self.models_dir / model_id
         return not all((model_dir / f).exists() for f in self.onnx_files)
+
+    def _active_is_shipped(self, sha: str, size: int) -> bool:
+        """True when the active file is byte-identical to the shipped one.
+
+        Size is checked first so a foreign file is rejected without reading it whole.
+        """
+        active = self.ACTIVE_DIR / self.onnx_files[0]
+        try:
+            return active.stat().st_size == size and self._cached_sha256(active) == sha
+        except OSError:
+            return False
 
     def import_stock(self) -> bool:
         """Import the release's own ONNX as the stock model. Returns True if it created the stock dir.
@@ -222,9 +237,11 @@ class ModelSwapper:
         shipped size and sha256. The tracker is irrelevant to that decision, so
         a device that swapped on an earlier release still gets its baseline. A
         mismatching file (a swapped model, an LFS pointer) is never labeled as
-        the release default. Size is checked first so a foreign file is
-        rejected without reading it whole. Whenever the stock dir exists, a
-        stale tracker is rewritten to name it.
+        the release default. Whenever the stock dir exists, a stale tracker is
+        rewritten to name it. A tracker naming a model with no recorded sha256
+        (a 0.11.1-era directory with the same ONNX filename) cannot be checked
+        against the active file; it is stale too when that file is provably
+        stock, since stock is then what runs.
         """
         entry = catalog.baseline_entry(self.model_type)
         if not entry or entry.get('source') != 'shipped':
@@ -236,15 +253,15 @@ class ModelSwapper:
         dest = self.models_dir / entry['id']
         created = False
         if not dest.exists():
-            active = self.ACTIVE_DIR / self.onnx_files[0]
-            try:
-                if active.stat().st_size != size or self._cached_sha256(active) != sha:
-                    return False
-            except OSError:
+            if not self._active_is_shipped(sha, size):
                 return False
             self._build_stock_dir(entry, dest)
             created = True
-        if self._tracker_is_stale():
+        stale = self._tracker_is_stale()
+        if not stale and self.expected_sha256(self._tracker_id()) is None:
+            # Already proven if the dir was just built; else prove it now (size first, hash cached).
+            stale = created or self._active_is_shipped(sha, size)
+        if stale:
             self.active_model_file.write_text(json.dumps({
                 'id': entry['id'],
                 'name': entry.get('name', entry['id']),
