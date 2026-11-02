@@ -339,23 +339,61 @@ class TestImportStock:
       (sw.ACTIVE_DIR / f).write_bytes(b'shipped-onnx')
     return sw
 
-  def test_imports_when_no_tracker(self, stocked):
+  def test_imports_when_active_matches_shipped_hash(self, stocked):
     assert stocked.import_stock() is True
     dest = stocked.models_dir / 'stock_0.11.2'
     assert (dest / 'driving_supercombo.onnx').read_bytes() == b'shipped-onnx'
     assert json.loads((dest / 'model_info.json').read_text())['source'] == 'shipped'
 
-  def test_is_idempotent(self, stocked):
-    assert stocked.import_stock() is True
-    assert stocked.import_stock() is False
-
-  def test_skips_when_tracker_exists(self, stocked):
+  def test_imports_even_when_a_tracker_exists(self, stocked):
     stocked.active_model_file.write_text(json.dumps({'id': 'something_else'}))
+    assert stocked.import_stock() is True
+
+  def test_skips_when_active_bytes_differ(self, stocked):
+    (stocked.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'swapped-onnx')  # same length, other bytes
     assert stocked.import_stock() is False
     assert not (stocked.models_dir / 'stock_0.11.2').exists()
 
-  def test_skips_when_active_dir_incomplete(self, stocked):
-    (stocked.ACTIVE_DIR / 'driving_supercombo.onnx').unlink()
+  def test_pointer_sized_file_is_not_imported(self, stocked):
+    (stocked.ACTIVE_DIR / 'driving_supercombo.onnx').write_text('version https://git-lfs.github.com/spec/v1\noid sha256:65a0\nsize 60918562\n')
+    assert stocked.import_stock() is False
+
+  def test_wrong_size_is_rejected_without_hashing(self, stocked, monkeypatch):
+    (stocked.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'x' * 99)
+    monkeypatch.setattr(stocked, '_file_sha256', MagicMock(side_effect=AssertionError('hashed')))
+    assert stocked.import_stock() is False
+
+  def test_stale_legacy_tracker_is_rewritten_to_stock(self, stocked):
+    legacy = stocked.models_dir / 'pop_model_37727'; legacy.mkdir()
+    (legacy / 'driving_vision.onnx').write_bytes(b'v')
+    stocked.active_model_file.write_text(json.dumps({'id': 'pop_model_37727', 'name': 'POP'}))
+    stocked.import_stock()
+    assert json.loads(stocked.active_model_file.read_text())['id'] == 'stock_0.11.2'
+
+  def test_missing_tracker_is_written_to_stock(self, stocked):
+    stocked.import_stock()
+    assert json.loads(stocked.active_model_file.read_text())['id'] == 'stock_0.11.2'
+
+  def test_tracker_naming_a_loadable_model_is_kept(self, stocked):
+    good = stocked.models_dir / 'good_model'; good.mkdir()
+    (good / 'driving_supercombo.onnx').write_bytes(b'onnx')
+    stocked.active_model_file.write_text(json.dumps({'id': 'good_model'}))
+    stocked.import_stock()
+    assert json.loads(stocked.active_model_file.read_text())['id'] == 'good_model'
+
+  def test_existing_stock_dir_still_repairs_stale_tracker(self, stocked):
+    assert stocked.import_stock() is True
+    stocked.active_model_file.unlink()
+    assert stocked.import_stock() is False
+    assert json.loads(stocked.active_model_file.read_text())['id'] == 'stock_0.11.2'
+
+  def test_no_baseline_for_version_imports_nothing(self, stocked, tmp_path):
+    (tmp_path / 'version.h').write_text('#define COMMA_VERSION "0.11.3"\n')
+    assert stocked.import_stock() is False
+    assert not stocked.active_model_file.exists()
+
+  def test_is_idempotent(self, stocked):
+    assert stocked.import_stock() is True
     assert stocked.import_stock() is False
 
   def test_imported_stock_is_listed_and_verified(self, stocked):

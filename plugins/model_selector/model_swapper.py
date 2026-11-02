@@ -5,6 +5,7 @@ Handles two independent model types:
 - Driving Models: driving_supercombo.onnx (compiled to driving_tinygrad.pkl)
 - Driver Monitoring Models: dmonitoring_model.onnx
 """
+import hashlib
 import os
 import shutil
 import json
@@ -141,26 +142,68 @@ class ModelSwapper:
 
         return models
 
-    def import_stock(self) -> bool:
-        """Import the release's own ONNX as the stock model. Returns True if imported.
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        """SHA-256 of a file, read in 1 MiB chunks (the ONNX is ~60 MB)."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            while chunk := f.read(1 << 20):
+                h.update(chunk)
+        return h.hexdigest()
 
-        Only runs while the active tracker is absent. An absent tracker proves no
-        swap has ever happened, so ACTIVE_DIR still holds the files the release
-        shipped; once a swap has run they could be any model, and labeling those
-        as the release default would put an untested model behind a trusted name.
+    def _tracker_is_stale(self) -> bool:
+        """True when the tracker is missing or names a model dir lacking any of onnx_files.
+
+        A tracker naming a legacy split-model directory is stale: the git tree's
+        stock file is what actually runs, so the tracker must not claim otherwise.
+        """
+        try:
+            model_id = json.loads(self.active_model_file.read_text()).get('id')
+        except (OSError, ValueError, AttributeError):
+            return True
+        if not model_id:
+            return True
+        model_dir = self.models_dir / model_id
+        return not all((model_dir / f).exists() for f in self.onnx_files)
+
+    def import_stock(self) -> bool:
+        """Import the release's own ONNX as the stock model. Returns True if it created the stock dir.
+
+        The proof is byte identity: the active file must match the catalog's
+        shipped size and sha256. The tracker is irrelevant to that decision, so
+        a device that swapped on an earlier release still gets its baseline. A
+        mismatching file (a swapped model, an LFS pointer) is never labeled as
+        the release default. Size is checked first so a foreign file is
+        rejected without reading it whole. Whenever the stock dir exists, a
+        stale tracker is rewritten to name it.
         """
         entry = catalog.baseline_entry(self.model_type)
         if not entry or entry.get('source') != 'shipped':
             return False
-        if self.active_model_file.exists():
+        sha, size = entry.get('sha256'), entry.get('size')
+        if not sha or not size:
             return False
 
         dest = self.models_dir / entry['id']
-        if dest.exists():
-            return False
-        if not all((self.ACTIVE_DIR / f).exists() for f in self.onnx_files):
-            return False
+        created = False
+        if not dest.exists():
+            active = self.ACTIVE_DIR / self.onnx_files[0]
+            try:
+                if active.stat().st_size != size or self._file_sha256(active) != sha:
+                    return False
+            except OSError:
+                return False
+            self._build_stock_dir(entry, dest)
+            created = True
+        if self._tracker_is_stale():
+            self.active_model_file.write_text(json.dumps({
+                'id': entry['id'],
+                'name': entry.get('name', entry['id']),
+                'tinygrad': self.get_tinygrad_commit(),
+            }))
+        return created
 
+    def _build_stock_dir(self, entry: dict, dest: Path) -> None:
         # Build in a _-prefixed temp dir (list_models skips those), then rename,
         # so an interrupted copy can never present as a complete model. The
         # name includes our pid: this and on_health_check's periodic poll can
@@ -185,7 +228,6 @@ class ModelSwapper:
             shutil.rmtree(tmp, ignore_errors=True)
             raise
         tmp.rename(dest)
-        return True
 
     def resolve_model_id(self, name_or_id: str) -> str:
         """
