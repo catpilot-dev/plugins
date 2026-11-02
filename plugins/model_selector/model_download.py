@@ -310,6 +310,17 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
             dest.with_name(dest.name + '.part').unlink(missing_ok=True)
             failed_files.append(filename)
 
+    if failed_files:
+        # Never leave a directory that check_updates counts as installed.
+        # A directory that already holds an ONNX file (earlier install) stays.
+        if not any(output_dir.glob('*.onnx')):
+            import shutil
+            shutil.rmtree(output_dir, ignore_errors=True)
+        print(f"⚠️  Download completed with {len(failed_files)} failures:")
+        for f in failed_files:
+            print(f"  - {f}")
+        return 1
+
     # Create model_info.json with type information
     info_file = output_dir / 'model_info.json'
     info_data = {
@@ -333,12 +344,7 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
     print()
     print("=" * 70)
 
-    if failed_files:
-        print(f"⚠️  Download completed with {len(failed_files)} failures:")
-        for f in failed_files:
-            print(f"  - {f}")
-    else:
-        print(f"✅ Download complete!")
+    print(f"✅ Download complete!")
 
     print(f"📍 Location: {output_dir}")
     print(f"📄 Metadata: {info_file}")
@@ -353,7 +359,7 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
     print(f"  2. Swap: python model_swapper.py --type {model_type.value} swap {model_id}")
     print("=" * 70)
 
-    return 0 if not failed_files else 1
+    return 0
 
 
 def list_available(model_type: ModelType = None):

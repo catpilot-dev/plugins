@@ -170,6 +170,25 @@ class TestDirectDownload:
     d = dl_env[0] / 'models' / 'driving' / 'pop_verified'
     assert not (d / 'driving_supercombo.onnx').exists()
 
+  def test_midstream_failure_leaves_no_part_or_model(self, dl_env, monkeypatch):
+    class Resp:
+      def raise_for_status(self): pass
+      def iter_content(self, chunk_size=None):
+        yield b'pop'
+        raise ConnectionError('cut')
+    monkeypatch.setattr(md.requests, 'get', lambda *a, **k: Resp())
+    assert md.download_model(md.ModelType.DRIVING, 'pop_verified') == 1
+    d = dl_env[0] / 'models' / 'driving' / 'pop_verified'
+    assert not list(d.glob('*.part')) and not (d / 'driving_supercombo.onnx').exists()
+
+  def test_failed_download_is_offered_again_by_check_updates(self, dl_env, monkeypatch, capsys):
+    fake_http(monkeypatch, b'tampered!')
+    assert md.download_model(md.ModelType.DRIVING, 'pop_verified') == 1
+    capsys.readouterr()
+    md.check_updates()
+    ids = {m['id'] for m in json.loads(capsys.readouterr().out)['driving']}
+    assert 'pop_verified' in ids
+
   def test_check_updates_offers_verified_converted_entry(self, dl_env, capsys):
     md.check_updates()
     ids = {m['id'] for m in json.loads(capsys.readouterr().out)['driving']}
