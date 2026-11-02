@@ -133,6 +133,104 @@ def test_arc_bypassed_during_lane_change():
   assert telem['arc_on'] is False
 
 
+# --- Lane-change onset hand-over (2026-11-02, routes 50f-513) -------------------
+# The driver's nudge yaws the car toward the target lane, so for a tick or two
+# after laneChangeStarting the pre-desire model plans a correction AWAY from the
+# lane change. The instant raw switch exposed that (513 seg 2: -0.64e-3 vs the
+# Arc's -0.17e-3 on a right change) and a decision in that window stepped the
+# 1.2 Nm lane-change cap the wrong way (32/92 LCs >= 0.5 Nm, wheel p90 7.6 deg).
+# preLaneChange is plain lane keeping (no desire yet): the Arc stays on.
+
+def _lc_mv(state, direction, k_arc=0.0):
+  m = _mv_plan(_circle_plan(k_arc))
+  m.meta = SimpleNamespace(laneChangeState=state, laneChangeDirection=direction)
+  return m
+
+
+def _settle(a, k=0.0, ticks=300):
+  for _ in range(ticks):
+    a.update(k, _lc_mv('off', 'none', k), 25.0, False)
+
+
+def test_pre_lane_change_keeps_the_arc():
+  a = LaneAnchor(AnchorConfig(arc_horizon=1.5))
+  _settle(a)
+  out, t = a.update(-0.0006, _lc_mv('preLaneChange', 'right'), 25.0, True)
+  assert t['arc_on'] is True
+  assert abs(out) < 1e-9                  # the Arc (0), not the raw -0.6e-3
+
+
+def test_lane_change_start_holds_arc_while_raw_points_away():
+  a = LaneAnchor(AnchorConfig(arc_horizon=1.5))
+  _settle(a)
+  out, t = a.update(-0.0006, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+  assert abs(out) < 1e-9
+  assert t['arc_on'] is True and t['lc_hold'] is True
+
+
+def test_hands_over_to_raw_once_it_turns_toward_the_change_and_stays():
+  a = LaneAnchor(AnchorConfig(arc_horizon=1.5))
+  _settle(a)
+  a.update(-0.0006, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+  out, t = a.update(0.001, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+  assert out == 0.001                     # bit-identical raw from the hand-over
+  assert t['arc_on'] is False and t['lc_hold'] is False
+  out, t = a.update(-0.0005, _lc_mv('laneChangeFinishing', 'right'), 25.0, True)
+  assert out == -0.0005                   # counter-lobe passes: no re-hold mid-change
+
+
+def test_left_change_mirrors():
+  a = LaneAnchor(AnchorConfig(arc_horizon=1.5))
+  _settle(a)
+  out, t = a.update(0.0006, _lc_mv('laneChangeStarting', 'left'), 25.0, True)
+  assert abs(out) < 1e-9 and t['lc_hold'] is True
+  out, t = a.update(-0.001, _lc_mv('laneChangeStarting', 'left'), 25.0, True)
+  assert out == -0.001 and t['lc_hold'] is False
+
+
+def test_handover_needs_the_margin_toward_the_change():
+  a = LaneAnchor(AnchorConfig(arc_horizon=1.5))
+  _settle(a)
+  m = _anchor.LC_HANDOVER_K
+  _, t = a.update(0.5 * m, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+  assert t['lc_hold'] is True             # noise-sized lean toward the change: still the Arc
+  out, t = a.update(1.5 * m, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+  assert out == 1.5 * m and t['lc_hold'] is False
+
+
+def test_hold_times_out_to_raw():
+  a = LaneAnchor(AnchorConfig(arc_horizon=1.5))
+  _settle(a)
+  n = int(round(_anchor.LC_HANDOVER_MAX_S / _anchor.DT_CTRL))
+  for _ in range(n):
+    out, t = a.update(-0.0006, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+    assert t['lc_hold'] is True
+  out, t = a.update(-0.0006, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+  assert out == -0.0006 and t['lc_hold'] is False
+
+
+def test_no_direction_hands_over_at_once():
+  a = LaneAnchor(AnchorConfig(arc_horizon=1.5))
+  _settle(a)
+  out, t = a.update(-0.0006, _lc_mv('laneChangeStarting', 'none'), 25.0, True)
+  assert out == -0.0006 and t['lc_hold'] is False
+
+
+def test_each_lane_change_rearms_the_hold():
+  a = LaneAnchor(AnchorConfig(arc_horizon=1.5))
+  _settle(a)
+  a.update(-0.0006, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+  a.update(0.001, _lc_mv('laneChangeStarting', 'right'), 25.0, True)      # handed over
+  _settle(a)
+  out, t = a.update(-0.0006, _lc_mv('laneChangeStarting', 'right'), 25.0, True)
+  assert abs(out) < 1e-9 and t['lc_hold'] is True
+
+
+def test_lane_change_hold_constants():
+  assert _anchor.LC_HANDOVER_K == pytest.approx(0.2e-3)
+  assert _anchor.LC_HANDOVER_MAX_S == pytest.approx(1.0)
+
+
 # --- Speed- and curvature-dependent arc look-ahead (2026-10-12) ---------------
 # Longer look-ahead removes more wander on straights at every speed (offline
 # 4d4-4dc: 75-95 km/h arc/raw 0.61 at 1.5 s -> 0.47 at 2.5 s) but softens
@@ -223,7 +321,7 @@ def test_telemetry_exact_key_set():
   a = LaneAnchor(AnchorConfig())
   _, telem = a.update(0.002, _mv_plan(_circle_plan(0.006)), 20.0, False)
   assert set(telem) == {'kappa_in', 'kappa_ref', 'kappa_arc', 'arc_on', 'arc_h', 'k_ahead', 'v_ego',
-                        'line_l', 'line_r', 'prob_l', 'prob_r'}
+                        'line_l', 'line_r', 'prob_l', 'prob_r', 'lc_hold'}
 
 
 def test_update_has_no_lat_delay_parameter():
