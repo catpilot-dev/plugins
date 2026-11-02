@@ -27,6 +27,10 @@ _SWAPPERS = {
   'dm': ModelSwapper(ModelType.DM),
 }
 
+# Per-type "active file no longer matches the selected model", set by
+# on_health_check (plugind) so show() never hashes on the UI thread.
+_DRIFT: dict[str, bool] = {}
+
 MODEL_TYPE_LABELS = {
   'driving': 'Driving Model',
   'dm': 'Driver Monitoring',
@@ -210,6 +214,8 @@ def on_software_settings_extend(default, layout):
               # appears and every row in the list is greyed out with no
               # explanation. Say so here instead of leaving a dead end.
               active_name = f'{active_name}, none tested for this openpilot version'
+          if _DRIFT.get(model_type):
+            active_name += ' — active file differs, re-activate'
           self._model_btns[model_type].action_item.set_value(active_name)
         except Exception:
           pass
@@ -439,10 +445,13 @@ def on_health_check(acc, **kwargs):
     try:
       active_id = swapper.get_active_model()
       if active_id and active_id != 'unknown':
+        _DRIFT[model_type_key] = swapper.active_file_matches(active_id) is False
         count = swapper.cache_compiled_pkl(active_id)
         if count > 0:
           from openpilot.common.swaglog import cloudlog
           cloudlog.info(f"model_selector: cached {count} pkl files for {model_type_key}/{active_id}")
+      else:
+        _DRIFT[model_type_key] = False
     except Exception:
       pass
   return {**acc, "model_selector": {"status": "ok"}}

@@ -435,3 +435,52 @@ class TestImportStock:
     assert stocked.import_stock() is True
     # The pid-qualified temp path must never survive as itself post-rename.
     assert not (stocked.models_dir / tmp_name).exists()
+
+
+class TestDrift:
+  @pytest.fixture
+  def drifty(self, swapper_mod, tmp_path, monkeypatch):
+    cat = _point_catalog_at(tmp_path, monkeypatch, CATALOG_FIXTURE)
+    sw = _build_swapper(swapper_mod, tmp_path, monkeypatch)
+    d = sw.models_dir / 'pop_supercombo_37727'; d.mkdir()
+    (d / 'driving_supercombo.onnx').write_bytes(b'pop-bytes')
+    (d / 'model_info.json').write_text(json.dumps({'name': 'POP', 'sha256': hashlib.sha256(b'pop-bytes').hexdigest()}))
+    return sw, cat
+
+  def test_matches_when_active_is_the_model(self, drifty):
+    sw, _ = drifty
+    (sw.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'pop-bytes')
+    assert sw.active_file_matches('pop_supercombo_37727') is True
+
+  def test_false_when_deploy_put_stock_back(self, drifty):
+    sw, _ = drifty
+    (sw.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'shipped-onnx')
+    assert sw.active_file_matches('pop_supercombo_37727') is False
+
+  def test_active_file_matches_false_for_pointer(self, drifty):
+    sw, _ = drifty
+    (sw.ACTIVE_DIR / 'driving_supercombo.onnx').write_text('version https://git-lfs.github.com/spec/v1\n')
+    assert sw.active_file_matches('pop_supercombo_37727') is False
+
+  def test_missing_active_file_is_false(self, drifty):
+    sw, _ = drifty
+    (sw.ACTIVE_DIR / 'driving_supercombo.onnx').unlink(missing_ok=True)
+    assert sw.active_file_matches('pop_supercombo_37727') is False
+
+  def test_shipped_expectation_comes_from_catalog(self, drifty):
+    sw, _ = drifty
+    assert sw.expected_sha256('stock_0.11.2') == hashlib.sha256(b'shipped-onnx').hexdigest()
+
+  def test_none_without_expectation(self, drifty):
+    sw, _ = drifty
+    d = sw.models_dir / 'old'; d.mkdir(); (d / 'model_info.json').write_text('{}')
+    assert sw.active_file_matches('old') is None
+
+  def test_hash_is_cached_by_size_and_mtime(self, drifty, monkeypatch):
+    sw, _ = drifty
+    (sw.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'pop-bytes')
+    calls = []
+    real = sw._file_sha256
+    monkeypatch.setattr(sw, '_file_sha256', lambda p: calls.append(p) or real(p))
+    sw.active_file_matches('pop_supercombo_37727'); sw.active_file_matches('pop_supercombo_37727')
+    assert len(calls) == 1

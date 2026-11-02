@@ -96,6 +96,7 @@ class ModelSwapper:
         self.onnx_files = self.config['onnx_files']
         self.compiled_file = self.config['compiled_file']
         self.display_name = self.config['display_name']
+        self._hash_cache: dict[Path, tuple[int, float, str]] = {}
 
     def _compiled_files(self, directory: Path) -> list[str]:
         """Return [compiled_file] if this model's compiled artefact is in directory, else []."""
@@ -151,6 +152,54 @@ class ModelSwapper:
                 h.update(chunk)
         return h.hexdigest()
 
+    def _cached_sha256(self, path: Path) -> str:
+        """sha256 of a file, re-read only when its size or mtime changes.
+
+        The health check polls every few seconds; an unchanged ~60 MB file
+        must not be re-hashed each time. Raises OSError if the file is missing.
+        """
+        cache = getattr(self, '_hash_cache', None)
+        if cache is None:
+            cache = self._hash_cache = {}
+        st = path.stat()
+        hit = cache.get(path)
+        if hit and hit[0] == st.st_size and hit[1] == st.st_mtime:
+            return hit[2]
+        digest = self._file_sha256(path)
+        cache[path] = (st.st_size, st.st_mtime, digest)
+        return digest
+
+    def expected_sha256(self, model_id: str) -> str | None:
+        """The sha256 the active file should have if model_id is active, or None.
+
+        Prefers the model dir's model_info.json, else the catalog hash of a
+        shipped entry.
+        """
+        try:
+            info = json.loads((self.models_dir / model_id / 'model_info.json').read_text())
+            if isinstance(info, dict) and info.get('sha256'):
+                return info['sha256']
+        except (OSError, ValueError):
+            pass
+        entry = catalog.entry(self.model_type, model_id)
+        if entry and entry.get('source') == 'shipped':
+            return entry.get('sha256') or None
+        return None
+
+    def active_file_matches(self, model_id: str) -> bool | None:
+        """Whether the file the build compiles is the selected model's file.
+
+        None when no expectation exists; False when the active file is
+        missing or differs (a deploy or updater put another file back).
+        """
+        expected = self.expected_sha256(model_id)
+        if not expected:
+            return None
+        try:
+            return self._cached_sha256(self.ACTIVE_DIR / self.onnx_files[0]) == expected
+        except OSError:
+            return False
+
     def _tracker_is_stale(self) -> bool:
         """True when the tracker is missing or names a model dir lacking any of onnx_files.
 
@@ -189,7 +238,7 @@ class ModelSwapper:
         if not dest.exists():
             active = self.ACTIVE_DIR / self.onnx_files[0]
             try:
-                if active.stat().st_size != size or self._file_sha256(active) != sha:
+                if active.stat().st_size != size or self._cached_sha256(active) != sha:
                     return False
             except OSError:
                 return False
