@@ -11,9 +11,12 @@ as a single `driving_supercombo.onnx` whose history queues live inside the graph
 0.11.2 cannot load any split vision+policy model, comma has published no other small model in the new format, and the
 comma-three small model appears frozen. Without this work the rebase silently replaces POP with CD210.
 
-The spike proved the conversion is trivial for POP specifically: POP shares CD210's vision checkpoint byte for byte and
-differs only in a same-architecture policy, so a POP supercombo is the stock 0.11.2 file with 50 policy weight arrays
-replaced. Verified exact (policy half equals POP's own policy; vision half and queue states bit-identical to stock) and
+The spike showed the conversion is small for POP specifically: POP shares CD210's vision backbone byte for byte and
+differs in a same-architecture policy plus a retrained hidden-state summarizer head (6 weights + 6 biases; CD210 ties that
+head to its internal policy summarizer, POP does not). A POP supercombo is therefore the stock 0.11.2 file with the policy
+weights replaced and the summarizer head transplanted (weights in place, biases as new dedicated initializers because the
+stock file shares them). Correction 2026-11-02: the spike's first file replaced only the policy and ran it on CD210's
+features; execution caught it. Verified exact (policy half equals POP's own policy; vision half and queue states bit-identical to stock) and
 compiles through the stock tinygrad path unchanged.
 
 ## Goals
@@ -141,15 +144,18 @@ LFS. The catalog URL is the asset's permanent download URL.
 (the tag's `driving_supercombo.onnx`), legacy `driving_vision.onnx` + `driving_policy.onnx`, output path. Behaviour,
 taken from the spike script `build_pop_supercombo.py` and `validate_swap.py`:
 
-1. Refuse unless every weight array of the legacy vision is byte-identical to one in the template (same vision
-   checkpoint) — otherwise print the two checkpoint ids and stop.
+1. Refuse unless every weight array of the legacy vision is byte-identical to one in the template, except the top-level
+   `summarizer.*` hidden-state head, which must align 1:1 (op, shape) with the template's head — otherwise print the two
+   checkpoint ids and stop. Transplant the head: weights in place; biases as new dedicated initializers with the head's
+   Gemms rewired, since the template shares its bias initializers with the internal policy summarizer.
 2. Build the fp16 weight sequence of the template's embedded policy and of the legacy policy in consuming-node order;
    refuse unless both have the same length and the same (op type, shape) at every position.
 3. Replace, in the template, every initializer byte-identical to a template-policy array with the aligned legacy array;
    set `model_checkpoint` to `<vision>/<legacy policy>`; keep `output_slices`; set `producer_name` to identify the tool;
    `onnx.checker.check_model`.
-4. `--verify` (default on): with onnxruntime, (a) vision slice, hidden slice and all `next_state_*` equal the template's
-   outputs bit for bit on random inputs; (b) the policy slice equals the legacy policy run standalone on the glue's
+4. `--verify` (default on): with onnxruntime, (a) every vision slice including `hidden_state` equals the legacy vision
+   model run standalone on the glue's warped frames, bit for bit, and every vision slice except `hidden_state` equals the
+   template's (backbone untouched); (b) the policy slice equals the legacy policy run standalone on the glue's
    policy-input tensors (found as non-initializer tensors consumed by `model/p_*` nodes but produced outside them),
    max abs diff 0; (c) ten recurrent steps stay finite.
 5. Print sha256, size, and a ready-to-paste catalog `files` object.

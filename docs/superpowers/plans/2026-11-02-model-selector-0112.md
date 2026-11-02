@@ -16,7 +16,7 @@
 - Tree paths at 0.11.2: `ACTIVE_DIR = /data/openpilot/openpilot/selfdrive/modeld/models`, version at `/data/openpilot/openpilot/common/version.h`.
 - Driving model is exactly `driving_supercombo.onnx`; its compiled artefact is `driving_tinygrad.pkl`. DM is `dmonitoring_model.onnx` / `dmonitoring_model_tinygrad.pkl`. Nothing else in `ACTIVE_DIR` may be deleted or overwritten by the plugin (`big_*`, `*_warp_*` files are shared or git-tracked).
 - Shipped 0.11.2 hashes (from the tag's LFS pointers): driving `65a08adc31d5c456219687d99b7bf5e44d61dae2d49ea67850e76105c7248cce`, 60918562 bytes; dm `dee5a294e8afaacc9295ac5d100e00733ecac278e79264b96331e40a3ede1b04`, 7844499 bytes.
-- POP converted file (spike reference, the tool must reproduce it byte for byte): sha256 `147f8c4e95ba4430bdbb2bc3e62f61ee8411b44671b69d0343bb942c5b63dd49`, 60918575 bytes; checkpoint `6a7d09ad-bcc9-43bc-916d-29287e60cee2/200/05a58a51-e0e3-4e9b-8e27-e644685f2c50/100`.
+- POP converted file: produced by the tool in Task 6 (vision backbone from the template, POP's retrained hidden-state summarizer head transplanted, POP's policy swapped in); checkpoint `6a7d09ad-bcc9-43bc-916d-29287e60cee2/200/05a58a51-e0e3-4e9b-8e27-e644685f2c50/100`. Its sha256 and size are whatever the tool prints; Task 7 copies them from the Task 6 report. (Corrected 2026-11-02 during execution: the spike's file `147f8c4e…` ran POP's policy on CD210's features — POP's `summarizer.*` head differs from CD210's — and is superseded.)
 - Catalog gate semantics unchanged: offered/activated only when `verified_on` contains the running version; exactly one `baseline_for` per type per version; the unlock marker opens the CLI only, never the UI.
 - Plugin UI imports stay lazy inside hook functions. Two-space indentation in plugin code (existing style); the tool follows the same.
 - Test command: `cd /home/oxygen/catpilot-dev/plugins && PYTHONPATH=. uv run pytest plugins/model_selector/tests .github/scripts/tests/test_model_watch.py -q` (baseline before Task 1: 86 + 35 passed). Do not use the catpilot venv's python: it can import `openpilot.selfdrive.plugins.manifest`, which makes two `TestOpenpilotVersion` fallback tests fail for reasons unrelated to this work.
@@ -531,7 +531,7 @@ cd /home/oxygen/catpilot-dev/plugins && S=/home/oxygen/catpilot-dev/spike_pop_su
 $S/.venv/bin/python tools/legacy_policy_swap.py $S/models/sc0112/driving_supercombo.onnx $S/models/pop/driving_vision.onnx $S/models/pop/driving_policy.onnx $S/out/pop_supercombo_tool.onnx
 sha256sum $S/out/pop_supercombo_tool.onnx $S/out/pop_supercombo.onnx
 ```
-Expected: verify passes; both sha256 lines read `147f8c4e95ba4430bdbb2bc3e62f61ee8411b44671b69d0343bb942c5b63dd49`; size 60918575. If the hashes differ, diff the two files' `metadata_props` and `producer_*` fields; weights must not differ.
+Expected (corrected during execution): verify passes with the summarizer transplanted; the tool prints the file's sha256 and size — record them for Task 7. Against the old spike file every vision slice except `hidden_state` is identical and `hidden_state` differs.
 
 - [ ] **Step 6: Commit**
 
@@ -564,7 +564,7 @@ Expected: exit 0, a ~70 MB pkl.
 
 ```bash
 cd /home/oxygen/catpilot-dev/plugins && cp /home/oxygen/catpilot-dev/spike_pop_supercombo/out/pop_supercombo_tool.onnx /tmp/pop_supercombo_37727.onnx
-gh release create models-0.11.2 /tmp/pop_supercombo_37727.onnx --repo catpilot-dev/plugins --title "Models for catpilot 0.11.2" --notes "pop_supercombo_37727.onnx: POP driving model (#37727) converted to the 0.11.2 supercombo format by tools/legacy_policy_swap.py. sha256 147f8c4e95ba4430bdbb2bc3e62f61ee8411b44671b69d0343bb942c5b63dd49, 60918575 bytes. Checkpoint 6a7d09ad-bcc9-43bc-916d-29287e60cee2/200/05a58a51-e0e3-4e9b-8e27-e644685f2c50/100."
+gh release create models-0.11.2 /tmp/pop_supercombo_37727.onnx --repo catpilot-dev/plugins --title "Models for catpilot 0.11.2" --notes "pop_supercombo_37727.onnx: POP driving model (#37727) converted to the 0.11.2 supercombo format by tools/legacy_policy_swap.py. sha256 <from the Task 6 tool run>, <size> bytes. Checkpoint 6a7d09ad-bcc9-43bc-916d-29287e60cee2/200/05a58a51-e0e3-4e9b-8e27-e644685f2c50/100."
 gh release view models-0.11.2 --repo catpilot-dev/plugins --json assets --jq '.assets[].url'
 ```
 Expected: one asset URL of the form `https://github.com/catpilot-dev/plugins/releases/download/models-0.11.2/pop_supercombo_37727.onnx`. `gh release create` publishes; stop and ask the user before running it if they have not confirmed in this session.
@@ -578,7 +578,7 @@ Expected: one asset URL of the form `https://github.com/catpilot-dev/plugins/rel
     assert pop['source'] == 'converted' and pop['verified_on'] == []
     f = pop['files'][0]
     assert f['name'] == 'driving_supercombo.onnx'
-    assert (f['sha256'], f['size']) == ('147f8c4e95ba4430bdbb2bc3e62f61ee8411b44671b69d0343bb942c5b63dd49', 60918575)
+    assert (f['sha256'], f['size']) == (<sha256 printed by the Task 6 tool run>, <size printed by the Task 6 tool run>)
     assert f['url'].startswith('https://github.com/catpilot-dev/plugins/releases/download/models-0.11.2/')
 ```
 Run: `PYTHONPATH=. uv run pytest plugins/model_selector/tests/test_catalog.py -q`. Expected: FAIL, then add the entry (`name` "POP model", `date` "2026-03-24", `pr` "#37727", `converted_from` `{commit: "12f1be19cc", vision: "6a7d09ad-bcc9-43bc-916d-29287e60cee2/200", policy: "05a58a51-e0e3-4e9b-8e27-e644685f2c50/100"}` with the full 40-char commit from `git -C /home/oxygen/catpilot-dev/catpilot rev-parse 12f1be19cc`, `notes` "POP driving model converted to the 0.11.2 supercombo by tools/legacy_policy_swap.py; test drive on 0.11.2 pending"), rerun → PASS.
