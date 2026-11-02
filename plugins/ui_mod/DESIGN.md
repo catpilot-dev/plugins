@@ -37,24 +37,22 @@ installed/removed plugins appear). The rows, in order:
 1. **Personality** — `multiple_button_item`, writes the stock
    `LongitudinalPersonality` param; disabled when the car has no longitudinal
    control.
-2. **Lane Keeping** — only if `lane_keeping` is installed and not
-   `.disabled`; toggles the plugin's `LaneKeepEnable` param.
-3. **Lane Centering in Turns** — if `lane_centering` present; toggles
+2. **Lane Centering in Turns** — if `lane_centering` present; toggles
    `LaneCenteringEnabled`.
-4. **Speed Limit Sign**, **Road Info**, **Mapd/OSM Data Integration** — if
+3. **Speed Limit Sign**, **Road Info**, **Mapd/OSM Data Integration** — if
    `speedlimitd` present; toggle `speedlimitd`'s `ShowSpeedLimitSign` and
    `OsmDataIntegration`, and ui_mod's own `RoadInfoOverlay`. The OSM toggle
    can add a conditional missing-tiles warning row directly under it — see
    below.
-5. **Look Ahead Steering** — if `look_ahead` present; toggles
+4. **Look Ahead Steering** — if `look_ahead` present; toggles
    `LookAheadEnabled`.
-6. **Cruise Speed Memory** and **Consecutive Lane Changes** — display-only
+5. **Cruise Speed Memory** and **Consecutive Lane Changes** — display-only
    rows (rendered disabled; describe catpilot core behavior, no param
    written).
-7. **Live Torque** / **Lateral Delay** — status text rows, only for
+6. **Live Torque** / **Lateral Delay** — status text rows, only for
    torque-tuned brands in `torqued.ALLOWED_CARS`; poll `liveTorqueParameters`
    / `liveDelay` (10 s cache).
-8. **Vehicle-specific rows** — appended by car plugins, see below.
+7. **Vehicle-specific rows** — appended by car plugins, see below.
 
 A heading strip (brand icon + `CP.carFingerprint`) is drawn above the scroller
 when a car is fingerprinted.
@@ -142,13 +140,6 @@ resized to fit the button. Tapping toggles the stock `ExperimentalMode` param
 (only when `ExperimentalModeConfirmed` and the car has longitudinal control),
 with a 2 s visual hold on the new state.
 
-**Green ring = lane keeping working.** Each `_update_state`, the button reads
-the `lane_keeping` topic off the plugin bus (`PluginSub(['lane_keeping'])`,
-live) and, as a replay fallback, from `pluginBusLog` entries. `state ==
-'anchor'` means the driver-side line is trusted and the position loop is live;
-the ring is drawn (green, `RING_WIDTH` 12 px) only when that is true **and**
-openpilot is `enabled`.
-
 ## Road info overlay (`road_info_overlay.py`)
 
 `on_render_overlay` draws the current road identifier (highway ref, e.g.
@@ -179,8 +170,6 @@ start/end markers, and a small URL caption.
 
 | Source | Where | Used for |
 |---|---|---|
-| `lane_keeping` (plugin bus) | `exp_button.py` | `state == 'anchor'` → green ring |
-| `pluginBusLog` (cereal) | `exp_button.py` | replay fallback for `lane_keeping` |
 | `speedLimitState` (plugin bus) | `road_info_overlay.py` | `wayRef` / `roadName` overlay |
 | COD `GET /v1.1/devices/{id}/stats` | `drive_stats.py` | weekly stats |
 | COD `POST /v1/route/{id}/drive_stats` | `drive_tracker.py` | push per-drive summary |
@@ -195,7 +184,6 @@ ui_mod's **own** param is a file in its data dir
 | Param | Owner / store | Meaning |
 |---|---|---|
 | `RoadInfoOverlay` | ui_mod data dir | Road-name overlay on/off (default off) |
-| `LaneKeepEnable` | lane_keeping data dir | Lane Keeping toggle |
 | `LaneCenteringEnabled` | lane_centering data dir | Lane Centering toggle |
 | `ShowSpeedLimitSign` | speedlimitd data dir | Speed-limit sign toggle |
 | `OsmDataIntegration` | speedlimitd data dir | OSM-as-base-speed toggle; ui_mod reads/writes it like any other cross-plugin toggle — the region-resolved default and freshness/priority logic live entirely in speedlimitd |
@@ -219,7 +207,7 @@ ui_mod/
   drive_tracker.py     # DriveTracker — live drive-stats accumulator + COD POST
   route_map.py         # RouteMapRenderer — CartoDB dark tiles + GPS trace
   route_map_widget.py  # RouteMapWidget — home left column wrapper
-  exp_button.py        # ExpButton — branded emblem, lane-keeping green ring
+  exp_button.py        # ExpButton — branded emblem
   road_info_overlay.py # ui.render_overlay — road name/ref from speedlimitd
   tests/               # test_drive_tracker.py, test_route_map.py
 ```

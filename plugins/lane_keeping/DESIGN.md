@@ -1,176 +1,102 @@
-# Lane Keeping — Design & Implementation
+# Lateral Reference Conditioner — Design
 
 Standalone plugin on `controls.curvature_correction` (100 Hz, inside
-controlsd, upstream of the vehicle's lateral controller). It does two jobs:
-it **conditions the model's curvature reference** (a light low-pass, always
-on), and it **damps the model's sub-Hz in-lane wander** — the ping-pong —
-through a bounded position feedback that never fights the model for
-position.
+controlsd, upstream of the vehicle's lateral controller). It conditions the
+model's curvature into the reference the controller tracks. It has one job
+and no position feedback.
 
 ## Signal flow
 
 ```
-modelV2 κ_des ──► κ_ref = LPF(κ, τ = kappa_filter_tau)          (always on)
-modelV2 lane line + plan ──► gap_pred ──► AC/DC split ──► κ_bias (damper)
-hook returns κ_ref + κ_bias ──► vehicle lateral controller
+modelV2 plan ──► k_ahead = max |plan curvature| within 2.5 s
+             ──► H = arc_horizon(v, k_ahead)
+             ──► κ_arc = 2y/(x²+y²) at the plan point H seconds ahead
+κ_src = κ_arc (or the model's desiredCurvature when there is no usable plan)
+κ_ref = LPF(κ_src, τ = kappa_filter_tau)           lane change: κ_ref = raw input (after the onset hand-over)
+hook returns κ_ref ──► vehicle lateral controller
 ```
 
-Two states: **anchor** (confident driver-side line, authority > 0 — the
-damper is active) and **model** (no usable line, or a lane change in
-progress — the bias releases to zero and the plugin is a smoothing
-passthrough). The ui_mod emblem ring shows the anchor state.
+## Arc look-ahead
 
-## AC Damper
+`κ_arc` is the curvature of the circle from the car, tangent to its heading,
+through the plan point `H` seconds ahead. It averages over one frame's path,
+so it carries no time lag (routes 4d4/4d5: 30–40 % less 0.1–1 Hz wander than
+`desiredCurvature` at 1.5–2.0 s, same timing). `position.y` shares
+`desiredCurvature`'s sign in this stack (RIGHT-positive, GPS-verified on
+route 4d4), so no sign conversion.
 
-The wheel-to-line gap on the driver side is measured (plan-based prediction
-at `x_pred`, bias-cancelling by construction — see below) and split into DC
-and AC. The DC — where the model chooses to place the car — is **conceded**
-via a slow tracker (`LaneKeepDcTau`, field-proven 5 s): the model closes its
-own position loop through the camera with unbounded authority, so every
-sustained output-side push loses (field-verified, repeatedly). The
-AC — the wander around that line — is damped through a bounded, rate-limited
-pure-pursuit curvature bias. Near the line an **asymmetric gate**
-(`LaneKeepAsymGap`, 0.6 m) suppresses corrections *toward* the line so
-recoveries are never opposed. The damper core is width-independent (the
-constant half-width cancels in the DC/AC split); only the asym threshold
-consumes `LaneKeepHalfWidth`, making the plugin vehicle-agnostic in one
-parameter (plus `LaneKeepDriverSide`).
+`H` on straights is `interp(v, [35, 55] km/h, [1.5, 2.5] s)`: longer removes
+more straight-line wander at every speed (4d4–4dc, 75–95 km/h: arc/raw 0.61 at
+1.5 s → 0.47 at 2.5 s) but softens S-curve legs and turns in early, worst at
+low speed. The speed edges moved from 45/75 to 35/55 km/h after route 4eb
+(2026-10-20): at 60 km/h the 2.1 s look-ahead passed 0.52 of the model's wobble
+against 0.46 at 2.5 s. `k_ahead`, the max plan curvature within 2.5 s, blends
+`H` down to 1.5 s over [1.5e-3, 3e-3] 1/m (straights p99 1.38e-3, steady curves
+p10 4.1e-3), so curves are unaffected by the speed schedule. Aim points closer
+than 5 m (crawl) are ill-conditioned: the model's curvature is used instead.
 
-## Control law details
+## Lane-change onset hand-over (2026-11-02)
 
-- **Gap measurement**: `gap = line_sign · laneLines[idx].y − half_width`
-  (idx 1 = left / 2 = right). Two sign conventions are in play: the modelV2
-  device frame is +y = RIGHT, while desiredCurvature is LEFT-positive — see
-  the `line_sign`/`curv_sign` comment in `anchor.py`. Both the raw and the
-  predicted gap are low-passed with `filter_tau` (0.7 s) against
-  measurement noise.
-- **Predictive gap**: evaluated at
-  `x_pred = clip(v · pred_delay_mult · lat_delay, 5, 50)` m
-  (`pred_delay_mult = 1.5`, sweep-measured optimum) as
-  `line(x_pred) − plan(x_pred)`. The line and the plan share the vision
-  frame, so their coherent wander cancels in the difference — measured RMSE
-  0.13–0.14 m, beating both a trivial predictor and a κ-path extrapolation.
-- **DC tracker**: EMA with `dc_tau`; seeds and adapts only from trusted
-  measurements (authority > 0, not in a hard-floor excursion), freezes on
-  line dropouts, resets on lane change and on deliberate disable.
-- **AC deadband**: the AC excess is deadbanded by
-  `interp(v, [15, 25] m/s, [ac_deadband, ac_deadband_hi])`. Both default to
-  0.10 m — a flat band. Setting `ac_deadband_hi` lower ("higher speed,
-  tighter deadband") is the opt-in speed taper; see the caution below.
-- **Pure pursuit**:
-  `κ = curv_sign · 2 · excess / lp²` with `lp = clip(v · t_preview, 1, lp_max)`,
-  scaled by the authority factor below. With the default (inert) `lp_max`,
-  the gain collapses as 1/v² — at ~80 km/h the damper is several times
-  weaker than at the urban speeds it was tuned at, and much of the model's
-  highway wander passes through. This is deliberate; see the caution below.
-- **Caution — speed-dependent authority is present but off by default.**
-  A field trial capped `lp_max` at 25 m (doubling gain at ~80 km/h) with the
-  deadband tightened to 0.05 m, and regressed badly: the stronger near-line
-  away-push arm-wrestled the model to a stalemate ON the lane line, the DC
-  tracker conceded during the ride (poisoning the reference), and on the
-  model's recovery the damper opposed the escape once the gap rose past the
-  asym threshold — ending in a sway to the far line. A stronger damper with
-  this structure loses the same fight harder. Do not raise highway gain
-  without structurally preventing all three mechanisms.
-- **Authority**: `interp(prob, [prob_on, prob_on + prob_fade], [0, 1])` with
-  `prob_on = 0.5`, `prob_fade = 0.1` (measured: gap noise in [0.5, 0.6)
-  equals the trusted band; below 0.5 is a real, route-inconsistent quality
-  cliff — do not lower).
-- **Bounds**: hard cap `kappa_bias_max = 0.002` 1/m, slew
-  `kappa_rate_max = 0.002` 1/m/s. Release on line loss or fading confidence
-  goes through the same rate limit (no snap); a lane change hard-zeros the
-  bias immediately and re-seeds the gap filters, so the new lane starts with
-  no memory of the old one.
-- **Hard floors** (`gap_hard_lo/hi`): absolute best-effort correction at
-  extreme gaps. **Field-disabled** (±99): the floors' sustained push turned
-  brief line touches into pinned stalemates (field A/B: 34 s holds vs 2.8 s
-  with the model alone). Code retained, params keep them off.
+During a lane change (`laneChangeStarting` / `laneChangeFinishing`, read from
+`modelV2.meta`) the reference is the model's raw curvature — but only once
+that curvature has turned toward `laneChangeDirection`: raw must sit
+`LC_HANDOVER_K` (0.2e-3 1/m) past the held Arc reference on the lane-change
+side, or `LC_HANDOVER_MAX_S` (1.0 s) passes. Until then the Arc stays on.
+`preLaneChange` is plain lane keeping (no desire yet), so the Arc stays on
+there too. Without `meta` the hook's `lane_changing` flag switches to raw at
+once, as before.
 
-## Reference conditioning
+Why: the driver's nudge yaws the car toward the target lane, so for a tick or
+two after the start the pre-desire model plans a correction away from the
+change. The instant raw switch exposed that spike (513 seg 2: −0.64e-3 vs the
+Arc's −0.17e-3 on a right change), and a BMW decision landing in that 0.1 s
+stepped the 1.2 Nm lane-change torque cap the wrong way: 32 of 92 lane changes
+on 510–513 moved ≥ 0.5 Nm the wrong way at the onset, the wheel p50 2.4° /
+p90 7.6°. Replay over 50f–513 (109 lane changes): hand-over p50 0.06 s after
+the start (max 0.07 s), onset wrong-way reference dips ≥ 0.3e-3 53 % → 19 %
+(the rest is the road's own curve; random non-LC moments: 7 %), raw passes
+bit-identically after the hand-over.
 
-The model curvature is low-passed with `kappa_filter_tau = 0.15 s` — enough
-to remove frame-to-frame jitter while the sub-Hz content deliberately
-passes (filtering it there would add group delay to curve entries; the
-damper handles it in the position domain instead). Rule learned the hard
-way when tuning this value: compare *group delay*, never a box-filter
-window length against a first-order τ.
+## Low-pass
 
-This smoothing runs **unconditionally**, even with the toggle off — the
-downstream lateral controller in this repo tracks the conditioned reference
-with a deadzone-free band and would be unsafe against raw κ_des. That is why
-the plugin is **enforced** (`.enforced` marker): full removal (`.disabled`)
-is coupled to reverting the consuming controller. The Driving-panel toggle
-(`LaneKeepEnable`, live ~1 s) gates only the position correction.
+`kappa_filter_tau` 0.15 s. Its group delay matches the field-verified 300 ms
+box filter's 0.125 s; 0.3 s lagged and wobbled (route 395). The downstream
+tracker is deadzone-free, which is why the reference is smoothed here rather
+than tolerated there.
 
 ## Configuration
 
-Params are files in `data/` (runtime:
-`/data/plugins-runtime/lane_keeping/data/`), read at process start except
-the live toggle. Full list in `_load_config` (`register.py`); the ones that
-matter in the field:
+Params are files in `data/` (runtime `/data/plugins-runtime/lane_keeping/data/`),
+read at process start.
 
-| param | field value | note |
+| param | default | note |
 |---|---|---|
-| `LaneKeepEnable` | 1 | **live** (~1 s): the Driving-panel toggle; gates only the position correction, never the smoothing |
-| `LaneKeepDriverSide` | left | left-hand drive; the other vehicle-specific param besides half-width |
-| `LaneKeepHalfWidth` | 0.91 | car half-width (m) |
-| `LaneKeepDcTau` | 5 | concession time constant (s); code default 20 |
-| `LaneKeepAsymGap` | 0.6 (default) | never-oppose-recovery threshold (m); 0 = symmetric |
-| `LaneKeepGapHardLo` / `Hi` | **−99 / 99 (floors disabled)** | code defaults 0.3/1.5 — see hard floors above |
-| `LaneKeepLpMax` | 9999 (default, inert) | pure-pursuit aim-point cap (m); lowering it raises highway gain — see the caution in Control law details |
-| `LaneKeepAcDeadband` / `Hi` | 0.10 / 0.10 (defaults, flat) | AC deadband (m); a lower `Hi` opts into the speed taper over 54–90 km/h |
-
-## Porting to other vehicles
-
-The plugin is vehicle-agnostic by construction: it reads modelV2, `v_ego`,
-and `lat_delay`, writes a bounded bias onto `desiredCurvature`, keeps every
-bound in physical units (1/m, m/s²), and its output still passes through
-controlsd's ISO curvature clipping downstream. Both LHD and RHD sign paths
-are implemented and tested. Checklist for a new platform:
-
-1. **Faithful tracking (the one hard requirement).** The inner lateral
-   controller must execute small `desiredCurvature` biases (≤ 0.002 1/m).
-   Any deadzone or heavy reference filter in the inner loop silently eats
-   the correction — a fat curvature-error tolerance once absorbed 44% of
-   the damper's commands here. Stock angle control tracks near-1:1 (best
-   case); stock torque control integrates small biases out through its
-   measured-a_y feedback (good; friction compensation makes low-speed
-   execution less crisp, but that is where the deadband is widest anyway).
-2. **Set the two vehicle params**: `LaneKeepHalfWidth`,
-   `LaneKeepDriverSide`.
-3. **Decide the reference smoothing.** Stock controllers are tuned for raw
-   κ_des and don't need `kappa_filter_tau`; it exists here because the
-   consuming tracker is deadzone-free (see Reference conditioning). On a
-   stock platform it is optional — and the `.enforced` coupling does not
-   apply.
-4. **Check `lat_delay` convergence.** The prediction horizon auto-scales
-   from liveDelay; on most cars it converges and the predictive gap works
-   as designed or better.
-5. **Shake down on telemetry, not feel.** The `lane_keeping` topic carries
-   anchored duty, bias amplitude, and — against measured curvature — the
-   faithful-tracking check itself, before trusting a subjective verdict.
-6. **Expect a tuning pass.** The structure ports; the deadband, `dc_tau`,
-   and speed breakpoints were shaped on one car's wander spectrum and one
-   region's road markings, so field values may want re-validation per
-   platform.
+| `LaneKeepKappaFilterTau` | 0.15 | reference low-pass (s) |
+| `LaneKeepArcHorizon` | 0 (auto) | arc aim point, plan seconds ahead; > 0 forces a fixed value (A/B) |
 
 ## Telemetry
 
-Topic `lane_keeping` on the plugin bus (recorded in rlogs via
-`customReserved1`), published at 100 Hz: `prob`, `line_y`, `gap`, `gap_filt`,
-`gap_pred`, `gap_dc`, `excess`, `excess_ac`, `kappa_in`, `kappa_ref`,
-`kappa_bias`, `authority`, `state` (`anchor`/`model`), `x_pred`, `v_ego`.
+Topic `lane_keeping` on the plugin bus (recorded in rlogs), 100 Hz: `kappa_in`
+(the model's curvature), `kappa_ref` (the reference returned), `kappa_arc`,
+`arc_on`, `arc_h`, `k_ahead` (−1 when unavailable), `v_ego`, and the ego lane
+geometry at the car for drive analysis: `line_l`, `line_r` (m, +y right),
+`prob_l`, `prob_r`; `lc_hold` (true while the lane-change onset hand-over
+holds the Arc).
 
-## Design history
+## Relation to the BMW controller
 
-Specs in `docs/superpowers/specs/`, newest governs:
-`2026-07-23-ac-stabilizer-design.md` (+ its 2026-07-27 asymmetric-damping
-addendum) supersedes the predictive-deadband and 2026-07-22 positioner
-specs. The arc — absolute band → predictive deadband → integral trim →
-AC/DC stabilizer → floors removed → asymmetric gate → speed-dependent
-authority tried and rolled back (lp cap + deadband taper; the caution in
-Control law details) — is traceable through the supersession
-banners; the one-line summary is that every mechanism which held an
-*opinion about position* was removed after losing to the model in the field
-(the fundamental finding: the e2e model counter-steers a sustained bias to
-a stalemate and wins), and what remains is a pure damper.
+The BMW lateral controller (`bmw_e9x_e8x/bmw/latcontroller.py`) is a
+deadzone-free tracker of this reference and patches itself in only when this
+plugin is loaded (`HOOK_READY`); without it the stock openpilot lateral
+controller runs.
+
+## History
+
+The driver-side lane-keeping position loop this plugin was named for (gap
+measurement, predictive deadband, AC/DC damper, asymmetric gate) was retired
+on 2026-10-20: the BMW controller's Direct Tracking law forced it off and it
+stayed off. Its design and results are in `docs/superpowers/specs/`
+(2026-07-22 driver-side-lane-keeping, 2026-07-23 predictive-deadband and
+ac-stabilizer) and in git before that date. The reference conditioning
+(2026-07-22 lateral-controller-simplification) and the arc (2026-10-12) are
+what remains.

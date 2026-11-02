@@ -22,18 +22,14 @@ driving screen, and the extra Settings panels.
 
 <img src="../../docs/bmw_e9x_onroad.jpg" width="66%" alt="Driving screen: color BMW emblem top right, road ref S20 at the bottom" />
 
-Above: the color emblem (experimental mode) with no green ring — lane keeping
-is standing by — and the road ref **S20** along the bottom.
+Above: the color emblem (experimental mode) and the road ref **S20** along
+the bottom.
 
 - The stock steering-wheel / experimental-mode button is replaced by your
   **car's brand emblem**. Tap it to toggle experimental mode, exactly like the
   stock button (only on cars where that's allowed).
   - White emblem = normal (chill) mode.
   - Color emblem = experimental mode.
-  - A **green ring** around the emblem means **Lane Keeping is actively
-    holding the lane** (the `lane_keeping` plugin is anchored). The ring goes
-    dark when lane keeping releases — worn paint, a lane change — and comes
-    back on its own.
 - If enabled, the current **road name / highway ref** shows at the bottom of
   the screen (read from the speed-limit plugin).
 
@@ -43,7 +39,7 @@ ui_mod adds two panels to Settings:
 
 - **Driving** — everything about how the car drives: personality
   (aggressive / standard / relaxed) plus a toggle for each installed driving
-  plugin (Lane Keeping, Lane Centering, Speed Limit Sign, Road Info, Look
+  plugin (Lane Centering, Speed Limit Sign, Road Info, Look
   Ahead Steering, …). When a car is recognized, that car's **own settings**
   (e.g. BMW lane-change and steering options) appear in this same list, under
   the car's emblem and fingerprint.
@@ -71,7 +67,7 @@ on. Once one is available, support is enabled by adding `"mici"` to
 ui_mod is a normal plugin: **Settings → Plugins → "UI Customizations"**. With
 it off you get the stock openpilot UI. There is no separate toggle for the
 home screen or the emblem — they come and go with the plugin as a whole. The
-individual features it exposes (Lane Keeping, Road Info, etc.) each have their
+individual features it exposes (Road Info, etc.) each have their
 own toggle in the Driving panel.
 
 ## More
