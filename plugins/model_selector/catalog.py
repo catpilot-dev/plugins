@@ -11,6 +11,7 @@ or storage layout; that belongs to ModelSwapper.MODEL_CONFIGS.
 """
 import json
 import os
+import re
 from pathlib import Path
 
 CATALOG_FILE = Path(__file__).resolve().parent / 'compatible_models.json'
@@ -19,6 +20,7 @@ UNLOCK_MARKER = (Path(os.getenv('PLUGINS_RUNTIME_DIR', '/data/plugins-runtime'))
                  / 'model_selector' / 'data' / '.unlocked')
 
 MODEL_TYPES = ('driving', 'dm')
+_HEX64 = re.compile(r'[0-9a-f]{64}')
 
 
 def _type_key(model_type) -> str:
@@ -80,6 +82,14 @@ def is_verified(model_type, model_id: str) -> bool:
   return any(e['id'] == model_id for e in verified_entries(model_type))
 
 
+def entry(model_type, model_id: str):
+  """The catalog entry with this id, regardless of version, or None."""
+  for e in load_catalog().get(_type_key(model_type), []):
+    if e['id'] == model_id:
+      return e
+  return None
+
+
 def baseline_entry(model_type):
   """The known-good fallback model for the running version, or None."""
   version = openpilot_version()
@@ -92,6 +102,19 @@ def baseline_entry(model_type):
 def unlocked() -> bool:
   """True when the maintainer has unlocked untested models on this device."""
   return UNLOCK_MARKER.exists()
+
+
+def _hash_problems(t, eid, obj) -> list:
+  problems = []
+  sha = obj.get('sha256')
+  if not sha:
+    problems.append(f"{t}: entry '{eid}' missing sha256")
+  elif not (isinstance(sha, str) and _HEX64.fullmatch(sha)):
+    problems.append(f"{t}: entry '{eid}' bad sha256")
+  size = obj.get('size')
+  if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+    problems.append(f"{t}: entry '{eid}' size must be a positive int")
+  return problems
 
 
 def validate_catalog(catalog: dict | None = None) -> list:
@@ -116,12 +139,34 @@ def validate_catalog(catalog: dict | None = None) -> list:
 
     for e in entries:
       eid = e.get('id', '?')
-      required = ['id', 'name', 'date', 'verified_on']
-      if e.get('source') != 'shipped':
+      source = e.get('source')
+      required = ['id', 'name', 'date']
+      if not isinstance(e.get('verified_on'), list):
+        problems.append(f"{t}: entry '{eid}' missing verified_on")
+      if source == 'converted':
+        required += ['converted_from', 'files']
+      elif source != 'shipped':
         required += ['commit', 'files']
       for field in required:
         if not e.get(field):
           problems.append(f"{t}: entry '{eid}' missing {field}")
+      if source == 'shipped':
+        problems += _hash_problems(t, eid, e)
+      if source == 'converted':
+        cf = e.get('converted_from')
+        if cf and not (isinstance(cf, dict) and cf.get('commit')):
+          problems.append(f"{t}: entry '{eid}' converted_from needs a commit")
+        files = e.get('files')
+        if files:
+          if not isinstance(files, list) or not all(isinstance(f, dict) for f in files):
+            problems.append(f"{t}: entry '{eid}' files must be objects with name/url/sha256/size")
+          else:
+            for f in files:
+              if not f.get('name'):
+                problems.append(f"{t}: entry '{eid}' file missing name")
+              if not str(f.get('url') or '').startswith('https://'):
+                problems.append(f"{t}: entry '{eid}' file '{f.get('name', '?')}' needs an https url")
+              problems += _hash_problems(t, f"{eid}/{f.get('name', '?')}", f)
       for ver in e.get('baseline_for', []):
         if ver not in e.get('verified_on', []):
           problems.append(f"{t}: '{eid}' is baseline_for {ver} but not verified_on it")

@@ -1,61 +1,36 @@
 {
   "driving": [
     {
-      "id": "stock_0.11.1",
+      "id": "stock_0.11.2",
       "name": "Release default",
-      "date": "2026-05-18",
+      "date": "2026-10-14",
       "source": "shipped",
+      "sha256": "65a08adc31d5c456219687d99b7bf5e44d61dae2d49ea67850e76105c7248cce",
+      "size": 60918562,
       "verified_on": [
-        "0.11.1"
+        "0.11.2"
       ],
       "baseline_for": [
-        "0.11.1"
+        "0.11.2"
       ],
-      "notes": "driving_vision.onnx + driving_policy.onnx shipped in catpilot v0.11.1"
-    },
-    {
-      "id": "pop_model_37727",
-      "name": "POP model",
-      "date": "2026-03-24",
-      "commit": "62bf6fb072880905a4c490f0f4f4a6b3c23346ec",
-      "pr": "#37727",
-      "files": [
-        "driving_vision.onnx",
-        "driving_policy.onnx"
-      ],
-      "verified_on": [
-        "0.11.1"
-      ],
-      "notes": "test driven on catpilot v0.11.1; the model running on the reference C3 as of 2026-08-19"
+      "notes": "CD210 as driving_supercombo.onnx shipped in catpilot v0.11.2"
     }
   ],
   "dm": [
     {
-      "id": "stock_dm_0.11.1",
+      "id": "stock_dm_0.11.2",
       "name": "Release default DM",
-      "date": "2026-05-18",
+      "date": "2026-09-18",
       "source": "shipped",
+      "sha256": "dee5a294e8afaacc9295ac5d100e00733ecac278e79264b96331e40a3ede1b04",
+      "size": 7844499,
       "verified_on": [
-        "0.11.1"
+        "0.11.2"
       ],
       "baseline_for": [
-        "0.11.1"
+        "0.11.2"
       ],
-      "notes": "dmonitoring_model.onnx shipped in catpilot v0.11.1"
-    },
-    {
-      "id": "le_mans_gt3_model_04dcdf4",
-      "name": "Le Mans GT3 Model",
-      "date": "2026-02-27",
-      "commit": "04dcdf46bc7c3d84f8a20f6e81cfb5b38dab8689",
-      "pr": "#37425",
-      "files": [
-        "dmonitoring_model.onnx"
-      ],
-      "verified_on": [
-        "0.11.1"
-      ],
-      "notes": "test driven on catpilot v0.11.1; the DM model running on the reference C3 as of 2026-08-19"
+      "notes": "Super Leicht dmonitoring_model.onnx shipped in catpilot v0.11.2"
     }
   ]
 }
