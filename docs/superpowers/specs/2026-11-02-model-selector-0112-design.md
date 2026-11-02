@@ -1,6 +1,6 @@
 # Model Selector for openpilot 0.11.2 onwards — design
 
-Status: draft for builder review, 2026-11-02. Branch `rebase/v0.11.2` of the plugins repo.
+Status: builder-checked 2026-11-02 (four findings folded in, marked "my call"); awaiting user approval. Branch `rebase/v0.11.2` of the plugins repo.
 Companion evidence: `/home/oxygen/catpilot-dev/spike_pop_supercombo/NOTES.md` (PC spike, throwaway).
 
 ## Intent and why
@@ -79,8 +79,24 @@ compiles through the stock tinygrad path unchanged.
 - Legacy model directories (a `driving_vision.onnx` but no `driving_supercombo.onnx`) are not activatable and do not
   appear in the SELECT list (the existing `has_onnx` filter already hides them). No automatic deletion; the developer's
   device is cleaned by hand once. (My call: simplest behaviour that cannot activate an unloadable model.)
-- `import_stock` copies `driving_supercombo.onnx` into `/data/models/driving/stock_0.11.2/` the first time, as today for
-  the split files.
+- `import_stock` copies `driving_supercombo.onnx` into `/data/models/driving/stock_0.11.2/` when the file in `ACTIVE_DIR`
+  is provably the shipped one: shipped catalog entries carry `sha256` and `size` (taken from the tag's LFS pointer, e.g.
+  driving `65a08adc31d5…`, 60,918,562 B), and the import runs whenever the active file matches them, whether or not an
+  active tracker exists. This replaces the 0.11.1 rule "import only while no tracker exists" (a history heuristic) with
+  a byte check, which is strictly stronger. Reason: every device that ever swapped on 0.11.1 carries a tracker, so the
+  old rule would leave 0.11.2 devices with no stock baseline in storage and no way back from a bad POP drive.
+  (Builder-check finding, my call.)
+- Stale tracker migration: when the active tracker names a model directory that lacks the required ONNX for this format
+  (a 0.11.1 legacy dir), the tracker is stale — the file actually running is whatever the git tree holds. After the
+  stock import above succeeds, the tracker is rewritten to the stock id so the panel shows the truth (CD210 running),
+  and the legacy id is never offered for the cancel-reboot swap-back. (My call.)
+- Active-file drift detection (in scope, detect only): a catpilot deploy or the updater daemon rewrites the git-tracked
+  `driving_supercombo.onnx` in `ACTIVE_DIR`, putting stock CD210 back under a POP tracker, and scons then quietly
+  compiles CD210 while the panel says POP. The `device.health_check` hook compares the active file's sha256 (cached by
+  size and mtime, computed off the UI thread) with the active model's recorded sha256 (`model_info.json` for converted
+  models, the catalog for shipped ones) and sets the Driving Model row's status to "active file differs — re-activate"
+  when they differ. No automatic re-apply (that would fight the deploy; out of scope). This is why `model_info.json`
+  records the sha256. (Builder-check finding, my call.)
 
 ### Catalog for this branch
 
@@ -92,10 +108,21 @@ compiles through the stock tinygrad path unchanged.
   = one object `{name: "driving_supercombo.onnx", url: <release asset URL>, sha256: <hex>, size: <bytes>}`,
   `converted_from: {commit: "12f1be19cc…", vision: "6a7d09ad-…/200", policy: "05a58a51-…/100"}`,
   `verified_on: []` until the developer's test drive on 0.11.2, then `["0.11.2"]`.
-  Until then it is installable only with the unlock file, which is the intended path for the first drive.
+  Until then it is installable only through the maintainer CLI with the unlock file present (see below); the UI never
+  offers or activates it.
 - dm `stock_dm_0.11.2`: shipped, verified and baseline for 0.11.2 (Super Leicht).
 - `catalog.validate_catalog` accepts the new `source: converted` kind (requires `files` objects with url/sha256/size) and
   still requires one baseline per type per version.
+
+### Unlock semantics and first install (builder-check finding, my call)
+
+The unlock file keeps "no UI surface": CHECK lists only verified entries and SELECT never enables Activate for an
+untested model, unlocked or not. This also means the 0.11.1-era DM directories still on the developer's device cannot be
+activated by accident while unlocked. What unlock opens is the CLI only, and the CLI must actually work for an untested
+catalog entry: `model_download.py download <id> --type driving --unlocked` (or with `data/.unlocked` present) looks the
+id up among all catalog entries, not only verified ones, before falling back to the maintainer registry; `model_swapper.py
+swap <id>` likewise accepts an untested catalog model when unlocked. "Installable by hand" in goal 2 means exactly this
+CLI path over ssh; there is no install-from-local-file command.
 
 ### Download path
 
@@ -134,12 +161,17 @@ A tinygrad compile is not part of the tool (it is slow and needs the openpilot t
 
 `.github/scripts/model_watch.py` watches `openpilot/selfdrive/modeld/models/driving_supercombo.onnx` and
 `dmonitoring_model.onnx` (path and names as of 0.11.2). It still only reports; a report never makes a model installable.
+Go-live: the workflow runs from the default branch and checks out `dev`, so the new script takes effect when this branch
+becomes the 0.11.2 release/default branch; nothing is edited on other branches now. Until then `dev`'s watcher stays
+quiet, which is the truthful state for split files upstream no longer changes. (My call, low stakes.)
 
 ### Developer's C3, one-off (after the boot gate)
 
 1. Convert POP on the PC with the tool, compile once with `compile_onnx.py` as a smoke test, upload the release asset,
    add the catalog entry with `verified_on: []`.
-2. Create `data/.unlocked`, use CHECK → download POP, SELECT → activate, reboot; first boot compiles (~1 min).
+2. Over ssh: create `/data/plugins-runtime/model_selector/data/.unlocked`, run the download CLI for
+   `pop_supercombo_37727`, then the swap CLI; reboot; first boot compiles (~1 min). Confirm the Driving Model row shows
+   POP with no drift warning before driving.
 3. Test drive. If POP is kept, set `verified_on: ["0.11.2"]` and remove the unlock file.
 4. Delete the legacy directories under `/data/models/driving/` (all nine) and `/data/models/dm/` extras by hand.
 
