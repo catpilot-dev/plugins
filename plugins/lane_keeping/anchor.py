@@ -4,8 +4,9 @@ Turns the model's curvature into the reference the vehicle's lateral
 controller tracks: an arc through the model's planned path `arc_horizon`
 seconds ahead (spatial averaging over one frame's path, so no time lag),
 low-passed with `kappa_filter_tau`. A lane change bypasses both — the model is
-deliberately reframing the trajectory. The ego lane-line geometry rides along
-in the telemetry for drive analysis.
+deliberately reframing the trajectory — once the model's curvature has turned
+toward the change (lane-change onset hand-over). The ego lane-line geometry
+rides along in the telemetry for drive analysis.
 
 History: docs/superpowers/specs/ (2026-07-22 lateral-controller-simplification,
 2026-10-18 bmw-direct-tracking, 2026-10-20 curve-feedforward-and-audit).
@@ -30,6 +31,20 @@ ARC_H_SPEED = [1.5, 2.5]                  # s
 ARC_H_CURVE = 1.5                         # s, on a curvy road ahead
 ARC_K_AHEAD_BP = [0.0015, 0.003]          # 1/m, straight -> curvy blend edges
 ARC_K_AHEAD_T = 2.5                       # s of plan scanned for curvature
+# Lane-change onset hand-over (routes 50f-513). The driver's nudge yaws the car
+# toward the target lane, so for a tick or two after laneChangeStarting the
+# pre-desire model still plans a correction AWAY from the change; switching to
+# raw at once exposed that (513 seg 2: -0.64e-3 vs the Arc's -0.17e-3 on a
+# right change) and a 300 ms decision landing there stepped the lane-change
+# torque cap the wrong way (32/92 LCs >= 0.5 Nm, wheel p50 2.4 / p90 7.6 deg).
+# The Arc reference holds until raw sits LC_HANDOVER_K past it toward
+# laneChangeDirection (replay: hand-over p50 0.06 s after the start, onset
+# wrong-way dips >= 0.3e-3 53 % -> 19 %, the rest is the road's own curve), or
+# LC_HANDOVER_MAX_S passes. preLaneChange is plain lane keeping: Arc stays on.
+LC_HANDOVER_K = 0.2e-3                    # 1/m, raw past the Arc toward the change
+LC_HANDOVER_MAX_S = 1.0                   # s, hold limit after laneChangeStarting
+LC_ACTIVE_STATES = ('laneChangeStarting', 'laneChangeFinishing')
+LC_DIRECTION_SIGN = {'right': 1.0, 'left': -1.0}   # +kappa = right (position.y +right)
 
 
 def _clip(x, lo, hi):
@@ -94,6 +109,17 @@ def arc_curvature(model_v2, horizon):
   return 2.0 * ya / (xa * xa + ya * ya)
 
 
+def lane_change_phase(model_v2, lane_changing):
+  """(active, direction sign) of the model's lane change. modelV2.meta when
+  present: active in LC_ACTIVE_STATES only (not preLaneChange), sign +1 right /
+  -1 left / 0 none. Without meta the caller's flag, direction unknown (0)."""
+  meta = getattr(model_v2, 'meta', None) if model_v2 is not None else None
+  if meta is None or not hasattr(meta, 'laneChangeState'):
+    return bool(lane_changing), 0.0
+  active = str(meta.laneChangeState) in LC_ACTIVE_STATES
+  return active, LC_DIRECTION_SIGN.get(str(getattr(meta, 'laneChangeDirection', 'none')), 0.0)
+
+
 def _interp_arr(x, xs, ys):
   # clamped-left linear interpolation over ascending xs; None past the end or
   # on malformed arrays (the caller falls back to the model's curvature)
@@ -122,18 +148,32 @@ class LaneAnchor:
   def __init__(self, config: AnchorConfig):
     self.cfg = config
     self.kappa_filt = None
+    self.lc_active = False   # previous tick's lane-change phase (rising edge arms the hold)
+    self.lc_hold = False     # onset hand-over: Arc held until raw turns toward the change
+    self.lc_ticks = 0        # ticks held since laneChangeStarting
 
   def update(self, curvature, model_v2, v_ego, lane_changing):
     """Returns (kappa_ref, telemetry). kappa_ref is the arc through the plan
     ahead, low-passed; the model's curvature when there is no usable plan; the
-    raw input during a lane change."""
+    raw input during a lane change, from the onset hand-over on."""
     cfg = self.cfg
     k_ahead = plan_curvature_ahead(model_v2)
     arc_h = cfg.arc_horizon if cfg.arc_horizon > 0.0 else arc_horizon(v_ego, k_ahead)
     kappa_arc = arc_curvature(model_v2, arc_h)
-    arc_on = kappa_arc is not None and not lane_changing
+    lc_active, lc_sign = lane_change_phase(model_v2, lane_changing)
+    if lc_active and not self.lc_active:
+      self.lc_hold = lc_sign != 0.0 and self.kappa_filt is not None
+      self.lc_ticks = 0
+    if self.lc_hold:
+      self.lc_ticks += 1
+      if not lc_active or lc_sign * (curvature - self.kappa_filt) >= LC_HANDOVER_K \
+         or self.lc_ticks * DT_CTRL > LC_HANDOVER_MAX_S + 1e-9:
+        self.lc_hold = False
+    self.lc_active = lc_active
+    raw = lc_active and not self.lc_hold
+    arc_on = kappa_arc is not None and not raw
     kappa_src = kappa_arc if arc_on else curvature
-    if lane_changing or self.kappa_filt is None:
+    if raw or self.kappa_filt is None:
       self.kappa_filt = kappa_src
       kappa_ref = kappa_src
     else:
@@ -155,5 +195,6 @@ class LaneAnchor:
       'k_ahead': float(k_ahead) if k_ahead is not None else -1.0,
       'v_ego': float(v_ego),
       'line_l': geo[0], 'line_r': geo[1], 'prob_l': geo[2], 'prob_r': geo[3],
+      'lc_hold': bool(self.lc_hold),
     }
     return kappa_ref, telem

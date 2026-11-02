@@ -16,7 +16,9 @@ car's lateral controller a steadier target instead:
   frame-to-frame wobble without adding delay.
 - **A light low-pass** (0.15 s) on top.
 - **Lane changes pass straight through** — the model is deliberately moving
-  the car, and the plugin gets out of the way.
+  the car, and the plugin gets out of the way, as soon as the model's path has
+  turned toward the new lane (a few hundredths of a second). That keeps the
+  car from twitching the wrong way at the start of a lane change.
 
 It does not pick the car's position in the lane and it adds no correction of
 its own; the model still decides where the car goes.

@@ -12,7 +12,7 @@ modelV2 plan ──► k_ahead = max |plan curvature| within 2.5 s
              ──► H = arc_horizon(v, k_ahead)
              ──► κ_arc = 2y/(x²+y²) at the plan point H seconds ahead
 κ_src = κ_arc (or the model's desiredCurvature when there is no usable plan)
-κ_ref = LPF(κ_src, τ = kappa_filter_tau)           lane change: κ_ref = raw input
+κ_ref = LPF(κ_src, τ = kappa_filter_tau)           lane change: κ_ref = raw input (after the onset hand-over)
 hook returns κ_ref ──► vehicle lateral controller
 ```
 
@@ -34,6 +34,28 @@ against 0.46 at 2.5 s. `k_ahead`, the max plan curvature within 2.5 s, blends
 `H` down to 1.5 s over [1.5e-3, 3e-3] 1/m (straights p99 1.38e-3, steady curves
 p10 4.1e-3), so curves are unaffected by the speed schedule. Aim points closer
 than 5 m (crawl) are ill-conditioned: the model's curvature is used instead.
+
+## Lane-change onset hand-over (2026-11-02)
+
+During a lane change (`laneChangeStarting` / `laneChangeFinishing`, read from
+`modelV2.meta`) the reference is the model's raw curvature — but only once
+that curvature has turned toward `laneChangeDirection`: raw must sit
+`LC_HANDOVER_K` (0.2e-3 1/m) past the held Arc reference on the lane-change
+side, or `LC_HANDOVER_MAX_S` (1.0 s) passes. Until then the Arc stays on.
+`preLaneChange` is plain lane keeping (no desire yet), so the Arc stays on
+there too. Without `meta` the hook's `lane_changing` flag switches to raw at
+once, as before.
+
+Why: the driver's nudge yaws the car toward the target lane, so for a tick or
+two after the start the pre-desire model plans a correction away from the
+change. The instant raw switch exposed that spike (513 seg 2: −0.64e-3 vs the
+Arc's −0.17e-3 on a right change), and a BMW decision landing in that 0.1 s
+stepped the 1.2 Nm lane-change torque cap the wrong way: 32 of 92 lane changes
+on 510–513 moved ≥ 0.5 Nm the wrong way at the onset, the wheel p50 2.4° /
+p90 7.6°. Replay over 50f–513 (109 lane changes): hand-over p50 0.06 s after
+the start (max 0.07 s), onset wrong-way reference dips ≥ 0.3e-3 53 % → 19 %
+(the rest is the road's own curve; random non-LC moments: 7 %), raw passes
+bit-identically after the hand-over.
 
 ## Low-pass
 
@@ -58,7 +80,8 @@ Topic `lane_keeping` on the plugin bus (recorded in rlogs), 100 Hz: `kappa_in`
 (the model's curvature), `kappa_ref` (the reference returned), `kappa_arc`,
 `arc_on`, `arc_h`, `k_ahead` (−1 when unavailable), `v_ego`, and the ego lane
 geometry at the car for drive analysis: `line_l`, `line_r` (m, +y right),
-`prob_l`, `prob_r`.
+`prob_l`, `prob_r`; `lc_hold` (true while the lane-change onset hand-over
+holds the Arc).
 
 ## Relation to the BMW controller
 
