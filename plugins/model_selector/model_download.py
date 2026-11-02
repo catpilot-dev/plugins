@@ -420,8 +420,12 @@ def check_updates():
         models_dir = BASE_DATA_DIR / 'models' / type_name
         installed = set()
         if models_dir.exists():
+            # model_info.json is written last, only after every file landed
+            # (the rule list_models applies): a directory holding just a
+            # .part file from a download killed mid-stream is not installed.
             installed = {d.name for d in models_dir.iterdir()
-                         if d.is_dir() and not d.name.startswith('_')}
+                         if d.is_dir() and not d.name.startswith('_')
+                         and (d / 'model_info.json').is_file()}
 
         verified = catalog.verified_entries(type_name)
         verified_total += len(verified)

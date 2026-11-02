@@ -189,6 +189,16 @@ class TestDirectDownload:
     ids = {m['id'] for m in json.loads(capsys.readouterr().out)['driving']}
     assert 'pop_verified' in ids
 
+  def test_download_killed_midstream_is_offered_again(self, dl_env, capsys):
+    # A reboot or power cut mid-stream skips every cleanup path: the directory
+    # holds only the .part file and no model_info.json, so it is not installed.
+    d = dl_env[0] / 'models' / 'driving' / 'pop_verified'
+    d.mkdir()
+    (d / 'driving_supercombo.onnx.part').write_bytes(b'pop')
+    md.check_updates()
+    ids = {m['id'] for m in json.loads(capsys.readouterr().out)['driving']}
+    assert 'pop_verified' in ids
+
   def test_check_updates_offers_verified_converted_entry(self, dl_env, capsys):
     md.check_updates()
     ids = {m['id'] for m in json.loads(capsys.readouterr().out)['driving']}
@@ -219,8 +229,10 @@ class TestCheckUpdates:
 
   def test_skips_installed(self, dl_env, capsys):
     tmp_path, _ = dl_env
-    (tmp_path / 'models' / 'driving' / 'good_model').mkdir()
-    (tmp_path / 'models' / 'driving' / 'pop_verified').mkdir()
+    for mid in ('good_model', 'pop_verified'):
+      d = tmp_path / 'models' / 'driving' / mid
+      d.mkdir()
+      (d / 'model_info.json').write_text('{}')
     md.check_updates()
     out = json.loads(capsys.readouterr().out)
     # good_model is now installed and stock_0.11.2 is shipped (never offered):
