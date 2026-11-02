@@ -688,6 +688,68 @@ class TestLaneChangeStepCap:
     assert self._step(monkeypatch, 28.0, 'laneChangeStarting', seen=False) == pytest.approx(-0.05, abs=1e-9)
 
 
+class TestLaneChangeYawPredictor:
+  """While the model runs a lane change, the P law's measured curvature is the
+  yaw curvature plus the curvature the wheel has added over the last
+  YAW_PRED_TICKS livePose ticks (0.3 s, the wheel -> yaw lag), which the yaw
+  has not shown yet (route 511 seg 6: the wheel ran 2 -> 12 deg, the rack held
+  it at 0 Nm, and the yaw-based P saw the overshoot ~0.3 s late). Only the
+  difference enters, so a standing wheel angle (alignment offset, a curve)
+  adds nothing.
+
+  kappa_wheel = -angle / (YAW_PRED_SR * L * 180/pi)   (angle + = left, kappa + = right)
+  wheel 0 -> -3 deg over the window at L = 2.66:
+  dk = 3 / (25 * 2.66 * 57.29578) = 7.8739e-4
+  """
+
+  V, DES, MEAS = 20.0, 0.002, 0.001
+  L = 2.66
+
+  def _run(self, monkeypatch, angles, lcs='laneChangeStarting'):
+    lac, sm, mod, state = _make_controller(monkeypatch)
+    sm.dmd.meta.laneChangeState = lcs
+    _set_measured(sm, self.V, self.MEAS)
+    for ang in angles:
+      _call_update(lac, self.DES, v_ego=self.V, steering_angle_deg=ang)
+    return state
+
+  def _err(self, k_meas):
+    return math.atan(self.DES * self.L) - math.atan(k_meas * self.L)
+
+  def test_wheel_motion_leads_the_yaw_during_a_lane_change(self, monkeypatch):
+    state = self._run(monkeypatch, [0.0] * 6 + [-3.0])
+    dk = 3.0 / (25.0 * self.L * 180.0 / math.pi)
+    assert state['kappa_pred'] == pytest.approx(dk, rel=1e-6)
+    assert state['delta_err'] == pytest.approx(self._err(self.MEAS + dk), rel=1e-6)
+    assert state['measured'] == pytest.approx(self.MEAS)        # telemetry keeps the yaw curvature
+
+  def test_wheel_back_toward_left_lowers_the_measured_curvature(self, monkeypatch):
+    state = self._run(monkeypatch, [-3.0] * 6 + [0.0])
+    dk = -3.0 / (25.0 * self.L * 180.0 / math.pi)
+    assert state['delta_err'] == pytest.approx(self._err(self.MEAS + dk), rel=1e-6)
+
+  def test_window_is_six_ticks(self, monkeypatch):
+    """Motion older than the window no longer counts: the step at tick 1 has
+    left the 7-sample history by tick 8."""
+    state = self._run(monkeypatch, [0.0] + [-3.0] * 7)
+    assert state['kappa_pred'] == 0.0
+    assert state['delta_err'] == pytest.approx(self._err(self.MEAS), rel=1e-9)
+
+  def test_standing_wheel_angle_adds_nothing(self, monkeypatch):
+    state = self._run(monkeypatch, [-10.0] * 7)
+    assert state['delta_err'] == pytest.approx(self._err(self.MEAS), rel=1e-9)
+
+  @pytest.mark.parametrize('lcs', ['off', 'preLaneChange'])
+  def test_yaw_only_outside_a_lane_change(self, monkeypatch, lcs):
+    state = self._run(monkeypatch, [0.0] * 6 + [-3.0], lcs=lcs)
+    assert state['kappa_pred'] == 0.0
+    assert state['delta_err'] == pytest.approx(self._err(self.MEAS), rel=1e-9)
+
+  def test_yaw_only_until_the_window_has_filled(self, monkeypatch):
+    state = self._run(monkeypatch, [0.0, 0.0, -3.0])
+    assert state['delta_err'] == pytest.approx(self._err(self.MEAS), rel=1e-9)
+
+
 class TestControllerHorizonDecoupled:
   """2026-10-12: CP.steerActuatorDelay 0.4 -> 0.7 so modeld plans for the
   measured straight-line loop delay (target -> yaw 0.90-1.0 s on routes
@@ -1299,7 +1361,7 @@ class TestDirectTracking:
     assert set(pay[-1]) == {
       'desired', 'measured', 'err', 'delta_err', 'target_frac', 'ramp_step', 'ramp_frames', 'action',
       'torque', 'output', 'vEgo', 'active', 'ff_nm', 'a_ref', 'relax_ticks', 'angle',
-      'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right', 'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn'}
+      'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right', 'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn', 'kappa_pred'}
 
   def test_telemetry_has_steering_signals(self, monkeypatch):
     """Steering-side signals ride the plugin bus with the controller state:
