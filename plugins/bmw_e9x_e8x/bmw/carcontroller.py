@@ -90,6 +90,19 @@ SPIN_HOLD_OFF_DPS = 100.0
 # the 10-frame debounce so a latch an Off cannot clear still faults.
 REARM_HOLDOFF_FRAMES = 5
 
+# Servo torque ceiling — DESIGN.md: "Servo torque ceiling". The panda's
+# TorqueMotorLimited check allows at most max(reported over its last 6
+# STEERING_STATUS samples, 0) + max_torque_error (1 Nm, bmw.h) and the mirror
+# below. Where the servo cannot follow — saturated at ~8.5 Nm in a tight slow
+# turn (route 511 seg 1: command 9.6 Nm, reports 6.4-8.8) — the command ran
+# past it, the panda rejected, the servo soft-offed and the re-arm reset it to
+# 0: ~16 deg of wheel spring-back each time. The ceiling keeps the command one
+# step inside the check: one sample fewer than the panda's window (so it lies
+# inside whichever window the panda holds) and one wire quantum (0.125 Nm)
+# under its margin. A servo that tracks the command never meets it.
+SERVO_CEILING_SAMPLES = 5
+SERVO_CEILING_MARGIN_NM = 0.875
+
 
 def minus5_landing_kmh(setpoint_kmh):
   """Where a minus5 will actually put the setpoint, in the same units as
@@ -129,6 +142,8 @@ class CarController(CarControllerBase):
     # Servo re-arm state (see REARM_HOLDOFF_FRAMES); re-arms counted for tests/telemetry.
     self.rearm_holdoff = 0
     self.servo_rearms = 0
+    # Servo torque ceiling (see SERVO_CEILING_SAMPLES): the latest reports, Nm.
+    self.servo_reports = deque(maxlen=SERVO_CEILING_SAMPLES)
     self.last_cruise_rx_timestamp = 0
     self.last_cruise_tx_timestamp = 0
     self.rx_cruise_stalk_counter_last = -1
@@ -197,6 +212,16 @@ class CarController(CarControllerBase):
     sign = 1.0 if apply_torque > 0 else -1.0
     ceiling = max(sign * CS.out.steeringTorqueEps, 0.0)
     return sign * min(abs(apply_torque), ceiling)
+
+  def _servo_ceiling(self, apply_torque):
+    """Keep the command within SERVO_CEILING_MARGIN_NM of the servo's recent
+    reports, on the panda's terms: the band is measured from zero when the
+    reports sit on the other side, and only ever lowers the command."""
+    if not self.servo_reports:
+      return apply_torque
+    if apply_torque >= 0:
+      return min(apply_torque, max(max(self.servo_reports), 0.0) + SERVO_CEILING_MARGIN_NM)
+    return max(apply_torque, min(min(self.servo_reports), 0.0) - SERVO_CEILING_MARGIN_NM)
 
   def _servo_rearm(self, CS):
     """True on the one frame an Off is sent to clear the servo's soft-off latch
@@ -452,6 +477,7 @@ class CarController(CarControllerBase):
         self.cruise_burst_released = True
 
     if self.flags & BmwFlags.STEPPER_SERVO_CAN:
+      self.servo_reports.append(float(CS.out.steeringTorqueEps))
       if CC.enabled and CC.latActive:
         if self._servo_rearm(CS):
           can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.Off))
@@ -461,6 +487,7 @@ class CarController(CarControllerBase):
                                              CarControllerParams.STEER_DELTA_UP, CarControllerParams.STEER_DELTA_DOWN,
                                              CarControllerParams.STEER_ERROR_MAX, CarControllerParams.STEER_MAX)
           apply_torque = self._spin_hold(apply_torque, CS)
+          apply_torque = self._servo_ceiling(apply_torque)
           self.apply_torque_last = apply_torque
           can_sends.append(bmwcan.create_steer_command(self.frame, SteeringModes.TorqueControl, apply_torque))
       elif not CS.cruise_stalk_cancel and not CS.out.brakePressed and not CS.out.gasPressed and self.apply_torque_last != 0:
