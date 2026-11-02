@@ -28,7 +28,7 @@ modelV2 ─► infer_lane_count ─► lane_count_stable ─► lane_count_limit
         ├► vision_speed_cap (≤2-lane narrow cap) ────────────────────┤
         └► curvature_speed_cap (distance-aware curve cap) ───────────┤
                                                                       ├─► min() ─► speedLimitState (5 Hz, plugin bus)
-livePose ─► measured a_y ─► reactive-a_y cap ─────────────────────────┤            │
+deviceMotion ─► measured a_y ─► reactive-a_y cap ─────────────────────────┤            │
         └► measured κ ─► curve-cap virtual apex point ────────────────┘            │
                                                                                    ▼
                                           planner.v_cruise hook ─► cap cruise speed
@@ -380,7 +380,7 @@ curve nears** instead of a last-second one-shot drop. `max_lat_accel` is the
 
 A **measured-curvature virtual apex point** is folded in at
 `d=0` (no braking-headroom term) using the driver's own `κ_meas = |yaw|/v` from
-`livePose`, but only when that reading is fresh this tick — it delivers the
+`deviceMotion`, but only when that reading is fresh this tick — it delivers the
 derated target exactly at the apex, where the model tends to cut the inner line.
 
 The function returns a **raw, unsnapped** km/h value floored at 30, and 0 when
@@ -393,13 +393,13 @@ Proactive capping can't see late-appearing curves or plant amplification (a
 recorded curve measured 3.6 m/s² where vision capped nothing), and the BMW
 lateral controller no longer ISO-cancels in curves, so the **ISO 3.0 m/s²
 defense lives here**. It low-passes measured `|a_y| = |v·yawRate|` from
-`livePose` (`REACT_TAU = 0.3 s`). When it exceeds the threshold
+`deviceMotion` (`REACT_TAU = 0.3 s`). When it exceeds the threshold
 (`MapdReactLatAccel`, default 2.5, clamp [1.8,3.0], 0 disables) continuously for
 `REACT_ENGAGE_S = 0.5 s` and `v_ego ≥ REACT_MIN_SPEED (~29 km/h)`, it engages
 `v = v_ego·sqrt(threshold/|a_y|) − REACT_HYST_MS (1 m/s)`. While engaged the cap
 only **moves down or holds** (never chases a_y up), floored at `REACT_MIN_SPEED`.
 Release ramps back up at `REACT_RELEASE_RATE = 1 m/s²` after
-`REACT_QUIET_S = 2 s` below `threshold − 0.3`, or immediately if `livePose` goes
+`REACT_QUIET_S = 2 s` below `threshold − 0.3`, or immediately if `deviceMotion` goes
 stale (`REACT_LIVEPOSE_STALE_S = 1 s`) — a stalled localizer must not latch a
 cap forever.
 

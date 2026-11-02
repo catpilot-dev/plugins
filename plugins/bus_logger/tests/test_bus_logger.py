@@ -17,8 +17,8 @@ _spec = importlib.util.spec_from_file_location("_bus_logger_mod", _mod_path,
 _bl = importlib.util.module_from_spec(_spec)
 # Stub out cereal and openpilot imports that aren't available locally
 from unittest.mock import MagicMock
-for mod_name in ("cereal", "cereal.messaging",
-                 "openpilot", "openpilot.common", "openpilot.common.realtime",
+for mod_name in ("openpilot", "openpilot.cereal", "openpilot.cereal.messaging",
+                 "openpilot.common", "openpilot.common.realtime",
                  "openpilot.selfdrive", "openpilot.selfdrive.plugins",
                  "openpilot.selfdrive.plugins.plugin_bus"):
   sys.modules.setdefault(mod_name, MagicMock())

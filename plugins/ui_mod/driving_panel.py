@@ -11,7 +11,7 @@ Vehicle heading (brand icon + fingerprint) shown when a car is detected.
 import os
 
 from config import PLUGINS_RUNTIME_DIR, PLUGINS_REPO_DIR, MEDIA_DIR, read_plugin_param, write_plugin_param
-from cereal import log
+from openpilot.cereal import log
 import pyray as rl
 from openpilot.common.params import Params
 from openpilot.selfdrive.plugins.hooks import hooks
@@ -89,16 +89,16 @@ class DrivingLayout(Widget):
     try:
       lt = None
       sm = ui_state.sm
-      if sm.recv_frame.get('liveTorqueParameters', 0) > 0:
-        lt = sm['liveTorqueParameters']
+      if sm.recv_frame.get('lateralTorqueParameters', 0) > 0:
+        lt = sm['lateralTorqueParameters']
       else:
-        from cereal import log
+        from openpilot.cereal import log
         data = Params().get('LiveTorqueParameters')
         if data:
           with log.Event.from_bytes(data) as evt:
-            lt = evt.liveTorqueParameters
+            lt = evt.lateralTorqueParameters
       if lt:
-        status = "Estimated" if lt.useParams and lt.liveValid else f"Estimating {lt.calPerc}%"
+        status = "Estimated" if lt.useParams and lt.valid else f"Estimating {lt.calPerc}%"
         self._torque_cache["val"] = f"{status} | F={lt.latAccelFactorFiltered:.2f} f={lt.frictionCoefficientFiltered:.3f}"
     except Exception:
       pass
@@ -113,14 +113,14 @@ class DrivingLayout(Widget):
     try:
       ld = None
       sm = ui_state.sm
-      if sm.recv_frame.get('liveDelay', 0) > 0:
-        ld = sm['liveDelay']
+      if sm.recv_frame.get('lateralDelay', 0) > 0:
+        ld = sm['lateralDelay']
       else:
-        from cereal import log
+        from openpilot.cereal import log
         data = Params().get('LiveDelay')
         if data:
           with log.Event.from_bytes(data) as evt:
-            ld = evt.liveDelay
+            ld = evt.lateralDelay
       if ld:
         s = str(ld.status).split('.')[-1]
         if s == 'estimated':

@@ -37,17 +37,17 @@ def mock_openpilot(monkeypatch):
   # on a healthy device. TestMapdPhase1Telemetry removes it to cover the
   # injection-missing device state.
   mock_services.SERVICE_LIST = {'modelV2': MagicMock(), 'gpsLocationExternal': MagicMock(),
-                                'livePose': MagicMock(), 'mapdOut': MagicMock()}
+                                'deviceMotion': MagicMock(), 'mapdOut': MagicMock()}
   mock_plugin_bus = MagicMock()
   # PluginSub().drain() must return None to avoid infinite loop in __init__
   mock_plugin_bus.PluginSub.return_value.drain.return_value = None
   for mod in ['openpilot', 'openpilot.common',
-              'openpilot.common.realtime', 'cereal', 'cereal.messaging',
-              'cereal.services',
+              'openpilot.common.realtime', 'openpilot.cereal', 'openpilot.cereal.messaging',
+              'openpilot.cereal.services',
               'openpilot.selfdrive', 'openpilot.selfdrive.plugins',
               'openpilot.selfdrive.plugins.plugin_bus']:
     monkeypatch.setitem(sys.modules, mod, MagicMock())
-  sys.modules['cereal.services'] = mock_services
+  sys.modules['openpilot.cereal.services'] = mock_services
   sys.modules['openpilot.selfdrive.plugins.plugin_bus'] = mock_plugin_bus
   sys.modules['openpilot.common.realtime'].Ratekeeper = MagicMock
 
@@ -1288,7 +1288,7 @@ class TestDistanceAwareCurveCap:
 
 
 class TestMeasuredCurvatureApexWiring:
-  """update() wires the SAME livePose plumbing the reactive cap already
+  """update() wires the SAME deviceMotion plumbing the reactive cap already
   consumes into curvature_speed_cap()'s kappa_meas virtual apex point — no
   new subscription, no new staleness tracking (route 3d0 seg 60 apex fix)."""
 
@@ -1309,14 +1309,14 @@ class TestMeasuredCurvatureApexWiring:
     mw._lc_sub = None
     return mw
 
-  # --- Test (c): no livePose update this tick -> kappa_meas stays None ->
+  # --- Test (c): no deviceMotion update this tick -> kappa_meas stays None ->
   #     curvature_speed_cap sees no virtual apex point -> result is exactly
   #     the path-only computation, unaffected by the apex-point feature.
-  def test_stale_livepose_no_virtual_point(self, sld):
+  def test_stale_device_motion_no_virtual_point(self, sld):
     mw = self._mw(sld)
     model = self._model(0.30, 20.0, 0.0)  # κ_path=0.015, d=0 -> path-only 36 km/h
     sm = MagicMock()
-    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     sm.__getitem__ = MagicMock(side_effect=lambda k: model if k == 'modelV2' else MagicMock())
     mw.sm = sm
@@ -1324,8 +1324,8 @@ class TestMeasuredCurvatureApexWiring:
     expected = sld.curvature_speed_cap(model, mw.curve_target_lat_accel, None)
     assert mw.curvature_cap == expected == 36
 
-  def test_fresh_livepose_wires_virtual_point(self, sld):
-    """Sanity check the wiring the other direction: a fresh, valid livePose
+  def test_fresh_device_motion_wires_virtual_point(self, sld):
+    """Sanity check the wiring the other direction: a fresh, valid deviceMotion
     reading with tight measured curvature DOES tighten self.curvature_cap
     below the path-only value."""
     mw = self._mw(sld)
@@ -1336,13 +1336,13 @@ class TestMeasuredCurvatureApexWiring:
     lp.velocityDevice.valid = True
     lp.velocityDevice.x = 10.0
     sm = MagicMock()
-    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': True}
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'deviceMotion': True}
     sm.update = MagicMock()
 
     def getitem(k):
       if k == 'modelV2':
         return model
-      if k == 'livePose':
+      if k == 'deviceMotion':
         return lp
       return MagicMock()
 
@@ -1365,7 +1365,7 @@ class TestCurvatureCapEnforcementVsDisplay:
     # lets us drive self.curvature_cap directly, same pattern as
     # TestReactiveCapIntegration.
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     mw.sm = sm
     mw._cmd_sub = None
@@ -1494,7 +1494,7 @@ class TestReactiveLatAccelCap:
 # ============================================================
 
 class TestReactiveCapHardening:
-  """Speed floor + stale-livePose release. Unlike TestReactiveLatAccelCap,
+  """Speed floor + stale-deviceMotion release. Unlike TestReactiveLatAccelCap,
   these drive the *real* low-pass filter from a cold start (no pre-set
   `_ay_filt`) to exercise the engage/ratchet/release transients end-to-end."""
 
@@ -1610,18 +1610,18 @@ class TestReactiveCapHardening:
       t += dt
     assert mw._react_cap_ms > engaged  # release ramp under way
 
-  def test_stale_livepose_forces_release(self, sld):
-    """A livePose that stops updating while the cap is latched must not be
+  def test_stale_device_motion_forces_release(self, sld):
+    """A deviceMotion that stops updating while the cap is latched must not be
     allowed to hold it forever. This mirrors the real call site: on a stale
     tick a_y_meas is None and v_ego is 0.0 (nothing to measure)."""
     mw = self._mw(sld)
     t, dt = 600.0, 0.1
-    for _ in range(20):  # engage, livePose "updating" every tick
+    for _ in range(20):  # engage, deviceMotion "updating" every tick
       mw._update_reactive_cap(2.8, 20.0, 2.5, t, dt, True)
       t += dt
     engaged = mw._react_cap_ms
     assert engaged > 0.0
-    for _ in range(15):  # 1.5 s with no livePose update — must not crash
+    for _ in range(15):  # 1.5 s with no deviceMotion update — must not crash
       mw._update_reactive_cap(None, 0.0, 2.5, t, dt, False)
       t += dt
     assert mw._react_cap_ms == 0.0  # stale localizer -> forced release
@@ -1638,7 +1638,7 @@ class TestReactiveCapIntegration:
     mw._sl_pub = MagicMock()
     # Controlled SubMaster: nothing updated this tick, model block skipped.
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     mw.sm = sm
     mw._cmd_sub = None
@@ -1682,7 +1682,7 @@ class TestLaneCountFirstInference:
       mw = mod.SpeedLimitMiddleware()
     mw._sl_pub = MagicMock()
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     mw.sm = sm
     mw._cmd_sub = None
@@ -1971,7 +1971,7 @@ class TestLaneCountFirstInference:
     mw._lc_sub = None
     holder = {'model': None}
     sm = MagicMock()
-    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     sm.__getitem__ = MagicMock(
       side_effect=lambda k: holder['model'] if k == 'modelV2' else MagicMock())
@@ -2288,7 +2288,7 @@ class TestGsDistanceGuardedRelease:
       mw = mod.SpeedLimitMiddleware()
     mw._sl_pub = MagicMock()
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     mw.sm = sm
     mw._cmd_sub = None
@@ -2354,7 +2354,7 @@ class TestGsDistanceGuardedRelease:
     mw._lc_sub = None
     holder = {'model': None}
     sm = MagicMock()
-    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': True, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     sm.__getitem__ = MagicMock(
       side_effect=lambda k: holder['model'] if k == 'modelV2' else MagicMock())
@@ -2910,7 +2910,7 @@ class TestOsmBaseSelection:
       mw = mod.SpeedLimitMiddleware()
     mw._sl_pub = MagicMock()
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     mw.sm = sm
     mw._cmd_sub = None
@@ -3046,7 +3046,7 @@ class TestOsmTilesMissingWritePath:
       mw = mod.SpeedLimitMiddleware()
     mw._sl_pub = MagicMock()
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     mw.sm = sm
     mw._cmd_sub = None
@@ -3151,7 +3151,7 @@ class TestCountryField:
     gps.latitude = gps_lat
     gps.longitude = gps_lon
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': True, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': True, 'deviceMotion': False}
     sm.update = MagicMock()
     sm.__getitem__ = MagicMock(side_effect=lambda k: gps if k == 'gpsLocationExternal' else MagicMock())
     mw.sm = sm
@@ -3324,7 +3324,7 @@ class TestOsmGateCountryResolution:
     gps.latitude = lat
     gps.longitude = lon
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': True, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': True, 'deviceMotion': False}
     sm.update = MagicMock()
     sm.__getitem__ = MagicMock(side_effect=lambda k: gps if k == 'gpsLocationExternal' else MagicMock())
     mw.sm = sm
@@ -3419,7 +3419,7 @@ class TestGsGateSharedStateIsolation:
       mw = mod.SpeedLimitMiddleware()
     mw._sl_pub = MagicMock()
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     mw.sm = sm
     mw._cmd_sub = None
@@ -3482,7 +3482,7 @@ class TestOsmGateTelemetry:
       mw = mod.SpeedLimitMiddleware()
     mw._sl_pub = MagicMock()
     sm = MagicMock()
-    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'livePose': False}
+    sm.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
     sm.update = MagicMock()
     mw.sm = sm
     mw._cmd_sub = None
@@ -3582,7 +3582,7 @@ class TestMapdPhase1Telemetry:
     telemetry. The mock sys.modules entry is restored by mock_openpilot's
     monkeypatch.
     """
-    services = sys.modules['cereal.services']
+    services = sys.modules['openpilot.cereal.services']
     services.SERVICE_LIST = {k: v for k, v in services.SERVICE_LIST.items()
                              if k != 'mapdOut'}
 
@@ -3592,7 +3592,7 @@ class TestMapdPhase1Telemetry:
     assert mw._mapd_service_available is False
     subs = sld.messaging.SubMaster.call_args[0][0]
     assert 'mapdOut' not in subs
-    assert 'modelV2' in subs and 'livePose' in subs
+    assert 'modelV2' in subs and 'deviceMotion' in subs
 
   def test_update_runs_and_still_publishes_absent_shape_without_service(self, sld):
     self._drop_mapd_service()
@@ -3676,7 +3676,7 @@ class TestMapdPhase1Telemetry:
     # added at the speedlimitd.py call site reads sm.alive, not just sm.valid.
     injected.sm.alive = {'mapdOut': True}
     # Route to real_sm.updated (not a bare {}) so every OTHER key (modelV2,
-    # gpsLocationExternal, livePose) behaves exactly as it does in the
+    # gpsLocationExternal, deviceMotion) behaves exactly as it does in the
     # baseline run above — the containment comparison is only meaningful if
     # mapdOut is the sole difference between the two update() calls. A literal
     # {} here made speedlimitd.py's unrelated `self.sm.updated['modelV2']`

@@ -50,8 +50,8 @@ installed/removed plugins appear). The rows, in order:
    rows (rendered disabled; describe catpilot core behavior, no param
    written).
 6. **Live Torque** / **Lateral Delay** — status text rows, only for
-   torque-tuned brands in `torqued.ALLOWED_CARS`; poll `liveTorqueParameters`
-   / `liveDelay` (10 s cache).
+   torque-tuned brands in `torqued.ALLOWED_CARS`; poll `lateralTorqueParameters`
+   / `lateralDelay` (10 s cache).
 7. **Vehicle-specific rows** — appended by car plugins, see below.
 
 A heading strip (brand icon + `CP.carFingerprint`) is drawn above the scroller

@@ -9,7 +9,7 @@ import importlib
 def mock_openpilot(monkeypatch):
   """Mock openpilot imports."""
   for mod in ['openpilot', 'openpilot.common', 'openpilot.common.swaglog',
-              'cereal', 'cereal.messaging']:
+              'openpilot.cereal', 'openpilot.cereal.messaging']:
     monkeypatch.setitem(sys.modules, mod, MagicMock())
 
 

@@ -8,7 +8,7 @@ import json
 import os
 import time
 
-import cereal.messaging as messaging
+import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
 from openpilot.selfdrive.plugins.plugin_bus import BUS_DIR
 

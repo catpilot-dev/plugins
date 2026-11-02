@@ -25,7 +25,7 @@ _SEG_RE = re.compile(r"^(.*)--\d+$")
 
 def _log_root() -> str:
   """Realdata root — indirection kept for tests."""
-  from openpilot.system.hardware.hw import Paths
+  from openpilot.common.hardware.hw import Paths
   return Paths.log_root()
 
 

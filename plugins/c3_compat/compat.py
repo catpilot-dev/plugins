@@ -127,7 +127,7 @@ def on_health_check(acc, **kwargs):
 
   # Check panda MCU type from pandaStates
   try:
-    from cereal import messaging
+    from openpilot.cereal import messaging
     if _health_sm is None:
       _health_sm = messaging.SubMaster(["pandaStates"])
     _health_sm.update(0)

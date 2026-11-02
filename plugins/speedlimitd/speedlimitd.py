@@ -26,7 +26,7 @@ import os
 import re
 import time
 import tomllib
-import cereal.messaging as messaging
+import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
 
 # Load speed tables from per-country TOML files
@@ -284,7 +284,7 @@ REACT_MIN_SPEED = 30.0 / 3.6     # m/s (~29 km/h) — below this the cap defers 
                           # is speed-independent (banking, yaw bias, a
                           # tightening spiral) and kills parking-speed noise
                           # engagement.
-REACT_LIVEPOSE_STALE_S = 1.0  # s — no livePose update for longer than this
+REACT_MOTION_STALE_S = 1.0  # s — no deviceMotion update for longer than this
                                # while engaged forces the release ramp: a
                                # stalled localizer must not latch a speed cap
                                # indefinitely. Held-slow is safe briefly; an
@@ -380,7 +380,7 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5, kappa_meas: float
   SpeedLimitMiddleware.update().
 
   `kappa_meas` (route 3d0 seg 60 apex fix): the driver's OWN measured
-  curvature, |yaw_rate|/max(v_ego, 0.1) from the same livePose signal the
+  curvature, |yaw_rate|/max(v_ego, 0.1) from the same deviceMotion signal the
   reactive cap already consumes, passed in only when that reading is fresh
   and valid. When given and above CURVE_GATE it is folded in as a virtual
   d=0 path point (no braking-headroom term — the apex itself is the most
@@ -721,7 +721,7 @@ def lane_count_limit(lane_count: int) -> int:
 
 class SpeedLimitMiddleware:
   def __init__(self):
-    # livePose (2026-07-28): lightest single, vehicle-agnostic source of a
+    # deviceMotion (2026-07-28): lightest single, vehicle-agnostic source of a
     # measured lateral accel — forward speed (velocityDevice.x) and yaw rate
     # (angularVelocityDevice.z) both come from the localizer, no car sensor or
     # steering ratio involved. a_y_meas = v · yaw_rate.
@@ -732,8 +732,8 @@ class SpeedLimitMiddleware:
     # this daemon and leave the car with NO speed-limit data at all. Phase 1
     # telemetry is not worth that, so subscribe conditionally and degrade to the
     # dead-mapd telemetry shape.
-    from cereal.services import SERVICE_LIST
-    _subs = ['modelV2', 'gpsLocationExternal', 'livePose']
+    from openpilot.cereal.services import SERVICE_LIST
+    _subs = ['modelV2', 'gpsLocationExternal', 'deviceMotion']
     self._mapd_service_available = 'mapdOut' in SERVICE_LIST
     if self._mapd_service_available:
       _subs.append('mapdOut')
@@ -867,7 +867,7 @@ class SpeedLimitMiddleware:
     self._react_over_since: float | None = None   # |a_y| first exceeded threshold
     self._react_quiet_since: float | None = None  # |a_y| first went quiet
     self._react_last_t: float = 0.0       # monotonic time of last reactive tick
-    self._react_livepose_last_t: float = 0.0  # monotonic time livePose last updated
+    self._react_motion_last_t: float = 0.0  # monotonic time deviceMotion last updated
 
     # The published limit. Transitions are NOT shaped here — planner_hook ramps
     # the enforced ceiling. This is the sign value: what the road says, now.
@@ -1004,7 +1004,7 @@ class SpeedLimitMiddleware:
 
   def _update_reactive_cap(self, a_y_meas, v_ego: float, threshold: float,
                            now: float, dt: float,
-                           livepose_updated: bool = True) -> float:
+                           motion_updated: bool = True) -> float:
     """Reactive measured-a_y speed cap (2026-07-28 layer contract).
 
     Low-passes |a_y_meas| (~0.3 s). When it exceeds `threshold` continuously
@@ -1015,17 +1015,17 @@ class SpeedLimitMiddleware:
     the driver rather than ratcheting toward zero; see the constant comment).
     Release ramps the cap back up at REACT_RELEASE_RATE once
     |a_y| < threshold−REACT_QUIET_MARGIN for REACT_QUIET_S, or immediately if
-    livePose has gone stale (no update for REACT_LIVEPOSE_STALE_S) while
+    deviceMotion has gone stale (no update for REACT_MOTION_STALE_S) while
     engaged — a stalled localizer must not latch a cap indefinitely.
     `threshold <= 0` disables the feature entirely.
 
     State lives on self; returns the current cap (m/s, 0 = disengaged). Kept a
-    pure function of its inputs so it is unit-testable without livePose msgs;
-    `livepose_updated` defaults True so existing pure-function callers/tests
+    pure function of its inputs so it is unit-testable without deviceMotion msgs;
+    `motion_updated` defaults True so existing pure-function callers/tests
     are unaffected.
     """
-    if livepose_updated:
-      self._react_livepose_last_t = now
+    if motion_updated:
+      self._react_motion_last_t = now
 
     if a_y_meas is not None and math.isfinite(a_y_meas):
       mag = abs(a_y_meas)
@@ -1051,11 +1051,11 @@ class SpeedLimitMiddleware:
     else:
       self._react_quiet_since = None
 
-    # A livePose that has stopped updating while a cap is latched must not be
+    # A deviceMotion that has stopped updating while a cap is latched must not be
     # allowed to hold that cap forever — force the release path immediately.
     stale = (self._react_cap_ms > 0.0
-             and self._react_livepose_last_t > 0.0
-             and now - self._react_livepose_last_t > REACT_LIVEPOSE_STALE_S)
+             and self._react_motion_last_t > 0.0
+             and now - self._react_motion_last_t > REACT_MOTION_STALE_S)
 
     if self._react_cap_ms <= 0.0:
       # Not engaged — engage after sustained over-threshold, but never below
@@ -1277,7 +1277,7 @@ class SpeedLimitMiddleware:
     # is available to curvature_speed_cap() as a same-tick virtual apex point
     # (route 3d0 seg 60 apex fix — see kappa_meas there). Runs every tick (not
     # gated on modelV2) off the localizer's measured yaw. a_y_meas = v · yaw_rate;
-    # both from livePose (vehicle-agnostic, no steering ratio). Catches curves
+    # both from deviceMotion (vehicle-agnostic, no steering ratio). Catches curves
     # the proactive vision cap missed and plant amplification — the ISO
     # 3.0 m/s² defense lives here (see __init__).
     react_dt = min(max(now - self._react_last_t, 0.0), 1.0) if self._react_last_t else 0.2
@@ -1286,13 +1286,13 @@ class SpeedLimitMiddleware:
     v_ego_meas = 0.0
     kappa_meas = None  # |yaw_rate| / max(v_ego, 0.1) — reused below as the
                         # curvature_speed_cap() virtual apex point; stays None
-                        # (no virtual point) unless livePose is fresh and valid
+                        # (no virtual point) unless deviceMotion is fresh and valid
                         # THIS tick — reusing the exact same freshness/validity
                         # check as a_y_meas, no separate staleness tracking added.
-    livepose_updated = self.sm.updated.get('livePose', False)
-    if livepose_updated:
+    motion_updated = self.sm.updated.get('deviceMotion', False)
+    if motion_updated:
       try:
-        lp = self.sm['livePose']
+        lp = self.sm['deviceMotion']
         av = lp.angularVelocityDevice
         vd = lp.velocityDevice
         if getattr(av, 'valid', True) and getattr(vd, 'valid', True):
@@ -1304,7 +1304,7 @@ class SpeedLimitMiddleware:
         v_ego_meas = 0.0
         kappa_meas = None
     self._update_reactive_cap(a_y_meas, v_ego_meas, self.react_lat_accel_threshold,
-                              now, react_dt, livepose_updated)
+                              now, react_dt, motion_updated)
 
     # --- Read lane data from vision model ---
     if self.sm.updated['modelV2']:
