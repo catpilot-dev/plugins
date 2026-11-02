@@ -7,7 +7,12 @@
 # safety suite there, builds the STM32F4 panda firmware, then restores the
 # workspace tree so its opendbc_repo carries no local modifications.
 #
-# Output: $WORKSPACE/panda/board/obj/panda.bin.signed  (flash from the C3)
+# bmw_hooks are registered under two safety-model ordinals: the workspace's
+# SAFETY_BMW (35, what the openpilot 0.11.1 base asks for) and 37 (upstream
+# opendbc's SafetyModel.bmw, what openpilot 0.11.2 asks for). One image serves
+# both bases, so it can be flashed and verified before the base moves.
+#
+# Output: $WORKSPACE/panda-bmw-fw/board/obj/panda.bin.signed  (flash from the C3)
 set -euo pipefail
 
 WORKSPACE="${BMW_FW_WORKSPACE:-$HOME/openpilot}"
@@ -17,15 +22,18 @@ SAFETY_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODES_BMW="opendbc/safety/modes/bmw.h"
 TEST_BMW="opendbc/safety/tests/test_bmw.py"
 LIBSAFETY_C="opendbc/safety/tests/libsafety/safety.c"
+DECLS_H="opendbc/safety/safety_declarations.h"
+SAFETY_H="opendbc/safety/safety.h"
+SAFETY_BMW_0112=37   # upstream SafetyModel.bmw (opendbc #3682), openpilot 0.11.2
 
 [ -d "$ODB" ] || { echo "firmware workspace not found: $ODB"; exit 1; }
-if ! git -C "$ODB" diff --quiet -- "$MODES_BMW" "$TEST_BMW" "$LIBSAFETY_C"; then
+if ! git -C "$ODB" diff --quiet -- "$MODES_BMW" "$TEST_BMW" "$LIBSAFETY_C" "$DECLS_H" "$SAFETY_H"; then
   echo "refusing: injection targets have local modifications in $ODB"
   exit 1
 fi
 
 restore() {
-  git -C "$ODB" checkout -- "$MODES_BMW" "$TEST_BMW" "$LIBSAFETY_C"
+  git -C "$ODB" checkout -- "$MODES_BMW" "$TEST_BMW" "$LIBSAFETY_C" "$DECLS_H" "$SAFETY_H"
 }
 trap restore EXIT
 
@@ -43,6 +51,25 @@ if 'bool ignition_can' not in src:
   src = src.replace(marker, marker +
     '\n\n// injected by bmw_e9x_e8x build_firmware.sh: firmware-only global\nbool ignition_can = false;')
   open(p, 'w').write(src)
+PYEOF
+# second ordinal for bmw_hooks (see header); refuse if the slot is taken
+python3 - "$ODB/$DECLS_H" "$ODB/$SAFETY_H" "$SAFETY_BMW_0112" <<'PYEOF'
+import re, sys
+decls_p, safety_p, ordinal = sys.argv[1], sys.argv[2], sys.argv[3]
+decls = open(decls_p).read()
+if re.search(rf'#define SAFETY_\w+ {ordinal}U\b', decls):
+  sys.exit(f'refusing: safety-model ordinal {ordinal} is already defined in {decls_p}')
+anchor = re.search(r'#define SAFETY_BMW \d+U\n', decls)
+if not anchor:
+  sys.exit(f'refusing: no SAFETY_BMW define in {decls_p}')
+decls = decls[:anchor.end()] + f'#define SAFETY_BMW_0112 {ordinal}U  // injected by bmw_e9x_e8x build_firmware.sh: openpilot 0.11.2\n' + decls[anchor.end():]
+open(decls_p, 'w').write(decls)
+safety = open(safety_p).read()
+entry = re.search(r'\n( *)\{SAFETY_BMW, &bmw_hooks\},[^\n]*\n', safety)
+if not entry:
+  sys.exit(f'refusing: no SAFETY_BMW registry entry in {safety_p}')
+safety = safety[:entry.end()] + f'{entry.group(1)}{{SAFETY_BMW_0112, &bmw_hooks}},  // injected: openpilot 0.11.2 ordinal\n' + safety[entry.end():]
+open(safety_p, 'w').write(safety)
 PYEOF
 
 source "$WORKSPACE/.venv/bin/activate"

@@ -1082,6 +1082,14 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
   note the device lib's `Panda.flash()` hangs on F4 re-enumeration and
   hardcodes H7 sector layout — call `Panda.flash_static(handle, code,
   mcu_type=McuType.F4)` with the panda already in bootstub instead.
+- **Two safety-model ordinals** (2026-11-02): the build also registers
+  `bmw_hooks` under 37, upstream opendbc's `SafetyModel.bmw`, which openpilot
+  0.11.2 asks for (the 0.11.1 base asks for the workspace's `SAFETY_BMW` 35).
+  One image serves both bases, so it can be flashed and verified on 0.11.1
+  before the base moves. The script refuses if 37 is already taken in the
+  workspace; the safety suite runs again through 37 (servo and no-servo
+  configs) and checks 36/38 stay unknown. First image: signature `39f4d7f6`,
+  `DEV-a0848226`, 58660 B (the Sep 30 image `a552508f` is the 35-only one).
 - **RX checks** on brake, gas, speed, either cruise-status message and the
   stalk, plus the stepper status when the servo param is set.
 - `disable_forwarding = true`; cruise-engaged state is taken from the DCC/NCC
