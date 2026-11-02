@@ -309,6 +309,18 @@ def test_main_prints_catalog_files_object(tmp_path, capsys, template, retrained,
                    'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
 
 
+def test_main_no_verify_withholds_the_catalog_object(tmp_path, capsys, template, retrained, legacy):
+  out = tmp_path / 'out.onnx'
+  assert lps.main(_write_inputs(tmp_path, template, retrained, legacy) + [str(out), '--no-verify']) == 0
+  printed = capsys.readouterr()
+  data = out.read_bytes()
+  assert 'UNVERIFIED — do not publish' in printed.err
+  lines = printed.out.splitlines()
+  assert f'sha256 {hashlib.sha256(data).hexdigest()}' in lines and f'size {len(data)}' in lines
+  assert lps.URL_PLACEHOLDER not in printed.out
+  assert not any(line.lstrip().startswith('{') for line in lines)
+
+
 def test_main_refuses_a_different_backbone_and_writes_nothing(tmp_path, capsys, template, legacy):
   out = tmp_path / 'out.onnx'
   assert lps.main(_write_inputs(tmp_path, template, make_vision(1, head_seed=1), legacy) + [str(out)]) == 1

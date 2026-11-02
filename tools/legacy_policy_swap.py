@@ -12,7 +12,8 @@ PC-only maintainer tool. The template supercombo (e.g. the stock 0.11.2 file) su
 
   python tools/legacy_policy_swap.py TEMPLATE LEGACY_VISION LEGACY_POLICY OUTPUT [--no-verify]
 
-The last line printed is the catalog `files` object for the output (fill in the release asset URL).
+The last line printed is the catalog `files` object for the output (fill in the release asset URL). With --no-verify
+only sha256 and size are printed, plus `UNVERIFIED — do not publish` on stderr: an unverified file must not be served.
 """
 import argparse
 import base64
@@ -367,7 +368,8 @@ def main(argv=None):
   ap.add_argument('legacy_vision', help='legacy driving_vision.onnx')
   ap.add_argument('legacy_policy', help='legacy driving_policy.onnx')
   ap.add_argument('output', help='converted driving_supercombo.onnx to write')
-  ap.add_argument('--no-verify', action='store_true', help='skip the onnxruntime verification')
+  ap.add_argument('--no-verify', action='store_true',
+                  help='skip the onnxruntime verification (the output is then not for publishing)')
   args = ap.parse_args(argv)
   template, legacy_vision, legacy_policy = (onnx.load(p) for p in (args.template, args.legacy_vision, args.legacy_policy))
   try:
@@ -384,6 +386,9 @@ def main(argv=None):
   sha256, size = _sha256(args.output), os.path.getsize(args.output)
   print(f'sha256 {sha256}')
   print(f'size {size}')
+  if args.no_verify:
+    print('UNVERIFIED — do not publish', file=sys.stderr)
+    return 0
   print(json.dumps({'name': OUTPUT_NAME, 'url': URL_PLACEHOLDER, 'sha256': sha256, 'size': size}))
   return 0
 
