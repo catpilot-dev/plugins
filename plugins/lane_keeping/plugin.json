@@ -1,7 +1,7 @@
 {
   "id": "lane_keeping",
   "name": "Lateral Reference Conditioner",
-  "version": "0.11.1",
+  "version": "2026.11.02",
   "type": "hook",
   "author": "catpilot",
   "description": "Lateral reference conditioner: an arc through the model's planned path ahead, low-passed, for the vehicle's lateral controller.",
