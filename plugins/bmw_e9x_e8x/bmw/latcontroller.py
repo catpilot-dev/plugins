@@ -27,6 +27,7 @@ module instance would carry its own state dict.
 """
 import os
 import sys
+from collections import deque
 
 # The plugin root must be importable for `from bmw.values import ...` whatever
 # the load order (this file lives in bmw/).
@@ -193,6 +194,17 @@ def on_lat_controller_init(result, lac, CP):
   # against 4.3-5.6 Nm, the car ran ~0.2 s behind the plan and the model added
   # correcting lobes = the wheel swing). Never above STEP_MAX_BP[0].
   LANE_CHANGE_STATES = ('laneChangeStarting', 'laneChangeFinishing')
+  # Yaw predictor, lane changes only: the P law's measured curvature adds the
+  # curvature the wheel has put in over the last YAW_PRED_TICKS livePose ticks
+  # (0.3 s = the wheel -> yaw lag, routes 4f7-511), which the yaw has not shown
+  # yet. The rack holds the wheel where it stops (route 511 seg 6: 2 -> 12 deg
+  # under <= 1.6 Nm, held at 0 Nm), so the yaw-only P reversed ~0.3 s after the
+  # overshoot was already in. Only the difference enters: a standing wheel
+  # angle (alignment offset, a curve) adds nothing, and the yaw stays the
+  # steady-state reference. YAW_PRED_SR: wheel deg per front-wheel deg incl.
+  # understeer, fitted on routes 510/511 (24.8-25.4).
+  YAW_PRED_TICKS = 6
+  YAW_PRED_SR = 25.0
 
   # Relax-dwell: in a measured deep curve an overshoot-side error must persist
   # this long before the decision may command below the current torque. It
@@ -232,6 +244,9 @@ def on_lat_controller_init(result, lac, CP):
     'slope': False,          # SlopeCompensation latched at the engagement edge
     'sl_bias': 0.0,          # learned straight-road torque (Nm); kept across engagements, never persisted
     'sl_learn': False,       # learn gate open this livePose tick (telemetry)
+    'lane_change': False,    # model runs a lane change this livePose tick (LANE_CHANGE_STATES)
+    'wheel_hist': deque(maxlen=YAW_PRED_TICKS + 1),  # wheel angle (deg) at the last livePose ticks
+    'kappa_pred': 0.0,       # yaw-predictor curvature added to the P law's measured (1/m)
   }
 
   def update(active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
@@ -290,9 +305,20 @@ def on_lat_controller_init(result, lac, CP):
       v = gain_reference_speed(v_true)
       state['measured'] = float(lp.angularVelocityDevice.z) / v_true
 
+      # Lane change (model state) gates the step cap and the yaw predictor.
+      state['lane_change'] = bool(
+        _sm.seen['drivingModelData']
+        and str(_sm['drivingModelData'].meta.laneChangeState) in LANE_CHANGE_STATES)
+      _hist = state['wheel_hist']
+      _hist.append(_angle)
+      state['kappa_pred'] = 0.0
+      if state['lane_change'] and len(_hist) == _hist.maxlen:
+        # angle + = left, kappa + = right.
+        state['kappa_pred'] = -math.radians(_hist[-1] - _hist[0]) / (YAW_PRED_SR * L)
+
       # Front-wheel-angle error (rear-axle bicycle model).
       delta_des = math.atan(state['desired'] * L)
-      delta_meas = math.atan(state['measured'] * L)
+      delta_meas = math.atan((state['measured'] + state['kappa_pred']) * L)
       delta_err_raw = delta_des - delta_meas
 
       delta_err = delta_err_raw
@@ -392,8 +418,7 @@ def on_lat_controller_init(result, lac, CP):
         # the plant respond one cadence, re-measure and step again (route 385
         # seg 27: single 8.3 Nm decisions drove 150 deg/s wheel bursts).
         step_max = float(np.interp(v, STEP_MAX_V, STEP_MAX_BP))
-        if (_sm.seen['drivingModelData']
-            and str(_sm['drivingModelData'].meta.laneChangeState) in LANE_CHANGE_STATES):
+        if state['lane_change']:
           step_max = STEP_MAX_BP[0]
         # Fast unwind in the LKA regime, only while the step moves torque
         # toward zero: releasing carries no abrupt-application hazard below
@@ -534,6 +559,7 @@ def on_lat_controller_init(result, lac, CP):
           'tu_guarded': int(state['guard'].suppressed),       # cumulative reversals held at 0 by the noise guard
           'sl_bias': float(state['sl_bias']),                  # learned straight-road torque (Nm)
           'sl_learn': bool(state['sl_learn']),                 # slope-bias learn gate open
+          'kappa_pred': float(state['kappa_pred']),            # yaw predictor, added to measured in the P law (1/m)
         }
         state['lat_pub'].send(payload)
       except Exception:

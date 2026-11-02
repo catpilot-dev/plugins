@@ -18,6 +18,8 @@ with no filtering of its own.
 **Error and gain** (rear-axle bicycle model, `L = CP.wheelbase`):
 
     delta_err = atan(kappa_ref·L) − atan(kappa_meas·L)      kappa_meas = yaw rate / v_true
+                                                            (+ kappa_pred during a lane change)
+    kappa_pred = −rad(wheel(t) − wheel(t − 0.3 s)) / (YAW_PRED_SR · L)   lane change only, else 0
     v         = max(v_true, V_GAIN_FLOOR)                   gain reference speed
     P_nm      = T_CAP_SLOPE_BASE · kappa_scale(|kappa_ref|) · v² · delta_err
     a_ref     = v_true² · kappa_ref                          reference lateral accel (m/s²)
@@ -49,6 +51,7 @@ ramp are 0, so every engagement ramps from 0.
 | `CF_AY0`, `CF_GAIN`, `CF_MAX_NM` | 0.2 m/s², 1.4 Nm per m/s², 2.0 Nm | curve feed-forward deadband, gain, cap (raised 2026-11-01) |
 | `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
 | `STEP_MAX_V` / `_BP` | [15, 28] m/s → [0.10, 0.05] frac | per-decision step cap |
+| `YAW_PRED_TICKS`, `YAW_PRED_SR` | 6 livePose ticks (0.3 s), 25 | lane-change yaw predictor window and wheel/front-wheel ratio (2026-11-02) |
 | `LANE_CHANGE_STATES` | laneChangeStarting, laneChangeFinishing | `drivingModelData.meta` states with the flat 0.10 step cap (2026-11-02) |
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
@@ -1045,6 +1048,20 @@ gone; the current law above is authoritative.
 > stays everywhere else. Verify next drive: lane-change direction changes (4),
 > yaw lag (0.85 s), post-change offset.
 
+> **2026-11-02 — lane-change yaw predictor (route 511 seg 6).** The flat step cap
+> cut the lane-change yaw lag 0.85 → 0.70 s on 511, but ~50 % of lane changes
+> still had a third ≥ 4° wheel swing. Worst, seg 6 (75 km/h): the wheel ran
+> 2 → 12° under ≤ 1.6 Nm, the yaw overshot the reference (2.6 vs 1.7e-3) and the
+> rack held 12° at 0 Nm; the yaw-based P saw the overshoot ~0.3 s late (wheel →
+> yaw lag), the return needed −2..−3 Nm, and the model added two correcting
+> lobes. During a lane change the P law's measured curvature now adds
+> `kappa_pred`, the curvature the wheel put in over the last 0.3 s. Only the
+> difference enters (offsets and steer-ratio error cancel at steady state; the
+> yaw stays the reference — not the retired angle-space / angle-FF designs).
+> Open-loop on 510/511: the demand turns against each lane-change lobe
+> 0.20–0.25 s earlier. Verify next drive: lane changes with a third ≥ 4° swing
+> (511: 50 %), yaw lag (0.70 s), no new wobble mid-change.
+
 ---
 
 ## 1. Why a custom controller (not stock latcontrol_torque)
@@ -1356,6 +1373,7 @@ Published each livePose tick. The exact field set is pinned by
 | `tu_guarded` | cumulative reversals held at 0 by the noise guard |
 | `sl_bias` | learned straight-road torque (Nm) |
 | `sl_learn` | slope-bias learn gate open this tick |
+| `kappa_pred` | yaw-predictor curvature added to `measured` in the P law (1/m); 0 outside lane changes |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 
