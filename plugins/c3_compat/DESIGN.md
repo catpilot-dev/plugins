@@ -22,7 +22,7 @@ overlay swap and before the plugin install / scons build:
 ```
 launch_chffrplus.sh
   └─ source /data/plugins-runtime/c3_compat/boot_patch.sh "$DIR"   # unless .disabled present
-       ├─ patch the openpilot tree (amplifier, panda, pandad, spi, dfu, multilang, hardware)
+       ├─ patch the openpilot tree (panda, pandad, spi, dfu, multilang, hardware)
        ├─ venv_sync.py --runtime-only --native-deps   (sync AGNOS 12.8 venv to uv.lock)
        ├─ install msgfmt stub + DRM raylib into the venv
        ├─ stop/mask Weston, install weston-ready stub, strip Wayland env
@@ -92,7 +92,11 @@ Supporting boot patches:
 - **§6 PATH/PYTHONPATH** — patches `launch_chffrplus.sh` so scons sees the venv:
   `/usr/local/venv/bin` on PATH (cythonize), venv site-packages + `opendbc_repo`
   on PYTHONPATH (system `/usr/bin/scons` uses `/usr/bin/python3` and the DBC
-  generator imports `opendbc`).
+  generator imports `opendbc`). The comma-deps-capnproto wheel's
+  `capnproto/install/bin` goes first on PATH: `cereal/SConscript` runs a bare
+  `capnpc`, and on 0.11.2 the headers it generates must match the wheel's
+  libcapnp the build links, not the AGNOS 12.8 system capnpc. Keyed on the PATH
+  line it writes (the launch script mentions c3_compat itself).
 
 ### pycapnp / messaging-layer memory leak (boot §1b, `venv_sync` SKIP set)
 
@@ -110,25 +114,33 @@ The comma three renders the raylib UI directly on `/dev/dri/card0` via a DRM
 backend, not through the Wayland/Weston compositor the AGNOS 12.8 venv's stock
 raylib expects.
 
-- **§2c DRM raylib** — the plugin ships a DRM-built
+- **§2c DRM raylib** (openpilot ≤ 0.11.1) — the plugin ships a DRM-built
   `_raylib_cffi.cpython-312-aarch64-linux-gnu.so` (plus the raylib Python package)
   under `raylib_drm/` (Git LFS). Boot copies it over the venv's Wayland build,
-  detected by probing the `.so` for the `gbm_create_device` symbol.
+  detected by probing the `.so` for the `gbm_create_device` symbol. **0.11.2**
+  replaces the PyPI `raylib` with `comma-deps-raylib` 6, whose own "comma"
+  backend (GLES/EGL/gbm/drm, selected when `/AGNOS` exists) renders on DRM
+  under different file names (`_raylib_cffi_comma.abi3.so`, `_backend.py`); the
+  step keys on the 5.5 `.so` being present and `_backend.py` absent, so it
+  never copies 5.5 files over the 6.0 package (that breaks the UI).
 - **§5 Weston** — `systemctl stop weston` + `mask weston` so raylib can take DRM
   master. The stock `weston-ready.service` is replaced with a `oneshot` /
   `RemainAfterExit=yes` `/bin/true` stub: AGNOS `comma.sh` polls
   `systemctl is-active weston-ready` up to ~200×; a masked service stays
   "inactive" (28 s timeout), the stub reports "active" immediately (~1 s boot).
 - **§7 launch_env.sh** — the AGNOS < 16 Wayland env block is replaced with a
-  plain `systemctl stop weston`, removing `WAYLAND_DISPLAY` etc.
+  plain `systemctl stop weston`, removing `WAYLAND_DISPLAY` etc. Keyed on the
+  `export WAYLAND_DISPLAY=` line (the file mentions c3_compat itself since 0.11.2).
 - **§3 multilang** — `multilang.py`'s `.mo` loader has its `except
   FileNotFoundError` broadened to `except Exception` so the empty stub `.mo`
   files (from the msgfmt stub) don't crash the UI.
 
-### Audio (boot §1)
+### Audio (boot §1 — retired)
 
-v0.10.3 dropped the `"tici"` entry from `amplifier.py`'s `CONFIGS`. Boot
-re-inserts the full tici `AmpConfig` / EQ block so the comma three speaker works.
+v0.10.3 dropped the `"tici"` entry from `amplifier.py`'s `CONFIGS`; the boot
+patch re-inserted it. Since openpilot 0.11.1 upstream applies one `CONFIG` list
+on every device (no per-device dict), so the insertion had no anchor and the
+comma three has been running the common list. §1 is a comment now.
 
 ### Panda — STM32F4 / Dos board (boot §8/8a/8b/9/10/11/12/13)
 
@@ -144,25 +156,59 @@ the panda library and pandad about F4:
   succeeds (new field defaults to 0).
 - **§8b version check skip** — `ensure_version` short-circuits for F4 (firmware
   v16 vs library v18) instead of raising "Reflash panda".
-- **§9 pandad** — skips firmware flashing for F4 (there is no `panda.bin.signed`;
-  the BMW plugin owns firmware), caches `_mcu_type`, skips the `first_run`
-  `reset(reconnect=True)` (F4 USB re-enumeration hangs the reconnect loop), adds a
-  2 s USB-settle `sleep` so native `pandad` can claim the device, sets
-  `BOARDD_SKIP_FW_CHECK=1`, and adds crash-backoff (5 s × crash count, capped 60 s)
-  so a `pandad` crash-loop can't cascade into a SOM reset / red-LED hang.
+- **§9 pandad** (≤ 0.11.1 layout) — skips firmware flashing for F4 (there is no
+  `panda.bin.signed`; the BMW plugin owns firmware), caches `_mcu_type`, skips the
+  `first_run` `reset(reconnect=True)` (F4 USB re-enumeration hangs the reconnect
+  loop), adds a 2 s USB-settle `sleep` so native `pandad` can claim the device,
+  sets `BOARDD_SKIP_FW_CHECK=1`, and adds crash-backoff (5 s × crash count, capped
+  60 s) so a `pandad` crash-loop can't cascade into a SOM reset / red-LED hang.
+- **§9b pandad** (0.11.2 layout: `panda_ready()` / `flash_panda()` via DFU, bare
+  `./pandad`) — on tici: no `HARDWARE.reset_internal_panda()` each pass (the USB
+  re-enumeration outruns `panda_ready`'s 1 s wait), an F4 passes `panda_ready()`
+  without the H7 `up_to_date()` check, and `flash_panda()` — BOOT0 → DFU →
+  recover + flash the **H7** image — is never reached (retry instead). Then the
+  same settle delay, `BOARDD_SKIP_FW_CHECK` and crash backoff.
 - **§10–12 SPI off (USB-only)** — v0.10.3's native `pandad` SPI protocol is
   incompatible with the F4 and crash-loops on it. Boot `chmod 000
   /dev/spidev0.0`; `spi.py` maps the resulting `PermissionError` →
-  `PandaSpiUnavailable`, and `dfu.py`'s `spi_list()` handler is broadened to
-  `except Exception`, so the C++/Python panda code cleanly falls back to USB.
+  `PandaSpiUnavailable` (two anchors: the `spidev.SpiDev()` open of ≤ 0.11.1 and
+  the raw `open(DEV_PATH)` of 0.11.2), and `dfu.py`'s `spi_list()` handler is
+  broadened to `except Exception`, so the Python panda code cleanly falls back to
+  USB. **The 0.11.2 native `pandad` has no USB path at all** — see below.
 - **§13** — clears `panda/python/__pycache__` so the patched sources take effect.
+
+### Not covered by boot patches on openpilot 0.11.2 (C++ that lived in the catpilot repo)
+
+Three pieces of comma-three support were never boot patches: they were in-repo
+C++ in catpilot commit `7a4e44e1f`, which the 0.11.2 rebase dropped (the plan
+assumed this plugin carried them). Until they are ported, 0.11.2 does not run on
+a comma three:
+
+- **camerad AR0231** — the comma three's sensor. `sensors/ar0231.cc` +
+  `ar0231_registers.h` (new files), a probe entry in `spectra.cc::openSensor`,
+  the `SConscript` source list, the class declaration in `sensor.h`, the encoder-
+  aligned NV12 buffer size in `camera_common.cc`, and the exposure tuning in
+  `camera_qcom2.cc`. `SensorInfo` is unchanged between 0.11.1 and 0.11.2 and
+  every anchor is present at the tag.
+- **native pandad over USB** — 0.11.2's `selfdrive/pandad` is SPI-only
+  (`PandaSpiHandle` only; `Panda::list()` = SPI list). `7a4e44e1f` added
+  `panda_comms.cc` (`PandaUsbHandle` on libusb) behind a `PandaCommsHandle`
+  base, USB-first connect with SPI fallback, and `-lusb-1.0`. The header and
+  `spi.cc` were rewritten upstream since, so this is a re-port, not a hunk.
+- **loggerd v4l_encoder** — retry loop until the Venus encoder answers
+  `VIDIOC_QUERYCAP` (boot-time race on AGNOS 12.8). Anchor present at the tag.
+
+Build-system items that *are* handled here: the comma-deps-* wheels (venv_sync
+installs them from uv.lock; its git-sourced native-deps step stands down when
+the lock ships them), and the wheel's `capnpc` first on PATH (§6).
 
 ### Modem / eSIM (boot §14)
 
 The AGNOS 12.8 modem fails `AT+CCHO` (ISD-R open) with "Unknown error", which
 crashes `configure_modem()` in `hardware.py` and blocks onroad/offroad
 transitions. Boot wraps the `get_sim_lpa().is_comma_profile()` call in
-`try/except` so modem init proceeds.
+`try/except` so modem init proceeds. 0.11.2 has no eSIM prime block in
+`hardware.py` (moved to the UI); the step reports that and does nothing.
 
 ## Runtime hook — `compat.py`
 

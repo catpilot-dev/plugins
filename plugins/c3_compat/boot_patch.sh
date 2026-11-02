@@ -11,36 +11,10 @@ OPENPILOT_DIR="${1:-/data/openpilot}"
 
 echo "[c3_compat] Applying AGNOS 12.8 patches to $OPENPILOT_DIR"
 
-# 1. Amplifier: add tici config (removed in v0.10.3 which dropped C3 support)
-#    0.11.2: file moved to common/hardware/comma/ and CONFIGS{} became a single CONFIG list;
-#    the pattern below no longer matches there and must be re-derived on the device.
-AMP_FILE="$OPENPILOT_DIR/openpilot/common/hardware/comma/amplifier.py"
-if [ -f "$AMP_FILE" ] && ! grep -q '"tici"' "$AMP_FILE"; then
-  python3 - "$AMP_FILE" << 'PYEOF'
-import sys
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-
-tici_config = '''  "tici": [
-    AmpConfig("Right speaker output from right DAC", 0b1, 0x2C, 0, 0b11111111),
-    AmpConfig("Right Speaker Mixer Gain", 0b00, 0x2D, 2, 0b00001100),
-    AmpConfig("Right speaker output volume", 0x1c, 0x3E, 0, 0b00011111),
-    AmpConfig("DAI2 EQ enable", 0b1, 0x49, 1, 0b00000010),
-
-    *configs_from_eq_params(0x84, EQParams(0x274F, 0xC0FF, 0x3BF9, 0x0B3C, 0x1656)),
-    *configs_from_eq_params(0x8E, EQParams(0x1009, 0xC6BF, 0x2952, 0x1C97, 0x30DF)),
-    *configs_from_eq_params(0x98, EQParams(0x0F75, 0xCBE5, 0x0ED2, 0x2528, 0x3E42)),
-    *configs_from_eq_params(0xA2, EQParams(0x091F, 0x3D4C, 0xCE11, 0x1266, 0x2807)),
-    *configs_from_eq_params(0xAC, EQParams(0x0A9E, 0x3F20, 0xE573, 0x0A8B, 0x3A3B)),
-  ],
-'''
-content = content.replace('CONFIGS = {\n  "tizi"', 'CONFIGS = {\n' + tici_config + '  "tizi"')
-with open(path, 'w') as f:
-    f.write(content)
-PYEOF
-  echo "[c3_compat] Patched amplifier.py with tici config"
-fi
+# 1. Amplifier: nothing to patch since openpilot 0.11.1 — upstream folded the
+#    per-device CONFIGS dict into one CONFIG list that initialize_configuration()
+#    applies on every device, and the tici-only entries left with it. The old
+#    "tici" insertion keyed on CONFIGS = {"tizi" ...} has been a no-op since then.
 
 # 1b. pycapnp: downgrade 2.2.2 → 2.1.0 to fix memory leak on C3
 #     pycapnp 2.2.2 leaks ~6MB/s in Event.new_message() (666k objects/10s).
@@ -104,11 +78,16 @@ if [ -f "$VENV_SYNC" ] && [ -f /data/openpilot/uv.lock ]; then
   done
 fi
 
-# 2c. DRM raylib: AGNOS 12.8 venv has Wayland raylib, but C3 uses DRM backend
-#     Copy DRM-built raylib from plugin's raylib_drm/ into venv (overwrites Wayland version)
+# 2c. DRM raylib (openpilot <= 0.11.1 only): the PyPI raylib 5.5 wheel in the
+#     AGNOS 12.8 venv is a Wayland build; copy the DRM build from raylib_drm/
+#     over it. openpilot 0.11.2 ships comma-deps-raylib 6 instead, which carries
+#     its own DRM "comma" backend (auto-selected on /AGNOS) under different file
+#     names — that package must never be touched (copying 5.5 files over it
+#     breaks the UI). Keyed on the 5.5 .so being present and raylib/_backend.py absent.
 RAYLIB_DRM="/data/plugins-runtime/c3_compat/raylib_drm"
 _raylib_so="$VENV_SITE/raylib/_raylib_cffi.cpython-312-aarch64-linux-gnu.so"
-if [ -d "$RAYLIB_DRM/raylib" ] && ! nm -D "$_raylib_so" 2>/dev/null | grep -q 'gbm_create_device'; then
+if [ -d "$RAYLIB_DRM/raylib" ] && [ -f "$_raylib_so" ] && [ ! -f "$VENV_SITE/raylib/_backend.py" ] \
+   && ! nm -D "$_raylib_so" 2>/dev/null | grep -q 'gbm_create_device'; then
   [ $_venv_patched -eq 0 ] && sudo mount -o remount,rw / 2>/dev/null
   sudo cp -rf "$RAYLIB_DRM/raylib/"* "$VENV_SITE/raylib/"
   _venv_patched=1
@@ -159,7 +138,10 @@ fi
 # 5b. commaai/dependencies stubs: v0.11.0 SConstruct imports pkg modules
 #     (bzip2, capnproto, eigen, ...) that are only pre-installed on AGNOS 16+.
 #     On AGNOS 12.8 we stub them to return system library paths so scons can parse.
-#     /data/pip_packages is on PYTHONPATH (set in step 6) and persists across reboots.
+#     /data/pip_packages is LAST on PYTHONPATH (launch_chffrplus.sh), so the real
+#     packages win where installed. openpilot 0.11.2 needs acados/json11 too and
+#     ships every one of them as a comma-deps-* wheel that venv_sync (2b)
+#     installs from uv.lock — there the stubs are inert and the wheels are required.
 if [ ! -f /data/pip_packages/bzip2.py ]; then
   mkdir -p /data/pip_packages
   for pkg_spec in \
@@ -189,19 +171,25 @@ fi
 #    scons at /usr/bin/scons uses #!/usr/bin/python3 which can't see venv packages.
 #    scons also shells out to cythonize, which lives in /usr/local/venv/bin/.
 #    DBC generator imports 'opendbc' — needs opendbc_repo on PYTHONPATH.
+#    capnpc: cereal/SConscript runs a bare `capnpc`; on 0.11.2 the C++ build links
+#    the comma-deps-capnproto wheel, whose capnpc must generate the headers (the
+#    AGNOS 12.8 system capnpc is another version -> "version mismatch"). Its
+#    bin dir goes first; absent on 0.11.1, harmless there.
+#    Guard: the launch script itself mentions c3_compat (it sources this file),
+#    so key on the PATH line this step writes.
 LAUNCH_FILE="$OPENPILOT_DIR/launch_chffrplus.sh"
-if [ -f "$LAUNCH_FILE" ] && ! grep -q 'c3_compat' "$LAUNCH_FILE"; then
-  python3 - "$LAUNCH_FILE" << 'PYEOF'
+if [ -f "$LAUNCH_FILE" ] && ! grep -q 'export PATH=".*/usr/local/venv/bin' "$LAUNCH_FILE"; then
+  python3 - "$LAUNCH_FILE" "$VENV_SITE" << 'PYEOF'
 import sys
-path = sys.argv[1]
+path, venv_site = sys.argv[1], sys.argv[2]
 with open(path) as f:
     content = f.read()
-# Add venv/bin to PATH (for cythonize, scons tools)
+# Add venv/bin (cythonize, scons tools) and the capnproto wheel's bin (capnpc) to PATH
 content = content.replace(
     'export PYTHONPATH="$PWD"',
-    '# c3_compat: venv bin for cythonize, venv site-packages + opendbc_repo for scons\n'
-    'export PATH="/usr/local/venv/bin:$PATH"\n'
-    'export PYTHONPATH="$PWD:$PWD/opendbc_repo:/usr/local/venv/lib/python3.12/site-packages"'
+    '# c3_compat: venv bin for cythonize, capnproto wheel bin for capnpc, venv site-packages + opendbc_repo for scons\n'
+    f'export PATH="{venv_site}/capnproto/install/bin:/usr/local/venv/bin:$PATH"\n'
+    f'export PYTHONPATH="$PWD:$PWD/opendbc_repo:{venv_site}"'
 )
 with open(path, 'w') as f:
     f.write(content)
@@ -210,8 +198,10 @@ PYEOF
 fi
 
 # 7. launch_env.sh: remove Wayland env vars (DRM backend uses /dev/dri/card0 directly)
+#    Guard: the file itself mentions c3_compat since 0.11.2 (AGNOS policy comment),
+#    so key on the Wayland export this step removes.
 LAUNCH_ENV="$OPENPILOT_DIR/launch_env.sh"
-if [ -f "$LAUNCH_ENV" ] && grep -q 'WAYLAND_DISPLAY' "$LAUNCH_ENV" && ! grep -q 'c3_compat' "$LAUNCH_ENV"; then
+if [ -f "$LAUNCH_ENV" ] && grep -q 'export WAYLAND_DISPLAY=' "$LAUNCH_ENV" && ! grep -q 'c3_compat: DRM backend' "$LAUNCH_ENV"; then
   python3 - "$LAUNCH_ENV" << 'PYEOF'
 import sys, re
 path = sys.argv[1]
@@ -395,10 +385,10 @@ fi
 
 # 9. Pandad: skip firmware flashing for F4 panda (BMW plugin handles firmware)
 #    Without this, pandad would try to flash non-existent panda.bin.signed
-#    0.11.2: pandad.py was restructured (flash_panda() via PandaDFU, Panda.list() loop); the
-#    patterns below no longer match there and must be re-derived on the device.
+#    Two layouts: <= 0.11.1 (flash_panda(serial), first_run reset, pandad <serial>)
+#    below, and 0.11.2 (panda_ready()/flash_panda() via DFU, bare ./pandad) in 9b.
 PANDAD_FILE="$OPENPILOT_DIR/openpilot/selfdrive/pandad/pandad.py"
-if [ -f "$PANDAD_FILE" ] && ! grep -q 'c3_compat' "$PANDAD_FILE"; then
+if [ -f "$PANDAD_FILE" ] && ! grep -q 'c3_compat' "$PANDAD_FILE" && ! grep -q 'def panda_ready' "$PANDAD_FILE"; then
   python3 - "$PANDAD_FILE" << 'PYEOF'
 import sys
 path = sys.argv[1]
@@ -494,6 +484,101 @@ with open(path, 'w') as f:
 PYEOF
   echo "[c3_compat] Patched pandad.py to skip F4 firmware flashing"
 fi
+
+# 9b. Pandad (openpilot 0.11.2 layout). Stock flow per pass: GPIO-reset the panda,
+#     panda_ready() (1 s wait, bootstub check, up_to_date() against the H7 image),
+#     and on failure flash_panda() = BOOT0 -> DFU -> recover + flash the H7 image.
+#     On the comma three every step is wrong for the F4: the USB re-enumeration
+#     after a reset outruns the 1 s wait, up_to_date() can never match, and the
+#     DFU path would push H7 images at an STM32F4 (the BMW plugin owns that
+#     firmware). On tici: no reset, F4 passes panda_ready() once connected,
+#     never flash — just retry; then the USB settle delay, BOARDD_SKIP_FW_CHECK
+#     for the native check and the crash backoff, as before.
+if [ -f "$PANDAD_FILE" ] && grep -q 'def panda_ready' "$PANDAD_FILE" && ! grep -q 'c3_compat' "$PANDAD_FILE"; then
+  python3 - "$PANDAD_FILE" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+n = 0
+
+old = 'import os\nimport signal\nimport subprocess\n'
+new = 'import os\nimport signal\nimport subprocess\nimport time  # c3_compat\n'
+if old in content:
+    content = content.replace(old, new, 1); n += 1
+
+old_ready = """      if p.bootstub:
+        cloudlog.warning(f"panda stuck in bootstub, version {p.get_version()}")
+        return False
+      if not p.up_to_date():"""
+new_ready = """      if p.bootstub:
+        cloudlog.warning(f"panda stuck in bootstub, version {p.get_version()}")
+        return False
+      # c3_compat: F4 (comma three) panda — the shipped image is H7-only, the BMW plugin owns the F4 firmware
+      from panda.python.constants import McuType
+      if p.get_mcu_type() == McuType.F4:
+        cloudlog.warning("c3_compat: F4 panda detected, skipping firmware check")
+        return True
+      if not p.up_to_date():"""
+if old_ready in content:
+    content = content.replace(old_ready, new_ready, 1); n += 1
+
+old_loop = """      HARDWARE.reset_internal_panda()
+      if not panda_ready():
+        flash_panda()
+        assert panda_ready(), "panda not ready after flashing"
+"""
+new_loop = """      # c3_compat: comma three (F4 panda) — no GPIO reset each pass (USB re-enumeration
+      # outruns panda_ready's wait) and never DFU-flash the H7 image onto it: retry instead
+      if HARDWARE.get_device_type() == "tici":
+        if not panda_ready():
+          cloudlog.warning("c3_compat: panda not ready, retrying")
+          time.sleep(1)
+          continue
+      else:
+        HARDWARE.reset_internal_panda()
+        if not panda_ready():
+          flash_panda()
+          assert panda_ready(), "panda not ready after flashing"
+"""
+if old_loop in content:
+    content = content.replace(old_loop, new_loop, 1); n += 1
+
+old_run = """      # run real pandad
+      os.environ['MANAGER_DAEMON'] = 'pandad'
+      process = subprocess.Popen(["./pandad"], cwd=os.path.join(BASEDIR, "openpilot/selfdrive/pandad"))
+      process.wait()
+"""
+new_run = """      # run real pandad
+      os.environ['MANAGER_DAEMON'] = 'pandad'
+      # c3_compat: give the kernel time to release the USB device so native pandad can
+      # claim it, and skip its firmware-signature check (the F4 image is the BMW plugin's)
+      time.sleep(2)
+      os.environ["BOARDD_SKIP_FW_CHECK"] = "1"
+      process = subprocess.Popen(["./pandad"], cwd=os.path.join(BASEDIR, "openpilot/selfdrive/pandad"))
+      process.wait()
+      # c3_compat: crash backoff (a crash loop -> heartbeat watchdog -> SOM reset -> red LED hang)
+      if process.returncode != 0:
+        main._crash_count = getattr(main, '_crash_count', 0) + 1
+        backoff = min(60, 5 * main._crash_count)
+        cloudlog.warning("c3_compat: native pandad exited %d, backing off %ds (crash #%d)",
+                         process.returncode, backoff, main._crash_count)
+        time.sleep(backoff)
+      else:
+        main._crash_count = 0
+"""
+if old_run in content:
+    content = content.replace(old_run, new_run, 1); n += 1
+
+if n == 4:
+    with open(path, 'w') as f:
+        f.write(content)
+    print("OK")
+else:
+    print(f"SKIP: only {n}/4 anchors found, pandad.py left untouched")
+PYEOF
+  echo "[c3_compat] Patched pandad.py (0.11.2 layout) for the F4 panda"
+fi
 # 10. SPI: disable for C3 (F4 panda) to force native pandad USB-only mode
 #     v0.10.3's native pandad SPI protocol is incompatible with STM32F4.
 #     Without this, native pandad crash-loops on SPI → SIGABRT → Python wrapper
@@ -532,10 +617,22 @@ new = '''      if speed not in SPI_DEVICES:
           # c3_compat: SPI disabled for F4 panda USB-only mode
           raise PandaSpiUnavailable("SPI device permission denied (F4 USB-only mode)")'''
 
+# 0.11.2 panda: the handle opens the device node directly
+old2 = '''      if speed not in SPI_DEVICES:
+        file = open(DEV_PATH, 'r+b', buffering=0)'''
+new2 = '''      if speed not in SPI_DEVICES:
+        try:
+          file = open(DEV_PATH, 'r+b', buffering=0)
+        except PermissionError as e:
+          # c3_compat: SPI disabled for F4 panda USB-only mode
+          raise PandaSpiUnavailable("SPI device permission denied (F4 USB-only mode)") from e'''
+
 if old in content:
     content = content.replace(old, new)
-    with open(path, 'w') as f:
-        f.write(content)
+elif old2 in content:
+    content = content.replace(old2, new2)
+with open(path, 'w') as f:
+    f.write(content)
 PYEOF
   echo "[c3_compat] Patched spi.py PermissionError → PandaSpiUnavailable"
 fi
@@ -597,11 +694,10 @@ if old in content:
     content = content.replace(old, new, 1)
     with open(path, 'w') as f:
         f.write(content)
-    print("OK")
+    print("[c3_compat] Patched hardware.py: guarded eSIM prime against AT command failure")
 else:
-    print("SKIP: pattern not found")
+    print("[c3_compat] hardware.py: no eSIM prime block (openpilot 0.11.2), nothing to patch")
 PYEOF
-  echo "[c3_compat] Patched hardware.py: guarded eSIM prime against AT command failure"
 fi
 
 echo "[c3_compat] Boot patches applied successfully"

@@ -65,6 +65,10 @@ COMMAAI_DEPS = [
     "libjpeg", "libyuv", "ncurses", "zeromq", "zstd",
 ]
 NATIVE_DEPS_CACHE = str(plugin_data_dir("c3_compat").parent / ".native_deps_installed")
+# openpilot 0.11.2 ships these as comma-deps-* wheels IN uv.lock (manylinux_2_28
+# aarch64, same module names). The normal lock sync installs them; the git
+# install above must then stand down or it would overwrite the wheels' libraries.
+COMMA_DEPS_WHEEL_RE = re.compile(r'^name = "comma-deps-', re.M)
 
 
 def sha256_of(text: str) -> str:
@@ -109,6 +113,11 @@ def _wheel_matches_target(url: str) -> bool:
 
     # Pure-python wheels work everywhere
     if "py3-none-any" in filename or "py2.py3-none-any" in filename:
+        return True
+
+    # Python-agnostic native wheels for this platform (openpilot 0.11.2's
+    # comma-deps-* bundles: py3-none-manylinux_2_28_aarch64; AGNOS 12.8 is glibc 2.39)
+    if "py3-none-" in filename and TARGET_ARCH in filename and "linux" in filename:
         return True
 
     # ABI-compatible wheels (e.g., cp39-abi3-manylinux*aarch64)
@@ -563,14 +572,28 @@ def ensure_venv(check_only: bool = False, dry_run: bool = False,
     return {"synced": synced, "hash": lock_hash[:12], **result}
 
 
+def lock_ships_comma_deps(lock_text: str) -> bool:
+    """Does this uv.lock carry the comma-deps-* wheels (openpilot >= 0.11.2)?"""
+    return COMMA_DEPS_WHEEL_RE.search(lock_text) is not None
+
+
 def ensure_native_deps(dry_run: bool = False) -> dict:
     """Install commaai/dependencies packages if missing from the venv.
 
-    These are not in uv.lock (they're git-sourced and bundle pre-built native
-    libraries needed by scons). Checks a cache file to skip on normal boots.
+    These are not in uv.lock on openpilot <= 0.11.1 (git-sourced, bundling the
+    pre-built native libraries scons needs). From 0.11.2 the lock ships them as
+    comma-deps-* wheels and this step stands down. Checks a cache file to skip
+    on normal boots.
 
     Returns: {installed: [...], failed: [...], skipped: bool}
     """
+    try:
+        with open(LOCAL_LOCK) as f:
+            if lock_ships_comma_deps(f.read()):
+                log.info("native deps: uv.lock ships comma-deps wheels, lock sync installs them")
+                return {"installed": [], "failed": [], "skipped": True, "reason": "comma-deps wheels in uv.lock"}
+    except FileNotFoundError:
+        pass
     # Fast path: if all were installed last time, check the cache
     try:
         with open(NATIVE_DEPS_CACHE) as f:
