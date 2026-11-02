@@ -33,10 +33,10 @@ class ModelSwapper:
     Architecture:
     - Primary: ONNX files (portable, from GitHub)
     - Cache: PKL files (device-specific, compiled once)
-    - Active: Symlinks in selfdrive/modeld/models/
+    - Active: real file copies in selfdrive/modeld/models/
 
     Two independent model systems:
-    - Driving models: /data/models/driving/ (vision + policy)
+    - Driving models: /data/models/driving/ (driving_supercombo.onnx)
     - DM models: /data/models/dm/ (dmonitoring)
     """
 

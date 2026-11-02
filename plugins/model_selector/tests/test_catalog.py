@@ -294,3 +294,12 @@ class TestShippedCatalog:
     assert (d['sha256'], d['size']) == ('65a08adc31d5c456219687d99b7bf5e44d61dae2d49ea67850e76105c7248cce', 60918562)
     m = next(e for e in c['dm'] if e['id'] == 'stock_dm_0.11.2')
     assert (m['sha256'], m['size']) == ('dee5a294e8afaacc9295ac5d100e00733ecac278e79264b96331e40a3ede1b04', 7844499)
+
+  def test_shipped_catalog_lists_pop_as_converted_and_untested(self, cat):
+    c = cat.load_catalog()
+    pop = next(e for e in c['driving'] if e['id'] == 'pop_supercombo_37727')
+    assert pop['source'] == 'converted' and pop['verified_on'] == []
+    f = pop['files'][0]
+    assert f['name'] == 'driving_supercombo.onnx'
+    assert (f['sha256'], f['size']) == ('98be77d66621ce26a064d71af6f81b36b04389b5106cee8dfdbd2a973d40fee5', 60926942)
+    assert f['url'] == 'https://github.com/catpilot-dev/plugins/releases/download/models-0.11.2/pop_supercombo_37727.onnx'

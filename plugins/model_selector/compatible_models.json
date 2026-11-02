@@ -14,6 +14,28 @@
         "0.11.2"
       ],
       "notes": "CD210 as driving_supercombo.onnx shipped in catpilot v0.11.2"
+    },
+    {
+      "id": "pop_supercombo_37727",
+      "name": "POP model",
+      "date": "2026-03-24",
+      "pr": "#37727",
+      "source": "converted",
+      "files": [
+        {
+          "name": "driving_supercombo.onnx",
+          "url": "https://github.com/catpilot-dev/plugins/releases/download/models-0.11.2/pop_supercombo_37727.onnx",
+          "sha256": "98be77d66621ce26a064d71af6f81b36b04389b5106cee8dfdbd2a973d40fee5",
+          "size": 60926942
+        }
+      ],
+      "converted_from": {
+        "commit": "12f1be19ccff662ebaba6b0337e9cf43d34d54db",
+        "vision": "6a7d09ad-bcc9-43bc-916d-29287e60cee2/200",
+        "policy": "05a58a51-e0e3-4e9b-8e27-e644685f2c50/100"
+      },
+      "verified_on": [],
+      "notes": "POP driving model (#37727) converted to the 0.11.2 supercombo by tools/legacy_policy_swap.py (policy + retrained hidden-state summarizer); test drive on 0.11.2 pending"
     }
   ],
   "dm": [

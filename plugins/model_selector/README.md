@@ -3,6 +3,11 @@
 Browse, download, and switch between openpilot driving and driver-monitoring
 models.
 
+This version targets **catpilot 0.11.2 onwards**. openpilot 0.11.2 loads a
+single combined driving model (`driving_supercombo.onnx`), so driving models
+saved on 0.11.1, which were split into separate vision and policy files, are not
+loadable here; they stay on disk, ignored, until you delete them.
+
 ## What it does
 
 openpilot ships with one driving model and one driver-monitoring (DM) model.
@@ -52,6 +57,10 @@ it puts the previous model back, so nothing changes until you actually reboot.
   test driven on your openpilot version, along with the model your release
   ships. Anything else on the device is shown as *untested* and can't be
   activated.
+- **"active file differs, re-activate."** If the Software row shows this after
+  the model name, the model file openpilot will actually load is not the one you
+  selected (an update or a git reset put another file back). Select the model and
+  tap **Activate** again, then reboot.
 - **After a catpilot update, a model you were using may become untested.**
   It keeps running — nothing changes under you — but the panel flags it and
   offers to switch you back to the model your release ships.
