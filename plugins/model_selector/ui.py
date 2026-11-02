@@ -447,12 +447,21 @@ def on_health_check(acc, **kwargs):
     drift[model_type_key] = False
     try:
       active_id = swapper.get_active_model()
-      if active_id and active_id != 'unknown':
-        drift[model_type_key] = swapper.active_file_matches(active_id) is False
-        count = swapper.cache_compiled_pkl(active_id)
-        if count > 0:
-          from openpilot.common.swaglog import cloudlog
-          cloudlog.info(f"model_selector: cached {count} pkl files for {model_type_key}/{active_id}")
+    except Exception:
+      continue
+    if not active_id or active_id == 'unknown':
+      continue
+    # Own try: a failing drift check must not skip the pkl caching below
+    # (cache_compiled_pkl applies its own drift gate).
+    try:
+      drift[model_type_key] = swapper.active_file_matches(active_id) is False
+    except Exception:
+      pass
+    try:
+      count = swapper.cache_compiled_pkl(active_id)
+      if count > 0:
+        from openpilot.common.swaglog import cloudlog
+        cloudlog.info(f"model_selector: cached {count} pkl files for {model_type_key}/{active_id}")
     except Exception:
       pass
   try:

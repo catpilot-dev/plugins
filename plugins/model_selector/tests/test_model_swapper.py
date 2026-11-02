@@ -476,6 +476,33 @@ class TestDrift:
     d = sw.models_dir / 'old'; d.mkdir(); (d / 'model_info.json').write_text('{}')
     assert sw.active_file_matches('old') is None
 
+  def test_cache_refuses_a_pkl_compiled_from_another_file(self, drifty):
+    # A deploy put stock back under the POP tracker; scons compiled stock.
+    sw, _ = drifty
+    (sw.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'shipped-onnx')
+    (sw.ACTIVE_DIR / 'driving_tinygrad.pkl').write_bytes(b'compiled-from-stock')
+    assert sw.cache_compiled_pkl('pop_supercombo_37727') == 0
+    d = sw.models_dir / 'pop_supercombo_37727'
+    assert not (d / 'driving_tinygrad.pkl').exists() and not (d / '.tinygrad_commit').exists()
+
+  def test_cache_copies_a_pkl_compiled_from_the_models_file(self, drifty):
+    sw, _ = drifty
+    (sw.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'pop-bytes')
+    (sw.ACTIVE_DIR / 'driving_tinygrad.pkl').write_bytes(b'compiled-from-pop')
+    assert sw.cache_compiled_pkl('pop_supercombo_37727') == 1
+    assert (sw.models_dir / 'pop_supercombo_37727' / 'driving_tinygrad.pkl').read_bytes() == b'compiled-from-pop'
+
+  def test_swap_away_from_a_drifted_model_caches_nothing_under_it(self, drifty):
+    sw, _ = drifty
+    good = sw.models_dir / 'good_model'; good.mkdir()
+    (good / 'driving_supercombo.onnx').write_bytes(b'onnx')
+    (good / 'model_info.json').write_text(json.dumps({'name': 'Good'}))
+    sw.active_model_file.write_text(json.dumps({'id': 'pop_supercombo_37727'}))
+    (sw.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'shipped-onnx')
+    (sw.ACTIVE_DIR / 'driving_tinygrad.pkl').write_bytes(b'compiled-from-stock')
+    assert sw.swap_model('good_model')['previous_model_cached'] == 0
+    assert not (sw.models_dir / 'pop_supercombo_37727' / 'driving_tinygrad.pkl').exists()
+
   def test_hash_is_cached_by_size_and_mtime(self, drifty, monkeypatch):
     sw, _ = drifty
     (sw.ACTIVE_DIR / 'driving_supercombo.onnx').write_bytes(b'pop-bytes')

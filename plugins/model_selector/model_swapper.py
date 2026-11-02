@@ -435,7 +435,10 @@ class ModelSwapper:
         """
         After openpilot compiles ONNX→PKL, cache the PKL files to model storage
 
-        This should be called after first boot with a new model
+        This should be called after first boot with a new model. Under drift
+        (active_file_matches is False) nothing is cached: the active pkl was
+        compiled from another model's file and must never be filed under
+        model_id, where a later swap would copy it back silently.
         """
         source_dir = self.models_dir / model_id
 
@@ -445,8 +448,10 @@ class ModelSwapper:
         cached_count = 0
         active_file = self.ACTIVE_DIR / self.compiled_file
         cached_file = source_dir / self.compiled_file
-        # Copy to cache if real file (not symlink) and not already cached
-        if active_file.is_file() and not active_file.is_symlink() and not cached_file.exists():
+        # Copy to cache if real file (not symlink), not already cached, and
+        # compiled from this model's file (checked last: it may hash the ONNX)
+        if (active_file.is_file() and not active_file.is_symlink() and not cached_file.exists()
+                and self.active_file_matches(model_id) is not False):
             shutil.copy2(active_file, cached_file)
             cached_count += 1
 
