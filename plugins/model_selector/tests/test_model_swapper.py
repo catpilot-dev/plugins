@@ -491,6 +491,7 @@ class TestDriftFile:
   def mod(self, swapper_mod, tmp_path, monkeypatch):
     cfgs = swapper_mod.ModelSwapper.MODEL_CONFIGS
     t = swapper_mod.ModelType.DRIVING
+    (tmp_path / 'models').mkdir()
     monkeypatch.setitem(cfgs, t, {**cfgs[t], 'models_dir': tmp_path / 'models' / 'driving'})
     return swapper_mod
 
@@ -502,7 +503,6 @@ class TestDriftFile:
     assert mod.read_drift() == {}
 
   def test_malformed_file_reads_empty(self, mod):
-    mod.drift_file().parent.mkdir(parents=True, exist_ok=True)
     mod.drift_file().write_text('not json')
     assert mod.read_drift() == {}
 
