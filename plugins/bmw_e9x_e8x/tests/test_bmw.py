@@ -1750,12 +1750,13 @@ class TestSpinHold:
   def test_only_along_the_command(self, monkeypatch):
     cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
     # wheel spinning against the command: the servo is braking it, torque is real
-    assert self._step(cc, mod, cs, ctrl, 2.5, -160, 0.5) == pytest.approx(2.0)
+    # (reported at the command: a report 1 Nm below it is the servo ceiling's case)
+    assert self._step(cc, mod, cs, ctrl, 2.5, -160, 1.9) == pytest.approx(2.0)
     assert not cc.spin_hold
 
   def test_below_threshold_is_the_normal_limiter(self, monkeypatch):
     cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
-    assert self._step(cc, mod, cs, ctrl, 2.5, +140, 0.5) == pytest.approx(2.0)
+    assert self._step(cc, mod, cs, ctrl, 2.5, +140, 1.9) == pytest.approx(2.0)
 
   def test_hysteresis_and_release_ramp(self, monkeypatch):
     cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.9)
@@ -1778,7 +1779,7 @@ class TestSpinHold:
     cc, mod, _, cs, ctrl = self._setup(monkeypatch, -1.9)
     assert self._step(cc, mod, cs, ctrl, -2.5, -160, -0.5) == pytest.approx(-0.5)
     cc, mod, _, cs, ctrl = self._setup(monkeypatch, -1.9)
-    assert self._step(cc, mod, cs, ctrl, -2.5, +160, -0.5) == pytest.approx(-2.0)
+    assert self._step(cc, mod, cs, ctrl, -2.5, +160, -1.9) == pytest.approx(-2.0)
 
   def test_steering_pressed_is_not_required(self, monkeypatch):
     # steeringPressed here is the voice button or the gas pedal, not a hand on
@@ -1796,6 +1797,82 @@ class TestSpinHold:
     ctrl.latActive = False
     self._step(cc, mod, cs, ctrl, 2.5, +160, 0.5)
     assert not cc.spin_hold
+
+
+class TestServoTorqueCeiling:
+  """Route 511 seg 1 (~22 km/h, tight turn, wheel -100..-143 deg): the command
+  ramped to 9.6 Nm while the servo saturated at 8.4-8.8 Nm (its real maximum:
+  no report on 4f7-511 exceeds 8.8). The panda's TorqueMotorLimited check
+  allows at most max(reported over its last 6 samples, 0) + 1 Nm, rejected 7
+  frames, the servo soft-offed, the re-arm reset it to 0 and the wheel sprang
+  back ~16 deg; twice, 1 s apart. The ceiling mirrors that check one step
+  inside it: the report window is one sample shorter than the panda's, so it
+  lies inside whichever window the panda holds, and the margin is one wire
+  quantum (0.125 Nm) under its 1 Nm. Replay over 4f7-511 (113 min engaged): it
+  binds only at those two bursts and at the pre-spin-hold 4f7 soft-offs.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _setup(self, monkeypatch, last_nm, history=()):
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, mod, sent = _make_servo_cc(monkeypatch)
+    cc.apply_torque_last = last_nm
+    cc.servo_reports.extend(history)
+    cs = make_stalk_carstate(szl_counter=0)
+    cs.out.steeringRateDeg = 0.0
+    cs.out.steeringPressed = False
+    ctrl = make_stalk_carcontrol(accel=0.0, v_target=24.0)
+    ctrl.latActive = True
+    self._t = 0
+    return cc, mod, sent, cs, ctrl
+
+  def _step(self, cc, mod, cs, ctrl, demand_nm, reported_nm):
+    cs.out.steeringTorqueEps = reported_nm
+    ctrl.actuators.torque = demand_nm / mod.CarControllerParams.STEER_MAX
+    self._t += 10_000_000
+    out, _ = cc.update(ctrl, cs, self._t)
+    return out.torqueOutputCan
+
+  def test_stays_inside_the_panda_check(self, monkeypatch):
+    _, mod, _, _, _ = self._setup(monkeypatch, 0.0)
+    assert mod.SERVO_CEILING_MARGIN_NM == pytest.approx(1.0 - 0.125)   # bmw.h max_torque_error 1 Nm
+    assert mod.SERVO_CEILING_SAMPLES == 6 - 1                          # MAX_SAMPLE_VALS 6
+
+  def test_saturated_servo_caps_the_command(self, monkeypatch):
+    cc, mod, sent, cs, ctrl = self._setup(monkeypatch, 9.3, [8.4] * 4)
+    out = self._step(cc, mod, cs, ctrl, demand_nm=9.6, reported_nm=8.4)
+    assert out == pytest.approx(8.4 + 0.875)
+    assert sent[-1] == (mod.SteeringModes.TorqueControl, pytest.approx(9.275))
+    assert cc.apply_torque_last == pytest.approx(9.275)       # the rate base is what was sent
+
+  def test_a_one_frame_dip_is_bridged_by_the_window(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 9.4, [8.4, 8.6, 8.4, 8.5])
+    assert self._step(cc, mod, cs, ctrl, 9.6, 6.4) == pytest.approx(8.6 + 0.875)
+
+  def test_window_is_five_reports(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 9.0, [9.0, 8.0, 8.0, 8.0])
+    assert self._step(cc, mod, cs, ctrl, 9.6, 8.0) == pytest.approx(9.1)    # 9.0 still in the window: 9.875
+    assert self._step(cc, mod, cs, ctrl, 9.6, 8.0) == pytest.approx(8.875)  # 9.0 has left it
+
+  def test_tracking_servo_is_untouched(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 2.0, [1.9] * 4)
+    assert self._step(cc, mod, cs, ctrl, 3.0, 1.95) == pytest.approx(2.1)   # STEER_DELTA_UP only
+    assert self._step(cc, mod, cs, ctrl, 3.0, 2.05) == pytest.approx(2.2)
+
+  def test_opposite_sign_report_allows_the_margin_only(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, 1.0, [-0.5] * 4)
+    assert self._step(cc, mod, cs, ctrl, 2.0, -0.5) == pytest.approx(0.875)
+
+  def test_negative_direction_mirrors(self, monkeypatch):
+    cc, mod, _, cs, ctrl = self._setup(monkeypatch, -9.3, [-8.4] * 4)
+    assert self._step(cc, mod, cs, ctrl, -9.6, -8.4) == pytest.approx(-9.275)
 
 
 class TestServoRearm:
@@ -1895,7 +1972,7 @@ class TestServoRearm:
 
   def test_no_soft_off_is_the_normal_path(self, monkeypatch):
     cc, mod, sent, cs, ctrl = self._setup(monkeypatch)
-    frame, out = self._step(cc, mod, sent, cs, ctrl, soft_off=False)
+    frame, out = self._step(cc, mod, sent, cs, ctrl, soft_off=False, reported_nm=2.0)
     assert frame == (mod.SteeringModes.TorqueControl, pytest.approx(2.1))
     assert cc.servo_rearms == 0
 

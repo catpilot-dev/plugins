@@ -1026,6 +1026,33 @@ burst, and the servo soft-off bit (`CONTROL_STATUS` bit2; the field is the
 upper nibble of 0x22F byte 1, so frame byte 1 bit 6) to last at most 3 status
 frames.
 
+### Servo torque ceiling (2026-11-02)
+
+The panda's `TorqueMotorLimited` check (`dist_to_meas_check`) allows a servo
+command of at most `max(reported over the last 6 STEERING_STATUS samples, 0) +
+max_torque_error` (1 Nm) — and the mirror image for negative commands. The
+carcontroller's `apply_dist_to_meas_limits` never mirrored it
+(`STEER_ERROR_MAX = 999` since the port), so wherever the servo could not follow
+the command the panda was the first to notice.
+
+Route 511 seg 1 (~22 km/h, tight turn, wheel −100..−143°): the controller ramped
+to 9.6 Nm while the servo saturated at 8.4–8.8 Nm (no report on 4f7–511 exceeds
+8.8 Nm). Seven frames were rejected, the servo soft-offed, the re-arm sent an
+Off and re-ramped from 0, and the wheel sprang back ~16° in 0.25 s; it repeated
+1 s later. Lateral stayed active, but each cycle is a visible kick.
+
+`CarController._servo_ceiling` runs after the spin hold on every TorqueControl
+frame: the command is lowered (never raised) to `max(max(servo_reports), 0) +
+SERVO_CEILING_MARGIN_NM` (negative: the mirror). `servo_reports` holds the last
+`SERVO_CEILING_SAMPLES` = 5 reports, appended every frame in every mode — one
+fewer than the panda's window, so it lies inside whichever window the panda
+holds; the margin 0.875 Nm is one wire quantum under the panda's 1 Nm.
+`apply_torque_last` takes the capped value, so the rate base is what was sent.
+A servo that tracks the command never meets the ceiling: a replay over routes
+4f7–511 (113 min engaged) binds only at the two 511 bursts and at the 4f7
+soft-offs from before the spin hold. The spin hold stays: while the driver
+spins the wheel along the command it holds at the report itself (margin 0).
+
 ## Panda safety (`safety/bmw.h`)
 
 Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
