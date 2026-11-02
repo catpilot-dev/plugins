@@ -24,9 +24,9 @@ with no filtering of its own.
     P_nm      = T_CAP_SLOPE_BASE · kappa_scale(|kappa_ref|) · v² · delta_err
     a_ref     = v_true² · kappa_ref                          reference lateral accel (m/s²)
     ff_nm     = clip(CF_GAIN · sign(a_ref) · max(|a_ref| − CF_AY0, 0), ±CF_MAX_NM)
-    demand    = ff_nm + P_nm (+ sl_bias)                    every livePose tick
+    demand    = ff_nm + P_nm (+ sl_bias)                    every deviceMotion tick
 
-**Decision**, every `CONTROL_HORIZON_S / 2` (6 livePose ticks, 300 ms) while active, in order:
+**Decision**, every `CONTROL_HORIZON_S / 2` (6 deviceMotion ticks, 300 ms) while active, in order:
 the demand on the full error (no on-target band — a sub-friction target is a
 hold; the feed-forward supplies the steady curve torque, ~55 % of the measured
 need, and P closes the rest); clip to `t_cap`; relax-dwell bridge in a deep
@@ -51,7 +51,7 @@ ramp are 0, so every engagement ramps from 0.
 | `CF_AY0`, `CF_GAIN`, `CF_MAX_NM` | 0.2 m/s², 1.4 Nm per m/s², 2.0 Nm | curve feed-forward deadband, gain, cap (raised 2026-11-01) |
 | `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
 | `STEP_MAX_V` / `_BP` | [15, 28] m/s → [0.10, 0.05] frac | per-decision step cap |
-| `YAW_PRED_TICKS`, `YAW_PRED_SR` | 6 livePose ticks (0.3 s), 25 | lane-change yaw predictor window and wheel/front-wheel ratio (2026-11-02) |
+| `YAW_PRED_TICKS`, `YAW_PRED_SR` | 6 deviceMotion ticks (0.3 s), 25 | lane-change yaw predictor window and wheel/front-wheel ratio (2026-11-02) |
 | `LANE_CHANGE_STATES` | laneChangeStarting, laneChangeFinishing | `drivingModelData.meta` states with the flat 0.10 step cap (2026-11-02) |
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
@@ -74,6 +74,8 @@ alone, no curve hold-floor) — a law no drive has run. The driven baseline is
 
 Dated notes in the order they were written. Mechanisms they describe may be
 gone; the current law above is authoritative.
+Service names follow openpilot 0.11.2 throughout (`deviceMotion`,
+`lateralDelay`); notes written before 2026-11-02 said `livePose` / `liveDelay`.
 
 > **2026-07-28 — SAFETY ARCHITECTURE: the lateral controller never gives up in
 > a turn. The ISO 11270 cancel machinery was removed.** The controller's
@@ -469,7 +471,7 @@ gone; the current law above is authoritative.
 > `Path.read_text()` on controlsd's 100 Hz RT thread risks costing a control
 > frame under eMMC contention). The init read is the **boot state**; the
 > Driving-panel "Steering Push Budget" toggle **hot-applies mid-drive** via
-> the `angle_budget` plugin-bus topic, polled at livePose rate into
+> the `angle_budget` plugin-bus topic, polled at deviceMotion rate into
 > `state['budget_on']` (tmpfs + memory — still no file I/O on the RT
 > thread). The param file the toggle also writes is what each later drive's
 > init read picks up. See § 12 ("To toggle `AngleBudget`") for the
@@ -587,7 +589,7 @@ gone; the current law above is authoritative.
 > untouched; rest is additionally escaped when
 > `|EMA(τ = HOLD_EMA_TAU) of delta_err| > HOLD_EMA_ESCAPE`.
 >
-> - `HOLD_EMA_TAU = 2.0` s — updated **every livePose tick** (α = 0.05/2.0 =
+> - `HOLD_EMA_TAU = 2.0` s — updated **every deviceMotion tick** (α = 0.05/2.0 =
 >   0.025), not at the decision cadence, so the lean estimate is independent
 >   of how often the controller decides.
 > - `HOLD_EMA_ESCAPE = 0.0012` rad, **strict `>`** — an EMA converging to a
@@ -698,7 +700,7 @@ gone; the current law above is authoritative.
 >
 > **What was deleted**: `BUDGET_DEG`, the `AngleBudget` param (plugin.json
 > and the init-time read), the `angle_budget` plugin-bus topic and its
-> livePose-rate subscriber poll, the "Steering Push Budget" Driving-panel
+> deviceMotion-rate subscriber poll, the "Steering Push Budget" Driving-panel
 > toggle plus `_set_angle_budget`/`_publish_angle_budget`, the
 > `ui.state_tick` heartbeat hook (`on_ui_state_tick`) that existed only to
 > carry that toggle — hook entry included — the `push_ref`/`push_moved`/
@@ -765,7 +767,7 @@ gone; the current law above is authoritative.
 > machine to be wrong about.
 >
 > **The machine** (100 Hz, in `update()` right after the `_angle` capture,
-> before the livePose branch):
+> before the deviceMotion branch):
 >
 > | state | entry | notes |
 > |---|---|---|
@@ -819,7 +821,7 @@ gone; the current law above is authoritative.
 > `|torque|/SB_SHED_FRAMES` per frame. It only ever *reduces* same-side
 > torque; an opposite-side counter-steer ramp already passes the drain test
 > and is never touched. This is also what makes the machine's placement
-> *before* the livePose branch safe.
+> *before* the deviceMotion branch safe.
 >
 > **Why the dwell gate stays**: `relax_dwell` exists precisely to bridge
 > modelV2's mid-turn `κ_des` dips (route 3a0 seg 8), and a dip is exactly the
@@ -906,7 +908,7 @@ gone; the current law above is authoritative.
 > output, and every non-`ov_` telemetry field on every tick.
 >
 > Placement: after the sb machine (EOD reads `sb_block`, which that machine
-> both arms and decrements) and before the livePose branch, so `state['torque']`
+> both arms and decrements) and before the deviceMotion branch, so `state['torque']`
 > and `state['desired']` are the values that were actually standing while the
 > ring recorded the motion being judged. The block **reuses `sb_ring`
 > read-only** — do not add a second ring. On disengage the sustain runs and the
@@ -1092,13 +1094,13 @@ When `|δ_err| ≤ HOLD_BAND` the cadence decision holds (target → 0 on straig
 
 > Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
 
-There is one knob — `CP.steerActuatorDelay` in `bmw/interface.py:87` — and every timing constant downstream subscribes to it via the liveDelay chain. Change SAD and the whole stack adapts.
+There is one knob — `CP.steerActuatorDelay` in `bmw/interface.py:87` — and every timing constant downstream subscribes to it via the lateralDelay chain. Change SAD and the whole stack adapts.
 
 ```
 CP.steerActuatorDelay              (bmw/interface.py — THE knob; currently 0.4)
         │
         ▼  + 0.2 (lagd.py:181 initial_lag = SAD + 0.2)
-liveDelay.lateralDelay             (= 0.6 s; permanently pinned for BMW —
+lateralDelay.lateralDelay             (= 0.6 s; permanently pinned for BMW —
                                     lagd never converges because it correlates
                                     on latcontrol_torque telemetry we don't
                                     produce; status stays 'unestimated')
@@ -1107,11 +1109,11 @@ liveDelay.lateralDelay             (= 0.6 s; permanently pinned for BMW —
         │       └──▶ get_curvature_from_plan samples κ_des on the predicted
         │            trajectory at this horizon (modeld.py:391)
         │
-        └──▶ controlsd lat_delay = liveDelay + LAT_SMOOTH_SECONDS = 0.6 s
+        └──▶ controlsd lat_delay = lateralDelay + LAT_SMOOTH_SECONDS = 0.6 s
                                     (LAT_SMOOTH_SECONDS = 0.0 on catpilot)
                 │
                 ▼  passed to LaC.update(..., lat_delay)
-        bmw/latcontroller.py update() per livePose tick:
+        bmw/latcontroller.py update() per deviceMotion tick:
                 model_action_t = lat_delay + DT_MDL = 0.65 s   ≡ modeld's lat_action_t
                 half_horizon   = model_action_t / 2 = 0.325 s
                 action_cadence_ticks = round(half_horizon / DT_LIVEPOSE)  = 6  (300 ms)
@@ -1123,7 +1125,7 @@ liveDelay.lateralDelay             (= 0.6 s; permanently pinned for BMW —
 
 | | value |
 |---|---:|
-| `liveDelay.lateralDelay` | 0.6 s |
+| `lateralDelay.lateralDelay` | 0.6 s |
 | `modeld lat_action_t` | 0.65 s |
 | `model_action_t` (in update) | 0.65 s |
 | `action_cadence_ticks` | 6 (= 300 ms decision period) |
@@ -1342,13 +1344,13 @@ Fire only when **the plant has actually overshot** `(κ_des - κ_meas) · κ_mea
 
 ## 9. Telemetry (plugin_bus topic `bmw_lat_control`, 20 Hz)
 
-Published each livePose tick. The exact field set is pinned by
+Published each deviceMotion tick. The exact field set is pinned by
 `test_payload_exact_key_set`.
 
 | field | meaning |
 |---|---|
 | `desired` | κ_ref the controller tracks (the lane_keeping Arc reference, 1/m) |
-| `measured` | κ_meas = livePose yaw rate / v_true (1/m) |
+| `measured` | κ_meas = deviceMotion yaw rate / v_true (1/m) |
 | `err` | κ_ref − κ_meas (debug) |
 | `delta_err` | front-wheel angle error (rad) — what the P law acts on |
 | `target_frac` | the decision's target torque fraction (−1..1), after guard, STEP_MAX and caps |
@@ -1383,7 +1385,7 @@ Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 
 - **Vision-only stack**: catpilot has no HD-map, lidar, radar fusion, or IMU-fusion for κ. All correction must come from `modelV2` outputs. Don't propose external-sensor escape hatches for vision-noise problems.
 - **Reference conditioning**: `lane_keeping` is registered on `controls.curvature_correction` — it hands this controller an arc through the model's planned path, low-passed. This `latcontroller` is a faithful tracker with no noise reasoning of its own; the controller requires the plugin (R10).
-- **lagd never converges for BMW**: `liveDelay.lateralDelay` is permanently pinned at `SAD + 0.2` because lagd correlates on latcontrol_torque telemetry our controller doesn't produce. `SAD` is the effective knob — not a hint to be overridden.
+- **lagd never converges for BMW**: `lateralDelay.lateralDelay` is permanently pinned at `SAD + 0.2` because lagd correlates on latcontrol_torque telemetry our controller doesn't produce. `SAD` is the effective knob — not a hint to be overridden.
 - **BMW hydraulic rack**: stiction holds δ at zero torque near centre, no self-centering there. Below ~0.3 m/s² of lateral acceleration no steady torque is needed; above it curves need steady torque (routes 4e9–4ec, 440 steady windows: ~1.5 Nm per m/s² beyond ~0.25) — see the 2026-10-20 curve-feed-forward design.
 
 ---
@@ -1451,7 +1453,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   `PluginPub` send **plus** a 1 Hz heartbeat republishing the param file
   (ZMQ PUB drops edge-triggered sends to a not-yet-connected subscriber, so
   the heartbeat is what makes it reliable), with the controller polling at
-  livePose rate — tmpfs + memory only, never a param-file read on the RT
+  deviceMotion rate — tmpfs + memory only, never a param-file read on the RT
   thread. Git history around commits fbb899b / 7afd501 has the working
   implementation.
 
@@ -1467,7 +1469,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
   constant pull (road slope, alignment) comes only from a standing error. On
   route 4e9 that was δ_err ≈ −2.2e-4 rad / ~0.08 Nm left, and the car sat
   +0.15 m right of the model's plan (plan at 3 s: +0.03 m).
-- **Law**: `sl_bias += (P_nm / SL_TAU_S)·dt` each livePose tick while the gate
+- **Law**: `sl_bias += (P_nm / SL_TAU_S)·dt` each deviceMotion tick while the gate
   is open, clamped to ±`SL_BIAS_MAX_NM`; `demand = ff_nm + P_nm + sl_bias`,
   applied whether or not the gate is open.
 - **Gate** (situation only, never the error's sign; see the hold-bias failure,
@@ -1501,7 +1503,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | Module constants | top of file | `V_GAIN_FLOOR`, LKA band, `CONTROL_HORIZON_S`, `SL_*`, `CF_*` + `curve_ff_nm`, the lane_keeping readiness check (R10) |
 | `on_lat_controller_init` | module | R10 guard, `config.read_plugin_param` import, cadence/gain/step/dwell constants, the state dict, `update` closure |
 | Engagement edge | top of `update()` | `SlopeCompensation` latch, guard reset; inactive zeroes torque/target/ramp |
-| livePose tick | `update()` | reference, speeds, `delta_err`, `kappa_scale`, `a_ref`/`ff_nm`, slope-bias learning, `demand_nm`, guard observe, relax-dwell |
+| deviceMotion tick | `update()` | reference, speeds, `delta_err`, `kappa_scale`, `a_ref`/`ff_nm`, slope-bias learning, `demand_nm`, guard observe, relax-dwell |
 | Decision | `update()`, every `action_cadence_ticks` while active | demand → `t_cap` → dwell bridge → guard → `STEP_MAX` |
 | Contact learning, take-up | `update()`, every CAN tick | `ContactLearner.observe`, `FreePlayTakeUp.step`, handover |
 | Ramp and telemetry | end of `update()` | per-frame ramp step, zero snap, `bmw_lat_control` payload (§9) |

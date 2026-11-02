@@ -10,7 +10,7 @@ owns a_y through v); the P-law reversing on overshoot IS the correction.
 Harness notes:
   - cereal.messaging is a MagicMock (test_helpers.install_all_mocks); we
     replace its SubMaster with a small controllable FakeSubMaster so
-    livePose content (yaw rate -> measured kappa, v_ego) is test-driven
+    deviceMotion content (yaw rate -> measured kappa, v_ego) is test-driven
     instead of MagicMock auto-attributes.
   - `state` (the controller's per-tick dict) is a closure variable of the
     nested `update` function returned by on_lat_controller_init — there is
@@ -52,7 +52,7 @@ def mock_deps(monkeypatch):
 
 
 class FakeSubMaster:
-  """Controllable stand-in for cereal.messaging.SubMaster(['livePose', 'drivingModelData']).
+  """Controllable stand-in for cereal.messaging.SubMaster(['deviceMotion', 'drivingModelData']).
 
   Real SubMaster exposes each service via __getitem__, plus .updated/.seen
   dicts keyed by service name. Tests drive lp.angularVelocityDevice.z
@@ -65,8 +65,8 @@ class FakeSubMaster:
       velocityDevice=SimpleNamespace(x=20.0),
     )
     self.dmd = SimpleNamespace(meta=SimpleNamespace(laneChangeState='off'))
-    self.updated = {'livePose': True, 'drivingModelData': True}
-    self.seen = {'livePose': True, 'drivingModelData': True}
+    self.updated = {'deviceMotion': True, 'drivingModelData': True}
+    self.seen = {'deviceMotion': True, 'drivingModelData': True}
 
   def update(self, timeout):
     pass
@@ -85,7 +85,7 @@ def _make_controller(monkeypatch, wheelbase=2.66, slope=None):
   reads SlopeCompensation at each engagement edge). The stub dispatches on the
   param KEY; a kwarg left None falls through to the production default ('').
   """
-  import cereal.messaging as messaging
+  import openpilot.cereal.messaging as messaging
   fake_sm = FakeSubMaster([])
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
 
@@ -121,7 +121,7 @@ def _closure_state(update_fn):
 
 
 def _set_measured(fake_sm, v, kappa_meas):
-  """Arrange livePose so update() computes state['measured'] == kappa_meas
+  """Arrange deviceMotion so update() computes state['measured'] == kappa_meas
   at ego speed v (measured = angularVelocityDevice.z / v)."""
   fake_sm.lp.velocityDevice.x = v
   fake_sm.lp.angularVelocityDevice.z = kappa_meas * v
@@ -259,8 +259,8 @@ class TestNonCancelPaths:
 # on the SLOW error bounds the lean latency: escape when the 2 s EMA of
 # delta_err exceeds HOLD_EMA_ESCAPE = 0.0012 (strict >).
 #
-# One _call_update == one livePose tick, so the EMA alpha per call is
-# DT_LIVEPOSE / HOLD_EMA_TAU = 0.05 / 2.0 = 0.025. A constant bias E reaches
+# One _call_update == one deviceMotion tick, so the EMA alpha per call is
+# DT_DEVICE_MOTION / HOLD_EMA_TAU = 0.05 / 2.0 = 0.025. A constant bias E reaches
 # 0.0012 after n ticks where E*(1 - 0.975^n) > 0.0012 -- E=0.0014 needs ~78
 # ticks (~3.9 s), E=0.0012 never (converges from below). The pre-existing
 # hysteresis tests above drive <= 4 ticks, far from any of this.
@@ -691,7 +691,7 @@ class TestLaneChangeStepCap:
 class TestLaneChangeYawPredictor:
   """While the model runs a lane change, the P law's measured curvature is the
   yaw curvature plus the curvature the wheel has added over the last
-  YAW_PRED_TICKS livePose ticks (0.3 s, the wheel -> yaw lag), which the yaw
+  YAW_PRED_TICKS deviceMotion ticks (0.3 s, the wheel -> yaw lag), which the yaw
   has not shown yet (route 511 seg 6: the wheel ran 2 -> 12 deg, the rack held
   it at 0 Nm, and the yaw-based P saw the overshoot ~0.3 s late). Only the
   difference enters, so a standing wheel angle (alignment offset, a curve)
@@ -777,7 +777,7 @@ class TestControllerHorizonDecoupled:
     assert a['torque'] == pytest.approx(b['torque'], abs=1e-12)
 
   def test_spread_is_the_field_tuned_300ms(self, monkeypatch):
-    """0.65 s horizon -> half 0.325 s -> 6 livePose ticks -> 30 CAN frames;
+    """0.65 s horizon -> half 0.325 s -> 6 deviceMotion ticks -> 30 CAN frames;
     one frame is applied inside the decision tick."""
     a, _ = self._decision(monkeypatch, 0.9)
     assert a['ramp_frames'] == 30 - 1
@@ -1011,7 +1011,7 @@ class TestDirectTracking:
   def test_disengage_zeroes_the_ramp_state(self, monkeypatch):
     """While lateral is inactive the law does not run on the state: disengaging
     zeroes torque/target/ramp, and the next engagement ramps from 0 on its
-    first livePose tick instead of jumping to a torque built while inactive."""
+    first deviceMotion tick instead of jumping to a torque built while inactive."""
     lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state.update(torque=0.3, target_frac=0.4, ramp_step=0.002, ramp_frames=10, action='ramp')
     _call_update(lac, 0.004, v_ego=25.0, active=False)
@@ -1053,7 +1053,7 @@ class TestDirectTracking:
     assert state['guard'].suppressed == 1
 
   def test_persisted_reversal_crosses(self, monkeypatch):
-    """Once the opposite error sign has persisted the guard window (3 livePose
+    """Once the opposite error sign has persisted the guard window (3 deviceMotion
     ticks), the reversal passes — the guard delays, it never blocks."""
     lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state['tick_count'] = 999; _call_update(lac, +0.002, v_ego=25.0)
@@ -1190,7 +1190,7 @@ class TestDirectTracking:
     lac, fake_sm, mod, state = self._engaged(monkeypatch)
     _seed_learner(state, 77.6, 65.0)
     _set_measured(fake_sm, 25.0, 0.002)
-    for _ in range(124):          # settle on the right curve; the flip lands 2 livePose ticks before a decision
+    for _ in range(124):          # settle on the right curve; the flip lands 2 deviceMotion ticks before a decision
       _call_update(lac, 0.002, v_ego=25.0, gap_deg=77.6)
     assert state['torque'] > 0.05 and state['takeup'].fires == 0
     _set_measured(fake_sm, 25.0, -0.002)
@@ -1484,7 +1484,7 @@ class TestDirectTracking:
                  tick_count=999)
     gap, fired_low, floor = 65.0, None, None
     for i in range(80):
-      fake_sm.updated = {'livePose': i % 5 == 0}
+      fake_sm.updated = {'deviceMotion': i % 5 == 0}
       if state['takeup'].state == 'taking_up':
         gap = 77.6                               # contact one tick after the fire
         fired_low = state['target_frac'] * 12.0 < TAKEUP_NM
@@ -1507,7 +1507,7 @@ class TestDirectTracking:
     state.update(torque=torque0, target_frac=torque0, ramp_frames=0, action='idle',
                  tick_count=999)
     for i in range(60):
-      fake_sm.updated = {'livePose': i % 5 == 0}
+      fake_sm.updated = {'deviceMotion': i % 5 == 0}
       _call_update(lac, 0.0015, v_ego=25.0, gap_deg=65.0)    # P demand >> TAKEUP_NM, right
     assert state['tu_demand'] * 12.0 > 1.0
     assert state['takeup'].fires == 1
@@ -1559,7 +1559,7 @@ class TestSlopeBias:
   def _run(self, lac, fake_sm, n, desired=0.0, kappa_meas=0.0, v=V, **kw):
     _set_measured(fake_sm, v, kappa_meas)
     for _ in range(n):
-      fake_sm.updated = {'livePose': True}
+      fake_sm.updated = {'deviceMotion': True}
       _call_update(lac, desired, v_ego=v, **kw)
 
   @pytest.mark.parametrize('kappa_meas', [2e-4, -2e-4])
@@ -1585,7 +1585,7 @@ class TestSlopeBias:
     lac, fake_sm, mod, state = self._engaged(monkeypatch)
     state.update(sl_bias=-0.1, torque=-0.1 / 12.0, tick_count=999)
     _set_measured(fake_sm, self.V, 0.0)
-    fake_sm.updated = {'livePose': True}
+    fake_sm.updated = {'deviceMotion': True}
     _call_update(lac, 0.0, v_ego=self.V)
     assert state['target_frac'] * 12.0 == pytest.approx(-0.1, abs=1e-6)
 
@@ -1614,7 +1614,7 @@ class TestSlopeBias:
     state['sl_bias'] = 0.03
     for _ in range(20):
       state['takeup'].state = 'taking_up'
-      fake_sm.updated = {'livePose': True}
+      fake_sm.updated = {'deviceMotion': True}
       _call_update(lac, 0.0, v_ego=self.V)
       assert state['sl_bias'] == 0.03 and state['sl_learn'] is False
 
@@ -1652,7 +1652,7 @@ class TestSlopeBias:
     targets = []
     _set_measured(fake_sm, self.V, kappa)
     for _ in range(40):
-      fake_sm.updated = {'livePose': True}
+      fake_sm.updated = {'deviceMotion': True}
       _call_update(lac, 0.0, v_ego=self.V)
       if state['tick_count'] == 0:
         targets.append(state['target_frac'] * 12.0)
@@ -1665,7 +1665,7 @@ class TestSlopeBias:
       v = 25.0 if i < 200 else 9.0
       desired = 3e-3 if 60 <= i < 120 else 0.0
       _set_measured(fake_sm, v, 2e-4 if i % 40 < 20 else -1e-4)
-      fake_sm.updated = {'livePose': i % 5 == 0}
+      fake_sm.updated = {'deviceMotion': i % 5 == 0}
       _call_update(lac, desired, v_ego=v, pressed=150 <= i < 170)
       out.append(lac.update.__closure__ and _closure_state(lac.update)['torque'])
     return out

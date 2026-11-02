@@ -1092,6 +1092,13 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
   note the device lib's `Panda.flash()` hangs on F4 re-enumeration and
   hardcodes H7 sector layout — call `Panda.flash_static(handle, code,
   mcu_type=McuType.F4)` with the panda already in bootstub instead.
+- **Safety-model ordinal on openpilot 0.11.2** (2026-11-02): upstream
+  opendbc now declares `SafetyModel.bmw @37` (with byd @35, volvo @36, mg @38),
+  so the manifest's injection is a no-op and openpilot asks the panda for mode
+  37. The flashed F4 firmware was built with `SAFETY_BMW 35U` (the firmware
+  workspace's `safety_declarations.h`): before booting 0.11.2 the firmware must
+  be rebuilt with `SAFETY_BMW 37U` and reflashed, or the panda will not enter
+  BMW safety and nothing engages. On the 0.11.1 base the ordinal stays 35.
 - **RX checks** on brake, gas, speed, either cruise-status message and the
   stalk, plus the stepper status when the servo param is set.
 - `disable_forwarding = true`; cruise-engaged state is taken from the DCC/NCC
@@ -1194,7 +1201,7 @@ bmw_e9x_e8x/
 
 - **`lagd` never converges** for this car (it correlates on
   `latcontrol_torque` telemetry the custom controller doesn't produce), so
-  `liveDelay.lateralDelay` is permanently pinned at `steerActuatorDelay + 0.2`.
+  `lateralDelay.lateralDelay` is permanently pinned at `steerActuatorDelay + 0.2`.
   `steerActuatorDelay` is the effective single timing knob — details in
   LATERAL_CONTROLLER.md §2.
 - **DCC is the exercised cruise path.** NCC and the ACC-module variants are

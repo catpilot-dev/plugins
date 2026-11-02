@@ -52,15 +52,15 @@ class GearShifter(IntEnum):
 @pytest.fixture(autouse=True)
 def mock_deps(monkeypatch):
   install_all_mocks(monkeypatch)
-  # lka_mode does `from cereal import car, log` — wire the enums it reads
-  # onto the installed cereal mock so tests and filter share identities.
-  cereal_mock = sys.modules['cereal']
+  # lka_mode does `from openpilot.cereal import log` and `from
+  # opendbc.car.structs import car` — wire the enums it reads onto the
+  # installed mocks so tests and filter share identities.
+  cereal_mock = sys.modules['openpilot.cereal']
   cereal_mock.log.OnroadEvent.EventName = EventName
   car_mock = MagicMock()
   car_mock.CarState.ButtonEvent.Type = ButtonType
   car_mock.CarState.GearShifter = GearShifter
-  cereal_mock.car = car_mock
-  monkeypatch.setitem(sys.modules, 'cereal.car', car_mock)
+  sys.modules['opendbc.car.structs'].car = car_mock
 
 
 class FakeEvents:

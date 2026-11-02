@@ -43,8 +43,8 @@ STEPPER_SERVO_CAN = 1
 
 
 def _load_car_params():
-  import cereal.messaging as messaging
-  from cereal import car
+  import openpilot.cereal.messaging as messaging
+  from opendbc.car.structs import car
   from openpilot.common.params import Params
   return messaging.log_from_bytes(Params().get("CarParams"), car.CarParams)
 
@@ -67,7 +67,8 @@ class LkaModeFilter:
     self.cancel_press_in_lka = False
 
   def filter(self, events, CS, CS_prev, op_enabled):
-    from cereal import car, log
+    from openpilot.cereal import log
+    from opendbc.car.structs import car
     EventName = log.OnroadEvent.EventName
 
     if not self.servo:
@@ -136,7 +137,8 @@ class LkaModeFilter:
     # on this car (pcmCruise=False). `unknown` (transient CAN glitch) is left
     # to the stock soft-disable so a one-frame dropout can't instantly
     # disengage. Entry-side gating is stock wrongGear NO_ENTRY, untouched.
-    from cereal import car, log
+    from openpilot.cereal import log
+    from opendbc.car.structs import car
     EventName = log.OnroadEvent.EventName
     GearShifter = car.CarState.GearShifter
     if op_enabled and CS.gearShifter not in (GearShifter.drive, GearShifter.unknown):

@@ -5,7 +5,7 @@ with this controller when the lane_keeping plugin (the Arc reference) is
 loaded; otherwise the stock lateral controller stays in place. Reference doc:
 LATERAL_CONTROLLER.md (current law at the top, dated history below).
 
-The law, per livePose tick (20 Hz) and per CAN tick (100 Hz):
+The law, per deviceMotion tick (20 Hz) and per CAN tick (100 Hz):
   delta_err = atan(kappa_ref*L) - atan(kappa_meas*L)        front-wheel angle (rad)
   P_nm      = T_CAP_SLOPE_BASE * kappa_scale * v^2 * delta_err
   a_ref     = v_true^2 * kappa_ref                          reference lateral accel
@@ -119,7 +119,7 @@ def on_lat_controller_init(result, lac, CP):
   Front-wheel-angle error (rear-axle bicycle model, L = CP.wheelbase):
     delta_err = atan(kappa_ref*L) - atan(kappa_meas*L),  kappa_meas = yaw rate / v_true
 
-  Demand, every livePose tick, on the full error:
+  Demand, every deviceMotion tick, on the full error:
     P_nm   = T_CAP_SLOPE_BASE * kappa_scale(|kappa_ref|) * v^2 * delta_err
     ff_nm  = curve_ff_nm(v_true^2 * kappa_ref)
     demand = ff_nm + P_nm (+ sl_bias)
@@ -134,11 +134,11 @@ def on_lat_controller_init(result, lac, CP):
   move the column is, in effect, a hold.
 
   Inactive: no decision runs and torque/target/ramp are zero, so each
-  engagement ramps from 0 on its first livePose tick.
+  engagement ramps from 0 on its first deviceMotion tick.
   """
   import math
-  from cereal import log
-  from cereal import messaging
+  from openpilot.cereal import log
+  from openpilot.cereal import messaging
   from bmw.values import CarControllerParams as CCP
   from bmw.takeup import SignGuard, ContactLearner, FreePlayTakeUp
 
@@ -164,10 +164,10 @@ def on_lat_controller_init(result, lac, CP):
   # event, not a per-tick read), so the user can A/B by re-engaging.
   # Default off; a failed read (incl. read_plugin_param unbound) is off.
 
-  # Decision cadence (livePose ticks) and CAN-rate ramp spread: both are half
+  # Decision cadence (deviceMotion ticks) and CAN-rate ramp spread: both are half
   # of CONTROL_HORIZON_S, so two decision-and-ramp cycles fit one horizon and
   # each ramp completes as the next decision lands. Panda enforces wire-rate.
-  DT_LIVEPOSE = 0.05                        # one livePose tick (s)
+  DT_DEVICE_MOTION = 0.05                        # one deviceMotion tick (s)
   DT_CAN_TICK = 0.01                        # one CAN tick at 100 Hz (s)
   ACTION_CADENCE_TICKS_FALLBACK = 5         # state-init only: primes the first decision
   # Plant-inversion gain, linear tire regime: tau_Nm = T_CAP_SLOPE * v^2 * delta
@@ -195,7 +195,7 @@ def on_lat_controller_init(result, lac, CP):
   # correcting lobes = the wheel swing). Never above STEP_MAX_BP[0].
   LANE_CHANGE_STATES = ('laneChangeStarting', 'laneChangeFinishing')
   # Yaw predictor, lane changes only: the P law's measured curvature adds the
-  # curvature the wheel has put in over the last YAW_PRED_TICKS livePose ticks
+  # curvature the wheel has put in over the last YAW_PRED_TICKS deviceMotion ticks
   # (0.3 s = the wheel -> yaw lag, routes 4f7-511), which the yaw has not shown
   # yet. The rack holds the wheel where it stops (route 511 seg 6: 2 -> 12 deg
   # under <= 1.6 Nm, held at 0 Nm), so the yaw-only P reversed ~0.3 s after the
@@ -211,13 +211,13 @@ def on_lat_controller_init(result, lac, CP):
   # bridges the model's reference dips mid-hairpin (route 3a0 seg 8; on
   # 4e9-4ec nine dips of 9-21 % for 0.15-0.55 s, holding 1.9-3.8 Nm). The
   # feed-forward cannot bridge them: it sits at its cap in a hairpin.
-  RELAX_DWELL_TICKS = 20      # livePose ticks (1.0 s at 20 Hz)
+  RELAX_DWELL_TICKS = 20      # deviceMotion ticks (1.0 s at 20 Hz)
   RELAX_DWELL_KAPPA = 0.010   # |kappa_meas| defining a deep curve (1/m)
 
   # Rear-axle bicycle-model wheelbase (m), for kappa <-> delta conversion.
   L = float(CP.wheelbase)
 
-  _sm = messaging.SubMaster(['livePose', 'drivingModelData'])
+  _sm = messaging.SubMaster(['deviceMotion', 'drivingModelData'])
   _learner = ContactLearner()
 
   state = {
@@ -225,12 +225,12 @@ def on_lat_controller_init(result, lac, CP):
     'target_frac': 0.0,        # plant-inversion target set each decision (cadence = CONTROL_HORIZON_S/2)
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
-    'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first livePose tick fires cadence immediately (no engagement gap)
+    'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first deviceMotion tick fires cadence immediately (no engagement gap)
     'action': 'init',          # debug: ramp / relax_dwell / idle / take_up
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad), what controller acts on
     'lat_pub': None,
     'desired': 0.0, 'measured': 0.0,
-    'relax_ticks': 0,             # consecutive livePose ticks of overshoot-side error while deep in a curve
+    'relax_ticks': 0,             # consecutive deviceMotion ticks of overshoot-side error while deep in a curve
     # Direct Tracking.
     'was_active': False,     # previous tick's `active`, for the engagement edge
     'guard': SignGuard(),    # noise guard on P-target sign reversals
@@ -243,9 +243,9 @@ def on_lat_controller_init(result, lac, CP):
     'demand_nm': 0.0,        # ff_nm + P_nm (+ sl_bias): what the decision targets
     'slope': False,          # SlopeCompensation latched at the engagement edge
     'sl_bias': 0.0,          # learned straight-road torque (Nm); kept across engagements, never persisted
-    'sl_learn': False,       # learn gate open this livePose tick (telemetry)
-    'lane_change': False,    # model runs a lane change this livePose tick (LANE_CHANGE_STATES)
-    'wheel_hist': deque(maxlen=YAW_PRED_TICKS + 1),  # wheel angle (deg) at the last livePose ticks
+    'sl_learn': False,       # learn gate open this deviceMotion tick (telemetry)
+    'lane_change': False,    # model runs a lane change this deviceMotion tick (LANE_CHANGE_STATES)
+    'wheel_hist': deque(maxlen=YAW_PRED_TICKS + 1),  # wheel angle (deg) at the last deviceMotion ticks
     'kappa_pred': 0.0,       # yaw-predictor curvature added to the P law's measured (1/m)
   }
 
@@ -265,7 +265,7 @@ def on_lat_controller_init(result, lac, CP):
       state['slope'] = False
       # Inactive: the law does not run on the state. Torque, target and ramp
       # are zeroed so the next engagement ramps from 0 under STEP_MAX on its
-      # first livePose tick instead of jumping to a torque built while the
+      # first deviceMotion tick instead of jumping to a torque built while the
       # output was 0 (the rack never received it). A take-up in flight ends.
       state.update(torque=0.0, target_frac=0.0, ramp_step=0.0, ramp_frames=0)
       state['takeup'].reset()
@@ -279,19 +279,19 @@ def on_lat_controller_init(result, lac, CP):
     _angle = float(getattr(CS, 'steeringAngleDeg', 0.0))
 
     _sm.update(0)
-    lp = _sm['livePose']
-    livepose_updated = _sm.updated['livePose']
+    lp = _sm['deviceMotion']
+    motion_updated = _sm.updated['deviceMotion']
 
-    # livePose tick (20 Hz): measured and desired every tick, a decision every
+    # deviceMotion tick (20 Hz): measured and desired every tick, a decision every
     # action_cadence_ticks (6 ticks, 300 ms: >= 2.5 tau of the rack's ~130 ms response,
     # so the plant has answered the previous step). CAN tick (100 Hz): ramp.
-    if livepose_updated:
+    if motion_updated:
       # Cadence and ramp length, both half of CONTROL_HORIZON_S; spread_frames
-      # is derived from the cadence (5 CAN ticks per livePose tick) so the ramp
+      # is derived from the cadence (5 CAN ticks per deviceMotion tick) so the ramp
       # ends exactly when the next decision lands (6 ticks = 30 frames = 300 ms).
       half_horizon = 0.5 * CONTROL_HORIZON_S
-      action_cadence_ticks = max(1, round(half_horizon / DT_LIVEPOSE))
-      spread_frames = action_cadence_ticks * int(DT_LIVEPOSE / DT_CAN_TICK)
+      action_cadence_ticks = max(1, round(half_horizon / DT_DEVICE_MOTION))
+      spread_frames = action_cadence_ticks * int(DT_DEVICE_MOTION / DT_CAN_TICK)
 
       # No filtering here: desired_curvature is already the lane_keeping Arc
       # reference, low-passed upstream. This controller tracks it faithfully.
@@ -301,7 +301,7 @@ def on_lat_controller_init(result, lac, CP):
       # use the actual speed or the loop settles at the wrong curvature at low
       # speed; v is the gain reference (P, t_cap, step_max),
       # floored at V_GAIN_FLOOR so v^2 never collapses toward zero.
-      v_true = max(float(lp.velocityDevice.x) if _sm.seen['livePose'] else CS.vEgo, 1.0)
+      v_true = max(float(lp.velocityDevice.x) if _sm.seen['deviceMotion'] else CS.vEgo, 1.0)
       v = gain_reference_speed(v_true)
       state['measured'] = float(lp.angularVelocityDevice.z) / v_true
 
@@ -344,7 +344,7 @@ def on_lat_controller_init(result, lac, CP):
         and abs(a_ref) < SL_AY_MAX
         and state['takeup'].state != 'taking_up')
       if state['sl_learn']:
-        state['sl_bias'] = float(np.clip(state['sl_bias'] + (_p_nm / SL_TAU_S) * DT_LIVEPOSE,
+        state['sl_bias'] = float(np.clip(state['sl_bias'] + (_p_nm / SL_TAU_S) * DT_DEVICE_MOTION,
                                          -SL_BIAS_MAX_NM, SL_BIAS_MAX_NM))
 
       # The demand the decision targets.
@@ -386,7 +386,7 @@ def on_lat_controller_init(result, lac, CP):
       if active and state['tick_count'] >= action_cadence_ticks:
         state['tick_count'] = 0
 
-        # The demand of this livePose tick, on the FULL error — no on-target
+        # The demand of this deviceMotion tick, on the FULL error — no on-target
         # band, a sub-friction target is in effect a hold (Direct spec §2).
         _tu_demand = None   # the decision's demand before the step cap (take-up size gate)
         target_frac = state['demand_nm'] / CCP.STEER_MAX
@@ -518,10 +518,10 @@ def on_lat_controller_init(result, lac, CP):
     pid_log.output = float(output)
     pid_log.saturated = bool(abs(output) > 0.99)
 
-    # Telemetry at livePose rate (20 Hz): most fields only change on livePose
+    # Telemetry at deviceMotion rate (20 Hz): most fields only change on deviceMotion
     # ticks. The exact field set is pinned by test_payload_exact_key_set and
     # listed in LATERAL_CONTROLLER.md §9.
-    if livepose_updated:
+    if motion_updated:
       try:
         if state['lat_pub'] is None:
           from openpilot.selfdrive.plugins.plugin_bus import PluginPub

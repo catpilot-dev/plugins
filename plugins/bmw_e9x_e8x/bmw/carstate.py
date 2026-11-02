@@ -4,7 +4,7 @@ from opendbc.car import Bus, structs, create_button_events
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
 from bmw.values import DBC, CanBus, BmwFlags, CruiseSettings
-import cereal.messaging as messaging
+import openpilot.cereal.messaging as messaging
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
@@ -114,8 +114,8 @@ class CarState(CarStateBase):
     self.cruise_state_enabled = False
     self.dtc_mode = False
 
-    # Subscribe to radarState, liveDelay
-    self.sm = messaging.SubMaster(['radarState', 'liveDelay'])
+    # Subscribe to radarState, lateralDelay
+    self.sm = messaging.SubMaster(['radarState', 'lateralDelay'])
     from openpilot.selfdrive.plugins.plugin_bus import PluginSub
     self._sl_sub = PluginSub(['speedLimitState'])
     self._sl_data = None

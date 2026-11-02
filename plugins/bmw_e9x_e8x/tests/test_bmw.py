@@ -10,14 +10,13 @@ _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
-from test_helpers import make_opendbc_mocks, make_cereal_mocks
+from test_helpers import make_opendbc_mocks, make_cereal_mocks, install_all_mocks
 
 
 @pytest.fixture(autouse=True)
 def mock_opendbc(monkeypatch):
-  """Mock opendbc imports so tests run without openpilot installed."""
-  for mod_name, mod_mock in make_opendbc_mocks().items():
-    monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+  """Mock opendbc and cereal imports so tests run without openpilot installed."""
+  install_all_mocks(monkeypatch)
 
 
 # ============================================================
@@ -1506,7 +1505,7 @@ class TestSetpointDebtLedger:
 
 class TestLateralTiming:
   """steerActuatorDelay is the only input to lagd's initial_lag, which this car
-  never moves off (lagd does not converge here): liveDelay = SAD + 0.2. Routes
+  never moves off (lagd does not converge here): lateralDelay = SAD + 0.2. Routes
   4d4/4d5 measured target -> yaw 0.90-1.0 s on straights, but that is mostly
   rack stiction on small corrections, not a pure delay: SAD 0.7 (route 4d9)
   made the model's own corrections overshoot - sway-band oscillation ~2x with

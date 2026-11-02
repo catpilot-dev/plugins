@@ -1,10 +1,9 @@
 import os
 from dataclasses import dataclass, field
 from enum import Enum, IntFlag
-from opendbc.car import Bus, Platforms, CarSpecs, PlatformConfig, DbcDict, STD_CARGO_KG
+from opendbc.car import Bus, Platforms, CarSpecs, PlatformConfig, DbcDict
 from opendbc.car.structs import CarParams
 from opendbc.car.docs_definitions import CarFootnote, CarHarness, CarDocs, CarParts, Column
-from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.fw_query_definitions import LiveFwVersions, OfflineFwVersions, FwQueryConfig
 
 # Plugin-local DBC directory (resolved at import time)
@@ -25,7 +24,7 @@ class CarControllerParams: #controls running @ 100hz
   # Used to select T_IDXS for curvature measurement — camera can only see
   # road beyond MIN_VISIBLE_DIST, below that is occluded by the bonnet.
   # d_min = BONNET_LENGTH × CAM_HEIGHT / (CAM_HEIGHT - BONNET_EDGE_HEIGHT)
-  CAM_HEIGHT = 1.19           # from liveCalibration.height (comma3 behind windshield)
+  CAM_HEIGHT = 1.19           # from extrinsicsCalibration.height (comma3 behind windshield)
   BONNET_LENGTH = 2.0         # camera to front edge of bonnet (est. from E90 front overhang ~820mm + windshield setback ~1180mm)
   BONNET_EDGE_HEIGHT = 0.8    # bonnet front edge height from ground (est. from E90 overall height 1421mm, ground clearance 130mm)
   MIN_VISIBLE_DIST = BONNET_LENGTH * CAM_HEIGHT / (CAM_HEIGHT - BONNET_EDGE_HEIGHT)  # ~6.1m
@@ -108,11 +107,11 @@ class BmwPlatformConfig(PlatformConfig):
 class CAR(Platforms):
   BMW_E82 = BmwPlatformConfig(
     [BmwCarDocs("BMW E82 2004-13")],
-    CarSpecs(mass=3145. * CV.LB_TO_KG + STD_CARGO_KG, wheelbase=2.66, steerRatio=16.00, tireStiffnessFactor=0.8)
+    CarSpecs(wheelbase=2.66, steerRatio=16.00, tireStiffnessFactor=0.8)
   )
   BMW_E90 = BmwPlatformConfig(
     [BmwCarDocs("BMW E90 2005-11")],
-    CarSpecs(mass=3300. * CV.LB_TO_KG + STD_CARGO_KG, wheelbase=2.76, steerRatio=19.0, tireStiffnessFactor=0.8)
+    CarSpecs(wheelbase=2.76, steerRatio=19.0, tireStiffnessFactor=0.8)
   )
 
 
@@ -152,6 +151,7 @@ def match_fw_to_car_fuzzy(live_fw_versions: LiveFwVersions, vin: str, offline_fw
 
 FW_QUERY_CONFIG = FwQueryConfig(
   requests=[],  # No firmware queries needed for VIN-based detection
+  fw_version_regex=br"\x00BMW_E(?:82|90)_DUMMY",  # fingerprints.py's placeholder entries
   match_fw_to_car_fuzzy=match_fw_to_car_fuzzy,
   extra_ecus=[],
   non_essential_ecus={},

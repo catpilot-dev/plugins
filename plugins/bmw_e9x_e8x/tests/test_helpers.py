@@ -38,7 +38,6 @@ if _PLUGINS_DIR not in sys.path:
 
 @dataclass
 class CarSpecs:
-  mass: float = 0.0
   wheelbase: float = 0.0
   steerRatio: float = 0.0
   tireStiffnessFactor: float = 0.0
@@ -150,7 +149,6 @@ def make_opendbc_mocks() -> dict:
   mods['opendbc.car'].CarSpecs = CarSpecs
   mods['opendbc.car'].PlatformConfig = PlatformConfig
   mods['opendbc.car'].DbcDict = DbcDict
-  mods['opendbc.car'].STD_CARGO_KG = 136
   mods['opendbc.car.common.conversions'].Conversions.LB_TO_KG = 0.453592
   mods['opendbc.car.docs_definitions'].CarDocs = CarDocs
   mods['opendbc.car.docs_definitions'].CarFootnote = CarFootnote
@@ -171,11 +169,12 @@ def make_cereal_mocks() -> dict:
   cereal_mock = MagicMock()
   cereal_mock.log = log_mock
   messaging_mock = MagicMock()
+  cereal_mock.messaging = messaging_mock   # `from openpilot.cereal import messaging` reads the attribute
 
   return {
-    'cereal': cereal_mock,
-    'cereal.log': log_mock,
-    'cereal.messaging': messaging_mock,
+    'openpilot.cereal': cereal_mock,
+    'openpilot.cereal.log': log_mock,
+    'openpilot.cereal.messaging': messaging_mock,
   }
 
 
@@ -183,8 +182,18 @@ def install_all_mocks(monkeypatch):
   """Install both opendbc and cereal mocks into sys.modules."""
   for mod_name, mod_mock in make_opendbc_mocks().items():
     monkeypatch.setitem(__import__('sys').modules, mod_name, mod_mock)
-  for mod_name, mod_mock in make_cereal_mocks().items():
-    monkeypatch.setitem(__import__('sys').modules, mod_name, mod_mock)
+  # 0.11.2: cereal lives under the openpilot package. The parent must
+  # resolve, and its `cereal` attribute must BE the installed mock:
+  # `import openpilot.cereal.messaging as m` binds by attribute walk, so a
+  # MagicMock parent left by another suite would hand out a different object.
+  sys_modules = __import__('sys').modules
+  if 'openpilot' not in sys_modules:
+    _pkg = __import__('types').ModuleType('openpilot'); _pkg.__path__ = []   # empty namespace: only the mocked submodules resolve
+    monkeypatch.setitem(sys_modules, 'openpilot', _pkg)
+  cereal_mocks = make_cereal_mocks()
+  for mod_name, mod_mock in cereal_mocks.items():
+    monkeypatch.setitem(sys_modules, mod_name, mod_mock)
+  monkeypatch.setattr(sys_modules['openpilot'], 'cereal', cereal_mocks['openpilot.cereal'], raising=False)
 
 
 # ============================================================

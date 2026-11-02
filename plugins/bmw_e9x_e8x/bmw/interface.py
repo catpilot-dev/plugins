@@ -90,9 +90,9 @@ class CarInterface(CarInterfaceBase):
     ret.steerControlType = structs.CarParams.SteerControlType.torque
     # BMW-specific: lagd never converges for our curvature/front-wheel-angle
     # controller (lagd correlates on latcontrol_torque telemetry that our
-    # plant-inversion path doesn't produce), so liveDelay.lateralDelay is
+    # plant-inversion path doesn't produce), so lateralDelay.lateralDelay is
     # permanently pinned at initial_lag = steerActuatorDelay + 0.2 (lagd.py:181).
-    # 0.4 → liveDelay = 0.6 s → modeld's lat_action_t ≈ 0.65 s. Route 4d9
+    # 0.4 → lateralDelay = 0.6 s → modeld's lat_action_t ≈ 0.65 s. Route 4d9
     # (2026-10-12) tried 0.7 to match the measured straight-line loop delay
     # (target → yaw 0.90-1.0 s, routes 4d4/4d5) and was "hardly driveable":
     # the model's own corrections overshot, ~2x the sway-band oscillation.
@@ -114,7 +114,5 @@ class CarInterface(CarInterfaceBase):
     ret.longitudinalActuatorDelay = 0.7
 
     ret.centerToFront = ret.wheelbase * 0.44
-
-    ret.startAccel = 0.0
 
     return ret
