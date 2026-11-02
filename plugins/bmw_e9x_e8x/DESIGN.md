@@ -1093,12 +1093,16 @@ Compiled C, safety model id **35** (`bmw`), declared in `plugin.json`'s
   hardcodes H7 sector layout — call `Panda.flash_static(handle, code,
   mcu_type=McuType.F4)` with the panda already in bootstub instead.
 - **Safety-model ordinal on openpilot 0.11.2** (2026-11-02): upstream
-  opendbc now declares `SafetyModel.bmw @37` (with byd @35, volvo @36, mg @38),
+  opendbc declares `SafetyModel.bmw @37` (with byd @35, volvo @36, mg @38),
   so the manifest's injection is a no-op and openpilot asks the panda for mode
-  37. The flashed F4 firmware was built with `SAFETY_BMW 35U` (the firmware
-  workspace's `safety_declarations.h`): before booting 0.11.2 the firmware must
-  be rebuilt with `SAFETY_BMW 37U` and reflashed, or the panda will not enter
-  BMW safety and nothing engages. On the 0.11.1 base the ordinal stays 35.
+  37; the 0.11.1 base asks for the firmware workspace's `SAFETY_BMW` 35. The
+  build registers `bmw_hooks` under both, so one image serves both bases and
+  can be flashed and verified on 0.11.1 before the base moves. The script
+  refuses if 37 is already taken in the workspace; the safety suite runs again
+  through 37 (servo and no-servo configs) and checks 36/38 stay unknown. A
+  panda still on the 35-only image (`a552508f`, Sep 30) will not enter BMW
+  safety under 0.11.2 and nothing engages: flash the dual image first
+  (signature `39f4d7f6`, `DEV-a0848226`, 58660 B).
 - **RX checks** on brake, gas, speed, either cruise-status message and the
   stalk, plus the stepper status when the servo param is set.
 - `disable_forwarding = true`; cruise-engaged state is taken from the DCC/NCC

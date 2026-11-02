@@ -842,5 +842,44 @@ class TestBmwSafetyNoServo(unittest.TestCase):
     self.assertTrue(self.safety.safety_tx_hook(self._cruise_stalk_msg(bus=BMW_F_CAN)))
 
 
+
+# openpilot 0.11.2 asks the panda for SafetyModel.bmw @37 (upstream opendbc
+# #3682); the 0.11.1 base asks for @35. One firmware serves both: the build
+# registers bmw_hooks under both ordinals (build_firmware.sh), so the panda can
+# be flashed and field-verified on 0.11.1 before the base moves.
+SAFETY_BMW_0112 = 37
+
+
+class TestBmwSafety0112Ordinal(TestBmwSafety):
+  """The whole servo suite again, entered through the 0.11.2 ordinal."""
+  def setUp(self):
+    super().setUp()
+    self.assertEqual(self.safety.set_safety_hooks(SAFETY_BMW_0112, BMW_PARAM_STEPPER_SERVO), 0)
+    self.safety.init_tests()
+    self._send_all_bmw_rx_checks()
+
+
+class TestBmwSafetyNoServo0112Ordinal(TestBmwSafetyNoServo):
+  """The no-servo config through the 0.11.2 ordinal."""
+  def setUp(self):
+    super().setUp()
+    self.assertEqual(self.safety.set_safety_hooks(SAFETY_BMW_0112, 0), 0)
+    self.safety.init_tests()
+
+
+class TestBmwSafetyOrdinals(unittest.TestCase):
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+
+  def test_both_ordinals_select_bmw(self):
+    for mode in (int(CarParams.SafetyModel.bmw), SAFETY_BMW_0112):
+      self.assertEqual(self.safety.set_safety_hooks(mode, BMW_PARAM_STEPPER_SERVO), 0, mode)
+
+  def test_neighbours_stay_unknown(self):
+    # 36 / 38 are volvo / mg upstream; this firmware carries neither
+    for mode in (36, 38):
+      self.assertNotEqual(self.safety.set_safety_hooks(mode, 0), 0, mode)
+
+
 if __name__ == "__main__":
   unittest.main()
