@@ -509,3 +509,21 @@ class TestDriftFile:
   def test_no_tmp_left_behind(self, mod):
     mod.write_drift({'driving': False})
     assert not mod.drift_file().with_name('.drift.tmp').exists()
+
+
+class TestActivationAllowed:
+  """The panel's Activate button: tested models only; the active one only when its file drifted."""
+
+  def test_inactive_tested_model_can_be_activated(self, swapper_mod):
+    assert swapper_mod.activation_allowed({'verified': True}, is_active=False, drifted=False) is True
+
+  def test_active_model_without_drift_is_greyed_out(self, swapper_mod):
+    assert swapper_mod.activation_allowed({'verified': True}, is_active=True, drifted=False) is False
+
+  def test_active_drifted_model_can_be_reactivated(self, swapper_mod):
+    assert swapper_mod.activation_allowed({'verified': True}, is_active=True, drifted=True) is True
+
+  @pytest.mark.parametrize('model', [{'verified': False}, {}])
+  @pytest.mark.parametrize('is_active,drifted', [(False, False), (True, False), (True, True)])
+  def test_untested_model_never_activates(self, swapper_mod, model, is_active, drifted):
+    assert swapper_mod.activation_allowed(model, is_active=is_active, drifted=drifted) is False

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from config import PLUGINS_RUNTIME_DIR
-from model_swapper import ModelSwapper, ModelType, read_drift, write_drift
+from model_swapper import ModelSwapper, ModelType, activation_allowed, read_drift, write_drift
 
 try:
   from plugins.model_selector import catalog
@@ -117,14 +117,14 @@ def on_software_settings_extend(default, layout):
   class ModelActionDialog(Widget):
     """3-button dialog: [Delete] (red) | [Cancel] | [Activate] (blue)."""
 
-    def __init__(self, model_name, is_active=False, can_activate=True, callback=None):
+    def __init__(self, model_name, can_activate=True, callback=None):
       super().__init__()
       self._callback = callback
       self._label = Label(model_name, 70, FontWeight.BOLD, text_color=rl.Color(201, 201, 201, 255))
       self._delete_btn = Button('Delete', lambda: self._done(ACTION_DELETE), button_style=ButtonStyle.DANGER)
       self._cancel_btn = Button('Cancel', lambda: self._done(ACTION_CANCEL))
       self._activate_btn = Button('Activate', lambda: self._done(ACTION_ACTIVATE), button_style=ButtonStyle.PRIMARY)
-      self._activate_btn.set_enabled(not is_active and can_activate)
+      self._activate_btn.set_enabled(can_activate)
 
     def _done(self, result):
       gui_app.pop_widget()
@@ -252,6 +252,9 @@ def on_software_settings_extend(default, layout):
           return
 
       active_id = _read_active(model_type)[0]
+      # A drifted active model stays activatable: re-activating it puts its
+      # file back (published by on_health_check; the UI never hashes).
+      drifted = read_drift().get(model_type) is True
       options = [_display_label(m) for m in models]
       current = ''
       for i, m in enumerate(models):
@@ -285,8 +288,8 @@ def on_software_settings_extend(default, layout):
                   return
                 self._activate(mt, mid)
 
-            action_dlg = ModelActionDialog(_display_label(m), is_active=is_active,
-                                           can_activate=m.get('verified', False),
+            action_dlg = ModelActionDialog(_display_label(m),
+                                           can_activate=activation_allowed(m, is_active, drifted),
                                            callback=on_action)
             gui_app.push_widget(action_dlg)
             return

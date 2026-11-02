@@ -545,6 +545,18 @@ class ModelSwapper:
         }
 
 
+def activation_allowed(model: dict, is_active: bool, drifted: bool) -> bool:
+    """Whether the panel enables Activate for this model.
+
+    Only tested models activate. The active model is normally greyed out (it is
+    already selected), except when its active file has drifted: activating it
+    again is how the selected model's file is put back.
+    """
+    if not model.get('verified', False):
+        return False
+    return not is_active or drifted
+
+
 def drift_file() -> Path:
     """Cross-process drift signal, next to the active trackers."""
     return ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]['models_dir'].parent / '.drift'
