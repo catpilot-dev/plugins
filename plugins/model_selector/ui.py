@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from config import PLUGINS_RUNTIME_DIR
-from model_swapper import ModelSwapper, ModelType
+from model_swapper import ModelSwapper, ModelType, read_drift, write_drift
 
 try:
   from plugins.model_selector import catalog
@@ -26,10 +26,6 @@ _SWAPPERS = {
   'driving': ModelSwapper(ModelType.DRIVING),
   'dm': ModelSwapper(ModelType.DM),
 }
-
-# Per-type "active file no longer matches the selected model", set by
-# on_health_check (plugind) so show() never hashes on the UI thread.
-_DRIFT: dict[str, bool] = {}
 
 MODEL_TYPE_LABELS = {
   'driving': 'Driving Model',
@@ -196,6 +192,8 @@ def on_software_settings_extend(default, layout):
 
     def show(self):
       self._untested_active = {}
+      # Published by on_health_check in plugind; the UI never hashes.
+      drift = read_drift()
       for model_type in MODEL_TYPE_LABELS:
         # One bad model type (e.g. a garbled catalog) must not take the whole
         # panel down — degrade that row instead of raising out of show().
@@ -214,7 +212,7 @@ def on_software_settings_extend(default, layout):
               # appears and every row in the list is greyed out with no
               # explanation. Say so here instead of leaving a dead end.
               active_name = f'{active_name}, none tested for this openpilot version'
-          if _DRIFT.get(model_type):
+          if drift.get(model_type) is True:
             active_name += ' — active file differs, re-activate'
           self._model_btns[model_type].action_item.set_value(active_name)
         except Exception:
@@ -441,17 +439,21 @@ def on_health_check(acc, **kwargs):
     except Exception:
       pass
 
+  drift = {}
   for model_type_key, swapper in _SWAPPERS.items():
+    drift[model_type_key] = False
     try:
       active_id = swapper.get_active_model()
       if active_id and active_id != 'unknown':
-        _DRIFT[model_type_key] = swapper.active_file_matches(active_id) is False
+        drift[model_type_key] = swapper.active_file_matches(active_id) is False
         count = swapper.cache_compiled_pkl(active_id)
         if count > 0:
           from openpilot.common.swaglog import cloudlog
           cloudlog.info(f"model_selector: cached {count} pkl files for {model_type_key}/{active_id}")
-      else:
-        _DRIFT[model_type_key] = False
     except Exception:
       pass
+  try:
+    write_drift(drift)
+  except Exception:
+    pass
   return {**acc, "model_selector": {"status": "ok"}}

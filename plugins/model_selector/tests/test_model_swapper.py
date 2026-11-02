@@ -484,3 +484,28 @@ class TestDrift:
     monkeypatch.setattr(sw, '_file_sha256', lambda p: calls.append(p) or real(p))
     sw.active_file_matches('pop_supercombo_37727'); sw.active_file_matches('pop_supercombo_37727')
     assert len(calls) == 1
+
+
+class TestDriftFile:
+  @pytest.fixture
+  def mod(self, swapper_mod, tmp_path, monkeypatch):
+    cfgs = swapper_mod.ModelSwapper.MODEL_CONFIGS
+    t = swapper_mod.ModelType.DRIVING
+    monkeypatch.setitem(cfgs, t, {**cfgs[t], 'models_dir': tmp_path / 'models' / 'driving'})
+    return swapper_mod
+
+  def test_round_trip(self, mod):
+    mod.write_drift({'driving': True, 'dm': False})
+    assert mod.read_drift() == {'driving': True, 'dm': False}
+
+  def test_missing_file_reads_empty(self, mod):
+    assert mod.read_drift() == {}
+
+  def test_malformed_file_reads_empty(self, mod):
+    mod.drift_file().parent.mkdir(parents=True, exist_ok=True)
+    mod.drift_file().write_text('not json')
+    assert mod.read_drift() == {}
+
+  def test_no_tmp_left_behind(self, mod):
+    mod.write_drift({'driving': False})
+    assert not mod.drift_file().with_name('.drift.tmp').exists()

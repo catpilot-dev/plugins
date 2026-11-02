@@ -545,6 +545,28 @@ class ModelSwapper:
         }
 
 
+def drift_file() -> Path:
+    """Cross-process drift signal, next to the active trackers."""
+    return ModelSwapper.MODEL_CONFIGS[ModelType.DRIVING]['models_dir'].parent / '.drift'
+
+
+def write_drift(states: dict[str, bool]) -> None:
+    """Atomically publish {model_type: drifted} for the UI process."""
+    path = drift_file()
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(json.dumps(states))
+    os.replace(tmp, path)
+
+
+def read_drift() -> dict[str, bool]:
+    """The published drift states; {} if missing, unreadable or malformed."""
+    try:
+        data = json.loads(drift_file().read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def main():
     """CLI tool for model management"""
     import argparse
