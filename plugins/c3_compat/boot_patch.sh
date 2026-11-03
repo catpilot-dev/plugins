@@ -760,9 +760,10 @@ if [ -d "$CAMERAD/sensors" ] && [ -f "$C3_SRC/camerad/ar0231.cc" ]; then
       echo "[c3_compat] Installed camerad/sensors/$f"
     fi
   done
-  python3 - "$CAMERAD" << 'PYEOF'
+  python3 - "$CAMERAD" "$C3_SRC" << 'PYEOF'
 import sys, os
 d = sys.argv[1]
+src = sys.argv[2]
 
 def patch(rel, pairs, marker='c3_compat'):
     path = os.path.join(d, rel)
@@ -802,6 +803,26 @@ patch('sensors/sensor.h', [(
     '\n'
     'class OX03C10 : public SensorInfo {\n',
 )])
+# bps_blobs.h: 0.11.2 ships the AR0231 slot of the auto-generated BPS IO-config
+# table (bps_cfg[1], indexed by cereal ImageSensor) as an empty placeholder, so the
+# ICP firmware gets an all-zero IO config at the cabin camera's acquire and asserts
+# (A5 watchdog, "SFR: Assertion Failure ... hlssr.c"). Restore 0.11.1's entry; the
+# OX03C10 entry is byte-identical across the two releases, so the format is the same.
+blobs = os.path.join(d, 'cameras', 'bps_blobs.h')
+with open(blobs) as f:
+    b = f.read()
+if 'c3_compat: AR0231 BPS IO config' not in b:
+    marker = '{ /* placeholder */ },\n{ /* placeholder */ },\n'
+    if b.count(marker) == 1:
+        with open(os.path.join(src, 'camerad', 'bps_cfg_ar0231.inc')) as f:
+            entry = f.read()
+        b = b.replace(marker, '{ /* placeholder */ },\n' + entry, 1)
+        with open(blobs, 'w') as f:
+            f.write(b)
+        print("[c3_compat] Patched camerad/cameras/bps_blobs.h: AR0231 BPS IO config restored")
+    else:
+        print("[c3_compat] WARNING camerad/cameras/bps_blobs.h: placeholder anchor not found, left untouched")
+
 patch('cameras/spectra.cc', [(
     '  if (!init_sensor_lambda(new OS04C10) &&\n      !init_sensor_lambda(new OX03C10)) {',
     '  if (!init_sensor_lambda(new AR0231) &&   // c3_compat: comma three sensor first\n'
