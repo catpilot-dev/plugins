@@ -212,6 +212,17 @@ loggerd.h's livestream encoder size for tici = tizi's 1152x720 (same 1928x1208 r
 
 ### Compiled comma-three support (boot §15–18, `src/`)
 
+**F4 health packet (§16c, `src/pandad/health_f4.h`).** The BMW plugin's F4 firmware answers USB 0xd2 with
+health v16 (58 bytes: uint32 voltage/current, one byte per boolean, float interrupt load). 0.11.2's
+`health_t` is 48 bytes with uint16 voltage/current and a `flags_pkt` bitfield, so a straight read shifts
+every field after `uptime`: ignition_line landed in safety_param, flags were read out of faults_pkt
+(always 0) and the car never went onroad (first 0.11.2 drive attempt: VBAT 15.3 V, ignitionLine False,
+safety 'silent', alternativeExperience 4864 = harness/safety bytes). `Panda::get_state()` now reads
+`health_f4_t` on a dos panda and `health_from_f4()` assembles the 0.11.2 struct (flags from the booleans,
+interrupt load scaled to uint8, sound level/temperature 0). Host-compiled tests: `tests/test_health_f4.py`.
+The Python library (`panda/python/__init__.py`) reads the same packet into its 48-byte struct; only
+pandad.py's heartbeat_lost check uses it on the device (§8a/§8b cover the length and version checks).
+
 **AR0231 BPS IO-config blob (§15, `src/camerad/bps_cfg_ar0231.inc`).** 0.11.2's auto-generated
 `cameras/bps_blobs.h` ships `bps_cfg[1]` (cereal `ImageSensor::ar0231`) as an empty placeholder.
 The cabin camera runs the BPS/ICP pipeline, so `configICP()` handed the ICP firmware an all-zero
