@@ -803,39 +803,40 @@ patch('sensors/sensor.h', [(
     '\n'
     'class OX03C10 : public SensorInfo {\n',
 )])
-# bps_blobs.h: 0.11.2 ships the AR0231 slot of the auto-generated BPS IO-config
-# table (bps_cfg[1], indexed by cereal ImageSensor) as an empty placeholder, so the
-# ICP firmware gets an all-zero IO config at the cabin camera's acquire and asserts
-# (A5 watchdog, "SFR: Assertion Failure ... hlssr.c"). Restore 0.11.1's entry; the
-# OX03C10 entry is byte-identical across the two releases, so the format is the same.
+# bps_blobs.h: 0.11.2 ships the AR0231 slot (index 1, cereal ImageSensor) of all three
+# auto-generated BPS tables -- bps_cfg (IO config), bps_striping_output, bps_settings --
+# as empty placeholders. The cabin camera runs the BPS pipeline (the SDM845 ISP has only
+# two full IFE pixel paths), so the ICP firmware got zeros: A5 watchdog at acquire
+# ("SFR: Assertion Failure ... hlssr.c") and, once the IO config was back, a failed
+# frame_process (error 4, "BPS sync failed") on every frame. Restore 0.11.1's entries
+# (bps_cfg's OX03C10 entry is byte-identical across the releases; the striping output
+# and settings tables changed for the other sensors, 0.11.1's AR0231 blobs are the
+# ones that drove this hardware). Each table is handled on its own marker so a
+# partially patched file completes.
 blobs = os.path.join(d, 'cameras', 'bps_blobs.h')
 with open(blobs) as f:
     b = f.read()
-if 'c3_compat: AR0231 BPS IO config' not in b:
-    import re
-    # entries 0 (unknown) and 1 (ar0231) are consecutive placeholder lines; keep 0, fill 1
-    m = re.search(r'(^[ \t]*\{[ \t]*/\* placeholder \*/[ \t]*\},[ \t]*\n)([ \t]*\{[ \t]*/\* placeholder \*/[ \t]*\},[ \t]*\n)', b, re.M)
+import re
+changed = []
+for tbl in ('bps_cfg', 'bps_striping_output', 'bps_settings'):
+    inc = os.path.join(src, 'camerad', f'{tbl}_ar0231.inc')
+    if not os.path.exists(inc):
+        continue
+    with open(inc) as f:
+        entry = f.read()
+    if entry.split('//')[-1].strip() in b:
+        continue
+    m = re.search(r'unsigned char ' + tbl + r'\[4\]\[[^\]]+\] = \{\n([ \t]*\{[ \t]*/\* placeholder \*/[ \t]*\},[ \t]*\n)([ \t]*\{[ \t]*/\* placeholder \*/[ \t]*\},[ \t]*\n)', b)
     if m:
-        with open(os.path.join(src, 'camerad', 'bps_cfg_ar0231.inc')) as f:
-            entry = f.read()
         b = b[:m.end(1)] + entry + b[m.end(2):]
-        with open(blobs, 'w') as f:
-            f.write(b)
-        print("[c3_compat] Patched camerad/cameras/bps_blobs.h: AR0231 BPS IO config restored")
+        changed.append(tbl)
     else:
-        print("[c3_compat] WARNING camerad/cameras/bps_blobs.h: placeholder anchor not found, left untouched")
+        print(f"[c3_compat] WARNING camerad/cameras/bps_blobs.h: {tbl} placeholder anchor not found, left untouched")
+if changed:
+    with open(blobs, 'w') as f:
+        f.write(b)
+    print(f"[c3_compat] Patched camerad/cameras/bps_blobs.h: AR0231 entries restored ({', '.join(changed)})")
 
-# hw.h: run the cabin (driver) camera through the IFE like the road cameras. 0.11.2's
-# BPS/ICP path (new striping blob, LUT + gamma programming, forced 600 MHz clock) was
-# re-tuned for the OS04C10/OX03C10 and fails every frame on the comma three's AR0231 +
-# 4.9 ICP firmware ("BPS sync failed after 43 ms", CAM-ICP frame_process error 4), so
-# the cabin stream never publishes and driver monitoring is blind. The IFE path is the
-# one the two AR0231 road cameras already use; dmonitoringmodeld only asks for
-# VISION_STREAM_CABIN and ships a 1928x1208 warp.
-patch('cameras/hw.h', [(
-    '  .output_type = ISP_BPS_PROCESSED,\n  .staggered_sof',
-    '  .output_type = ISP_IFE_PROCESSED,  // c3_compat: AR0231 cabin camera through the IFE (BPS path fails per frame on the comma three)\n  .staggered_sof',
-)])
 patch('cameras/spectra.cc', [(
     '  if (!init_sensor_lambda(new OS04C10) &&\n      !init_sensor_lambda(new OX03C10)) {',
     '  if (!init_sensor_lambda(new AR0231) &&   // c3_compat: comma three sensor first\n'
