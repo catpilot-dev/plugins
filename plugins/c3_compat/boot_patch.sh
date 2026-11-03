@@ -8,6 +8,9 @@
 # and set -e would propagate to the parent shell, killing the launch chain
 # on any non-zero exit from build.py, manager.py, etc.
 OPENPILOT_DIR="${1:-/data/openpilot}"
+# this plugin's runtime directory (artifacts under raylib_drm/ and src/ are addressed from here)
+C3_COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+C3_SRC="$C3_COMPAT_DIR/src"
 
 echo "[c3_compat] Applying AGNOS 12.8 patches to $OPENPILOT_DIR"
 
@@ -745,8 +748,6 @@ fi
 #     openpilot 0.11.2 rebase. The sources ship with this plugin under src/ and
 #     are copied in before scons runs; the hooks below are text patches on the
 #     stock files, guarded by their c3_compat markers like every other section.
-C3_COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-C3_SRC="$C3_COMPAT_DIR/src"
 
 # 15. camerad: AR0231 image sensor (the comma three's cameras). 0.11.2 ships only
 #     the comma 3X / four sensors (OS04C10, OX03C10); without this camerad finds
