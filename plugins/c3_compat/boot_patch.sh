@@ -1029,4 +1029,57 @@ if [ -d "$HDR_SRC" ]; then
   fi
 fi
 
+# 19. Native device type: openpilot 0.11.2 dropped "tici" from HardwareComma's
+#     device_map (common/hardware/comma/hardware.h), so every C++ daemon that
+#     asks for the device type (pandad, loggerd, camerad via set_ir_power) hits
+#     assert(it != device_map.end()) on the comma three. Restore the 0.11.1
+#     entries: tici in the map, IR LEDs untouched on tici (as on tizi), and the
+#     livestream encoder dimensions loggerd.h keys on the device (tici shares
+#     the 1928x1208 road camera with tizi -> 1152x720).
+HW_H="$OPENPILOT_DIR/openpilot/common/hardware/comma/hardware.h"
+LOGGERD_H="$OPENPILOT_DIR/openpilot/system/loggerd/loggerd.h"
+if [ -f "$HW_H" ] && ! grep -q '"tici"' "$HW_H"; then
+  python3 - "$HW_H" "$LOGGERD_H" << 'PYEOF'
+import sys
+hw_path, lg_path = sys.argv[1], sys.argv[2]
+with open(hw_path) as f:
+    s = f.read()
+n = 0
+old = '      {"tizi", cereal::InitData::DeviceType::TIZI},\n'
+new = '      {"tici", cereal::InitData::DeviceType::TICI},  // c3_compat: comma three\n      {"tizi", cereal::InitData::DeviceType::TIZI},\n'
+if old in s:
+    s = s.replace(old, new, 1); n += 1
+old = '    if (device == cereal::InitData::DeviceType::TIZI) {\n      return;\n'
+new = '    if (device == cereal::InitData::DeviceType::TICI ||  // c3_compat\n        device == cereal::InitData::DeviceType::TIZI) {\n      return;\n'
+if old in s:
+    s = s.replace(old, new, 1); n += 1
+if n == 2:
+    with open(hw_path, 'w') as f:
+        f.write(s)
+    print("[c3_compat] Patched hardware.h: tici in device_map")
+else:
+    print(f"[c3_compat] WARNING hardware.h: {n}/2 anchors found, left untouched")
+try:
+    with open(lg_path) as f:
+        s = f.read()
+except FileNotFoundError:
+    sys.exit(0)
+m = 0
+for old, new in (
+    ('    case cereal::InitData::DeviceType::TIZI: return 1152;\n',
+     '    case cereal::InitData::DeviceType::TICI:  // c3_compat\n    case cereal::InitData::DeviceType::TIZI: return 1152;\n'),
+    ('    case cereal::InitData::DeviceType::TIZI:\n    case cereal::InitData::DeviceType::MICI: return 720;\n',
+     '    case cereal::InitData::DeviceType::TICI:  // c3_compat\n    case cereal::InitData::DeviceType::TIZI:\n    case cereal::InitData::DeviceType::MICI: return 720;\n'),
+):
+    if old in s:
+        s = s.replace(old, new, 1); m += 1
+if m == 2:
+    with open(lg_path, 'w') as f:
+        f.write(s)
+    print("[c3_compat] Patched loggerd.h: livestream size for tici")
+else:
+    print(f"[c3_compat] WARNING loggerd.h: {m}/2 anchors found, left untouched")
+PYEOF
+fi
+
 echo "[c3_compat] Boot patches applied successfully"
