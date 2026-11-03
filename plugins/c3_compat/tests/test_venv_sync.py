@@ -89,3 +89,14 @@ def test_native_deps_still_run_on_old_lock(vs, tmp_path, monkeypatch):
 ])
 def test_wheel_matches_target_accepts_py3_none_manylinux_aarch64(vs, fn, ok):
   assert vs._wheel_matches_target("https://x/" + fn) is ok
+
+
+def test_runs_as_a_script_without_pythonpath(tmp_path):
+  """boot_patch.sh runs venv_sync.py as a bare script before launch_chffrplus.sh exports PYTHONPATH:
+  the shared `config` module (runtime root, one directory up) must be importable from the script itself."""
+  import os, subprocess
+  script = os.path.join(_PLUGINS_DIR, 'c3_compat', 'venv_sync.py')
+  env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+  r = subprocess.run([sys.executable, script, '--help'], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+  assert r.returncode == 0, r.stderr
+  assert 'usage' in r.stdout.lower()

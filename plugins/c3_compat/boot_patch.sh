@@ -73,7 +73,7 @@ fi
 #     the code was deployed (COD update, manual git checkout, AGNOS reflash).
 VENV_SYNC="/data/plugins-runtime/c3_compat/venv_sync.py"
 if [ -f "$VENV_SYNC" ] && [ -f /data/openpilot/uv.lock ]; then
-  /usr/local/venv/bin/python3 "$VENV_SYNC" --runtime-only --native-deps 2>&1 | while IFS= read -r line; do
+  PYTHONPATH="/data/plugins-runtime${PYTHONPATH:+:$PYTHONPATH}" /usr/local/venv/bin/python3 "$VENV_SYNC" --runtime-only --native-deps 2>&1 | while IFS= read -r line; do
     echo "[c3_compat] $line"
   done
 fi

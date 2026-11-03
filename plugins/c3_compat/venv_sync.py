@@ -39,7 +39,13 @@ except ImportError:
 
 log = logging.getLogger("venv_sync")
 
-from config import OPENPILOT_DIR, plugin_data_dir
+# The shared `config` module lives one directory up (/data/plugins-runtime/ on the
+# device, plugins/ in the repo). boot_patch.sh runs this file as a bare script before
+# launch_chffrplus.sh exports PYTHONPATH, so the import path is set here.
+_RUNTIME_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _RUNTIME_ROOT not in sys.path:
+    sys.path.insert(0, _RUNTIME_ROOT)
+from config import OPENPILOT_DIR, plugin_data_dir  # noqa: E402
 
 # --- Paths ---
 LOCAL_LOCK = os.path.join(OPENPILOT_DIR, "uv.lock")
