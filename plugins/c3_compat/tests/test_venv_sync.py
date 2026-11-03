@@ -100,3 +100,42 @@ def test_runs_as_a_script_without_pythonpath(tmp_path):
   r = subprocess.run([sys.executable, script, '--help'], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
   assert r.returncode == 0, r.stderr
   assert 'usage' in r.stdout.lower()
+
+
+LOCK_OPTIONAL_NATIVE = '''
+[[package]]
+name = "openpilot"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "numpy" }]
+
+[package.optional-dependencies]
+testing = [{ name = "comma-deps-libusb" }, { name = "pytest" }]
+
+[[package]]
+name = "numpy"
+version = "2.5.3"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://files.example/numpy-2.5.3-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:aa" }]
+
+[[package]]
+name = "comma-deps-libusb"
+version = "1.0.29.post103"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://files.example/comma_deps_libusb-1.0.29.post103-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:bb" }]
+
+[[package]]
+name = "pytest"
+version = "8.0.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://files.example/pytest-8.0.0-py3-none-any.whl", hash = "sha256:cc" }]
+'''
+
+
+def test_runtime_only_keeps_optional_comma_deps_wheels(vs):
+  """SConstruct imports every vendored comma-deps-* package it links (c3_compat adds libusb for pandad USB);
+  upstream lists some of them only under optional-dependencies, so --runtime-only must still install them."""
+  pkgs = vs.parse_lock_packages(LOCK_OPTIONAL_NATIVE, runtime_only=True)
+  assert 'numpy' in pkgs
+  assert 'comma-deps-libusb' in pkgs
+  assert 'pytest' not in pkgs

@@ -58,6 +58,12 @@ HASH_CACHE = str(plugin_data_dir("c3_compat").parent / ".venv_synced_hash")
 TARGET_PYTHON = "cp312"
 TARGET_ARCH = "aarch64"
 
+# commaai/dependencies wheels (native libs SConstruct imports) — always synced, even from optional groups
+NATIVE_DEPS_PREFIX = "comma-deps-"
+
+# pip install of one wheel on the C3: numpy took > 120 s on UFS (0.11.2 upgrade)
+PIP_INSTALL_TIMEOUT_S = 600
+
 # --- Packages pinned by boot_patch.sh — do not override ---
 # pycapnp: 2.2.2 has 6MB/s memory leak in Event.new_message() on C3;
 #          boot_patch.sh downgrades to 2.1.0 before venv_sync runs.
@@ -326,12 +332,17 @@ def _walk_deps(packages: dict, needed: set, root: str | None = None,
             if _marker_applies_to_c3(marker) and dep_name not in needed:
                 queue.append(dep_name)
 
-        # Optional dependencies (dev/testing/tools groups — only from root package)
-        if name == root and include_optional:
+        # Optional dependencies (dev/testing/tools groups — only from root package).
+        # The vendored native libraries (comma-deps-*) are build inputs: SConstruct
+        # imports every one it links (c3_compat adds libusb for pandad USB) and some
+        # sit only in optional groups upstream, so a runtime-only walk keeps them.
+        if name == root:
             for group_deps in pkg["opt_deps"].values():
                 for dep in group_deps:
                     dep_name = dep["name"]
                     marker = dep.get("marker", "")
+                    if not include_optional and not dep_name.startswith(NATIVE_DEPS_PREFIX):
+                        continue
                     if _marker_applies_to_c3(marker) and dep_name not in needed:
                         queue.append(dep_name)
 
@@ -486,7 +497,7 @@ def install_packages(actions: list[PackageAction], dry_run: bool = False) -> dic
             # No --target: install into venv normally so dist-info gets updated correctly
             cmd = ["sudo", "-E", VENV_PIP, "install",
                    "--no-deps", "--no-cache-dir", "-q", act.wheel_url]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT_S,
                                     env=pip_env)
             if result.returncode == 0:
                 installed.append({"name": act.name, "version": act.needed_version, "action": act.action})
