@@ -210,7 +210,9 @@ the stock files (guarded by `c3_compat` markers like every other section).
   retried every 500 ms for ~15 s instead.
 - **§18 kernel UAPI headers** — 0.11.2 takes the Qualcomm camera/video headers
   from the system (#37993): `media/cam_*.h`, `media/msm_camsensor_sdk.h`,
-  `media/msm_media_info.h` and the VIDC control IDs in `linux/v4l2-controls.h`.
+  `media/msm_media_info.h`, the VIDC control IDs in `linux/v4l2-controls.h`, and the ION
+allocator headers `linux/ion.h` + `linux/msm_ion.h` that msgq's `visionbuf_ion.cc` needs (ION left
+mainline Linux in 5.11, so Ubuntu's headers never had them).
   AGNOS 16+ has them in `/usr/include`; AGNOS 12.8 has none of `media/` and the
   stock Ubuntu `v4l2-controls.h`. `src/linux_include/` carries the comma three
   kernel's own set (the 0.11.1 `third_party/linux/include` files camerad built
@@ -273,7 +275,7 @@ c3_compat/
   raylib_drm/      # DRM-backend raylib .so + package (Git LFS; openpilot <= 0.11.1)
   src/camerad/     # AR0231 sensor driver (ar0231.cc, ar0231_registers.h) -> system/camerad/sensors/
   src/pandad/      # panda_usb.cc: libusb PandaUsbHandle -> selfdrive/pandad/
-  src/linux_include/  # comma three kernel UAPI headers (media/, linux/v4l2-controls.h) -> /usr/local/include
+  src/linux_include/  # comma three kernel UAPI headers (media/*.h, linux/{ion,msm_ion,v4l2-controls}.h) -> /usr/local/include
   __init__.py      # UI_BORDER_SIZE constant
   tests/test_compat.py
   tests/test_venv_sync.py

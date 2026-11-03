@@ -1025,7 +1025,7 @@ if [ -d "$HDR_SRC" ]; then
       sudo cp "$HDR_SRC/$sub"/*.h "$HDR_DST/$sub/"
     done
     sudo mount -o remount,ro / 2>/dev/null || true
-    echo "[c3_compat] Installed kernel UAPI headers (media/, linux/v4l2-controls.h) to $HDR_DST"
+    echo "[c3_compat] Installed kernel UAPI headers (media/*.h, linux/{ion,msm_ion,v4l2-controls}.h) to $HDR_DST"
   fi
 fi
 
