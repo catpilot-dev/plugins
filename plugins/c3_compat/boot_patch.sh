@@ -1016,6 +1016,63 @@ PYEOF
   fi
 fi
 
+# 16c. pandad: health packet v16 of the F4 ("dos") panda. The BMW plugin's firmware
+#      answers USB 0xd2 with the 58-byte v16 layout (uint32 voltage/current, one byte
+#      per boolean, float interrupt load); 0.11.2's health_t is 48 bytes with uint16
+#      voltage/current and a flags_pkt bitfield. Read into health_t, every field after
+#      uptime is shifted: ignition_line landed in safety_param, flags were read out of
+#      faults_pkt (always 0) -> the car never went onroad on 0.11.2 (first drive
+#      attempt 2026-11-03: VBAT 15.3 V, ignitionLine False). Panda::get_state() now
+#      reads health_f4_t on a dos panda and translates it (src/pandad/health_f4.h,
+#      host-tested in tests/test_health_f4.py).
+PANDAD_DIR="$OPENPILOT_DIR/openpilot/selfdrive/pandad"
+if [ -d "$PANDAD_DIR" ] && [ -f "$C3_SRC/pandad/health_f4.h" ]; then
+  if ! cmp -s "$C3_SRC/pandad/health_f4.h" "$PANDAD_DIR/health_f4.h"; then
+    cp "$C3_SRC/pandad/health_f4.h" "$PANDAD_DIR/health_f4.h"
+    echo "[c3_compat] Installed pandad/health_f4.h"
+  fi
+  python3 - "$PANDAD_DIR" << 'PYEOF'
+import sys, os
+d = sys.argv[1]
+def patch(rel, pairs, marker):
+    path = os.path.join(d, rel)
+    with open(path) as f:
+        s = f.read()
+    if marker in s:
+        return
+    n = 0
+    for old, new in pairs:
+        if old in s:
+            s = s.replace(old, new, 1); n += 1
+    if n == len(pairs):
+        with open(path, 'w') as f:
+            f.write(s)
+        print(f"[c3_compat] Patched pandad/{rel} for the F4 health packet")
+    else:
+        print(f"[c3_compat] WARNING pandad/{rel}: {n}/{len(pairs)} anchors found, left untouched (F4 health)")
+
+patch('panda.h', [(
+    '#include "panda/board/health.h"\n',
+    '#include "panda/board/health.h"\n#include "selfdrive/pandad/health_f4.h"  // c3_compat: F4 health v16\n',
+)], 'health_f4.h')
+patch('panda.cc', [(
+    'std::optional<health_t> Panda::get_state() {\n'
+    '  health_t health {0};\n'
+    '  int err = handle->control_read(0xd2, 0, 0, (unsigned char*)&health, sizeof(health));\n',
+    'std::optional<health_t> Panda::get_state() {\n'
+    '  health_t health {0};\n'
+    '  if (hw_type == cereal::PandaState::PandaType::DOS) {  // c3_compat: the F4 firmware speaks health v16\n'
+    '    health_f4_t h4 {0};\n'
+    '    int err4 = handle->control_read(0xd2, 0, 0, (unsigned char*)&h4, sizeof(h4));\n'
+    '    if (err4 < 0) return std::nullopt;\n'
+    '    health_from_f4(health, h4);\n'
+    '    return health;\n'
+    '  }\n'
+    '  int err = handle->control_read(0xd2, 0, 0, (unsigned char*)&health, sizeof(health));\n',
+)], 'health_f4_t')
+PYEOF
+fi
+
 # 17. loggerd: wait for the Venus hardware encoder. On AGNOS 12.8 the VIDC
 #     device node exists before its firmware is loaded; the stock constructor
 #     asserts on the first failed ioctl and encoderd crash-loops at boot.
