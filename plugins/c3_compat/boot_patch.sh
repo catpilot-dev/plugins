@@ -812,11 +812,13 @@ blobs = os.path.join(d, 'cameras', 'bps_blobs.h')
 with open(blobs) as f:
     b = f.read()
 if 'c3_compat: AR0231 BPS IO config' not in b:
-    marker = '{ /* placeholder */ },\n{ /* placeholder */ },\n'
-    if b.count(marker) == 1:
+    import re
+    # entries 0 (unknown) and 1 (ar0231) are consecutive placeholder lines; keep 0, fill 1
+    m = re.search(r'(^[ \t]*\{[ \t]*/\* placeholder \*/[ \t]*\},[ \t]*\n)([ \t]*\{[ \t]*/\* placeholder \*/[ \t]*\},[ \t]*\n)', b, re.M)
+    if m:
         with open(os.path.join(src, 'camerad', 'bps_cfg_ar0231.inc')) as f:
             entry = f.read()
-        b = b.replace(marker, '{ /* placeholder */ },\n' + entry, 1)
+        b = b[:m.end(1)] + entry + b[m.end(2):]
         with open(blobs, 'w') as f:
             f.write(b)
         print("[c3_compat] Patched camerad/cameras/bps_blobs.h: AR0231 BPS IO config restored")
