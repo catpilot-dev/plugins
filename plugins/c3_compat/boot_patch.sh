@@ -825,6 +825,17 @@ if 'c3_compat: AR0231 BPS IO config' not in b:
     else:
         print("[c3_compat] WARNING camerad/cameras/bps_blobs.h: placeholder anchor not found, left untouched")
 
+# hw.h: run the cabin (driver) camera through the IFE like the road cameras. 0.11.2's
+# BPS/ICP path (new striping blob, LUT + gamma programming, forced 600 MHz clock) was
+# re-tuned for the OS04C10/OX03C10 and fails every frame on the comma three's AR0231 +
+# 4.9 ICP firmware ("BPS sync failed after 43 ms", CAM-ICP frame_process error 4), so
+# the cabin stream never publishes and driver monitoring is blind. The IFE path is the
+# one the two AR0231 road cameras already use; dmonitoringmodeld only asks for
+# VISION_STREAM_CABIN and ships a 1928x1208 warp.
+patch('cameras/hw.h', [(
+    '  .output_type = ISP_BPS_PROCESSED,\n  .staggered_sof',
+    '  .output_type = ISP_IFE_PROCESSED,  // c3_compat: AR0231 cabin camera through the IFE (BPS path fails per frame on the comma three)\n  .staggered_sof',
+)])
 patch('cameras/spectra.cc', [(
     '  if (!init_sensor_lambda(new OS04C10) &&\n      !init_sensor_lambda(new OX03C10)) {',
     '  if (!init_sensor_lambda(new AR0231) &&   // c3_compat: comma three sensor first\n'
