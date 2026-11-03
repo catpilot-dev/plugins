@@ -125,6 +125,29 @@ raylib expects.
   under different file names (`_raylib_cffi_comma.abi3.so`, `_backend.py`); the
   step keys on the 5.5 `.so` being present and `_backend.py` absent, so it
   never copies 5.5 files over the 6.0 package (that breaks the UI).
+- **§2d Adreno-linked comma backend** (openpilot 0.11.2+) — comma-deps-raylib 6's
+  `_raylib_cffi_comma.abi3.so` links `libEGL.so.1`/`libGLESv2.so.2`/`libgbm.so.1`, which
+  on AGNOS 12.8 are Mesa (GLVND). Mesa's msm driver cannot drive the 4.9 downstream
+  kernel, so EGL lands on llvmpipe, which segfaults on the first frame (threads
+  `llvmpipe-N`, `libgallium-24.2.8`). The comma three renders through Qualcomm's
+  `libEGL_adreno.so` + `libGLESv2_adreno.so` on Qualcomm's `libgbm.so` (backend
+  `msm_drm`) — the same linkage as the 0.11.1 `raylib_drm` build — and that EGL offers
+  the ABGR8888 (`AB24`) visual the backend asks for, so no format change is needed.
+  `raylib_drm/comma-<wheel version>/_raylib_cffi_comma.abi3.so` is the wheel's own file
+  with three `DT_NEEDED` entries rewritten:
+  `patchelf --replace-needed libEGL.so.1 libEGL_adreno.so --replace-needed libGLESv2.so.2
+  libGLESv2_adreno.so --replace-needed libgbm.so.1 libgbm.so <file>` (symbols are
+  unversioned). Boot swaps it in only when the venv file's sha256 is the known wheel
+  original (kept as `.orig`); an unknown hash (wheel bump) logs a WARNING and leaves the
+  venv alone — re-run the recipe and update the hash. Dead ends worth remembering:
+  `LD_PRELOAD` is ignored because the venv python has `cap_net_bind_service` (secure-exec
+  mode); binary-patching the backend's `GBM_FORMAT_ABGR8888` immediates to ARGB8888 does
+  make Mesa's config search pass but still ends on llvmpipe.
+- **§7b `NO_MASTER=1`** (launch_env.sh) — the comma backend takes its DRM fd from a broker
+  (`magic`, `/tmp/drmfd.sock`, AGNOS 19) and otherwise opens `/dev/dri/card0` itself only
+  when `NO_MASTER` is set (`DRM_FD=<inherited fd>` is the other option). No broker on
+  AGNOS 12.8, so the launch tree exports it. Touch is `/dev/input/event2` (Samsung
+  Touchscreen here, matches), backlight `panel0-backlight`, `som_id` 8 → 90° rotation.
 - **§5 Weston** — `systemctl stop weston` + `mask weston` so raylib can take DRM
   master. The stock `weston-ready.service` is replaced with a `oneshot` /
   `RemainAfterExit=yes` `/bin/true` stub: AGNOS `comma.sh` polls
@@ -178,6 +201,14 @@ the panda library and pandad about F4:
   broadened to `except Exception`, so the Python panda code cleanly falls back to
   USB. The 0.11.2 native `pandad` gets its USB transport from §16.
 - **§13** — clears `panda/python/__pycache__` so the patched sources take effect.
+
+### Native device type (boot §19)
+
+openpilot 0.11.2 dropped `tici` from `HardwareComma::get_device_type()`'s map
+(`common/hardware/comma/hardware.h`), so native pandad asserted right after connecting to
+the panda (`Assertion it != device_map.end()`); loggerd/camerad would follow. §19 restores
+the 0.11.1 entries: `{"tici", TICI}` in the map, IR LEDs left alone on tici (as on tizi), and
+loggerd.h's livestream encoder size for tici = tizi's 1152x720 (same 1928x1208 road camera).
 
 ### Compiled comma-three support (boot §15–18, `src/`)
 
@@ -272,7 +303,8 @@ c3_compat/
   venv_sync.py     # uv.lock → AGNOS 12.8 venv synchronizer (+ native deps)
   compat.py        # device.health_check hook + startup logging
   watchdog.sh      # on-demand vitals/dmesg snapshotter → /data/crash_diag/
-  raylib_drm/      # DRM-backend raylib .so + package (Git LFS; openpilot <= 0.11.1)
+  raylib_drm/      # raylib/: DRM-built 5.5 .so + package (openpilot <= 0.11.1); comma-<ver>/: Adreno-relinked
+                   # raylib 6 comma backend (openpilot 0.11.2+). Both Git LFS
   src/camerad/     # AR0231 sensor driver (ar0231.cc, ar0231_registers.h) -> system/camerad/sensors/
   src/pandad/      # panda_usb.cc: libusb PandaUsbHandle -> selfdrive/pandad/
   src/linux_include/  # comma three kernel UAPI headers (media/*.h, linux/{ion,msm_ion,v4l2-controls}.h) -> /usr/local/include

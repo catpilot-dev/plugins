@@ -99,6 +99,36 @@ if [ $_venv_patched -eq 1 ]; then
   sudo mount -o remount,ro / 2>/dev/null || true
 fi
 
+# 2d. raylib 6 "comma" backend on the comma three (openpilot 0.11.2+). The
+#     comma-deps-raylib wheel links its backend against libEGL.so.1 / libGLESv2.so.2 /
+#     libgbm.so.1, which on AGNOS 12.8 resolve to Mesa (GLVND); Mesa's msm driver
+#     cannot drive the 4.9 downstream kernel, falls back to llvmpipe and segfaults
+#     on the first frame. The comma three renders through Qualcomm's libEGL_adreno /
+#     libGLESv2_adreno on Qualcomm's libgbm (exactly what the 0.11.1 raylib_drm
+#     build linked), whose GBM display offers the ABGR8888 visual the backend
+#     asks for. The shipped module is the wheel's own file with three DT_NEEDED
+#     entries rewritten (patchelf --replace-needed; recipe in DESIGN.md), keyed on
+#     the wheel's sha256 so a wheel bump surfaces as a warning, never a swap.
+#     LD_PRELOAD cannot do this: the venv python carries cap_net_bind_service, so
+#     the loader runs in secure mode and ignores it.
+_cb="$VENV_SITE/raylib/_raylib_cffi_comma.abi3.so"
+_cb_src="$C3_COMPAT_DIR/raylib_drm/comma-6.0.0.1.post103/_raylib_cffi_comma.abi3.so"
+_cb_orig_sha="ebb0b6c4112a39d700e06fd40947023485d3c14c0d0ac36abef8c6a9551d7502"
+if [ -f "$_cb" ] && [ -f "$VENV_SITE/raylib/_backend.py" ] && [ -f "$_cb_src" ]; then
+  _cb_sha=$(sha256sum "$_cb" | cut -d' ' -f1); _cb_src_sha=$(sha256sum "$_cb_src" | cut -d' ' -f1)
+  if [ "$_cb_sha" = "$_cb_src_sha" ]; then
+    :  # already the Adreno-linked module
+  elif [ "$_cb_sha" = "$_cb_orig_sha" ]; then
+    sudo mount -o remount,rw / 2>/dev/null
+    sudo cp "$_cb" "$_cb.orig"
+    sudo cp "$_cb_src" "$_cb"
+    sudo mount -o remount,ro / 2>/dev/null || true
+    echo "[c3_compat] Installed Adreno-linked raylib comma backend (original kept as .orig)"
+  else
+    echo "[c3_compat] WARNING: raylib comma backend has unknown sha256 ${_cb_sha:0:12} (new comma-deps-raylib wheel?) — not swapped; UI will fall back to llvmpipe. Re-run the patchelf recipe in DESIGN.md"
+  fi
+fi
+
 # 3. Multilang: patch to handle invalid/empty .mo files gracefully
 MULTILANG_FILE="$OPENPILOT_DIR/openpilot/system/ui/lib/multilang.py"
 if [ -f "$MULTILANG_FILE" ] && grep -q 'except FileNotFoundError' "$MULTILANG_FILE"; then
@@ -223,6 +253,15 @@ fi
         f.write(content)
 PYEOF
   echo "[c3_compat] Patched launch_env.sh for DRM backend (removed Wayland config)"
+fi
+
+# 7b. launch_env.sh: raylib 6's comma backend gets its DRM fd from a broker
+#     ("magic", /tmp/drmfd.sock, AGNOS 19) and otherwise only opens /dev/dri/card0
+#     itself when NO_MASTER is set. No broker on AGNOS 12.8 -> export it for the
+#     whole launch tree (manager -> ui). Harmless on 0.11.1 (raylib 5.5 ignores it).
+if [ -f "$LAUNCH_ENV" ] && ! grep -q 'export NO_MASTER=' "$LAUNCH_ENV"; then
+  printf '\n# c3_compat: no DRM fd broker (magic) on AGNOS 12.8 — raylib comma backend opens /dev/dri/card0 itself\nexport NO_MASTER=1\n' >> "$LAUNCH_ENV"
+  echo "[c3_compat] Patched launch_env.sh: NO_MASTER=1 for the raylib comma backend"
 fi
 
 # 8. Panda: restore STM32F4 (Dos board) support for C3 internal panda
