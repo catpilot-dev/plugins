@@ -212,6 +212,13 @@ loggerd.h's livestream encoder size for tici = tizi's 1152x720 (same 1928x1208 r
 
 ### Compiled comma-three support (boot §15–18, `src/`)
 
+**AR0231 BPS IO-config blob (§15, `src/camerad/bps_cfg_ar0231.inc`).** 0.11.2's auto-generated
+`cameras/bps_blobs.h` ships `bps_cfg[1]` (cereal `ImageSensor::ar0231`) as an empty placeholder.
+The cabin camera runs the BPS/ICP pipeline, so `configICP()` handed the ICP firmware an all-zero
+IO config: A5 watchdog 3 ms after the firmware download, `SFR: Assertion Failure ... hlssr.c`,
+acquire timeout, `assert(h)` in camerad. §15 writes 0.11.1's 768-byte entry back (the OX03C10
+entry is byte-identical across the two releases, so the blob format is unchanged).
+
 Three pieces of comma-three support were never boot patches: upstream removed
 them with the comma three and catpilot carried them as in-repo C++ (commit
 `7a4e44e1f`) until the openpilot 0.11.2 rebase dropped that commit. Since
