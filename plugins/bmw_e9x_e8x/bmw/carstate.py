@@ -64,6 +64,23 @@ def should_button_enable(buttonEvents, *, dcc_engaged, dcc_engaged_prev,
   return False
 
 
+def lane_change_torque(*, button: bool, left_blinker: bool, right_blinker: bool) -> int:
+  """Signed steering 'torque' that confirms a lane change in openpilot's desire helper.
+
+  The E90 has no steering-torque sensor, so the confirmation is the steering-wheel
+  button (VoiceControl) pressed with the blinker on: +1 toward a left change, -1 toward
+  a right one, 0 otherwise. The gas pedal is deliberately not an input — pressing gas
+  while signalling must not start a lane change.
+  """
+  if not button:
+    return 0
+  if left_blinker:
+    return 1
+  if right_blinker:
+    return -1
+  return 0
+
+
 def temps_payload(cp_PT, cp_aux, servo):
   """bmw_temps plugin-bus payload (deg C): engine coolant and oil, plus the
   stepper servo's board temperature (STEERING_STATUS) when a servo is fitted."""
@@ -166,13 +183,10 @@ class CarState(CarStateBase):
       cp_PT.vl["SteeringButtons"]['VoiceControl'] != 0 or \
       self.prev_gas_pressed and not ret.gasPressed
 
-    ret.steeringPressed = cp_PT.vl["SteeringButtons"]['VoiceControl'] != 0 or ret.gasPressed
-    if ret.steeringPressed and ret.leftBlinker:
-      ret.steeringTorque = 1
-    elif ret.steeringPressed and ret.rightBlinker:
-      ret.steeringTorque = -1
-    else:
-      ret.steeringTorque = 0
+    lc_button = cp_PT.vl["SteeringButtons"]['VoiceControl'] != 0
+    ret.steeringPressed = lc_button or ret.gasPressed
+    # lane-change confirmation: steering button only (gas still counts as driver input above)
+    ret.steeringTorque = lane_change_torque(button=lc_button, left_blinker=ret.leftBlinker, right_blinker=ret.rightBlinker)
 
     ret.espDisabled = cp_PT.vl['StatusDSC_KCAN']['DSC_full_off'] != 0
     ret.cruiseState.available = not ret.espDisabled

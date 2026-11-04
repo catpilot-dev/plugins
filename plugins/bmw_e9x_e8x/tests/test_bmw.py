@@ -2014,3 +2014,28 @@ class TestServoRearm:
     frame, _ = self._step(cc, mod, sent, cs, ctrl, soft_off=True)
     assert frame == (mod.SteeringModes.Off, 0)                  # no stale holdoff
     assert cc.servo_rearms == 2
+
+
+class TestLaneChangeConfirmation:
+  """Lane change is confirmed by the steering-wheel button only, never by the gas pedal.
+  openpilot's desire helper confirms on steeringPressed with steeringTorque signed toward the blinker."""
+
+  def _cs(self):
+    return importlib.import_module('bmw.carstate')
+
+  def test_button_with_left_blinker_confirms_left(self):
+    assert self._cs().lane_change_torque(button=True, left_blinker=True, right_blinker=False) == 1
+
+  def test_button_with_right_blinker_confirms_right(self):
+    assert self._cs().lane_change_torque(button=True, left_blinker=False, right_blinker=True) == -1
+
+  def test_no_button_no_confirmation(self):
+    assert self._cs().lane_change_torque(button=False, left_blinker=True, right_blinker=False) == 0
+    assert self._cs().lane_change_torque(button=False, left_blinker=False, right_blinker=True) == 0
+
+  def test_button_without_blinker_no_confirmation(self):
+    assert self._cs().lane_change_torque(button=True, left_blinker=False, right_blinker=False) == 0
+
+  def test_gas_is_not_a_confirmation_input(self):
+    import inspect
+    assert 'gas' not in ' '.join(inspect.signature(self._cs().lane_change_torque).parameters)
