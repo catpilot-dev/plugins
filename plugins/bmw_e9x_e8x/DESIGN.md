@@ -1131,7 +1131,7 @@ From `plugin.json` — **eight** hooks:
 |---|---|---|
 | `controls.lat_controller_init` | `on_lat_controller_init` (`bmw.latcontroller`) | installs the custom BMW lateral controller — see [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md) |
 | `controls.post_actuators` | `on_post_actuators` (`register`) | overwrites `actuators.speed` with `long_plan.vTarget` (time-aligned with aTarget) for the DCC v_error gate |
-| `car.cruise_initialized` | `on_cruise_initialized` (`register`) | cruise-ceiling memory: restore `v_cruise_kph_last` (30–145 km/h) on re-engage |
+| `car.cruise_initialized` | `on_cruise_initialized` (`register`) | cruise-ceiling memory: restore `v_cruise_kph_last` (30–145 km/h) on re-engage; otherwise (unless stock resumed the last speed) start at `INITIAL_ENGAGE_KPH` = 100 km/h or the current set speed if higher — openpilot 0.11.2 dropped its 105 km/h experimental-mode start (#39077) |
 | `ui.vehicle_settings` | `on_vehicle_settings` (`register`) | append the Temperature-Overlay toggle + Resume-Button note to the Driving panel's vehicle section (only when `CP.brand == 'bmw'`) |
 | `ui.render_overlay` | `on_render_overlay` (`ui_overlay`) | draw coolant/oil temperature on the driving HUD |
 | `device.health_check` | `on_health_check` (`register`) | report whether the BMW interface registered into opendbc |

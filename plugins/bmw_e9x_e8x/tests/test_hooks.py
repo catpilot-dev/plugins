@@ -149,6 +149,46 @@ class TestCruiseCeilingMemory:
     assert helper.v_cruise_kph == 80
 
 
+class TestInitialEngageSpeed:
+  """Engagements that restore nothing start at 100 km/h (or the current speed if higher).
+  openpilot 0.11.2 dropped the 105 km/h experimental-mode start (#39077) and starts at
+  max(vEgo, 40 km/h); speedlimitd caps the speed from vision anyway."""
+
+  def test_first_engage_slow_starts_at_100(self, param_dir):
+    import register
+    helper = SimpleNamespace(v_cruise_kph=40, v_cruise_kph_last=255, v_cruise_cluster_kph=40)
+    register.on_cruise_initialized(None, helper, None)
+    assert helper.v_cruise_kph == 100
+    assert helper.v_cruise_cluster_kph == 100
+
+  def test_first_engage_faster_than_100_keeps_current_speed(self, param_dir):
+    import register
+    helper = SimpleNamespace(v_cruise_kph=115, v_cruise_kph_last=255, v_cruise_cluster_kph=115)
+    register.on_cruise_initialized(None, helper, None)
+    assert helper.v_cruise_kph == 115
+
+  def test_memory_off_reengage_starts_at_100(self, param_dir):
+    (param_dir / 'CruiseCeilingMemory').write_text('0')
+    import register
+    helper = SimpleNamespace(v_cruise_kph=40, v_cruise_kph_last=80, v_cruise_cluster_kph=40)
+    register.on_cruise_initialized(None, helper, None)
+    assert helper.v_cruise_kph == 100
+
+  def test_memory_off_resume_button_keeps_stock_restore(self, param_dir):
+    """Stock already restored the last set speed (resume/accel button): leave it."""
+    (param_dir / 'CruiseCeilingMemory').write_text('0')
+    import register
+    helper = SimpleNamespace(v_cruise_kph=80, v_cruise_kph_last=80, v_cruise_cluster_kph=80)
+    register.on_cruise_initialized(None, helper, None)
+    assert helper.v_cruise_kph == 80
+
+  def test_memory_restore_wins_over_initial(self, param_dir):
+    import register
+    helper = SimpleNamespace(v_cruise_kph=40, v_cruise_kph_last=70, v_cruise_cluster_kph=40)
+    register.on_cruise_initialized(None, helper, None)
+    assert helper.v_cruise_kph == 70
+
+
 # ============================================================
 # Vehicle Settings (ui.vehicle_settings hook)
 # ============================================================

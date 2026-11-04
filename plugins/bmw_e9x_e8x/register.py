@@ -107,19 +107,36 @@ def on_post_actuators(default, actuators, CS, long_plan):
   return None
 
 
+# Set speed for an engagement that restores nothing (first of the drive, or memory off).
+# openpilot 0.11.2 dropped the 105 km/h experimental-mode start (#39077) and starts at
+# max(vEgo, 40 km/h); speedlimitd caps the actual target from vision, so a high
+# ceiling is the right default and saves an adjustment every drive.
+INITIAL_ENGAGE_KPH = 100
+_CEILING_RANGE_KPH = (30, 145)
+
+
 def on_cruise_initialized(result, v_cruise_helper, CS):
-  """Hook callback: restore last cruise ceiling on re-engagement.
+  """Hook callback: set the cruise ceiling right after an engagement.
 
-  Stock openpilot resets cruise speed to V_CRUISE_INITIAL on every engagement
-  for BMW because engagement is a state transition (not a resume button press).
-  This restores the user's last-adjusted ceiling within the same onroad session.
+  1. Cruise Ceiling Memory (param, default on): restore the last-adjusted ceiling
+     within the same onroad session — stock resets it on every engagement for BMW
+     because engagement is a state transition, not a resume button press.
+  2. Otherwise, unless stock already restored the last speed (resume/accel button),
+     start at INITIAL_ENGAGE_KPH or the current set speed, whichever is higher.
   """
-  if _read_param('CruiseCeilingMemory') == '0':
-    return result
+  lo, hi = _CEILING_RANGE_KPH
+  last = v_cruise_helper.v_cruise_kph_last
+  last_valid = lo <= last <= hi
 
-  if 30 <= v_cruise_helper.v_cruise_kph_last <= 145:
-    v_cruise_helper.v_cruise_kph = v_cruise_helper.v_cruise_kph_last
-    v_cruise_helper.v_cruise_cluster_kph = v_cruise_helper.v_cruise_kph_last
+  if last_valid and _read_param('CruiseCeilingMemory') != '0':
+    v = last
+  elif last_valid and v_cruise_helper.v_cruise_kph == last:
+    return result   # stock resumed the previous set speed
+  else:
+    v = max(INITIAL_ENGAGE_KPH, v_cruise_helper.v_cruise_kph)
+
+  v_cruise_helper.v_cruise_kph = v
+  v_cruise_helper.v_cruise_cluster_kph = v
   return result
 
 

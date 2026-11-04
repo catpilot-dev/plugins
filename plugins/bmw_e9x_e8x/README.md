@@ -56,7 +56,10 @@ When a BMW is detected, the vehicle section of **Settings → Driving** adds:
 
 - **Cruise Speed Memory** — re-engaging cruise within a drive restores the
   set-speed ceiling you last dialed in, instead of resetting to openpilot's
-  default (40 km/h, or 105 km/h in experimental mode).
+  default (your current speed, at least 40 km/h).
+- **100 km/h initial set speed** — the first engagement of a drive (or any
+  engagement with Cruise Speed Memory off) starts the ceiling at 100 km/h, or
+  your current speed if higher. speedlimitd caps the actual target from vision.
 
 ## Status and limits
 
