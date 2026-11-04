@@ -1162,8 +1162,9 @@ platform) is folded into opendbc's torque params at load time. Lateral-timing
 knobs (chiefly `steerActuatorDelay = 0.4`) live in `interface.py`; see
 [LATERAL_CONTROLLER.md](LATERAL_CONTROLLER.md).
 
-> Note: the old README listed a `ConsecutiveLaneChange` param — it does not
-> exist in the code or manifest and has been dropped.
+> Consecutive lane changes are stock openpilot behavior since 0.11.2 (blinker held:
+> each steering-button press after a change finishes starts the next one); the
+> plugin carries no code or param for it.
 
 ## Telemetry
 

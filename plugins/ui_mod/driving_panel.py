@@ -218,14 +218,6 @@ class DrivingLayout(Widget):
       enabled=False,
     ))
 
-    # --- Consecutive Lane Change (catpilot core feature, all platforms) ---
-    items.append(toggle_item(
-      "Consecutive Lane Changes",
-      "Full-press blinker stalk, then press steering button during active lane change to chain the next one immediately.",
-      initial_state=True,
-      enabled=False,
-    ))
-
     # --- Live Torque & Lateral Delay status (only for torqued-supported brands) ---
     CP = ui_state.CP
     if CP is not None and CP.lateralTuning.which() == 'torque':
