@@ -47,10 +47,7 @@ installed/removed plugins appear). The rows, in order:
 4. **Look Ahead Steering** — if `look_ahead` present; toggles
    `LookAheadEnabled`.
 5. **Cruise Speed Memory** — display-only row (rendered disabled; describes
-   catpilot core behavior, no param written). The former "Consecutive Lane
-   Changes" row was dropped with openpilot 0.11.2: stock openpilot now returns
-   to the pre-lane-change state when a change finishes with the blinker still
-   on, so each further confirmation starts the next change.
+   catpilot core behavior, no param written).
 6. **Live Torque** / **Lateral Delay** — status text rows, only for
    torque-tuned brands in `torqued.ALLOWED_CARS`; poll `lateralTorqueParameters`
    / `lateralDelay` (10 s cache).
