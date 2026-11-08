@@ -62,6 +62,12 @@ STEP5_GRID_PHASE = 2.0        # km/h
 # frames, not seconds. DESIGN.md: "minus5 is released after two frames".
 MINUS5_ASSERT_FRAMES = 2      # transmitted frames, then release
 MINUS1_YIELD_KMH = 1.0
+# minus1 is a tap, never a hold: at most this many consecutive slots, then one
+# idle slot releases the lever. Out of a hold of >= ~0.4 s DCC can reset a deep
+# setpoint to vEgo (a snap-up: braking drops ~0.5 m/s² for ~0.85 s); shorter
+# runs never did (0 of 248 deep-gap steps, routes 515-52c). Two slots is
+# ~0.35-0.4 s, on the threshold. DESIGN.md: "minus1 is a tap, never a hold".
+MINUS1_MAX_SLOTS = 1
 PENDING_TIMEOUT = 0.5         # s — forget what was sent, or an unresponsive DCC silences us for good
 
 # Driver-spin hold — DESIGN.md: "Driver-spin hold". Above its no-load speed
@@ -173,6 +179,7 @@ class CarController(CarControllerBase):
     # setpoint we have asked for but not yet seen arrive.
     self.slot_cmd = None
     self.slot_decided_ns = 0
+    self.minus1_slots = 0        # consecutive slots decided as minus1
     self.setpoint_pending = 0.0
     self.setpoint_pending_ns = 0
     self.setpoint_last_seen = None
@@ -357,6 +364,7 @@ class CarController(CarControllerBase):
     if not self.setpoint_braking:
       self.setpoint_pending = 0.0
       self.slot_cmd = None
+      self.minus1_slots = 0
 
     cruise_stalk_human_pressing = CS.cruise_stalk_resume or CS.cruise_stalk_cancel or CS.cruise_stalk_speed != 0
 
@@ -432,15 +440,19 @@ class CarController(CarControllerBase):
                 self.setpoint_pending += m5_drop_kmh
                 self.setpoint_pending_ns = now_nanos
                 self.setpoint_commanding = True
-              elif err_kmh >= active_deadzone_kmh and headroom_kmh >= 1:
+              elif (err_kmh >= active_deadzone_kmh and headroom_kmh >= 1
+                    and self.minus1_slots < MINUS1_MAX_SLOTS):
                 self.slot_cmd = CruiseStalk.minus1
                 self.setpoint_pending += MINUS1_YIELD_KMH
                 self.setpoint_pending_ns = now_nanos
                 self.setpoint_commanding = True
               else:
+                # Includes the forced idle slot after a minus1 tap.
                 self.slot_cmd = None
+              self.minus1_slots = (self.minus1_slots + 1
+                                   if self.slot_cmd is CruiseStalk.minus1 else 0)
             if self.slot_cmd is not None:
-              # minus5 releases after MINUS5_ASSERT_FRAMES; minus1 holds the slot.
+              # minus5 releases after MINUS5_ASSERT_FRAMES; minus1 holds its one slot.
               if (self.slot_cmd is not CruiseStalk.minus5
                   or self.slot_cmd_frames < MINUS5_ASSERT_FRAMES):
                 if cruise_cmd(self.slot_cmd, SINGLE_INTERVAL):

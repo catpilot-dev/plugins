@@ -1029,6 +1029,37 @@ class TestSetpointBias:
     if m1:
       assert max(m1) >= 3, f"minus1 should still hold its slot; runs={m1}"
 
+  def test_minus1_is_a_tap_never_a_hold(self):
+    """DCC resets a deep setpoint to vEgo (a snap-up: braking drops ~0.5 m/s²
+    for ~0.85 s) only out of a minus1 HOLD of >= ~0.4 s — 0 snaps in 248
+    deep-gap steps from shorter runs vs 9-18% per step from longer ones
+    (routes 515-52c). So minus1 asserts for at most MINUS1_MAX_SLOTS slot(s),
+    then an idle slot releases the lever before the next tap.
+    """
+    import bmw.carcontroller as mod
+    # -0.5 wants ~4 km/h: too little for minus5's grid landing, so this is
+    # several minus1 slots in a row under the old law.
+    _, sent, _, _, _ = self._drive(accel=-0.5, v_ego_kmh=86.0,
+                                   setpoint_kmh=87.0, seconds=2.5)
+    runs, start, last = [], None, None
+    for t, names in sent:
+      if 'minus1' not in names:
+        continue
+      if last is None or t - last > 0.12:
+        if last is not None:
+          runs.append((start, last))
+        start = t
+      last = t
+    if last is not None:
+      runs.append((start, last))
+    assert len(runs) >= 2, f"expected repeated taps, got runs={runs}"
+    slot = mod.CRUISE_STALK_IDLE_TICK_STOCK
+    longest = max(b - a for a, b in runs)
+    assert longest < mod.MINUS1_MAX_SLOTS * slot + 0.05, (
+      f"minus1 asserted for {longest:.2f} s; runs={runs}")
+    gaps = [runs[i + 1][0] - runs[i][1] for i in range(len(runs) - 1)]
+    assert min(gaps) >= slot - 0.05, f"no idle slot between taps; gaps={gaps}"
+
   def test_pending_prevents_a_second_minus5_before_the_first_is_seen(self):
     """The setpoint is only reported back at ~5 Hz. Without discounting what is
     already in flight, a large error draws minus5 in consecutive slots and

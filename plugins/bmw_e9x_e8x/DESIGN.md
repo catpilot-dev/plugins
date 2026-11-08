@@ -163,6 +163,8 @@ current speed and the DCC set-speed, and issues stalk pulses:
   magnitude, `plus5` taken only when its grid landing fits; decel side: by the
   setpoint error left (see below); decel is blocked below the cruise minimum +
   buffer.
+  `minus1` is a one-slot tap followed by an idle slot, never a hold (see
+  *minus1 is a tap, never a hold*).
   The **accel** side is gated by `V_ERROR_DEADZONE` (~0.5 km/h) plus accel sign
   and set-speed headroom. The **decel** side is gated by the setpoint deadzone
   instead — see *The setpoint is a torque request* below.
@@ -658,6 +660,48 @@ frame out of that window. 24 of 54 bursts came out at 1 frame, and the share
 that moved the setpoint *not at all* rose 5% → 11%. Two frames is what was
 measured never to double-step, so ask for exactly that and let the cadence take
 as long as it needs.
+
+### minus1 is a tap, never a hold
+
+A held `minus1` can cost the whole braking episode's setpoint. Out of a hold
+DCC sometimes resets a deep setpoint straight to ≈ vEgo with no plus frame
+sent — a **snap-up**. Braking drops ~0.5 m/s² within 0.6 s and the law
+re-brakes by 0.85 s, which is the ~1 Hz brake pulse felt in lead braking
+(routes 515–52c, ~0.2 per engaged minute, present on 0.11.1 as well).
+
+It keys on how long the lever has been held, not on the gap or on elapsed
+time (non-snapping episodes sat 3–5 s at a gap ≤ −5 km/h). Over 2483
+`minus1`-only readback steps on eight routes:
+
+| `minus1` run before the step | deep-gap (≤ −3 km/h) steps | snap-ups |
+|---|---|---|
+| < 0.4 s | 248 | **0** |
+| ≥ 0.4 s | — | 9–18% per step |
+
+A leaked SZL idle frame inside a hold doubles the rate (18% vs 7%, p ≈ 0.02):
+DCC seems to read a release out of hold mode as "store the current speed",
+which is invisible at a shallow gap and a brake dropout at a deep one.
+
+So `minus1` asserts for at most `MINUS1_MAX_SLOTS` (1) slot, then one idle slot
+releases the lever before the next tap. `minus5` is unaffected: it is already
+released after two frames. A tap yields ~1–1.3 km/h (isolated runs, n = 1287,
+3% zero), against ~3–4 km/h/s held — the "toggling gains nothing" row above
+measured rate against TX cadence inside a hold, not hold against tap. Two slots
+(~0.35–0.4 s) sits on the threshold and is rejected.
+
+Closed-loop bench (518 / 52c / 529 / 51b × 3 seeds, the plant refit plus a
+tap/hold lever model validated at 0.14–0.29 snap-ups/min sim vs 0.00–0.26
+recorded):
+
+| law | snap-ups/min | delivered | jerk p90 | `minus1` frames/min | decel at aT < −0.9 |
+|---|---|---|---|---|---|
+| held `minus1` | 0.23–0.37 | 0.73–0.76 | 0.43–0.47 | 83–85 | −0.70..−0.76 |
+| **1 slot on / 1 off** | **0.00** | 0.75 | 0.35 | 57 | −0.79 |
+| 2 on / 1 off | 0.00–0.19 | 0.76–0.78 | 0.35–0.38 | 65 | −0.78..−0.82 |
+
+The zero is by construction of the 0.4 s rule the lever model encodes; the
+field data (0 of 248) is what supports it. On-car check: snap-ups, delivered
+decel, the 0x194 +1 rate.
 
 ### ±5 needs no threshold
 
