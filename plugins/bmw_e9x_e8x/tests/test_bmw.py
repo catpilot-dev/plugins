@@ -935,7 +935,7 @@ class TestSetpointBias:
     assert cc.setpoint_braking, "disagreement/neutral must hold, not release"
 
   def _drive(self, accel, v_ego_kmh, setpoint_kmh, seconds, respond=True,
-             v_target_kmh=None):
+             v_target_kmh=None, v_target_rate=None):
     """Explicit loop that exposes the controller, for the per-slot machinery.
 
     respond=False pins the setpoint, which is what a DCC that has stopped
@@ -959,7 +959,7 @@ class TestSetpointBias:
       el = 0.0
       for _ in range(int(round(dur / self.STEP))):
         t += self.STEP; el += self.STEP
-        vt = (vt0 + a * el * 3.6) * self.KPH
+        vt = (vt0 + (a if v_target_rate is None else v_target_rate) * el * 3.6) * self.KPH
         if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
           szl = (szl + 1) % 15
           if respond:
@@ -1060,6 +1060,43 @@ class TestSetpointBias:
     gaps = [runs[i + 1][0] - runs[i][1] for i in range(len(runs) - 1)]
     assert min(gaps) >= slot - 0.05, f"no idle slot between taps; gaps={gaps}"
 
+  def test_accel_side_inverts_the_plant(self):
+    """0.11.2's vTarget never implies more acceleration than aTarget, so it sits
+    ~1 km/h ahead of the car — inside DCC's dead band (readback ~1.17 km/h above
+    vEgo at zero accel; route 530: a 0.03-0.04 m/s² at a 0-2 km/h gap). The
+    accel side therefore asks for the gap that delivers aTarget, like the decel
+    side: v + accel / K_DCC_UP + DCC_HOLD_OFFSET_KMH."""
+    import bmw.carcontroller as mod
+    _, sent, _, sp_end, _ = self._drive(accel=0.3, v_ego_kmh=70.0, setpoint_kmh=71.0,
+                                        seconds=3.0, v_target_kmh=71.0, v_target_rate=0.0)
+    assert any('plus1' in n for _, n in sent), "the gap that delivers aTarget was not asked for"
+    want = 70.0 + 0.3 / mod.K_DCC_UP + mod.DCC_HOLD_OFFSET_KMH
+    # The accel side keeps no pending ledger, so steps in flight (0.13 s
+    # latency, 5 Hz readback) overshoot by up to two whole steps at HOLD cadence
+    # past the first integer at or above the target; on the car
+    # vEgo closes that within ~1 s at the extra 0.2 m/s².
+    assert want - 1.0 <= sp_end <= want + 2.5, f"setpoint {sp_end:.1f}, want ~{want:.1f}"
+    # ...and it is the gap, not vTarget (71), that it settles near.
+    assert sp_end >= 73.0, sp_end
+
+  def test_accel_side_needs_the_planner_to_want_more_speed(self):
+    """vTarget still guards the accel side: no plus while vTarget is not ahead
+    of the car (v_error gate), whatever aTarget says."""
+    # accel 0.6 wants a 6.8 km/h gap — past the restore deadzone, so this also
+    # catches the restore branch chasing the gap around the v_error gate.
+    acts, _, _ = self._run(accel=0.6, v_ego_kmh=70.0, setpoint_kmh=71.0,
+                           v_target_kmh=70.0, v_target_rate=0.0)
+    assert 'plus1' not in acts and 'plus5' not in acts, acts
+
+  def test_braking_latches_when_v_target_sits_below_the_car(self):
+    """Over the speed target vTarget is capped flat at v_cruise, so its trend
+    never falls and the concordance gate never latched: route-518 bench held
+    +2 km/h over vCruiseOut for 14 s with aTarget -0.5. A vTarget more than
+    BRAKE_LATCH_BELOW_KMH under the car is the second estimate agreeing."""
+    acts, _, _ = self._run(accel=-0.5, v_ego_kmh=72.0, setpoint_kmh=73.0,
+                           v_target_kmh=70.0, v_target_rate=0.0)
+    assert acts & {'minus1', 'minus5'}, acts
+
   def test_pending_prevents_a_second_minus5_before_the_first_is_seen(self):
     """The setpoint is only reported back at ~5 Hz. Without discounting what is
     already in flight, a large error draws minus5 in consecutive slots and
@@ -1121,8 +1158,11 @@ class TestSetpointBias:
     assert round(mod.DV_WINDOW * 20) >= 5
 
   def test_floor_still_blocks(self):
-    """min_cruise_setpoint is 35 km/h and the branch guard still owns it."""
-    acts, _, _ = self._run(accel=-1.0, v_ego_kmh=40.0, setpoint_kmh=35.0,
+    """min_cruise_setpoint is minEnableSpeed + 1 = 31 km/h and the branch guard
+    owns it: under half a step of headroom, and minus5 would land below it.
+    (This once sat at 35 km/h with a flat vTarget and passed only because
+    braking never latched.)"""
+    acts, _, _ = self._run(accel=-1.0, v_ego_kmh=40.0, setpoint_kmh=31.5,
                            v_target_kmh=35.0, v_target_rate=0.0)
     assert 'minus1' not in acts and 'minus5' not in acts, acts
 

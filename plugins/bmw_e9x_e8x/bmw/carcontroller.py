@@ -28,6 +28,14 @@ BURST_LIVE_WINDOW = 0.5       # s — burst considered live until this long with
 V_ERROR_DEADZONE = 0.5 / 3.6   # m/s — accel-side entry gate
 ACCEL_HOLD_THRESHOLD = 0.3     # m/s² — HOLD above, SINGLE below
 ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — plus5 offered above; its landing test decides
+# The accel side inverts the plant too — DESIGN.md: "The accel side inverts the
+# plant". 0.11.2's vTarget never implies more acceleration than aTarget, so it
+# sits ~1 km/h ahead of the car, inside DCC's dead band. Measured refit over
+# 518/52c/529/51b: a = 0.107 x (readback - vEgo - 1.17 km/h), so the setpoint
+# that delivers aTarget is vEgo + accel / K_DCC_UP + DCC_HOLD_OFFSET_KMH.
+K_DCC_UP = 0.107               # m/s² per km/h of setpoint gap (measured, not shaded)
+DCC_HOLD_OFFSET_KMH = 1.17     # readback above vEgo at zero accel
+ACCEL_BIAS_MAX = 12.0          # km/h above vEgo, same bound as the decel side
 
 # Decel setpoint inverts the plant — DESIGN.md: "The setpoint is a torque
 # request, not a speed". K_DCC is stiffer than the measured 0.0935 so every ask
@@ -47,6 +55,10 @@ SETPOINT_HOLD_DEADZONE = 1.0   # km/h — once an episode is under way
 # vTarget delta is read. DV_WINDOW is the deque length, not a tuning knob.
 # DESIGN.md: "Concordance gate — two estimates must agree".
 DV_WINDOW = 0.30               # s — 6 modelV2 frames at 20 Hz
+# Over the speed target vTarget is capped flat at v_cruise, so its trend never
+# falls; a vTarget this far under the car is the second estimate agreeing.
+# DESIGN.md: "Concordance gate — two estimates must agree".
+BRAKE_LATCH_BELOW_KMH = 1.0
 
 # Command selection: one decision per SZL slot, keyed on the setpoint error
 # left after what is still in flight (setpoint_pending). minus1 is a 1 km/h
@@ -347,7 +359,8 @@ class CarController(CarControllerBase):
     if not CC.enabled:
       self.setpoint_braking = False
       self.v_target_hist.clear()
-    elif accel < 0 and dv_target < 0:
+    elif accel < 0 and (dv_target < 0
+                        or v_target < v_current - BRAKE_LATCH_BELOW_KMH * CV.KPH_TO_MS):
       self.setpoint_braking = True
     elif accel > 0 and dv_target > 0:
       self.setpoint_braking = False
@@ -393,9 +406,17 @@ class CarController(CarControllerBase):
         else:
           # Setpoint target: v_target (planner vTarget ~0.5 s ahead, not the
           # driver's set speed), deepened by the plant-inverting bias during a
-          # braking episode. Only the decel side inverts — DESIGN.md: "Only the
-          # decel side inverts the plant".
+          # braking episode and lifted to the gap that delivers aTarget while
+          # accelerating — DESIGN.md: "The setpoint is a torque request, not a
+          # speed" and "The accel side inverts the plant".
           sp_target = v_target
+          if not self.setpoint_braking and accel > 0 and v_error > V_ERROR_DEADZONE:
+            # The gap that delivers aTarget, or vTarget if that is further:
+            # never cap the destination at the ask (route 45c). Only while
+            # vTarget is ahead of the car, or the restore branch below would
+            # chase the gap past the vTarget guard.
+            gap_kmh = min(accel / K_DCC_UP + DCC_HOLD_OFFSET_KMH, ACCEL_BIAS_MAX)
+            sp_target = max(v_target, v_current + gap_kmh * CV.KPH_TO_MS)
           if self.setpoint_braking:
             # min(accel, 0): a positive blip holds the bias; the latch releases.
             bias = max(min(accel, 0.0) / K_DCC, -SETPOINT_BIAS_MAX) * CV.KPH_TO_MS

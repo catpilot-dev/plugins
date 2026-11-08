@@ -416,6 +416,16 @@ for the first 300 ms of every engagement. Holding costs nothing — the latch an
 the history are cleared together when `CC.enabled` drops, so the state held is
 always not-braking, i.e. 300 ms of the old clamped behaviour.
 
+**A `vTarget` below the car also agrees** (0.11.2). Over the speed target
+catpilot's `vTarget` is capped flat at `v_cruise`, so its trend never falls and
+the latch never closed: the bench held +2 km/h over `vCruiseOut` for 14 s on
+518 with `aTarget` −0.5, the setpoint sitting at vEgo + 1.3 (zero accel).
+`accel < 0` with `vTarget` more than `BRAKE_LATCH_BELOW_KMH` (1 km/h) under
+vEgo latches braking too. It is a level, not a trend, so it is a genuine
+second estimate; on the old clamped accel side it changed nothing measurable
+(flips 12.8 → 12.8/min), and with the accel inversion it takes overspeed past
+`vCruiseOut` 28.8 → 21.3 s.
+
 **The wider deadzone does not make this redundant** — the question was asked
 after route 459 and measured on 459 + 45a. The two act at different points: the
 gate decides *which target* the setpoint chases, the deadzone decides whether
@@ -736,6 +746,8 @@ route-45b cut-in. The step is still offered only above
 
 ### Only the decel side inverts the plant
 
+*0.11.1 history — on 0.11.2 the accel side inverts too, see the next section; its `max` keeps this section's lesson.*
+
 `min(v_target, v_ego + ask)` looks symmetric and is not. Braking, the ask is
 *deeper* than `v_target`, so the min picks it and **adds** authority.
 Accelerating, the ask is *shallower*, so the same min picks it and **removes**
@@ -769,6 +781,58 @@ destination. Unfixed for now; the lag it caused was worse than the flapping it
 cured.
 
 The plus5 landing guard is independent of all this and stays.
+
+### The accel side inverts the plant (0.11.2)
+
+The section above was measured on 0.11.1, whose `vTarget` was the MPC plan at
+`action_t` and ran well ahead of the car (515: vTarget − vEgo p90 +4.0 km/h).
+catpilot's 0.11.2 `vTarget` never implies more acceleration than `aTarget`
+(it is capped at the speed `aTarget`'s own slope reaches), so it sits a median
+~1 km/h ahead — **inside DCC's dead band**. The refit plant is
+`a = 0.107 × (readback − vEgo − 1.17 km/h)`: route 530 measured 0.03–0.04 m/s²
+at a 0–2 km/h gap, 0.22 at 3–4, 0.33 at 4–6. POP's `aTarget` was unchanged
+from 0.11.1 (530 p50/p90 0.16/0.36 vs 515 0.09/0.28); what changed is the
+destination the setpoint chased, and the car crept.
+
+So while accelerating the setpoint chases the gap that delivers `aTarget`, or
+`vTarget` if that is further:
+
+```
+sp_target = max(v_target, vEgo + min(accel / K_DCC_UP + DCC_HOLD_OFFSET_KMH, ACCEL_BIAS_MAX))
+```
+
+The `max` keeps the 45c lesson — the destination is never capped at the ask —
+and the lift applies only while `v_error > V_ERROR_DEADZONE`, the same gate
+the plus branch has, so `vTarget` decides *whether* to accelerate and
+`aTarget` *how hard*. (Lifting regardless would let the restore branch chase
+the gap past that gate once `aTarget` ≥ ~0.2 asks for more than its deadzone.) `K_DCC_UP` is the
+measured 0.107, not shaded like the decel side's `K_DCC`: there is no
+overshoot-into-the-car to fear on the way up. There is no pending ledger on the
+accel side, so steps in flight overshoot the gap by up to ~2 km/h at HOLD
+cadence; vEgo closes that within a second.
+
+Closed-loop bench (530/518/52c/529 × 3 seeds, the lever plant plus a planner
+surrogate that reacts to the simulated speed: e2e feedback on the speed error,
+`a_cruise` against speedlimitd's `vCruiseOut`; validated on 530 at delivered/
+asked 0.40 sim vs 0.43 recorded):
+
+| | current | inverted + below-latch |
+|---|---|---|
+| accel delivered / asked | 0.33 | **0.90** |
+| accel at `aTarget` 0.1–0.4 | 0.07 | 0.20 m/s² |
+| free-road time > 8 km/h under `vCruiseOut` | 240 s | 225 s |
+| time > 2 km/h over `vCruiseOut` | 11.6 s | 21.1 s (mostly arriving faster at a limit drop) |
+| braking delivered / asked, snap-ups | 0.76, 0 | 0.77, 0 |
+| our plus frames / min | 107 | 175 |
+| setpoint direction reversals / min | 3.5–3.9 | **6.0–11.2** |
+
+Two limits to read it by. Under-speed time barely moves: POP itself asks only
+0.1–0.15 m/s² there, and delivering that faithfully is still gentle — 0.11.1's
+pull was the MPC `vTarget` asking for more than `aTarget`. And the reversals
+scale with how strongly the surrogate planner answers the car's own speed
+(6.0 with none, 11.2 at the strongest tried; 454's chatter was 19.3), which the
+bench cannot know: **the on-car check is accel/brake pumping**, alongside
+under-speed time and overspeed past `vCruiseOut`.
 
 ### The command gate is a Schmitt trigger
 
