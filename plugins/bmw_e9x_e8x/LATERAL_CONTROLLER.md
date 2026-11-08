@@ -24,7 +24,9 @@ with no filtering of its own.
     P_nm      = T_CAP_SLOPE_BASE · kappa_scale(|kappa_ref|) · v² · delta_err
     a_ref     = v_true² · kappa_ref                          reference lateral accel (m/s²)
     ff_nm     = clip(CF_GAIN · sign(a_ref) · max(|a_ref| − CF_AY0, 0), ±CF_MAX_NM)
-    demand    = ff_nm + P_nm (+ sl_bias)                    every deviceMotion tick
+    demand    = ff_nm + P_nm (+ sl_bias) (+ ci_nm)          every deviceMotion tick
+    ci_nm    += CI_KI · delta_err · dt   while |a_ref| ≥ CI_AY_ON, v ≥ CI_MIN_V, no lane change, unpressed
+              ·= exp(−dt / CI_TAU_LEAK_S) otherwise;  clip ±CI_MAX_NM;  0 on a kappa_ref side change and on disengage
 
 **Decision**, every `CONTROL_HORIZON_S / 2` (6 deviceMotion ticks, 300 ms) while active, in order:
 the demand on the full error (no on-target band — a sub-friction target is a
@@ -55,10 +57,33 @@ ramp are 0, so every engagement ramps from 0.
 | `LANE_CHANGE_STATES` | laneChangeStarting, laneChangeFinishing | `drivingModelData.meta` states with the flat 0.10 step cap (2026-11-02) |
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
+| `CI_AY_ON`, `CI_MIN_V`, `CI_KI`, `CI_MAX_NM`, `CI_TAU_LEAK_S` | 0.15 m/s² (= `SL_AY_MAX`), 40 km/h, 75 Nm/(rad·s), 0.5 Nm, 1.5 s | Curve integrator (`CurveIntegrator` switch, default off, 2026-11-08 A/B) |
 | `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
 
 **Switches** (Driving panel, param files under `bmw_e9x_e8x/data/`):
-`SlopeCompensation` (read at each engagement), default off.
+`SlopeCompensation` and `CurveIntegrator` (each read at each engagement), default off.
+
+**Curve integrator (2026-11-08, A/B behind `CurveIntegrator`).** In a steady
+curve P supplies what the feed-forward leaves out only by holding a standing
+error, and rack friction grows with load, so the car settles wide. The 515/530
+same-road study (`bmw_lat_control` vs CAN yaw) found understeer of +0.1..+0.7e-3
+below 90 km/h on every drive, falling with speed (515: +0.64 at 50-70 km/h,
++0.11 at 80-90), right bends worse than left (515: +0.73 vs -0.03e-3), and
+not a 0.11.2 regression at matched speed. A stick-slip rack fitted from six
+routes gives breakaway ~0.33 + 0.67·|a_y| Nm and self-aligning torque
+~1.7 Nm per m/s². A fixed feed-forward increase cannot match a need that
+varies by bend direction and road (a lower `CF_AY0` over-supplied gentle right
+bends in 55-91 % of windows, 2026-10-21), so `ci_nm` learns it per bend.
+Unlike the July hold-bias (37e34b7) nothing freezes it: an overshoot reverses
+delta_err and it integrates down at the same rate. Its gate is the complement
+of the slope-bias learn gate (`|a_ref|` ≥ vs < 0.15 m/s²), so the two never
+learn on the same tick. The closed-loop bench built for it did not validate
+(rack model 1.04° rms against a ~0.6° effect; the left/right split came out
+reversed), so the evidence is an on-car A/B on the 515/530 road: understeer by
+speed and bend direction, outside drift, torque reversals, slow weave in long
+bends. `CI_KI` is 75, half the first cut: in the same (unvalidated) bench,
+understeer reduction and 0.1-0.5 Hz weave both scaled about linearly with it
+(150: -0.15e-3 / +70 %, 75: -0.09e-3 / +35 %, 40: -0.05e-3 / +21 %).
 
 **Verification.** Unit tests in `tests/test_latcontroller.py` and
 `tests/test_takeup.py`; a differential replay against the previous build is the
@@ -1376,6 +1401,7 @@ Published each deviceMotion tick. The exact field set is pinned by
 | `sl_bias` | learned straight-road torque (Nm) |
 | `sl_learn` | slope-bias learn gate open this tick |
 | `kappa_pred` | yaw-predictor curvature added to `measured` in the P law (1/m); 0 outside lane changes |
+| `ci_nm` | curve integrator torque added to the demand (Nm); 0 when `CurveIntegrator` is off |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 

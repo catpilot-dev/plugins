@@ -21,6 +21,10 @@
     "SlopeCompensation": {
       "default": false,
       "description": "Learn and apply the steady straight-road torque (road slope, alignment). Write 1 to enable. Read at each engagement."
+    },
+    "CurveIntegrator": {
+      "default": false,
+      "description": "Integrate the remaining curvature error in curves and add it to the steering torque (mild-curve understeer). Write 1 to enable. Read at each engagement."
     }
   },
   "cereal": {

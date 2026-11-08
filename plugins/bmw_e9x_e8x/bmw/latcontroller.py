@@ -81,6 +81,24 @@ SL_KAPPA_DES = 1e-3        # straight: |kappa_ref| below this (1/m)
 SL_KAPPA_MEAS = 1.5e-3     # and |kappa_meas| below this (1/m)
 SL_AY_MAX = 0.15           # and |a_ref| below this (m/s^2): gentle bends charged the bias on route 4ec
 
+# Curve integrator (CurveIntegrator switch, default off; LATERAL_CONTROLLER.md
+# "Curve integrator"). In a steady curve P only supplies the torque the
+# feed-forward leaves out by holding a standing error, and rack friction grows
+# with load (fitted breakaway ~0.33 + 0.67*|a_y| Nm), so the car settles wide:
+# understeer +0.1..+0.7e-3 below 90 km/h on every drive, right bends worse than
+# left (route 515: +0.73 vs -0.03e-3). ci_nm integrates delta_err in curves and
+# is added to the demand. It always unwinds (no freeze: the July hold-bias
+# froze on overshoot and ratcheted to its cap, 37e34b7), leaks away outside
+# curves, resets on an S-curve sign flip and on disengage, and pauses in lane
+# changes. Its gate is the complement of the slope-bias learn gate.
+CI_AY_ON = SL_AY_MAX       # integrate only at |a_ref| >= this (m/s^2)
+CI_MIN_V = 40 / 3.6        # and above 40 km/h (m/s)
+CI_KI = 75.0               # Nm per (rad of delta_err * s): 0.3e-3 under -> ~0.3 Nm in ~4 s. Half the
+                           # first cut: the (unvalidated) bench traded understeer for 0.1-0.5 Hz weave
+                           # about linearly in CI_KI (150: -0.15e-3 / +70 %, 75: -0.09e-3 / +35 %)
+CI_MAX_NM = 0.5            # cap (Nm), about one breakaway band
+CI_TAU_LEAK_S = 1.5        # decay time constant outside the gate (s)
+
 # Curve feed-forward (docs/superpowers/specs/2026-10-20-bmw-curve-feedforward-
 # and-audit-design.md). Above ~0.3 m/s^2 a curve needs steady torque this
 # hydraulic rack's stiction does not supply (440 steady windows on 4e9-4ec:
@@ -244,6 +262,8 @@ def on_lat_controller_init(result, lac, CP):
     'slope': False,          # SlopeCompensation latched at the engagement edge
     'sl_bias': 0.0,          # learned straight-road torque (Nm); kept across engagements, never persisted
     'sl_learn': False,       # learn gate open this deviceMotion tick (telemetry)
+    'curve_int': False,      # CurveIntegrator latched at the engagement edge
+    'ci_nm': 0.0,            # curve integrator torque (Nm), added to the demand
     'lane_change': False,    # model runs a lane change this deviceMotion tick (LANE_CHANGE_STATES)
     'wheel_hist': deque(maxlen=YAW_PRED_TICKS + 1),  # wheel angle (deg) at the last deviceMotion ticks
     'kappa_pred': 0.0,       # yaw-predictor curvature added to the P law's measured (1/m)
@@ -260,9 +280,16 @@ def on_lat_controller_init(result, lac, CP):
         state['slope'] = read_plugin_param('bmw_e9x_e8x', 'SlopeCompensation', '') == '1'
       except Exception:
         state['slope'] = False
+      try:
+        state['curve_int'] = read_plugin_param('bmw_e9x_e8x', 'CurveIntegrator', '') == '1'
+      except Exception:
+        state['curve_int'] = False
+      state['ci_nm'] = 0.0
       state['guard'].reset()
     elif not active:
       state['slope'] = False
+      state['curve_int'] = False
+      state['ci_nm'] = 0.0
       # Inactive: the law does not run on the state. Torque, target and ramp
       # are zeroed so the next engagement ramps from 0 under STEP_MAX on its
       # first deviceMotion tick instead of jumping to a torque built while the
@@ -347,8 +374,22 @@ def on_lat_controller_init(result, lac, CP):
         state['sl_bias'] = float(np.clip(state['sl_bias'] + (_p_nm / SL_TAU_S) * DT_DEVICE_MOTION,
                                          -SL_BIAS_MAX_NM, SL_BIAS_MAX_NM))
 
+      # Curve integrator: integrate delta_err in a curve, leak it away outside.
+      # A reference that changes sides (S-curve) drops what the last bend
+      # needed at once rather than integrating it down through the next one.
+      if state['curve_int'] and active:
+        if state['ci_nm'] * state['desired'] < 0.0:
+          state['ci_nm'] = 0.0
+        if (abs(a_ref) >= CI_AY_ON and v_true >= CI_MIN_V and not state['lane_change']
+            and not getattr(CS, 'steeringPressed', False)):
+          state['ci_nm'] = float(np.clip(state['ci_nm'] + CI_KI * delta_err * DT_DEVICE_MOTION,
+                                         -CI_MAX_NM, CI_MAX_NM))
+        else:
+          state['ci_nm'] *= math.exp(-DT_DEVICE_MOTION / CI_TAU_LEAK_S)
+
       # The demand the decision targets.
-      state['demand_nm'] = state['ff_nm'] + _p_nm + (state['sl_bias'] if state['slope'] else 0.0)
+      state['demand_nm'] = (state['ff_nm'] + _p_nm + (state['sl_bias'] if state['slope'] else 0.0)
+                            + state['ci_nm'])
 
       # The noise guard judges reversal persistence on the 20 Hz sign of the
       # whole demand, as an error-equivalent (Direct spec §3): on delta_err
@@ -559,7 +600,8 @@ def on_lat_controller_init(result, lac, CP):
           'tu_guarded': int(state['guard'].suppressed),       # cumulative reversals held at 0 by the noise guard
           'sl_bias': float(state['sl_bias']),                  # learned straight-road torque (Nm)
           'sl_learn': bool(state['sl_learn']),                 # slope-bias learn gate open
-          'kappa_pred': float(state['kappa_pred']),            # yaw predictor, added to measured in the P law (1/m)
+          'kappa_pred': float(state['kappa_pred']),
+          'ci_nm': float(state['ci_nm']),                      # curve integrator torque (Nm, 0 when off)            # yaw predictor, added to measured in the P law (1/m)
         }
         state['lat_pub'].send(payload)
       except Exception:
