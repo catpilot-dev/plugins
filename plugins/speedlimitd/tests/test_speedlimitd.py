@@ -3762,7 +3762,8 @@ class TestMapCurveTelemetry:
             for la, lo in points],
       position=SimpleNamespace(latitude=pos[0], longitude=pos[1]))
 
-  def _scenario(self, sld, monkeypatch, curved=True, with_path=True, car_s=0.0, gs=True):
+  def _scenario(self, sld, monkeypatch, curved=True, with_path=True, car_s=0.0, gs=True,
+                v_ego=None):
     """An S20 G/S hold, mapd on S20, the car at the start of a 400 m straight
     followed by an R=300 arc. Tile queries are frozen so the test drives the
     tile reader's state through _ingest_osm_result, like the G/S suites."""
@@ -3788,6 +3789,12 @@ class TestMapCurveTelemetry:
 
     def tick(dt=0.2, move_path=True):
       clock['t'] += dt
+      if v_ego is not None:
+        from types import SimpleNamespace
+        mw.sm.updated['deviceMotion'] = True
+        mw.sm.data['deviceMotion'] = SimpleNamespace(
+          velocityDevice=SimpleNamespace(x=v_ego, valid=True),
+          angularVelocityDevice=SimpleNamespace(z=0.0, valid=True))
       if with_path:
         if move_path:
           state['pos_n'] += 1
@@ -3957,3 +3964,37 @@ class TestMapCurveToggle:
     on = tick_on()
     assert on['mapCurveGate'] == 'mapd_absent'
     assert (on['speedLimit'], on['source']) == (off['speedLimit'], off['source'])
+
+
+class TestMapCurveShaping:
+  """Review Important #2: the cap may not step the target down when the gate
+  opens with a curve already near, nor flicker off for a one-tick dropout."""
+
+  _s20_result = staticmethod(TestMapCurveTelemetry._s20_result)
+  _mapd_out = staticmethod(TestMapCurveTelemetry._mapd_out)
+  _extended = staticmethod(TestMapCurveTelemetry._extended)
+  _scenario = TestMapCurveTelemetry._scenario
+  _toggle = staticmethod(TestMapCurveToggle._toggle)
+
+  def test_gate_opening_near_curve_ramps_from_current_speed(self, sld, monkeypatch):
+    self._toggle(monkeypatch, {'v': '1'})
+    _, tick, _ = self._scenario(sld, monkeypatch, car_s=390, v_ego=30.0)   # 108 km/h
+    first = tick()
+    assert first['mapCurveCap'] < 90                    # the raw cap is near the curve...
+    assert first['mapCurveShaped'] >= 107                # ...but the shaped cap starts at v_ego
+    prev = first['mapCurveShaped']
+    for _ in range(50):                                  # 10 s at 5 Hz (108→83 needs 8.7 s)
+      pub = tick()
+      assert prev - pub['mapCurveShaped'] <= 0.8 * 3.6 * 0.2 + 1.0   # ≤ COMFORT_BRAKE (+rounding)
+      prev = pub['mapCurveShaped']
+    assert pub['mapCurveShaped'] == pub['mapCurveCap']   # converged onto the raw cap
+
+  def test_one_tick_gate_dropout_holds_the_cap(self, sld, monkeypatch):
+    self._toggle(monkeypatch, {'v': '1'})
+    mw, tick, _ = self._scenario(sld, monkeypatch, car_s=390)
+    assert tick()['source'] == 4
+    mw.sm.put('mapdOut', self._mapd_out(sel='fail'))     # mapd loses the road for a tick
+    pub = tick()
+    assert pub['mapCurveGate'] == 'sel_type' and pub['source'] == 4   # held
+    pub = tick(dt=3.0)                                   # 3.2 s without a valid cap
+    assert pub['source'] != 4                            # released

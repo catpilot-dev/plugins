@@ -787,6 +787,9 @@ class SpeedLimitMiddleware:
     self._map_curve_gate = 'off_gs'
     self._map_curve_result = None
     self._map_curve_error_logged = False
+    self._mc_shaped_ms = None       # cap as applied: ramped and held (see _shape_map_curve)
+    self._mc_hold_until = 0.0
+    self._mc_last_t = 0.0
 
     self.country_bboxes = load_country_bboxes()
     self.country_detected = False
@@ -1161,6 +1164,33 @@ class SpeedLimitMiddleware:
         except Exception:
           pass
 
+  MAP_CURVE_HOLD_S = 3.0
+
+  def _shape_map_curve(self, now: float, v_ego: float) -> None:
+    """Turn the raw map cap into the value the speed decision may use.
+
+    The raw cap jumps whenever the gate opens with a curve already near (G/S
+    entry, mapd recovering, a tile lapse ending), and vanishes for any one-tick
+    gate failure. Safety caps reach the planner un-ramped, so both would land on
+    the setpoint as a step. Shaped: when it first appears it starts from the
+    current speed and descends no faster than COMFORT_BRAKE; it holds for
+    MAP_CURVE_HOLD_S across gate dropouts, like the vision cap; it rises at once.
+    """
+    dt = min(max(now - self._mc_last_t, 0.0), 1.0)
+    self._mc_last_t = now
+    r = self._map_curve_result if self._map_curve_gate == 'ok' else None
+    raw = r.cap_kph / 3.6 if r is not None and r.cap_kph > 0 else None
+    if raw is not None:
+      if self._mc_shaped_ms is None:
+        self._mc_shaped_ms = max(raw, v_ego)
+      elif raw < self._mc_shaped_ms:
+        self._mc_shaped_ms = max(raw, self._mc_shaped_ms - COMFORT_BRAKE * dt)
+      else:
+        self._mc_shaped_ms = raw
+      self._mc_hold_until = now + self.MAP_CURVE_HOLD_S
+    elif self._mc_shaped_ms is not None and now >= self._mc_hold_until:
+      self._mc_shaped_ms = None
+
   def _map_curve_telemetry(self) -> dict:
     """mapCurve* keys for speedLimitState — published every tick, toggle on or off."""
     r = self._map_curve_result if self._map_curve_gate == 'ok' else None
@@ -1174,6 +1204,7 @@ class SpeedLimitMiddleware:
       'mapCurvePathAhead': int(round(r.path_ahead_m)) if r is not None else 0,
       'mapCurveLat': round(r.lateral_m, 1) if r is not None else 0.0,
       'mapCurveGate': self._map_curve_gate,
+      'mapCurveShaped': int(round(self._mc_shaped_ms * 3.6)) if self._mc_shaped_ms else 0,
     }
 
   def _ingest_osm_result(self, result: dict | None):
@@ -1646,6 +1677,7 @@ class SpeedLimitMiddleware:
         or self.lane_count_stable <= 2)
     gs_mode = not gs_released
     self._update_map_curve(now, gs_mode)
+    self._shape_map_curve(now, v_ego_meas)
 
     # OSM Data Integration: a fresh posted limit replaces the base inference
     # entirely (vision stays the fallback; safety caps below still min() over
@@ -1702,9 +1734,8 @@ class SpeedLimitMiddleware:
       candidates.append((react_cap_kph, 4, 0.7))  # reactiveLatAccel (safety class)
     # G/S map curve cap (2026-11-09): same safety class as the vision curve cap,
     # and only when the MapdCurveLookahead toggle is on. Off, it is telemetry only.
-    mc = self._map_curve_result
-    if self.map_curve_enabled and self._map_curve_gate == 'ok' and mc is not None and mc.cap_kph > 0:
-      candidates.append((float(max(round(mc.cap_kph), MIN_SPEED_LIMIT)), 4, 0.7))  # mapCurveLookahead
+    if self.map_curve_enabled and self._mc_shaped_ms is not None:
+      candidates.append((float(max(round(self._mc_shaped_ms * 3.6), MIN_SPEED_LIMIT)), 4, 0.7))  # mapCurveLookahead
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # base inference (lane-count / gs_osm), source 2
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
