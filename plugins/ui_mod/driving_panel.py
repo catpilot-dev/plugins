@@ -192,6 +192,16 @@ class DrivingLayout(Widget):
       )
       items.append(self._osm_integration)
 
+      current_mc = read_plugin_param('speedlimitd', 'MapdCurveLookahead') == '1'
+      self._map_curve = toggle_item(
+        "Map Curve Look-ahead (G/S)",
+        "Slow down for curves ahead on G/S expressways using mapd's map path, "
+        "beyond what the camera can see. Off: the map cap is computed and logged only.",
+        current_mc,
+        callback=self._on_map_curve_lookahead,
+      )
+      items.append(self._map_curve)
+
       if current_osm and _osm_tiles_missing():
         items.append(ListItem(
           title="⚠ Offline Map Tiles",
@@ -254,6 +264,9 @@ class DrivingLayout(Widget):
 
   def _on_osm_integration(self, state):
     write_plugin_param('speedlimitd', 'OsmDataIntegration', '1' if state else '0')
+
+  def _on_map_curve_lookahead(self, state):
+    write_plugin_param('speedlimitd', 'MapdCurveLookahead', '1' if state else '0')
 
   def _on_look_ahead(self, state):
     write_plugin_param('look_ahead', 'LookAheadEnabled', '1' if state else '0')

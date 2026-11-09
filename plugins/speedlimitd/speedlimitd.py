@@ -952,6 +952,8 @@ class SpeedLimitMiddleware:
       zero_disables=True)
     self.osm_integration_enabled = read_plugin_param(
       'speedlimitd', 'OsmDataIntegration', '') == '1'
+    self.map_curve_enabled = read_plugin_param(
+      'speedlimitd', 'MapdCurveLookahead', '') == '1'
 
   def _resolve_osm_default(self, country: str) -> bool:
     """One-time region default for OsmDataIntegration (first GPS fix).
@@ -1698,6 +1700,11 @@ class SpeedLimitMiddleware:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
     if react_active:
       candidates.append((react_cap_kph, 4, 0.7))  # reactiveLatAccel (safety class)
+    # G/S map curve cap (2026-11-09): same safety class as the vision curve cap,
+    # and only when the MapdCurveLookahead toggle is on. Off, it is telemetry only.
+    mc = self._map_curve_result
+    if self.map_curve_enabled and self._map_curve_gate == 'ok' and mc is not None and mc.cap_kph > 0:
+      candidates.append((float(max(round(mc.cap_kph), MIN_SPEED_LIMIT)), 4, 0.7))  # mapCurveLookahead
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # base inference (lane-count / gs_osm), source 2
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])

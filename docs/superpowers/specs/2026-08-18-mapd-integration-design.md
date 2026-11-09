@@ -88,6 +88,10 @@ One drive answers the three open questions:
 
 ### Phase 2 — cutover and deletion
 
+> **Superseded 2026-11-09** by `2026-11-09-mapd-gs-curve-lookahead-design.md`: road
+> identity stays with the tile reader, nothing below is deleted, and Phase 2 is a
+> G/S-only map curve look-ahead instead.
+
 `mapdOut` becomes the source. Deleted:
 
 - `plugins/speedlimitd/osm_query.py`

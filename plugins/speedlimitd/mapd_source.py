@@ -4,12 +4,11 @@ Pure and stateless: no I/O, no clock, no globals, no imports from speedlimitd.
 That keeps it unit-testable with plain stubs and keeps speedlimitd.py (already
 ~1700 lines) from absorbing another responsibility.
 
-PHASE 1 SCOPE: observation only. This module reports what mapd sees so a drive
-can be compared against the offline tile reader that still drives control.
-Phase 2 adds result_from_mapd(), which rebuilds the osm_query-shaped dict for
-_ingest_osm_result — deliberately not written yet, because nothing calls it and
-the Phase 1 drive may change its shape. See
-docs/superpowers/specs/2026-08-18-mapd-integration-design.md.
+Observation only. This module reports what mapd sees so a drive can be
+compared against the offline tile reader, which keeps driving road identity
+(the planned result_from_mapd() cutover was dropped on route 531 evidence — see
+docs/superpowers/specs/2026-11-09-mapd-gs-curve-lookahead-design.md). mapd's
+road-ahead path is consumed separately, by map_curve.py, on G/S only.
 """
 
 # MapdOut.highwayClass -> the OSM highway=* string speedlimitd already uses for

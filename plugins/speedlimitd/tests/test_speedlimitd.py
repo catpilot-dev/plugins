@@ -3762,7 +3762,7 @@ class TestMapCurveTelemetry:
             for la, lo in points],
       position=SimpleNamespace(latitude=pos[0], longitude=pos[1]))
 
-  def _scenario(self, sld, monkeypatch, curved=True, with_path=True):
+  def _scenario(self, sld, monkeypatch, curved=True, with_path=True, car_s=0.0, gs=True):
     """An S20 G/S hold, mapd on S20, the car at the start of a 400 m straight
     followed by an R=300 arc. Tile queries are frozen so the test drives the
     tile reader's state through _ingest_osm_result, like the G/S suites."""
@@ -3780,7 +3780,7 @@ class TestMapCurveTelemetry:
     monkeypatch.setattr(mod.time, 'monotonic', lambda: clock['t'])
     seg = tmc.straight_then_arc(400, radius=300) if curved else tmc.straight(1200)
     points = tmc.path_of(seg, 10)
-    car = tmc.car_on(seg, 0)
+    car = tmc.car_on(seg, car_s)
     mw._gps_valid = True
     mw._gps_lat, mw._gps_lon = car
     mw.sm.put('mapdOut', self._mapd_out())
@@ -3796,7 +3796,11 @@ class TestMapCurveTelemetry:
       mw.update()
       return mw._sl_pub.send.call_args[0][0]
 
-    mw._ingest_osm_result(self._s20_result())
+    if gs:
+      mw._ingest_osm_result(self._s20_result())
+    else:
+      mw._ingest_osm_result(self._s20_result(wayRef='', roadName='金海路', highwayType='primary',
+                                             roadContext=1, refDistances={}))
     return mw, tick, clock
 
   def test_extended_out_subscribed_when_service_present(self, sld):
@@ -3866,3 +3870,90 @@ class TestMapCurveTelemetry:
     pub = tick()
     assert pub['mapCurveGate'] == 'error' and pub['mapCurveCap'] == 0
     assert pub['speedLimit'] == base['speedLimit'] and pub['source'] == base['source']
+
+
+class TestMapCurveToggle:
+  """MapdCurveLookahead lets the G/S map cap enter the speed decision as a
+  source-4 safety cap. Default off; off is identical to no feature."""
+
+  _s20_result = staticmethod(TestMapCurveTelemetry._s20_result)
+  _mapd_out = staticmethod(TestMapCurveTelemetry._mapd_out)
+  _extended = staticmethod(TestMapCurveTelemetry._extended)
+  _scenario = TestMapCurveTelemetry._scenario
+
+  @staticmethod
+  def _toggle(monkeypatch, state):
+    import config
+    monkeypatch.setattr(config, 'read_plugin_param',
+                        lambda pid, key, default='': state['v'] if key == 'MapdCurveLookahead' else '')
+
+  def test_param_declared_default_off(self):
+    import json
+    manifest = os.path.join(os.path.dirname(__file__), '..', 'plugin.json')
+    with open(manifest) as f:
+      p = json.load(f)['params']['MapdCurveLookahead']
+    assert p['type'] == 'bool' and p['default'] is False
+
+  def test_read_params_wires_toggle(self, sld, monkeypatch):
+    state = {'v': '1'}
+    self._toggle(monkeypatch, state)
+    mw = sld.SpeedLimitMiddleware()
+    mw._read_params()
+    assert mw.map_curve_enabled is True
+    state['v'] = ''
+    mw._read_params()
+    assert mw.map_curve_enabled is False
+
+  def test_toggle_on_lowers_limit_as_source_4(self, sld, monkeypatch):
+    self._toggle(monkeypatch, {'v': ''})
+    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=390)
+    off = tick_off()
+    self._toggle(monkeypatch, {'v': '1'})
+    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=390)
+    on = tick_on()
+    assert 30 < on['mapCurveCap'] < off['speedLimit']   # the curve really binds
+    assert on['source'] == 4 and on['safetyCapped'] is True
+    assert on['speedLimit'] == sld.snap_to_standard_speed(on['mapCurveCap'])
+    assert on['mapCurveActive'] is True and off['source'] != 4
+
+  def test_cap_above_limit_changes_nothing(self, sld, monkeypatch):
+    self._toggle(monkeypatch, {'v': ''})
+    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=0)
+    off = tick_off()
+    self._toggle(monkeypatch, {'v': '1'})
+    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=0)
+    on = tick_on()
+    assert on['mapCurveCap'] > off['speedLimit']        # far curve: cap above the limit
+    assert (on['speedLimit'], on['source']) == (off['speedLimit'], off['source'])
+
+  def test_toggle_has_no_effect_off_gs(self, sld, monkeypatch):
+    self._toggle(monkeypatch, {'v': ''})
+    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=390, gs=False)
+    off = tick_off()
+    self._toggle(monkeypatch, {'v': '1'})
+    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=390, gs=False)
+    on = tick_on()
+    assert on['mapCurveGate'] == 'off_gs'
+    assert (on['speedLimit'], on['source']) == (off['speedLimit'], off['source'])
+
+  def test_toggle_off_after_on_removes_cap(self, sld, monkeypatch):
+    state = {'v': '1'}
+    self._toggle(monkeypatch, state)
+    mw, tick, _ = self._scenario(sld, monkeypatch, car_s=390)
+    assert tick()['source'] == 4
+    state['v'] = ''
+    pub = tick(dt=5.0)                                   # next 5 s param read
+    assert pub['mapCurveActive'] is False and pub['source'] != 4
+
+  def test_toggle_on_without_extended_service_changes_nothing(self, sld, monkeypatch):
+    services = sys.modules['openpilot.cereal.services']
+    services.SERVICE_LIST = {k: v for k, v in services.SERVICE_LIST.items()
+                             if k != 'mapdExtendedOut'}
+    self._toggle(monkeypatch, {'v': ''})
+    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=390, with_path=False)
+    off = tick_off()
+    self._toggle(monkeypatch, {'v': '1'})
+    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=390, with_path=False)
+    on = tick_on()
+    assert on['mapCurveGate'] == 'mapd_absent'
+    assert (on['speedLimit'], on['source']) == (off['speedLimit'], off['source'])

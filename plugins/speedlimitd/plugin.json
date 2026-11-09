@@ -44,6 +44,12 @@
       "default": true,
       "label": "Show Speed Limit Sign",
       "desc": "Display speed limit sign on HUD"
+    },
+    "MapdCurveLookahead": {
+      "type": "bool",
+      "default": false,
+      "label": "Map Curve Look-ahead (G/S)",
+      "desc": "Slow down for curves ahead on G/S expressways using mapd's map path"
     }
   }
 }

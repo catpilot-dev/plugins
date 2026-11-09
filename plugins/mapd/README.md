@@ -15,11 +15,16 @@ running or absent, and an absent service degrades to vision-only rather than fai
 Tiles are downloaded by COD's web UI into `/data/media/0/osm/offline/`, which is
 exactly where mapd reads them.
 
-**Phase 2 — cutting control over to mapd (`mapd_source.result_from_mapd`, then
-deleting `osm_query.py`, `osm_reader.capnp`, `generate_hw_tiles.py` and the
-margin-release machinery) — is NOT started.** It is gated on a Phase 1 drive that
-has never happened: `mapdRefAgree` rate, mapd uptime, S20 coverage delta and
-selType distribution are all still unmeasured.
+**Phase 2 — G/S curve look-ahead, not a cutover (2026-11-09).** Route 531 showed
+mapd's way match and the tile reader fail in complementary ways, and the tile-only
+G/S logic already handled every S20 moment, so road identity stays with the tile
+reader and nothing in the tile stack is deleted. Phase 2 is instead a map curve cap
+on G/S expressways only: speedlimitd reads `mapdExtendedOut.path` (registered at
+mapd's 2 MB queue size, not logged) and computes its own cap with its own a_y
+budget, beyond the camera's ~100 m. It is always published as `mapCurve*` in
+`speedLimitState`, and slows the car only when the Driving-panel toggle
+"Map Curve Look-ahead (G/S)" (`MapdCurveLookahead`, default off) is on. See
+`docs/superpowers/specs/2026-11-09-mapd-gs-curve-lookahead-design.md`.
 
 ## What it's for
 
