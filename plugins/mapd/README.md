@@ -1,10 +1,14 @@
 # Mapd — OpenStreetMap Data
 
-**Status: RE-ACTIVATED on v2.4.0 (2026-11-09), pending a drive.** `plugin.json`
+**Status: RE-ACTIVATED on v2.4.0 (2026-11-09); first drives clean.** `plugin.json`
 declares the process again, and `mapdOut` is now registered at mapd's own 2 MB
 queue size. That size mismatch is the suspected cause of the v2.3.1 SIGBUS (see
-[the root cause](#root-cause-mapdout-queue-size-mismatch)). Nothing is confirmed
-on the road yet.
+[the root cause](#root-cause-mapdout-queue-size-mismatch)). Routes 532/534
+(2026-11-09, 39 min): `/dev/shm/msgq_mapdOut` is 2 MB, `mapdOut` arrived at a
+steady 20 Hz in every segment — 1200 messages per minute, no gap a respawn would
+leave — swaglog shows one `mapd` spawn before each drive and none during (the
+success criterion below), and no mapd error. Way-match quality against the tile
+reader is not assessed yet.
 
 Nothing in the control path notices. speedlimitd has always derived every control
 decision from the offline tile reader (`osm_query.OsmTileReader`); it consumes

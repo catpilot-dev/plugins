@@ -310,17 +310,18 @@ if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
     rm -f "$PLUGINS_DEST/lane_keeping/.disabled"
   fi
 fi
-# mapd is INTERFACE-ONLY as of 2026-08-19: plugin.json declares no process, so
-# the Go binary never launches. speedlimitd's control path is and always was the
-# offline tile reader (osm_query.OsmTileReader); mapdOut fed Phase-1 observation
-# telemetry only (mapd_source.telemetry_from_mapd), which degrades to
-# (None, False) when the service is absent — see speedlimitd.py:1285.
-# Still ENFORCED (not .disabled) on purpose: .disabled makes custom_capnp.py
-# revert slots 17-19 to the CustomReservedN stub and services.py drop mapdOut,
-# which would tear down the very interface we are keeping warm for the day
-# pfeiferj cuts a release containing gomsgq v0.1.11 (mapd commit fe45d10 —
-# shadow readers no longer panic on torn reads). Re-activation is one edit:
-# restore the "processes" entry in plugins/mapd/plugin.json.
+# mapd RUNS AGAIN as of 2026-11-09 (v2.4.0): plugin.json declares the process
+# and services.py registers mapdOut at mapd's own 2 MB queue size (the size
+# mismatch is the suspected cause of the v2.3.1 SIGBUS). First drives (routes
+# 532/534, 39 min): mapdOut continuous at 20 Hz in every segment, no mapd error
+# in the logs. speedlimitd's control path is still the offline tile reader
+# (osm_query.OsmTileReader); mapdOut is Phase-1 observation telemetry
+# (mapd_source.telemetry_from_mapd) that degrades to (None, False) when the
+# service is absent, and mapdExtendedOut.path feeds the G/S map curve cap
+# behind a Driving-panel toggle. ENFORCED (not .disabled) on purpose: .disabled
+# makes custom_capnp.py revert slots 17-19 to the CustomReservedN stub and
+# services.py drop mapdOut, which tears down the interface those consumers are
+# built against. Interface-only (no process) from 2026-08-19 to 2026-11-09.
 # History: v2.0.6-v2.2.0 hardcoded a slotless ("shadow") carState subscription
 # whose torn reads panic gomsgq; v2.3.0 made shadow per-queue but shipped the
 # OTHER queues slotted, and mapd's panic-restarts leak reader slots until the
