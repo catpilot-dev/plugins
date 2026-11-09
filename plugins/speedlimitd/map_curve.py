@@ -16,10 +16,14 @@ single misplaced node reads as a sharp curve. Here a vertex's curvature is the
 NET heading change across a window of `window_m` metres of path centred on it:
 a one-node zig-zag turns one way and straight back, so it largely cancels,
 while a real arc accumulates. The cancellation is partial for windows whose
-edge falls inside the zig-zag: on 20 m node spacing a single node misplaced by
-up to ~3.5 m stays under the 0.003 straight-road gate, a larger one does not.
-A wider window would hide that but loses sparse-node arcs (60 m spacing,
-R=400 reads as straight at 80 m), so 50 m is the compromise.
+edge falls inside the zig-zag, and with raw OSM segments that leak scales with
+1/node-spacing: dense nodes (5–10 m, common at bridges and junctions) turned a
+1–2 m misplaced node into a 50–70 km/h phantom cap. So the path is first
+resampled at a fixed MAP_CURVE_RESAMPLE_M, which bounds the leak by the
+resample spacing instead: a single node misplaced by up to ~3 m stays under
+the 0.003 straight-road gate at any node density. A wider window would hide
+more but loses sparse-node arcs (60 m spacing, R=400 reads as straight at
+80 m), so 50 m is the compromise.
 """
 import math
 from bisect import bisect_right
@@ -28,12 +32,14 @@ from typing import Callable, Sequence
 
 MAP_CURVE_WINDOW_M = 50.0
 MAP_CURVE_MAX_LOOKAHEAD_M = 800.0
+MAP_CURVE_RESAMPLE_M = 20.0
 TILE_BLIP_TOLERANCE_S = 2.0   # the tile reader may lose the G/S ref this long
 PATH_FRESH_S = 2.5            # mapdExtendedOut.position must change this often (1 Hz)
 
 _R_EARTH = 6371000.0
 _MIN_SEGMENT_M = 0.1
 _END_MARGIN_M = 0.5
+_BEHIND_START_M = 5.0   # car this far behind the path's first point → no path ahead
 
 
 @dataclass(frozen=True)
@@ -95,38 +101,59 @@ def map_curve_cap(points: Sequence[tuple[float, float]], car_lat: float, car_lon
   if len(xy) < 2:
     return None
 
-  # Cumulative arc length and per-segment bearing.
+  # Cumulative arc length of the raw polyline.
   cum = [0.0]
-  heading = []
   for (x0, y0), (x1, y1) in zip(xy, xy[1:]):
     cum.append(cum[-1] + math.hypot(x1 - x0, y1 - y0))
-    heading.append(math.atan2(x1 - x0, y1 - y0))
   total = cum[-1]
 
   # Project the car (at the origin) onto the polyline.
   best_d = math.inf
   s_car = 0.0
+  behind_start = 0.0
   for k, ((x0, y0), (x1, y1)) in enumerate(zip(xy, xy[1:])):
     dx, dy = x1 - x0, y1 - y0
     seg_len2 = dx * dx + dy * dy
-    t = max(0.0, min(1.0, (-x0 * dx - y0 * dy) / seg_len2))
+    t_raw = (-x0 * dx - y0 * dy) / seg_len2
+    t = max(0.0, min(1.0, t_raw))
     d = math.hypot(x0 + t * dx, y0 + t * dy)
     if d < best_d:
       best_d = d
       s_car = cum[k] + t * (cum[k + 1] - cum[k])
-  if s_car >= total - _END_MARGIN_M:
+      behind_start = -t_raw * math.sqrt(seg_len2) if k == 0 and t_raw < 0 else 0.0
+  if s_car >= total - _END_MARGIN_M or behind_start > _BEHIND_START_M:
     return None
 
-  def heading_at(s: float) -> float:
-    k = min(max(bisect_right(cum, s) - 1, 0), len(heading) - 1)
-    return heading[k]
+  # Resample at a fixed spacing (see module docstring) and take bearings there.
+  def point_at(s: float) -> tuple[float, float]:
+    k = min(max(bisect_right(cum, s) - 1, 0), len(xy) - 2)
+    f = (s - cum[k]) / (cum[k + 1] - cum[k])
+    return (xy[k][0] + f * (xy[k + 1][0] - xy[k][0]),
+            xy[k][1] + f * (xy[k + 1][1] - xy[k][1]))
+
+  n = max(int(total // MAP_CURVE_RESAMPLE_M), 1)
+  rs = [i * MAP_CURVE_RESAMPLE_M for i in range(n + 1)]
+  if total - rs[-1] > _MIN_SEGMENT_M:
+    rs.append(total)
+  rxy = [point_at(v) for v in rs]
+  heading = [math.atan2(x1 - x0, y1 - y0) for (x0, y0), (x1, y1) in zip(rxy, rxy[1:])]
+
+  def chord_at(s: float) -> int:
+    return min(max(bisect_right(rs, s) - 1, 0), len(heading) - 1)
+
+  def chord_mid(k: int) -> float:
+    return (rs[k] + rs[k + 1]) / 2.0
+
+  def to_ll(x: float, y: float) -> tuple[float, float]:
+    return (car_lat + math.degrees(y / _R_EARTH),
+            car_lon + math.degrees(x / (_R_EARTH * cos_lat)))
 
   half = window_m / 2.0
   horizon = s_car + max_lookahead_m
   cap_ms = None
   bind = (0.0, 0.0, None, None)
-  for i in range(1, len(xy) - 1):
-    s_i = cum[i]
+  for i in range(1, len(rxy) - 1):
+    s_i = rs[i]
     if s_i <= s_car:
       continue
     if s_i > horizon:
@@ -134,7 +161,13 @@ def map_curve_cap(points: Sequence[tuple[float, float]], car_lat: float, car_lon
     h = min(half, s_i, total - s_i)
     if h < window_m / 4.0:
       continue
-    kappa = abs(_wrap_pi(heading_at(s_i + h) - heading_at(s_i - h))) / (2.0 * h)
+    # A chord's bearing is the tangent at its midpoint, so divide the heading
+    # change by the midpoints' separation, not by the window width.
+    k_lo, k_hi = chord_at(s_i - h), chord_at(s_i + h)
+    span = chord_mid(k_hi) - chord_mid(k_lo)
+    if span <= 0.0:
+      continue
+    kappa = abs(_wrap_pi(heading[k_hi] - heading[k_lo])) / span
     if kappa < curve_gate:
       continue
     target_ay = max_lat_accel * _interp(kappa, [0.02, 0.035], [1.0, tight_curve_factor])
@@ -142,7 +175,7 @@ def map_curve_cap(points: Sequence[tuple[float, float]], car_lat: float, car_lon
     v_now = math.sqrt(target_ay / kappa + 2.0 * comfort_brake * d_i)
     if cap_ms is None or v_now < cap_ms:
       cap_ms = v_now
-      bind = (d_i, kappa, ll[i][0], ll[i][1])
+      bind = (d_i, kappa, *to_ll(*rxy[i]))
 
   path_ahead = min(total - s_car, max_lookahead_m)
   if cap_ms is None:

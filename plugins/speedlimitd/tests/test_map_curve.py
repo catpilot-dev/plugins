@@ -129,20 +129,33 @@ def test_car_past_path_end_is_none():
 
 
 def test_coarse_node_arc_still_detected():
-  # R=400 arc sampled every 60 m (sparse OSM nodes)
-  seg = straight_then_arc(300, radius=400)
+  # R=250 arc (κ=0.004, above the 0.003 gate) sampled every 60 m (sparse OSM
+  # nodes). With nodes wider apart than the window, a vertex's turn can only be
+  # placed to within a node gap, so the estimate is looser than on dense arcs.
+  seg = straight_then_arc(300, radius=250)
   r = map_curve.map_curve_cap(path_of(seg, 60), *car_on(seg, 0), **K)
-  assert r.kappa == pytest.approx(1 / 400, rel=0.3) and r.cap_kph > 0
+  assert r.kappa == pytest.approx(1 / 250, rel=0.5) and r.cap_kph > 0
 
 
-def test_single_node_kink_on_straight_does_not_bind():
-  # one vertex displaced 3 m laterally on an otherwise straight 1 km road
-  pts, _ = _walk(straight(1000), 20)
-  pts = [(x + 3.0, y) if abs(y - 300) < 1e-6 else (x, y) for x, y in pts]
+@pytest.mark.parametrize('spacing,offset', [(20, 3.0), (10, 2.0), (10, 2.5), (5, 1.0), (5, 2.0)])
+def test_single_node_kink_on_straight_does_not_bind(spacing, offset):
+  # one vertex displaced laterally on an otherwise straight 1.2 km road. Dense
+  # nodes (5–10 m, common at G/S bridges and junctions) are the hard case: a
+  # segment-bearing window edge landing on the kink segment sees its full
+  # deflection (review finding #1).
+  pts, _ = _walk(straight(1200), spacing)
+  pts = [(x + offset, y) if abs(y - 300) < 1e-6 else (x, y) for x, y in pts]
   path = [_to_ll(x, y) for x, y in pts]
-  for s in (0, 200, 280, 295):
+  for s in range(0, 300, 5):
     r = map_curve.map_curve_cap(path, *_to_ll(0.0, s), **K)
-    assert r.cap_kph == 0.0, f'car at {s} m'
+    assert r.cap_kph == 0.0, f'car at {s} m: phantom {r.cap_kph:.0f} km/h'
+
+
+def test_car_before_path_start_is_none():
+  # path starts 200 m ahead of the car (stale fix / path rebuilt ahead): no
+  # cap measured from the path start (review minor #1, plan review focus #3)
+  seg = straight_then_arc(400, radius=300)
+  assert map_curve.map_curve_cap(path_of(seg, 10), *_to_ll(0.0, -200.0), **K) is None
 
 
 def test_lateral_distance_reported():
