@@ -51,15 +51,18 @@ def inject_services(services_py: str, services: dict) -> int:
   # Rewrite stale single-line entries in place. Plugin service names never
   # collide with stock openpilot ones, so this only ever touches lines that a
   # plugin injected. A name present in any other form is left alone.
+  #
+  # EVERY matching line, not just the first: catpilot's boot-time
+  # selfdrive/plugins/builder.py appends its own "# plugin services
+  # (auto-generated)" block after ours, so a device carries each plugin
+  # service twice, and in a dict literal the LAST duplicate wins.
   for name, entry in sorted(services.items()):
     want = _entry_line(name, entry)
     entry_re = re.compile(rf'^\s*"{re.escape(name)}"\s*:\s*\(.*\),\s*$')
     for i, line in enumerate(lines):
-      if entry_re.match(line):
-        if line != want:
-          lines[i] = want
-          added += 1
-        break
+      if entry_re.match(line) and line != want:
+        lines[i] = want
+        added += 1
   content_now = "\n".join(lines)
 
   # Find closing brace of _services dict (standalone "}" line)

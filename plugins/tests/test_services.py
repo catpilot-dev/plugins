@@ -60,3 +60,16 @@ class TestInject:
     sl = _sl(p)
     assert sl['carState'] == (True, 100., 10)
     assert sl['modelV2'] == (True, 20., None, 10 * 1024 * 1024)
+
+  def test_rewrites_every_duplicate_not_just_the_first(self, tmp_path):
+    """The C3 carries mapdOut twice: install.sh's line, then the
+    "# plugin services (auto-generated)" block from catpilot's boot-time
+    builder.py. A dict literal keeps the LAST duplicate, so rewriting only
+    the first would leave the effective entry at 250 KB."""
+    p = _write(tmp_path, _STOCK.replace('}\n',
+        '  "mapdOut": (True, 20.0, 20),\n'
+        '  # plugin services (auto-generated)\n'
+        '  "mapdOut": (True, 20.0, 20),\n}\n'))
+    assert services.inject_services(str(p), {'mapdOut': [True, 20.0, 20, 2097152]}) == 2
+    assert _sl(p)['mapdOut'] == (True, 20.0, 20, 2097152)
+    assert '(True, 20.0, 20),' not in p.read_text()
