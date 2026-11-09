@@ -3998,3 +3998,22 @@ class TestMapCurveShaping:
     assert pub['mapCurveGate'] == 'sel_type' and pub['source'] == 4   # held
     pub = tick(dt=3.0)                                   # 3.2 s without a valid cap
     assert pub['source'] != 4                            # released
+
+
+class TestMapCurveTileRefMemory:
+  """Review Important #3: the 2 s tolerance must also cover a one-query tile
+  snap to a CROSSING G/S road, not only a snap to a non-G/S one."""
+
+  _s20_result = staticmethod(TestMapCurveTelemetry._s20_result)
+  _mapd_out = staticmethod(TestMapCurveTelemetry._mapd_out)
+  _extended = staticmethod(TestMapCurveTelemetry._extended)
+  _scenario = TestMapCurveTelemetry._scenario
+
+  def test_snap_to_crossing_gs_within_2s_keeps_gate_open(self, sld, monkeypatch):
+    mw, tick, _ = self._scenario(sld, monkeypatch)
+    assert tick()['mapCurveGate'] == 'ok'
+    mw._ingest_osm_result(self._s20_result(wayRef='G15', roadName='沈海高速',
+                                           refDistances={'G15': 2.0, 'S20': 6.0}))
+    assert tick()['mapCurveGate'] == 'ok'               # S20 was seen 0.2 s ago
+    pub = tick(dt=2.0)                                   # 2.2 s since S20, still G15
+    assert pub['mapCurveGate'] == 'ref_mismatch'

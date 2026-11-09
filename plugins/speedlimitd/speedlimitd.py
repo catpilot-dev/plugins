@@ -780,8 +780,7 @@ class SpeedLimitMiddleware:
     import map_curve
     self._map_curve = map_curve
     self.map_curve_enabled = False
-    self._mc_tile_ref = ''          # last G/S ref the tile reader matched...
-    self._mc_tile_ref_t = 0.0       # ...and when (the 2 s blip tolerance)
+    self._mc_tile_refs: dict[str, float] = {}   # G/S refs the tile reader matched → when
     self._mc_path_pos = None        # mapdExtendedOut.position last seen...
     self._mc_path_pos_t = 0.0       # ...and when it last changed (freshness)
     self._map_curve_gate = 'off_gs'
@@ -1116,8 +1115,16 @@ class SpeedLimitMiddleware:
     """Refresh the G/S map curve gate and cap. Never raises into update()."""
     try:
       mc = self._map_curve
+      # Every G/S ref the tile reader matched in the last 2 s, not only the
+      # latest: a one-query snap to a crossing G/S (S20 → G15 → S20) must not
+      # read as "mapd is on a different road".
       if is_gs_expressway_ref(self.last_way_ref):
-        self._mc_tile_ref, self._mc_tile_ref_t = self.last_way_ref, now
+        self._mc_tile_refs[self.last_way_ref] = now
+      recent = {r: t for r, t in self._mc_tile_refs.items()
+                if now - t <= mc.TILE_BLIP_TOLERANCE_S}
+      self._mc_tile_refs = recent
+      tile_ref = max(recent, key=recent.get) if recent else ''
+      tile_ref_age = now - recent[tile_ref] if recent else math.inf
 
       # Both mapd services must exist: without the path there is no cap to
       # compute, and that is "mapd absent", not "path stale".
@@ -1141,9 +1148,9 @@ class SpeedLimitMiddleware:
 
       gate = mc.map_curve_gate(
         gs_mode=gs_mode, gps_valid=self._gps_valid,
-        tile_ref=self._mc_tile_ref, tile_ref_age_s=now - self._mc_tile_ref_t,
+        tile_ref=tile_ref, tile_ref_age_s=tile_ref_age,
         mapd_ok=mapd_ok, mapd_sel_type=sel,
-        refs_match=mc.refs_share_gs(mapd_ref, self._mc_tile_ref, is_gs_expressway_ref),
+        refs_match=any(mc.refs_share_gs(mapd_ref, r, is_gs_expressway_ref) for r in recent),
         path_ok=path_ok, path_age_s=now - self._mc_path_pos_t)
       result = None
       if gate == 'ok':
