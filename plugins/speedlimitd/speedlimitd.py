@@ -330,6 +330,11 @@ TIGHT_CURVE_FACTOR = 0.75  # a_y target derate at hairpin-class curvature. Route
                            # buys margin around it.
 
 
+# Curvature below this is a straight road (~330 m radius). Shared by the vision
+# curve cap and the G/S map curve cap so both use one definition.
+MAP_CURVE_GATE_KAPPA = 0.003
+
+
 def _interp(x: float, xp: list, fp: list) -> float:
   """Clamped 1-D linear interpolation for a single scalar (no numpy dep)."""
   if x <= xp[0]:
@@ -415,7 +420,7 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5, kappa_meas: float
       conf_dist = min(MAX_VISION, positions_x[i])
       break
 
-  CURVE_GATE = 0.003  # negligible curvature (~330 m radius)
+  CURVE_GATE = MAP_CURVE_GATE_KAPPA  # negligible curvature (~330 m radius)
 
   # T_IDXS = 10 * (i/32)^2:  i=10 → 1.0s   i=22 → 4.7s   i=30 → 8.8s
   # Per-point pass within both time AND distance bounds. d_i is position.x[i]
@@ -737,6 +742,12 @@ class SpeedLimitMiddleware:
     self._mapd_service_available = 'mapdOut' in SERVICE_LIST
     if self._mapd_service_available:
       _subs.append('mapdOut')
+    # mapdExtendedOut carries mapd's road-ahead path for the G/S map curve cap.
+    # Injected the same way as mapdOut and absent for the same reasons, so it is
+    # subscribed on the same condition: an unknown service crash-loops SubMaster.
+    self._map_curve_service_available = 'mapdExtendedOut' in SERVICE_LIST
+    if self._map_curve_service_available:
+      _subs.append('mapdExtendedOut')
     self.sm = messaging.SubMaster(_subs)
     from openpilot.selfdrive.plugins.plugin_bus import PluginPub
     self._sl_pub = PluginPub('speedLimitState')
@@ -762,6 +773,20 @@ class SpeedLimitMiddleware:
     # control path — the tile reader above still drives everything.
     self._mapd_telemetry = mapd_source.telemetry_from_mapd(None, False, '')
     self._mapd_sample_error_logged = False  # log the sampling except: once, not every 5 s
+
+    # G/S map curve cap (docs/superpowers/specs/2026-11-09-mapd-gs-curve-lookahead-design.md).
+    # Computed only in G/S mode, always published as mapCurve* telemetry, and
+    # entering the speed decision only when the MapdCurveLookahead toggle is on.
+    import map_curve
+    self._map_curve = map_curve
+    self.map_curve_enabled = False
+    self._mc_tile_ref = ''          # last G/S ref the tile reader matched...
+    self._mc_tile_ref_t = 0.0       # ...and when (the 2 s blip tolerance)
+    self._mc_path_pos = None        # mapdExtendedOut.position last seen...
+    self._mc_path_pos_t = 0.0       # ...and when it last changed (freshness)
+    self._map_curve_gate = 'off_gs'
+    self._map_curve_result = None
+    self._map_curve_error_logged = False
 
     self.country_bboxes = load_country_bboxes()
     self.country_detected = False
@@ -1081,6 +1106,73 @@ class SpeedLimitMiddleware:
         v_react = v_ego * math.sqrt(threshold / ay) - REACT_HYST_MS
         self._react_cap_ms = min(self._react_cap_ms, max(v_react, REACT_MIN_SPEED))
     return self._react_cap_ms
+
+  def _update_map_curve(self, now: float, gs_mode: bool) -> None:
+    """Refresh the G/S map curve gate and cap. Never raises into update()."""
+    try:
+      mc = self._map_curve
+      if is_gs_expressway_ref(self.last_way_ref):
+        self._mc_tile_ref, self._mc_tile_ref_t = self.last_way_ref, now
+
+      # Both mapd services must exist: without the path there is no cap to
+      # compute, and that is "mapd absent", not "path stale".
+      mapd_ok = (self._mapd_service_available and self._map_curve_service_available
+                 and bool(self.sm.alive.get('mapdOut', False))
+                 and bool(self.sm.valid.get('mapdOut', False)))
+      mapd_ref, sel = '', ''
+      if mapd_ok:
+        mapd_out = self.sm['mapdOut']
+        mapd_ref, sel = mapd_out.wayRef or '', str(mapd_out.waySelectionType)
+
+      path_ok = (self._map_curve_service_available
+                 and bool(self.sm.alive.get('mapdExtendedOut', False))
+                 and bool(self.sm.valid.get('mapdExtendedOut', False)))
+      ext = None
+      if path_ok:
+        ext = self.sm['mapdExtendedOut']
+        pos = (float(ext.position.latitude), float(ext.position.longitude))
+        if pos != self._mc_path_pos:
+          self._mc_path_pos, self._mc_path_pos_t = pos, now
+
+      gate = mc.map_curve_gate(
+        gs_mode=gs_mode, gps_valid=self._gps_valid,
+        tile_ref=self._mc_tile_ref, tile_ref_age_s=now - self._mc_tile_ref_t,
+        mapd_ok=mapd_ok, mapd_sel_type=sel,
+        refs_match=mc.refs_share_gs(mapd_ref, self._mc_tile_ref, is_gs_expressway_ref),
+        path_ok=path_ok, path_age_s=now - self._mc_path_pos_t)
+      result = None
+      if gate == 'ok':
+        result = mc.map_curve_cap(
+          [(p.latitude, p.longitude) for p in ext.path], self._gps_lat, self._gps_lon,
+          max_lat_accel=self.curve_target_lat_accel, comfort_brake=COMFORT_BRAKE,
+          tight_curve_factor=TIGHT_CURVE_FACTOR, curve_gate=MAP_CURVE_GATE_KAPPA)
+        if result is None:
+          gate = 'no_path_ahead'
+      self._map_curve_gate, self._map_curve_result = gate, result
+    except Exception:
+      self._map_curve_gate, self._map_curve_result = 'error', None
+      if not self._map_curve_error_logged:
+        self._map_curve_error_logged = True
+        try:
+          from openpilot.common.swaglog import cloudlog
+          cloudlog.warning("speedlimitd: map curve cap failed")
+        except Exception:
+          pass
+
+  def _map_curve_telemetry(self) -> dict:
+    """mapCurve* keys for speedLimitState — published every tick, toggle on or off."""
+    r = self._map_curve_result if self._map_curve_gate == 'ok' else None
+    has_cap = r is not None and r.cap_kph > 0
+    return {
+      'mapCurveCap': int(round(r.cap_kph)) if has_cap else 0,
+      'mapCurveActive': self.map_curve_enabled,
+      'mapCurveDist': round(r.dist_m, 1) if has_cap else 0.0,
+      'mapCurveKappa': round(r.kappa, 5) if has_cap else 0.0,
+      'mapCurveLatLon': [round(r.lat, 6), round(r.lon, 6)] if has_cap else [],
+      'mapCurvePathAhead': int(round(r.path_ahead_m)) if r is not None else 0,
+      'mapCurveLat': round(r.lateral_m, 1) if r is not None else 0.0,
+      'mapCurveGate': self._map_curve_gate,
+    }
 
   def _ingest_osm_result(self, result: dict | None):
     """Update road identity state from an OSM tile query result.
@@ -1551,6 +1643,7 @@ class SpeedLimitMiddleware:
             and now - self._gs_absent_since >= GS_RELEASE_CONT_S)
         or self.lane_count_stable <= 2)
     gs_mode = not gs_released
+    self._update_map_curve(now, gs_mode)
 
     # OSM Data Integration: a fresh posted limit replaces the base inference
     # entirely (vision stays the fallback; safety caps below still min() over
@@ -1679,6 +1772,7 @@ class SpeedLimitMiddleware:
       # reach planner_hook, so any accidental key collision below must win
       # over these keys, not silently override them.
       **self._mapd_telemetry,
+      **self._map_curve_telemetry(),
       'speedLimit': self._displayed_speed_limit,
       'source': source,
       'confirmed': self.confirmed,
