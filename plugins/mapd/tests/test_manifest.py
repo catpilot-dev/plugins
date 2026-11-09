@@ -64,6 +64,15 @@ class TestService:
     assert entry[3] == 2 * 1024 * 1024
 
 
+  def test_extended_out_registered_at_mapds_queue_size(self):
+    """mapd creates mapdExtendedOut at QUEUE_SIZE_MEDIUM (2 MB), same as
+    mapdOut. A smaller registration shrinks mapd's shm file and SIGBUSes its
+    publisher (README root-cause section). Not logged: the spec keeps the path
+    out of the rlog, and the binding point travels in speedLimitState."""
+    entry = _manifest()['services']['mapdExtendedOut']
+    assert entry == [False, 1.0, None, 2 * 1024 * 1024]
+
+
 class TestProcess:
   def test_mapd_process_is_declared(self):
     """Re-activated on v2.4.0 (2026-11-09) with mapdOut's queue_size set to 2 MB.

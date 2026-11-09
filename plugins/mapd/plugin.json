@@ -29,7 +29,8 @@
     "standalone_schema": "cereal/standalone.capnp"
   },
   "services": {
-    "mapdOut": [true, 20.0, 20, 2097152]
+    "mapdOut": [true, 20.0, 20, 2097152],
+    "mapdExtendedOut": [false, 1.0, null, 2097152]
   },
   "panel": false,
   "hooks": {

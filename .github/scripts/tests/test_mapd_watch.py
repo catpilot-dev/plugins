@@ -584,6 +584,7 @@ class TestChecklist:
     body = mw._issue_body(_release(), '### Schema\n', '')
     assert 'ServiceQueueSize["mapdOut"]' in body
     assert 'plugins/mapd/plugin.json' in body
+    assert 'ServiceQueueSize["mapdExtendedOut"]' in body
 
 
 class TestPlanReleases:

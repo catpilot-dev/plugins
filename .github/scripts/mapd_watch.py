@@ -441,10 +441,11 @@ def _issue_body(release: dict, schema: str, commit: str) -> str:
 - [ ] bump the pin to `{tag}` in BOTH `plugins/mapd/mapd_manager.py`
       (`MAX_ALLOWED_VERSION`) and `plugins/mapd/plugin.json` (`MapdVersion`
       default); `test_manifest.py` fails if they drift
-- [ ] check that `ServiceQueueSize["mapdOut"]` in upstream `settings/const.go` still
-      equals the 4th element of `mapdOut` in `plugins/mapd/plugin.json` (2 MB).
-      Every opener ftruncates the shared queue file to its own size, so a mismatch
-      shrinks it under mapd's mmap and SIGBUSes the publisher
+- [ ] check that `ServiceQueueSize["mapdOut"]` and `ServiceQueueSize["mapdExtendedOut"]`
+      in upstream `settings/const.go` still equal the 4th element of the matching
+      entries in `plugins/mapd/plugin.json` (2 MB). Every opener ftruncates the
+      shared queue file to its own size, so a mismatch shrinks it under mapd's
+      mmap and SIGBUSes the publisher
 - [ ] read the release notes for new settings keys that `mapd_defaults.json`
       should declare
 - [ ] keep **every** `subscriber` entry in `mapd_defaults.json` on `shadow: true`.
