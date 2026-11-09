@@ -3843,15 +3843,19 @@ class TestMapCurveTelemetry:
     assert len(pub['mapCurveLatLon']) == 2 and pub['mapCurveActive'] is False
 
   def test_toggle_off_actuation_identical(self, sld, monkeypatch):
-    """Load-bearing: with the toggle off a sharp curve ahead changes nothing
-    but the mapCurve* keys."""
-    mw_a, tick_a, _ = self._scenario(sld, monkeypatch, with_path=True)
-    pub_a = tick_a()
-    mw_b, tick_b, _ = self._scenario(sld, monkeypatch, with_path=False)
-    pub_b = tick_b()
-    assert pub_a['mapCurveCap'] > 0                    # the curve really was seen
+    """Load-bearing: with the toggle off a curve ahead that WOULD bind changes
+    nothing but the mapCurve* keys, tick after tick (review Important #4: the
+    first version sat at s=0, where the cap is above the limit, so it passed
+    even with the toggle check deleted)."""
+    import config
+    monkeypatch.setattr(config, 'read_plugin_param', lambda pid, key, default='': '')
+    _, tick_a, _ = self._scenario(sld, monkeypatch, with_path=True, car_s=390)
+    _, tick_b, _ = self._scenario(sld, monkeypatch, with_path=False, car_s=390)
     strip = lambda p: {k: v for k, v in p.items() if not k.startswith('mapCurve')}
-    assert strip(pub_a) == strip(pub_b)
+    for _ in range(10):
+      pub_a, pub_b = tick_a(), tick_b()
+      assert 30 < pub_a['mapCurveShaped'] < pub_b['speedLimit']   # it WOULD bind
+      assert strip(pub_a) == strip(pub_b)
 
   def test_frozen_path_position_goes_stale(self, sld, monkeypatch):
     mw, tick, _ = self._scenario(sld, monkeypatch)
