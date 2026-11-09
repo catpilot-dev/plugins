@@ -51,8 +51,8 @@ MAINTAINER = '@OxygenLiu'
 # the check and drops the section from the issue body. Empty since 2026-08-21:
 # it held `fe45d10` (PR #133, gomsgq v0.1.11) while mapd was dormant over the
 # ungated `panic("Invalid Msgq message size")` that killed the binary on a
-# shadow reader's expected torn read. v2.3.1 carries that fix and we are pinned
-# to it, so every future release contains it too and the section would be noise.
+# shadow reader's expected torn read. v2.3.1 carries that fix and every later
+# release (we are pinned past it) does too, so the section would be noise.
 # Set it again if a future upstream fix ever gates us the same way.
 REQUIRED_COMMIT = ''
 
@@ -410,6 +410,16 @@ def _issue_body(release: dict, schema: str, commit: str) -> str:
     tag = release['tag_name']
     has_asset = any(a.get('name') == 'mapd' for a in release.get('assets') or [])
     asset = '`mapd` present' if has_asset else '**no `mapd` asset** — not installable'
+    # The gate sentence names only the sections this body actually carries: with
+    # REQUIRED_COMMIT retired there is one verdict section, not two, and "both
+    # sections above" pointed at a section that was not there.
+    if commit:
+        gate = ("Bump only once **both** sections above say yes: the crash fix is "
+                "in, and every field listed under Schema has landed in its slot "
+                "file.")
+    else:
+        gate = ("Bump only once every field listed under **Schema** has landed in "
+                "its slot file, or the section says identical.")
     return f"""{MARKER} {tag}
 
 {MAINTAINER} — new mapd release upstream. We are pinned to `{MAX_ALLOWED_VERSION}`.
@@ -423,21 +433,28 @@ def _issue_body(release: dict, schema: str, commit: str) -> str:
 
 {commit}
 {schema}
-### Re-activation checklist
+### Bump checklist
 
-Only if both sections above say yes. This issue reports; it changes nothing.
+{gate} This issue reports; it changes nothing.
 
-- [ ] restore the process entry in `plugins/mapd/plugin.json`:
-      `"processes": [{{"name": "mapd", "module": "mapd_runner", "condition": "always_run"}}]`
-- [ ] bump `MAX_ALLOWED_VERSION` in `plugins/mapd/mapd_manager.py` to `{tag}`
-- [ ] keep **every** `subscriber` entry in `mapd_defaults.json` on `shadow: true`
-      — v0.1.11 still has no deregistration, so slotted readers still leak a slot
-      per death (`selfdriveState` was measured 15/15 full)
-- [ ] success criterion: one long-lived mapd PID across a whole drive, versus
-      the 1–2 min flap baseline
+- [ ] add every field listed under Schema to the slot file it names
+- [ ] bump the pin to `{tag}` in BOTH `plugins/mapd/mapd_manager.py`
+      (`MAX_ALLOWED_VERSION`) and `plugins/mapd/plugin.json` (`MapdVersion`
+      default); `test_manifest.py` fails if they drift
+- [ ] check that `ServiceQueueSize["mapdOut"]` in upstream `settings/const.go` still
+      equals the 4th element of `mapdOut` in `plugins/mapd/plugin.json` (2 MB).
+      Every opener ftruncates the shared queue file to its own size, so a mismatch
+      shrinks it under mapd's mmap and SIGBUSes the publisher
+- [ ] read the release notes for new settings keys that `mapd_defaults.json`
+      should declare
+- [ ] keep **every** `subscriber` entry in `mapd_defaults.json` on `shadow: true`.
+      gomsgq still has no deregistration, so slotted readers leak a slot per
+      death (`selfdriveState` was measured 15/15 full)
+- [ ] deploy, then reboot (plugind freezes manifests at discovery). Success
+      criterion: one long-lived mapd PID across a whole drive
 
-Close this issue once handled — bumped or dismissed. Either way this tag will
-not be reported again.
+Close this issue once handled, whether bumped or dismissed. Either way this tag
+will not be reported again.
 """
 
 

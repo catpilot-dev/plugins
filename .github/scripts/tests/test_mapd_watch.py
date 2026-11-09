@@ -19,9 +19,8 @@ _spec.loader.exec_module(mw)
 # the clean case needs a real fixture, or "identical" only ever proves the
 # parser agrees with itself.
 #
-# This is now the OLDER of the two real fixtures: our slots have caught up to
-# v2.3.1, so v2.3.0 is behind us and is kept only to prove the differ reports
-# that direction as `removed` rather than as a clean diff.
+# The oldest real fixture, now only the base the newer fixtures are derived
+# from: v2.3.1 and v2.4.0 below are each one verbatim upstream delta on top.
 _V230_CUSTOM_CAPNP = """using Go = import "/go.capnp";
 @0xb526ba661d550a59;
 $Go.package("custom");
@@ -202,10 +201,8 @@ struct MapdOut @0xa4f1eb3323f5f582 {
 
 # v2.3.1 changed exactly this and nothing else: two new MapdExtendedOut fields,
 # MapdOut untouched — which is why the single-struct differ called it
-# "schema-safe. No new fields." (issue #30). We have since adopted both fields
-# and pinned v2.3.1, so THIS is the clean baseline: every struct here is
-# field-identical to the slot files on disk, and every synthetic mutation below
-# is exactly one deliberate step away from clean.
+# "schema-safe. No new fields." (issue #30). We adopted both fields and pinned
+# v2.3.1; since the v2.4.0 bump this is the release BEHIND our slots.
 _V231_CUSTOM_CAPNP = _V230_CUSTOM_CAPNP.replace(
     '  position @3 :MapdPosition;\n',
     '  position @3 :MapdPosition;\n'
@@ -218,7 +215,16 @@ _V231_CUSTOM_CAPNP = _V230_CUSTOM_CAPNP.replace(
 # v2.3.1; they will not lag whatever comes next either, once it is adopted.
 # Synthetic keeps "a change confined to a non-MapdOut struct is still caught"
 # true forever.
-_EXTENDED_ONLY_CHANGE_CAPNP = _V231_CUSTOM_CAPNP.replace(
+# v2.4.0 added exactly `isForward @27 :Bool` to MapdOut (issue #31). We adopted
+# it and pinned v2.4.0, so THIS is the clean baseline: every struct here is
+# field-identical to the slot files on disk, and every synthetic mutation below
+# is exactly one deliberate step away from clean.
+_V240_CUSTOM_CAPNP = _V231_CUSTOM_CAPNP.replace(
+    '  conditionalSpeedLimit @26 :Text;\n',
+    '  conditionalSpeedLimit @26 :Text;\n  isForward @27 :Bool;\n')
+assert 'isForward' in _V240_CUSTOM_CAPNP  # fixture, not a no-op
+
+_EXTENDED_ONLY_CHANGE_CAPNP = _V240_CUSTOM_CAPNP.replace(
     '  loopRateMin @5 :Float32;\n',
     '  loopRateMin @5 :Float32;\n  someFutureField @6 :Float32;\n')
 assert 'someFutureField' in _EXTENDED_ONLY_CHANGE_CAPNP  # fixture, not a no-op
@@ -230,7 +236,7 @@ _OURS_FIELDS = _OURS['MapdOut']
 _OURS_ENUMS = mw.STANDALONE_CAPNP.read_text()
 
 
-def _release(tag='v2.4.0', **over):
+def _release(tag='v2.5.0', **over):
   r = {'tag_name': tag, 'draft': False, 'prerelease': False,
        'published_at': '2026-09-01T00:00:00Z',
        'html_url': f'https://github.com/pfeiferj/mapd/releases/tag/{tag}',
@@ -273,20 +279,20 @@ class TestParseFields:
   real struct at install time."""
 
   def test_parses_the_wrapped_upstream_struct(self):
-    fields = mw.parse_fields(_V231_CUSTOM_CAPNP, 'MapdOut')
-    assert len(fields) == 27
-    assert sorted(f['ordinal'] for f in fields.values()) == list(range(27))
+    fields = mw.parse_fields(_V240_CUSTOM_CAPNP, 'MapdOut')
+    assert len(fields) == 28
+    assert sorted(f['ordinal'] for f in fields.values()) == list(range(28))
     assert fields['highwayClass'] == {'ordinal': 24, 'type': 'HighwayClass'}
 
   def test_parses_our_bare_fragment(self):
     fields = mw.parse_fields(_OURS_FIELDS, 'MapdOut')
-    assert len(fields) == 27
-    assert sorted(f['ordinal'] for f in fields.values()) == list(range(27))
+    assert len(fields) == 28
+    assert sorted(f['ordinal'] for f in fields.values()) == list(range(28))
     assert fields['conditionalSpeedLimit'] == {'ordinal': 26, 'type': 'Text'}
 
   def test_parses_the_other_two_watched_structs(self):
     """MapdExtendedOut and MapdIn are consumed exactly like MapdOut."""
-    assert mw.parse_fields(_V231_CUSTOM_CAPNP, 'MapdExtendedOut') == {
+    assert mw.parse_fields(_V240_CUSTOM_CAPNP, 'MapdExtendedOut') == {
         'downloadProgress': {'ordinal': 0, 'type': 'MapdDownloadProgress'},
         'settings': {'ordinal': 1, 'type': 'Text'},
         'path': {'ordinal': 2, 'type': 'List(MapdPathPoint)'},
@@ -294,23 +300,23 @@ class TestParseFields:
         'loopRateAverage': {'ordinal': 4, 'type': 'Float32'},
         'loopRateMin': {'ordinal': 5, 'type': 'Float32'},
     }
-    assert set(mw.parse_fields(_V231_CUSTOM_CAPNP, 'MapdIn')) == {
+    assert set(mw.parse_fields(_V240_CUSTOM_CAPNP, 'MapdIn')) == {
         'type', 'float', 'str', 'bool', 'jsonPath'}
 
   def test_does_not_absorb_fields_from_neighbouring_structs(self):
     """MapdPosition's latitude/longitude sit above MapdOut in the same file."""
-    assert 'latitude' not in mw.parse_fields(_V231_CUSTOM_CAPNP, 'MapdOut')
+    assert 'latitude' not in mw.parse_fields(_V240_CUSTOM_CAPNP, 'MapdOut')
 
   def test_missing_struct_in_a_file_with_blocks_is_an_error_not_a_scrape(self):
     """A rename or deletion must fail loudly. Falling back to bare-fragment
     mode here would scrape every field line in the file and report a
     plausible-looking diff against a struct that no longer exists."""
     with pytest.raises(mw.SchemaError):
-      mw.parse_fields(_V231_CUSTOM_CAPNP.replace('struct MapdOut',
+      mw.parse_fields(_V240_CUSTOM_CAPNP.replace('struct MapdOut',
                                                  'struct MapdOutV2'), 'MapdOut')
 
   def test_ignores_commented_out_field_lines(self):
-    text = _OURS_FIELDS + "\n  # futureField @27 :Text;\n"
+    text = _OURS_FIELDS + "\n  # futureField @28 :Text;\n"
     assert 'futureField' not in mw.parse_fields(text, 'MapdOut')
 
 
@@ -323,49 +329,48 @@ class TestParseEnum:
     assert mw.parse_enum(_OURS_ENUMS, 'NoSuchEnum') is None
 
   def test_referenced_enums_are_derived_from_the_field_types(self):
-    fields = mw.parse_fields(_V231_CUSTOM_CAPNP, 'MapdOut')
-    assert set(mw.referenced_enums(fields, _V231_CUSTOM_CAPNP)) == {
+    fields = mw.parse_fields(_V240_CUSTOM_CAPNP, 'MapdOut')
+    assert set(mw.referenced_enums(fields, _V240_CUSTOM_CAPNP)) == {
         'RoadContext', 'WaySelectionType', 'HighwayClass'}
 
   def test_struct_typed_fields_are_not_mistaken_for_enums(self):
     """MapdExtendedOut's fields are structs, lists and floats — no enums."""
-    fields = mw.parse_fields(_V231_CUSTOM_CAPNP, 'MapdExtendedOut')
-    assert mw.referenced_enums(fields, _V231_CUSTOM_CAPNP) == []
+    fields = mw.parse_fields(_V240_CUSTOM_CAPNP, 'MapdExtendedOut')
+    assert mw.referenced_enums(fields, _V240_CUSTOM_CAPNP) == []
 
 
 class TestDiffSchema:
-  def test_v231_is_identical_to_our_slots(self):
-    """The real baseline: all three structs at v2.3.1 — the version we pin and
+  def test_v240_is_identical_to_our_slots(self):
+    """The real baseline: all three structs at v2.5.0 — the version we pin and
     run — are field-identical to slot17/18/19.capnp. The counts are asserted
     too, and per struct: a differ that parsed nothing would otherwise report
     'identical' vacuously."""
-    diff = mw.diff_schema(_V231_CUSTOM_CAPNP, _OURS, _OURS_ENUMS)
+    diff = mw.diff_schema(_V240_CUSTOM_CAPNP, _OURS, _OURS_ENUMS)
     assert diff['identical']
     assert set(diff['structs']) == set(mw.WATCHED_STRUCTS)
     counts = {n: (s['theirs_field_count'], s['ours_field_count'])
               for n, s in diff['structs'].items()}
     assert counts == {'MapdExtendedOut': (6, 6), 'MapdIn': (5, 5),
-                      'MapdOut': (27, 27)}
+                      'MapdOut': (28, 28)}
     for s in diff['structs'].values():
       assert s['identical']
       assert s['added'] == s['removed'] == s['changed'] == []
 
-  def test_v230_is_now_behind_our_slots(self):
-    """Our slots caught up to v2.3.1, so the older release is the side that is
-    missing fields. That must surface as `removed` (fields WE declare that
+  def test_v231_is_now_behind_our_slots(self):
+    """Our slots caught up to v2.5.0, so the older release is the side that is
+    missing a field. That must surface as `removed` (a field WE declare that
     upstream lacks) and never as 'identical': downgrading the pin is safe to
     read but is not a pure add, and the issue body has to say so."""
-    diff = mw.diff_schema(_V230_CUSTOM_CAPNP, _OURS, _OURS_ENUMS)
+    diff = mw.diff_schema(_V231_CUSTOM_CAPNP, _OURS, _OURS_ENUMS)
     assert not diff['identical']
-    assert diff['structs']['MapdOut']['identical']
+    assert diff['structs']['MapdExtendedOut']['identical']
     assert diff['structs']['MapdIn']['identical']
-    extended = diff['structs']['MapdExtendedOut']
-    assert not extended['identical']
-    assert extended['added'] == []
-    assert extended['removed'] == [('loopRateAverage', 4, 'Float32'),
-                                   ('loopRateMin', 5, 'Float32')]
-    assert extended['theirs_field_count'] == 4
-    assert extended['ours_field_count'] == 6
+    out = diff['structs']['MapdOut']
+    assert not out['identical']
+    assert out['added'] == []
+    assert out['removed'] == [('isForward', 27, 'Bool')]
+    assert out['theirs_field_count'] == 27
+    assert out['ours_field_count'] == 28
 
   def test_a_change_outside_mapd_out_is_still_caught(self):
     """REGRESSION (issue #30). The differ once read MapdOut and nothing else,
@@ -386,18 +391,18 @@ class TestDiffSchema:
     assert extended['slot'] == 'plugins/mapd/cereal/slot17.capnp'
 
   def test_reports_an_upstream_added_field(self):
-    theirs = _V231_CUSTOM_CAPNP.replace(
-        '  conditionalSpeedLimit @26 :Text;',
-        '  conditionalSpeedLimit @26 :Text;\n  tollRoad @27 :Bool;')
+    theirs = _V240_CUSTOM_CAPNP.replace(
+        '  isForward @27 :Bool;',
+        '  isForward @27 :Bool;\n  tollRoad @28 :Bool;')
     diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
     assert not diff['identical']
-    assert diff['structs']['MapdOut']['added'] == [('tollRoad', 27, 'Bool')]
-    assert diff['structs']['MapdOut']['theirs_field_count'] == 28
+    assert diff['structs']['MapdOut']['added'] == [('tollRoad', 28, 'Bool')]
+    assert diff['structs']['MapdOut']['theirs_field_count'] == 29
 
   def test_reports_a_field_added_to_mapd_in(self):
     """MapdIn is what WE publish, so an upstream addition there is a command we
     cannot send — silent in exactly the same way."""
-    theirs = _V231_CUSTOM_CAPNP.replace(
+    theirs = _V240_CUSTOM_CAPNP.replace(
         '  jsonPath @4 :Text;\n}', '  jsonPath @4 :Text;\n  int @5 :Int64;\n}')
     diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
     assert not diff['identical']
@@ -405,7 +410,7 @@ class TestDiffSchema:
     assert diff['structs']['MapdOut']['identical']
 
   def test_reports_an_upstream_added_enumerant(self):
-    theirs = _V231_CUSTOM_CAPNP.replace(
+    theirs = _V240_CUSTOM_CAPNP.replace(
         '  livingStreet @13;', '  livingStreet @13;\n  service @14;')
     diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
     assert not diff['identical']
@@ -416,7 +421,7 @@ class TestDiffSchema:
   def test_diffs_an_enum_reached_only_through_mapd_in(self):
     """MapdInputType is referenced by no MapdOut field at all. A new input type
     we cannot name is a command we cannot send."""
-    theirs = _V231_CUSTOM_CAPNP.replace(
+    theirs = _V240_CUSTOM_CAPNP.replace(
         '  setShadowGpsLocationExternal @46;',
         '  setShadowGpsLocationExternal @46;\n  setShadowLiveDelay @47;')
     diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
@@ -425,15 +430,15 @@ class TestDiffSchema:
     assert inputs['added'] == [('setShadowLiveDelay', 47)]
 
   def test_reports_a_renumbered_field_as_changed(self):
-    theirs = _V231_CUSTOM_CAPNP.replace('  wayId @25 :Int64;',
+    theirs = _V240_CUSTOM_CAPNP.replace('  wayId @25 :Int64;',
                                         '  wayId @25 :UInt64;')
     diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
     assert [n for n, _, _ in diff['structs']['MapdOut']['changed']] == ['wayId']
 
   def test_reports_an_enum_we_do_not_declare_at_all(self):
-    theirs = _V231_CUSTOM_CAPNP.replace(
-        '  conditionalSpeedLimit @26 :Text;',
-        '  conditionalSpeedLimit @26 :Text;\n  surface @27 :SurfaceType;'
+    theirs = _V240_CUSTOM_CAPNP.replace(
+        '  isForward @27 :Bool;',
+        '  isForward @27 :Bool;\n  surface @28 :SurfaceType;'
     ).replace('struct MapdOut',
               'enum SurfaceType {\n  paved @0;\n  gravel @1;\n}\n\nstruct MapdOut')
     diff = mw.diff_schema(theirs, _OURS, _OURS_ENUMS)
@@ -448,26 +453,26 @@ class TestDiffSchema:
     """Only MapdOut renamed — the other two still parse. The verdict must not
     be 'two of three are fine'."""
     with pytest.raises(mw.SchemaError):
-      mw.diff_schema(_V231_CUSTOM_CAPNP.replace('struct MapdExtendedOut',
+      mw.diff_schema(_V240_CUSTOM_CAPNP.replace('struct MapdExtendedOut',
                                                 'struct MapdExtendedOutV2'),
                      _OURS, _OURS_ENUMS)
 
 
 class TestSchemaSection:
   def test_clean_diff_says_schema_safe(self):
-    section = mw.schema_section('v2.4.0', fetch=lambda tag: _V231_CUSTOM_CAPNP)
+    section = mw.schema_section('v2.5.0', fetch=lambda tag: _V240_CUSTOM_CAPNP)
     assert 'schema-safe' in section
     # Per-struct counts, so a vacuous "identical" stays impossible.
-    assert '`MapdOut` upstream: 27 fields' in section
+    assert '`MapdOut` upstream: 28 fields' in section
     assert '`MapdExtendedOut` upstream: 6 fields' in section
     assert '`MapdIn` upstream: 5 fields' in section
 
   def test_added_field_is_listed_by_name_and_ordinal(self):
-    theirs = _V231_CUSTOM_CAPNP.replace(
-        '  conditionalSpeedLimit @26 :Text;',
-        '  conditionalSpeedLimit @26 :Text;\n  tollRoad @27 :Bool;')
-    section = mw.schema_section('v2.4.0', fetch=lambda tag: theirs)
-    assert '`tollRoad @27 :Bool;`' in section
+    theirs = _V240_CUSTOM_CAPNP.replace(
+        '  isForward @27 :Bool;',
+        '  isForward @27 :Bool;\n  tollRoad @28 :Bool;')
+    section = mw.schema_section('v2.5.0', fetch=lambda tag: theirs)
+    assert '`tollRoad @28 :Bool;`' in section
     assert 'add to `plugins/mapd/cereal/slot19.capnp`' in section
     assert 'schema-safe' not in section
 
@@ -477,7 +482,7 @@ class TestSchemaSection:
     that struct and point at its slot file. Synthetic (see
     _EXTENDED_ONLY_CHANGE_CAPNP) so the guard outlives every pin bump."""
     section = mw.schema_section(
-        'v2.4.0', fetch=lambda tag: _EXTENDED_ONLY_CHANGE_CAPNP)
+        'v2.5.0', fetch=lambda tag: _EXTENDED_ONLY_CHANGE_CAPNP)
     assert 'schema-safe' not in section
     assert '`MapdExtendedOut`' in section
     assert 'slot17' in section
@@ -486,7 +491,7 @@ class TestSchemaSection:
     # The clean structs are still named, with their counts, so "we checked all
     # three" is visible rather than assumed.
     assert '`MapdOut` → `plugins/mapd/cereal/slot19.capnp`: identical.' in section
-    assert '`MapdOut` upstream: 27 fields' in section
+    assert '`MapdOut` upstream: 28 fields' in section
 
   def test_unfetchable_file_still_yields_a_section_stating_the_gap(self):
     """The one exception to fail-loudly: a release notification is worth more
@@ -494,7 +499,7 @@ class TestSchemaSection:
     def _boom(tag):
       raise mw.requests.HTTPError('404')
 
-    section = mw.schema_section('v2.4.0', fetch=_boom)
+    section = mw.schema_section('v2.5.0', fetch=_boom)
     assert 'Could not be checked' in section
     assert 'by hand' in section
     # Every slot the reader has to diff by hand is named.
@@ -515,7 +520,7 @@ class TestCommitSection:
 
   @pytest.mark.parametrize('status', ['ahead', 'identical'])
   def test_ahead_or_identical_means_the_fix_is_in(self, status):
-    section = mw.commit_section('v2.4.0', status)
+    section = mw.commit_section('v2.5.0', status)
     assert 'Contains' in section
     assert 'Does NOT contain' not in section
 
@@ -526,7 +531,7 @@ class TestCommitSection:
     assert 'Does NOT contain' in section
 
   def test_unrecognised_status_asks_for_a_hand_check(self):
-    assert 'by hand' in mw.commit_section('v2.4.0', 'wat')
+    assert 'by hand' in mw.commit_section('v2.5.0', 'wat')
 
   def test_retired_gate_is_the_shipped_default(self):
     """The autouse fixture arms the gate; the shipped constant must be empty,
@@ -539,21 +544,52 @@ class TestCommitSection:
 
   def test_empty_required_commit_drops_the_section(self, monkeypatch):
     monkeypatch.setattr(mw, 'REQUIRED_COMMIT', '')
-    assert mw.commit_section('v2.4.0', 'behind') == ''
+    assert mw.commit_section('v2.5.0', 'behind') == ''
 
   def test_build_issue_skips_the_compare_call_once_the_gate_is_retired(self, monkeypatch):
     monkeypatch.setattr(mw, 'REQUIRED_COMMIT', '')
     monkeypatch.setattr(mw, 'fetch_compare_status', lambda tag: pytest.fail(
         'compare must not be called with REQUIRED_COMMIT retired'))
-    monkeypatch.setattr(mw, 'fetch_upstream_capnp', lambda tag: _V231_CUSTOM_CAPNP)
+    monkeypatch.setattr(mw, 'fetch_upstream_capnp', lambda tag: _V240_CUSTOM_CAPNP)
     body = mw.build_issue(_release())['body']
-    assert 'gomsgq' not in body
+    # The section heading, not the word "gomsgq": the checklist itself names
+    # gomsgq when it explains why subscribers stay shadow.
+    assert '### Crash fix' not in body
+
+
+class TestChecklist:
+  """The checklist gate must name only the sections the body actually has.
+
+  REGRESSION (issue #31): with REQUIRED_COMMIT retired the body carried one
+  verdict section, yet the checklist still said "Only if both sections above
+  say yes", pointing the reader at a section that was not there."""
+
+  def test_retired_gate_names_only_the_schema_section(self):
+    body = mw._issue_body(_release(), '### Schema\n', '')
+    assert 'both' not in body.lower().split('### bump checklist')[1].split('- [ ]')[0]
+    assert 'every field listed under **Schema**' in body
+
+  def test_armed_gate_names_both_sections(self):
+    body = mw._issue_body(_release(), '### Schema\n', '### Crash fix (x)\n')
+    assert '**both** sections above' in body
+
+  def test_checklist_is_a_bump_not_a_reactivation(self):
+    """mapd runs again since v2.4.0. "Restore the process entry" would tell
+    the reader to re-add something that is already there."""
+    body = mw._issue_body(_release(), '### Schema\n', '')
+    assert 'Re-activation' not in body
+    assert 'restore the process entry' not in body
+
+  def test_checklist_carries_the_queue_size_check(self):
+    body = mw._issue_body(_release(), '### Schema\n', '')
+    assert 'ServiceQueueSize["mapdOut"]' in body
+    assert 'plugins/mapd/plugin.json' in body
 
 
 class TestPlanReleases:
   def test_newer_than_the_pin_is_reported(self):
-    planned = mw.plan_releases([_release('v2.4.0')], set())
-    assert [r['tag_name'] for r in planned] == ['v2.4.0']
+    planned = mw.plan_releases([_release('v2.5.0')], set())
+    assert [r['tag_name'] for r in planned] == ['v2.5.0']
 
   def test_the_pinned_release_itself_is_not_news(self):
     assert mw.plan_releases([_release(mw.MAX_ALLOWED_VERSION)], set()) == []
@@ -571,25 +607,25 @@ class TestPlanReleases:
     assert mw.plan_releases([_release('nightly')], set()) == []
 
   def test_drafts_and_prereleases_are_skipped(self):
-    releases = [_release('v2.4.0', draft=True), _release('v2.5.0', prerelease=True)]
+    releases = [_release('v2.5.0', draft=True), _release('v2.6.0', prerelease=True)]
     assert mw.plan_releases(releases, set()) == []
 
   def test_already_reported_tag_is_not_refiled(self):
-    assert mw.plan_releases([_release('v2.4.0')], {'v2.4.0'}) == []
+    assert mw.plan_releases([_release('v2.5.0')], {'v2.5.0'}) == []
 
   def test_reports_oldest_first(self):
-    releases = [_release('v3.0.0'), _release('v2.4.0'), _release('v2.10.0')]
+    releases = [_release('v3.0.0'), _release('v2.5.0'), _release('v2.10.0')]
     assert [r['tag_name'] for r in mw.plan_releases(releases, set())] == [
-        'v2.4.0', 'v2.10.0', 'v3.0.0']
+        'v2.5.0', 'v2.10.0', 'v3.0.0']
 
 
 class TestReportedTags:
   def test_extracts_marker_from_bodies(self):
-    assert mw.reported_tags([_issue('v2.4.0'), _issue('v2.5.0')]) == {'v2.4.0', 'v2.5.0'}
+    assert mw.reported_tags([_issue('v2.5.0'), _issue('v2.6.0')]) == {'v2.5.0', 'v2.6.0'}
 
   def test_closed_issues_still_count_as_reported(self):
     """Closed means handled — bumped or dismissed. Never re-report it."""
-    assert mw.reported_tags([_issue('v2.4.0', state='closed')]) == {'v2.4.0'}
+    assert mw.reported_tags([_issue('v2.5.0', state='closed')]) == {'v2.5.0'}
 
   def test_ignores_bodies_without_the_marker(self):
     assert mw.reported_tags([{'number': 2, 'state': 'open', 'body': 'unrelated'}]) == set()
@@ -600,12 +636,12 @@ class TestReportedTags:
   def test_round_trips_the_marker_it_writes(self, monkeypatch):
     """Day 1's body must feed day 2's dedup set, or every release is refiled
     daily."""
-    monkeypatch.setattr(mw, 'fetch_upstream_capnp', lambda tag: _V231_CUSTOM_CAPNP)
+    monkeypatch.setattr(mw, 'fetch_upstream_capnp', lambda tag: _V240_CUSTOM_CAPNP)
     monkeypatch.setattr(mw, 'fetch_compare_status', lambda tag: 'ahead')
-    body = mw.build_issue(_release('v2.4.0'))['body']
+    body = mw.build_issue(_release('v2.5.0'))['body']
     reported = mw.reported_tags([{'number': 1, 'state': 'open', 'body': body}])
-    assert reported == {'v2.4.0'}
-    assert mw.plan_releases([_release('v2.4.0')], reported) == []
+    assert reported == {'v2.5.0'}
+    assert mw.plan_releases([_release('v2.5.0')], reported) == []
 
 
 class TestFetchIssues:
@@ -642,9 +678,9 @@ class TestEnsureLabel:
 class TestMain:
   def test_dry_run_plans_against_the_real_reported_set_and_creates_nothing(
       self, monkeypatch, capsys):
-    monkeypatch.setattr(mw, 'fetch_releases', lambda: [_release('v2.4.0')])
+    monkeypatch.setattr(mw, 'fetch_releases', lambda: [_release('v2.5.0')])
     monkeypatch.setattr(mw, 'fetch_issues', lambda repo: [])
-    monkeypatch.setattr(mw, 'fetch_upstream_capnp', lambda tag: _V231_CUSTOM_CAPNP)
+    monkeypatch.setattr(mw, 'fetch_upstream_capnp', lambda tag: _V240_CUSTOM_CAPNP)
     monkeypatch.setattr(mw, 'fetch_compare_status', lambda tag: 'ahead')
 
     def _must_not_be_called(*a, **k):
@@ -656,7 +692,7 @@ class TestMain:
     rc = mw.main(['--repo', 'owner/repo', '--dry-run'])
 
     assert rc == 0
-    assert 'mapd release: v2.4.0' in capsys.readouterr().out
+    assert 'mapd release: v2.5.0' in capsys.readouterr().out
 
   def test_missing_repo_is_a_usage_error(self, monkeypatch):
     monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
@@ -667,13 +703,13 @@ class TestMain:
   def test_files_one_issue_per_release_after_ensuring_the_label(self, monkeypatch):
     calls = []
     monkeypatch.setattr(mw, 'fetch_releases',
-                        lambda: [_release('v2.4.0'), _release('v2.5.0')])
+                        lambda: [_release('v2.5.0'), _release('v2.6.0')])
     monkeypatch.setattr(mw, 'fetch_issues', lambda repo: [])
-    monkeypatch.setattr(mw, 'fetch_upstream_capnp', lambda tag: _V231_CUSTOM_CAPNP)
+    monkeypatch.setattr(mw, 'fetch_upstream_capnp', lambda tag: _V240_CUSTOM_CAPNP)
     monkeypatch.setattr(mw, 'fetch_compare_status', lambda tag: 'ahead')
     monkeypatch.setattr(mw, 'ensure_label', lambda repo: calls.append('label'))
     monkeypatch.setattr(mw, 'create_issue',
                         lambda repo, item: calls.append(item['title']) or 7)
 
     assert mw.main(['--repo', 'owner/repo']) == 0
-    assert calls == ['label', 'mapd release: v2.4.0', 'mapd release: v2.5.0']
+    assert calls == ['label', 'mapd release: v2.5.0', 'mapd release: v2.6.0']
