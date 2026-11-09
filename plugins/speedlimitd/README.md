@@ -14,7 +14,9 @@ It works out the limit from what it can see and what it knows about the road:
 - **The map.** Pre-downloaded offline map tiles tell it the road's identity —
   its name, and whether it's a numbered expressway (a "G" national or "S"
   provincial route). On expressways it raises the limit accordingly (100 or
-  120 km/h). By default it does **not** trust the map's posted speed numbers or
+  120 km/h), and holds it while the map still places you on the expressway,
+  even if the camera briefly sees fewer lanes (a truck hiding the lane lines,
+  a merge). It drops to the ramp limit once the map agrees you've left. By default it does **not** trust the map's posted speed numbers or
   road geometry for ordinary roads — in China those are too often wrong or
   ambiguous where roads stack on top of each other — so it reads the road
   itself with the camera instead. An optional toggle (see below) lets it use
@@ -26,7 +28,8 @@ It works out the limit from what it can see and what it knows about the road:
   comfortable speed for the curve, then starts easing the cap down *before* you
   reach it so the slowdown is gradual, not a last-second lurch. A second,
   faster safeguard reacts to how hard the car is actually cornering and tightens
-  the cap if a curve turns out sharper than it looked.
+  the cap if a curve turns out sharper than it looked. On G/S expressways it can
+  optionally look much further ahead using the map (see below).
 
 Whatever these sources suggest, the car always obeys the **lowest** of them.
 
@@ -85,12 +88,29 @@ the car still obeys whichever number is lowest.
   speedlimitd simply keeps reading the road with the camera — as it does
   whenever the map has nothing fresh and plausible to offer.
 
+## Map curve look-ahead (G/S expressways)
+
+*Map Curve Look-ahead (G/S)*, in **Settings → Driving**, lets speedlimitd slow
+down for curves up to 800 m ahead on G/S expressways, well beyond the ~100 m the
+camera can see, using the road shape from the **mapd** plugin's map data.
+
+- **Default: off.** Off, it still works out the map's curve speed and records it
+  in the drive log, but never acts on it.
+- **G/S expressways only**, and only while the offline map and mapd agree you're
+  on the same expressway. On every other road the camera decides, as before.
+- **Needs the mapd plugin** running. Without it the toggle does nothing.
+- It slows you gently (the same comfortable braking as the camera's curve cap)
+  and never lifts a lower limit.
+- On gentle expressways like S20 it rarely has anything to do: the curves there
+  are wide enough to take at the posted limit.
+
 ## Limitations
 
 - **It's an assist.** It's a cap and a suggestion. You are still driving and
   still responsible for the speed you travel at.
 - **No high-definition map.** It has no lane-level HD map and no radar/lidar
-  road model. Everything comes from offline tiles plus the camera.
+  road model. Everything comes from offline tiles plus the camera (and, for the
+  optional expressway curve look-ahead, mapd's map data).
 - **The camera can be fooled.** When it reads low, the gas pedal overrides it;
   the design deliberately errs toward the cautious (lower) number.
 - It's tuned and tested in **Shanghai, China** only.
