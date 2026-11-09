@@ -787,6 +787,7 @@ class SpeedLimitMiddleware:
     self._map_curve_result = None
     self._map_curve_error_logged = False
     self._mc_shaped_ms = None       # cap as applied: ramped and held (see _shape_map_curve)
+    self._gps_fix_t = 0.0           # last valid fix; _gps_valid itself latches on the first
     self._mc_hold_until = 0.0
     self._mc_last_t = 0.0
 
@@ -1147,7 +1148,8 @@ class SpeedLimitMiddleware:
           self._mc_path_pos, self._mc_path_pos_t = pos, now
 
       gate = mc.map_curve_gate(
-        gs_mode=gs_mode, gps_valid=self._gps_valid,
+        gs_mode=gs_mode,
+        gps_valid=self._gps_valid and now - self._gps_fix_t <= self.MAP_CURVE_GPS_FRESH_S,
         tile_ref=tile_ref, tile_ref_age_s=tile_ref_age,
         mapd_ok=mapd_ok, mapd_sel_type=sel,
         refs_match=any(mc.refs_share_gs(mapd_ref, r, is_gs_expressway_ref) for r in recent),
@@ -1172,6 +1174,7 @@ class SpeedLimitMiddleware:
           pass
 
   MAP_CURVE_HOLD_S = 3.0
+  MAP_CURVE_GPS_FRESH_S = 1.5   # gpsLocationExternal is ~10 Hz; older means frozen
 
   def _shape_map_curve(self, now: float, v_ego: float) -> None:
     """Turn the raw map cap into the value the speed decision may use.
@@ -1339,6 +1342,7 @@ class SpeedLimitMiddleware:
         self._gps_lat = gps.latitude
         self._gps_lon = gps.longitude
         self._gps_valid = True
+        self._gps_fix_t = now
         if not self.country_detected:
           country = country_from_gps(gps.latitude, gps.longitude, self.country_bboxes)
           if country:
