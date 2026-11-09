@@ -1830,17 +1830,19 @@ class TestLaneCountFirstInference:
     assert pub['inferredSpeed'] == 80
     assert pub['inferredSpeed'] not in (100, 120)
 
-  def test_gs_narrow_ramp_immediate_release(self, sld):
-    # lane_count_stable ≤ 2 while a G ref matches → immediate release to
-    # lane-count mode (narrow ramp/exit), never a stale expressway limit
-    # (review gap b).
+  def test_gs_entered_narrow_gets_narrow_limit(self, sld):
+    # A G/S stretch entered while lane_count_stable ≤ 2 promotes from the
+    # narrow count → 40, never an expressway limit (review gap b). Since
+    # 2026-11-09 (route 534) a narrow count no longer RELEASES a hold the tile
+    # reader still matches, so this is G/S mode carrying 40, not lane-count
+    # mode; the narrow release now waits for the tile reader to leave the way.
     mw = self._mw(sld)
     mw.lane_count_stable = 2
     mw._ingest_osm_result(self._result(wayRef='G50', roadContext=0,
                                        highwayType='motorway'))
     mw.update()
     pub = self._published(mw)
-    assert pub['inferenceMode'] == 'lane_count'
+    assert pub['inferenceMode'] == 'gs_osm'
     assert pub['inferredSpeed'] == 40            # narrow-road limit, immediate
 
   # --- Test 3: G/S stickiness -------------------------------
@@ -2590,6 +2592,129 @@ class TestGsDistanceGuardedRelease:
       clock['t'] += 0.2
     assert self._published(mw)['inferenceMode'] == 'gs_osm'   # ref present → no path-2
 
+  # ====== Camera narrow on a still-matched G/S road (route 534, 2026-11-09) ======
+  # Route 534: on S20 at 85-88 km/h vision read ≤2 lanes for ~3 s, the leaky
+  # narrow accumulator committed lane_count_stable=2, and the unconditional
+  # narrow release dropped the published limit 100→40 while the tile reader
+  # still matched S20 — 214 such flaps across 138 routes (689 G/S minutes).
+  # The narrow release now needs the tile reader to have left the G/S way too.
+
+  def _narrow_on_matched_s1(self, mw, holder, clock, seconds=4.0, **extra):
+    """S1 keeps matching every tick while raw sits at 2 lanes for `seconds`."""
+    holder['model'] = self._model(2)
+    for _ in range(int(round(seconds / 0.2))):
+      mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0,
+                                         highwayType='trunk', **extra))
+      mw.update()
+      clock['t'] += 0.2
+
+  def test_camera_narrow_on_matched_gs_keeps_promote(self, sld, monkeypatch):
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 20000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(4)
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+    mw.update()
+    clock['t'] += 0.2
+    assert self._published(mw)['inferredSpeed'] == 100
+    self._narrow_on_matched_s1(mw, holder, clock)
+    assert mw.lane_count_stable == 2              # the narrow commit DID happen
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert pub['inferredSpeed'] == 100            # promote held, not 40
+    assert pub['speedLimit'] == 100               # nor capped by the ≤2-lane vision cap
+
+  def test_camera_narrow_vision_cap_does_not_defeat_held_promote(self, sld, monkeypatch):
+    # Both inner lines confident and nothing beyond them: vision_speed_cap
+    # reads a 2-lane link (40). On a G/S way the tile reader still matches,
+    # that must not cap the held 100 either.
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 20500.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(4)
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+    mw.update()
+    clock['t'] += 0.2
+    link = self._straight_model([0.1, 0.7, 0.7, 0.1])
+    assert sld.vision_speed_cap(link) == 40 and sld.infer_lane_count(link) <= 2
+    holder['model'] = link
+    for _ in range(20):                                   # 4 s, S1 matching
+      mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+      mw.update()
+      clock['t'] += 0.2
+    assert mw.vision_cap_stable == 40                     # the cap IS armed
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'gs_osm'
+    assert pub['inferredSpeed'] == 100
+
+  def test_camera_narrow_on_matched_gs_keeps_osm_limit(self, sld, monkeypatch):
+    # The route-534 configuration: OSM Data Integration ON, posted 100 trusted.
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 21000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.country_detected = True
+    mw.country = 'cn'
+    mw.osm_integration_enabled = True
+    mw._read_params = lambda: None    # no param file in tests: keep the toggle ON
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(4)
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk',
+                                       speedLimit=100.0 / 3.6))
+    mw.update()
+    clock['t'] += 0.2
+    assert self._published(mw)['inferenceMode'] == 'osm'
+    self._narrow_on_matched_s1(mw, holder, clock, speedLimit=100.0 / 3.6)
+    assert mw.lane_count_stable == 2
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'osm'
+    assert pub['speedLimit'] == 100
+
+  def test_camera_narrow_releases_as_soon_as_tile_leaves_gs(self, sld, monkeypatch):
+    # Genuine exit: the narrow reading is already committed when the tile
+    # reader moves onto the ramp → release on that very tick (no 1.5 s path-2
+    # run, no 10 s timer).
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 22000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(4)
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+    mw.update()
+    clock['t'] += 0.2
+    self._narrow_on_matched_s1(mw, holder, clock)
+    mw._ingest_osm_result(self._result(roadName='ramp', highwayType='motorway_link'))
+    mw.update()
+    pub = self._published(mw)
+    assert pub['inferenceMode'] == 'lane_count'
+    assert pub['inferredSpeed'] == 40
+
+  def test_new_gs_stretch_entered_narrow_does_not_inherit_old_promote(self, sld, monkeypatch):
+    # The held promote survives narrow readings only within one G/S stretch: a
+    # later expressway entered on a narrow road starts from its own 40, never
+    # from the previous road's 120.
+    mw, holder = self._mw_model(sld)
+    clock = {'t': 23000.0}
+    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
+    mw.lane_count_stable = 4
+    holder['model'] = self._model(4)
+    mw._ingest_osm_result(self._result(wayRef='G50', roadContext=0, highwayType='motorway'))
+    mw.update()
+    assert self._published(mw)['inferredSpeed'] == 120
+    # Leave G50 for 35 s of ordinary road (sticky ceiling expires).
+    mw._ingest_osm_result(self._result(roadName='res', highwayType='residential'))
+    clock['t'] += 35.0
+    mw.update()
+    assert self._published(mw)['inferenceMode'] == 'lane_count'
+    # Enter S1 on a road vision already reads as narrow.
+    mw.lane_count_stable = 2
+    holder['model'] = self._model(2)
+    mw._ingest_osm_result(self._result(wayRef='S1', roadContext=0, highwayType='trunk'))
+    clock['t'] += 0.2
+    mw.update()
+    assert self._published(mw)['inferredSpeed'] == 40
+
   # ============ Both paths coexist (layered for geometry) ==================
 
   def test_coexist_margin_first_on_wide_ramp(self, sld, monkeypatch):
@@ -2683,16 +2808,18 @@ class TestGsDistanceGuardedRelease:
     assert self._published(mw)['inferenceMode'] == 'lane_count'
     assert mw._gs_force_release is True
 
-  def test_f1_edge_misread_releases_expressway_hold_accepted(self, sld, monkeypatch):
-    """F1 accepted-risk characterization (user decision 2026-08-03, made with the
-    replay + review numbers in view). With the edge boost gated to ≥3 visible
-    lanes, an edge-lane MISREAD on a genuine expressway (vision sees only 2 lines
-    while hugging an edge) reads RAW 2 — the gate does NOT rescue it to 3.
-    Sustained ≥3 s while gs-held (ref still matching), the narrow accumulator
-    commits lane_count_stable=2 and the existing lane≤2 escape releases the
-    100/120 hold to a 40 base inference. Asserted AS the accepted behavior
-    (damped by the 3 s accumulator + display ladder, gas-overridable) so a future
-    change that alters it is a conscious one."""
+  def test_f1_edge_misread_holds_expressway_promote(self, sld, monkeypatch):
+    """F1 edge-lane misread on a genuine expressway (vision sees only 2 lines
+    while hugging an edge) reads RAW 2 — the ≥3-visible-lanes edge-boost gate
+    does NOT rescue it to 3 — and after ≥3 s the narrow accumulator commits
+    lane_count_stable=2.
+
+    Until 2026-11-09 this was the user-ACCEPTED risk (decision 2026-08-03): the
+    lane≤2 escape released the 100/120 hold to 40. Superseded by user decision
+    2026-11-09 after route 534 (three 100→40 drops on S20 at 85-88 km/h) and a
+    138-route scan (214 such mid-road releases): with the tile reader still
+    matching the G/S way, a camera narrow reading no longer releases the hold
+    or takes the promote down."""
     mw, holder = self._mw_model(sld)
     clock = {'t': 22000.0}
     monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
@@ -2716,8 +2843,8 @@ class TestGsDistanceGuardedRelease:
       clock['t'] += 0.2
     pub = self._published(mw)
     assert mw.lane_count_stable == 2               # accumulator committed narrow
-    assert pub['inferenceMode'] == 'lane_count'    # 100/120 hold released
-    assert pub['inferredSpeed'] == 40              # narrow base inference
+    assert pub['inferenceMode'] == 'gs_osm'        # hold kept: S1 still matches
+    assert pub['inferredSpeed'] == 100             # wide promote held, not 40
 
 
 # ============================================================

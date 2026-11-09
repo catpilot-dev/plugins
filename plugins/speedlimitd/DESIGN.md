@@ -131,7 +131,7 @@ transient). Release happens on **any** of:
 | Continuous absence | `GS_RELEASE_CONT_S = 10 s` | non-G/S matches unbroken this long (an alternating flicker keeps resetting it → stickiness preserved) |
 | Margin rule (path 1) | `GS_RELEASE_MARGIN_M = 8 m`, `GS_RELEASE_MARGIN_S = 5 s` | matched way is decisively closer than the held G/S way (or held ref absent → +inf) continuously for 5 s (time-based since 2026-08-18; equals the old 2-consecutive-query window at the former 5 s cadence). Uses `refDistances` from `osm_query`; an absolute distance gate on the held way was proven insufficient (held S1 only 13.5 m off at ramp entry) |
 | Lane-drop (path 2) | `GS_LANE_DROP_S = 1.5 s` | held ref absent **and** raw lane count ≤2 continuous — two independent exit signals, no OSM-distance dependence |
-| Narrow section | — | `lane_count_stable ≤ 2` releases immediately (a ramp must obey the narrow limit, never a stale 100/120) |
+| Narrow section | — | `lane_count_stable ≤ 2` **and** the tile reader no longer matching the G/S way (absence run active) releases immediately. Camera-only narrowing on a still-matched G/S way neither releases the hold nor takes a wide promote down, and the ≤2-lane vision cap is skipped in G/S mode (2026-11-09, route 534: 214 mid-road 100/120→40 flaps over 138 routes; on real exits the tile reader left a median ~4 s later, and planner_hook's same-road floor already waited for that before braking). A stretch entered narrow still promotes from the narrow count (40); `_gs_limit_kph` resets on release |
 
 `_eval_gs_margin_release` runs once per OSM query (in `_ingest_osm_result`); a
 genuine G/S re-match clears the force-release latch and re-establishes the held
@@ -243,7 +243,7 @@ on straight roads:
 | 40 km/h ramp sign matched to a 高速/高架 mainline | the 60 km/h floor |
 
 Requiring `gs_mode` rather than the ref alone inherits every G/S release guard:
-the ≤2-lane release, the margin rule, `gs_lane_drop`, and the continuous-absence
+the narrow-section release, the margin rule, `gs_lane_drop`, and the continuous-absence
 timer.
 
 `osmTrusted` and `osmRejectReason` (`''｜disabled｜no_data｜stale｜not_gs｜low_value`)

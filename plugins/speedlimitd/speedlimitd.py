@@ -245,12 +245,12 @@ def infer_lane_count(model_msg) -> int:
   # ACCEPTED TRADE (user decision 2026-08-03, made with the replay + review
   # numbers in view). Deploy-gate replay: gating to >=3 adds ~1 wide-road
   # spurious-40 per ~2 h (龙东大道-class, gas-overridable), and — via a ≥3 s
-  # sustained edge-lane MISREAD reading base 2 on a genuine expressway — can
-  # release a 100/120 G/S hold to 40 (review F1). Both are accepted in exchange
-  # for the counter reporting what vision actually sees on narrow roads; the
-  # release edge is damped by the 3 s narrow accumulator + the display step
-  # ladder. See the F1 characterization test, asserted AS accepted behavior so a
-  # future change to it is a conscious one.
+  # sustained edge-lane MISREAD reading base 2 on a genuine expressway — used to
+  # release a 100/120 G/S hold to 40 (review F1). Both were accepted in exchange
+  # for the counter reporting what vision actually sees on narrow roads. Since
+  # 2026-11-09 (user decision, route 534) the F1 half is closed: a narrow count
+  # on a G/S way the tile reader still matches no longer releases the hold (see
+  # the gs_released block and test_f1_edge_misread_holds_expressway_promote).
   if base_count >= 3:
     near_left, near_right = _near_road_edge(model_msg)
     if near_left or near_right:
@@ -993,7 +993,7 @@ class SpeedLimitMiddleware:
     excludes both audited map-matching failure modes: viaduct tags landing on
     the surface road beneath (no G/S ref) and ramp signs landing on the
     mainline (below the floor). Requiring gs_mode inherits every G/S release
-    guard — the <=2-lane release, the margin rule, gs_lane_drop and the
+    guard — the narrow-section release, the margin rule, gs_lane_drop and the
     continuous-absence timer — at no extra cost.
 
     The permissive branch keys on self.country_detected, NOT on self.country
@@ -1644,10 +1644,15 @@ class SpeedLimitMiddleware:
       road_ctx_for_infer = self.last_road_context
       if not self.last_way_ref and road_ctx_for_infer == 'freeway':
         road_ctx_for_infer = 'city'
-      self._gs_limit_kph = infer_speed_from_road_type(
-        self.last_highway_type, self.lane_count_stable, road_ctx_for_infer,
-        width_class=self.lane_width_class, osm_type=self.last_osm_hwtype,
-      )
+      # A narrow (≤2) lane count must not take a wide promote down while the
+      # tile reader still matches the G/S way (route 534: camera ≤2-lane
+      # readings on 4-lane S20 → 100→40). Only a wide count recomputes it, or
+      # a fresh stretch (0, reset on release below) entered on a narrow road.
+      if self.lane_count_stable >= 3 or self._gs_limit_kph == 0:
+        self._gs_limit_kph = infer_speed_from_road_type(
+          self.last_highway_type, self.lane_count_stable, road_ctx_for_infer,
+          width_class=self.lane_width_class, osm_type=self.last_osm_hwtype,
+        )
       self._gs_last_seen_t = now
       self._gs_absent_since = None        # a G/S match resets the absence run
       self._gs_lane_drop_since = None     # ...and the path-2 lane-drop run
@@ -1675,9 +1680,15 @@ class SpeedLimitMiddleware:
     #     accumulates it in one run; an alternating stacked flicker keeps
     #     resetting _gs_absent_since so it never accumulates (stickiness kept).
     #     This is the fallback when candidate distances are unavailable;
-    #   - a narrow section (lane_count_stable ≤ 2, already debounced): a ramp/
-    #     exit off the expressway must obey the narrow-road limit immediately,
-    #     never a stale 100/120.
+    #   - a narrow section (lane_count_stable ≤ 2, already debounced) once the
+    #     tile reader has stopped matching the G/S way (absence run active): a
+    #     ramp/exit must obey the narrow-road limit the moment the map agrees.
+    #     Camera-only narrowing on a still-matched G/S way does NOT release
+    #     (route 534, 2026-11-09): 214 such releases across 138 routes were
+    #     mid-road flaps (occlusion, merges, jams) that dropped 100/120 → 40
+    #     for seconds; on real exits the tile reader left a median ~4 s later,
+    #     and planner_hook's same-road floor already waited for that before
+    #     braking, so the release now waits for the same signal.
     gs_released = (
         self._gs_last_seen_t == 0.0
         or now - self._gs_last_seen_t > GS_STICKY_S
@@ -1685,8 +1696,10 @@ class SpeedLimitMiddleware:
         or gs_lane_drop
         or (self._gs_absent_since is not None
             and now - self._gs_absent_since >= GS_RELEASE_CONT_S)
-        or self.lane_count_stable <= 2)
+        or (self.lane_count_stable <= 2 and self._gs_absent_since is not None))
     gs_mode = not gs_released
+    if gs_released:
+      self._gs_limit_kph = 0              # next G/S stretch promotes afresh
     self._update_map_curve(now, gs_mode)
     self._shape_map_curve(now, v_ego_meas)
 
@@ -1717,8 +1730,12 @@ class SpeedLimitMiddleware:
     # without implying a narrow road, so the cap would fire spuriously. Also
     # skipped when OSM carries the base — the ≤2-lane narrow-road heuristic
     # must not defeat an authoritative posted limit (rural 2-lane roads are
-    # legitimately 90-100 in the US/EU).
-    if not osm_base and self.vision_cap_stable > 0 and self.lane_count_stable < 3:
+    # legitimately 90-100 in the US/EU). Skipped in G/S mode too: the held
+    # promote already carries the narrow limit for a stretch entered narrow,
+    # and a wide promote must not be defeated by a camera ≤2-lane reading on
+    # a way the tile reader still matches (route 534).
+    if (not osm_base and not gs_mode and self.vision_cap_stable > 0
+        and self.lane_count_stable < 3):
       inferred_speed = min(inferred_speed, self.vision_cap_stable)
 
     MIN_SPEED_LIMIT = 30   # km/h — no real road is below this
