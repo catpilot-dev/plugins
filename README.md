@@ -2,8 +2,8 @@
 
 Plugins for [catpilot](https://github.com/catpilot-dev/catpilot) — the
 features that ride on top of stock openpilot. They come pre-installed with
-every catpilot release and are versioned with it (release `0.11.1` ships
-plugins `0.11.1`): flash catpilot, and everything below is already on the
+every catpilot release and are versioned with it (release `0.11.2` ships
+plugins `0.11.2`): flash catpilot, and everything below is already on the
 device.
 
 ## What you get

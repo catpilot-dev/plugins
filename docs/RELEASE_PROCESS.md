@@ -52,13 +52,18 @@ Three repos, two cadences:
 2. Push catpilot branch `release-vX.Y.Z`; bump `OPENPILOT_VERSION` in
    `selfdrive/plugins/manifest.py` as part of the rebase.
 3. Push plugins branch `release-vX.Y.Z` (from dev, hook-contract-matched to
-   the new base); set every `plugin.json` version to `X.Y.Z`.
+   the new base); set every `plugin.json` version to `X.Y.Z`. Carry
+   `.github/workflows/` onto it (identical to dev's copies) and make it the
+   repository's **default branch** on GitHub: `schedule` triggers fire only from
+   the default branch, so the upstream watches silently stop otherwise.
 4. Cut COD GitHub release `vX.Y.Z` with a `cod-vX.Y.Z.tar.gz` asset.
 5. Move the installer stable pointer: write `release-vX.Y.Z` into
    `infra/installer/assets/stable`, then `wrangler deploy`. Give it a minute:
    edges serve the old pointer briefly, so never delete the previous branch
    until the root path returns the new one consistently.
-6. Tag `vX.Y.Z` in all three repos and create the GitHub Releases.
+6. Tag `vX.Y.Z` in all three repos and create the GitHub Releases; fast-forward
+   `main` in catpilot and plugins to the same point (`main` == `dev` ==
+   `release-vX.Y.Z` at a release).
 7. The previous channel branch stops receiving rolling updates.
 
 ## Cutting a rolling release (plugins / COD)
@@ -83,8 +88,10 @@ plugins can only reach hooks that exist in the installed base.
 
 ## Open items
 
-- catpilot's GitHub default branch (`main`) still shows the pre-0.11 lineage;
-  repoint or archive it so visitors land on the release line.
+- ~~catpilot's GitHub default branch (`main`) still shows the pre-0.11 lineage~~
+  — done 2026-08-10: `main` was moved to the release line (the old line is
+  archived as `legacy-0.10.x`), and both repos' GitHub default branch is the
+  current channel branch.
 - ~~COD self-update should respect the channel~~ — done (COD `2bf0348`):
   the checker lists releases and picks the newest tag on the device's own
   channel (`vX.Y.Z` / `vX.Y.Z-YYYY.MM.DD` sharing VERSION's `X.Y.Z` prefix);

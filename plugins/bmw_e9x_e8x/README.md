@@ -28,6 +28,14 @@ emulating cruise-stalk presses. The plugin owns the stalk message properly and
 shapes set-speed changes to openpilot's target, so slowing for lead cars and
 curves is smooth rather than steppy.
 
+**Steering-only (LKA) mode.** Braking, a cancel press or DCC dropping out
+(below 30 km/h) no longer switches openpilot off: steering stays engaged while
+you drive the pedals, shown by a green LKA badge and a grey border. A second
+cancel press switches openpilot off; set or resume brings cruise back. Below
+30 km/h, where DCC can't engage, a tap of the cruise stalk up or down engages
+steering only. Cars without the steering actuator skip this mode and disengage
+as stock.
+
 **VIN-based fingerprinting.** The plugin reads
 the model code and variants straight from the VIN. Detection is deterministic.
 
@@ -49,17 +57,22 @@ When a BMW is detected, the vehicle section of **Settings → Driving** adds:
 - **Temperature Overlay** — coolant and oil temperature at the bottom right of
   the driving screen, colored blue through red from cold to critical. On by
   default.
+- **Slope Compensation** — learns the small steady steering torque the car
+  needs to drive straight (road camber, alignment) and applies it. Off by
+  default; applies at the next engagement.
 - **Resume Button Repurposed** — On this car the
   cruise stalk's resume button does double duty: a short press resumes cruise
   when disengaged, or confirms/cancels a detected speed limit when engaged; a
   long press cycles the driving Personality.
 
+Cruise set speed, always on (no switch):
+
 - **Cruise Speed Memory** — re-engaging cruise within a drive restores the
   set-speed ceiling you last dialed in, instead of resetting to openpilot's
   default (your current speed, at least 40 km/h).
-- **100 km/h initial set speed** — the first engagement of a drive (or any
-  engagement with Cruise Speed Memory off) starts the ceiling at 100 km/h, or
-  your current speed if higher. speedlimitd caps the actual target from vision.
+- **100 km/h initial set speed** — the first engagement of a drive starts the
+  ceiling at 100 km/h, or your current speed if higher. speedlimitd caps the
+  actual target from vision.
 
 ## Status and limits
 
@@ -69,7 +82,11 @@ This is a community port of an unsupported car. Treat it accordingly.
   ACC-module variants are recognized but much less exercised.
 - **Tuned on an E90.** The E82 shares the software but has seen far less road
   time.
-- **No cruise below 30 km/h**, per the car.
+- **No cruise below 30 km/h**, per the car; steering-only mode covers it
+  (see above).
+- **openpilot 0.11.2 needs the updated panda firmware.** A panda flashed for
+  0.11.1 doesn't enter BMW safety on 0.11.2 and nothing engages. Flash the
+  dual 0.11.1/0.11.2 image first ([DESIGN.md](DESIGN.md), Panda safety).
 
 ## More
 

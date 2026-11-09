@@ -1,7 +1,7 @@
 {
   "id": "bus_logger",
   "name": "Plugin Bus Logger",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "type": "hybrid",
   "author": "catpilot",
   "description": "Logs all plugin bus messages to cereal for rlog capture and debugging.",

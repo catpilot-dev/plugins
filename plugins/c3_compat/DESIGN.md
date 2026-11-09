@@ -2,8 +2,8 @@
 
 Infrastructure plugin that lets the comma three (SoC: Snapdragon 845; internal
 panda: STM32F4 "Dos" board; OS: AGNOS 12.8) run the current catpilot, which is
-built against newer hardware and a newer AGNOS. Upstream openpilot removed
-comma-three support in v0.10.3; this plugin restores it as a set of **idempotent
+built against newer hardware and a newer AGNOS. Upstream openpilot's last release
+for the comma three was v0.10.0; this plugin restores its support as a set of **idempotent
 boot-time patches** applied to the deployed openpilot tree plus one runtime
 health hook — no maintained fork, no source overlays of the affected files.
 
