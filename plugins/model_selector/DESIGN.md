@@ -215,7 +215,10 @@ The converted ONNX is a GitHub release asset (`models-0.11.2` on
 catpilot-dev/plugins), and the entry's `url`, `sha256` and `size` pin exactly
 those bytes: the catalog, not the release page, is the trust root. The asset
 name is stable, so the URL is known before publishing. Entries ship with
-`verified_on: []` until a test drive on that version.
+`verified_on: []` until a test drive on that version. POP passed its 0.11.2 test drive
+(routes 517–534, 2026-11-04..09) and is `verified_on: ["0.11.2"]`; the
+release asset must be published before the catalog that lists it ships, or a
+download on a fresh install fails.
 
 ### Active-file drift
 

@@ -34,8 +34,10 @@
         "vision": "6a7d09ad-bcc9-43bc-916d-29287e60cee2/200",
         "policy": "05a58a51-e0e3-4e9b-8e27-e644685f2c50/100"
       },
-      "verified_on": [],
-      "notes": "POP driving model (#37727) converted to the 0.11.2 supercombo by tools/legacy_policy_swap.py (policy + retrained hidden-state summarizer); test drive on 0.11.2 pending"
+      "verified_on": [
+        "0.11.2"
+      ],
+      "notes": "POP driving model (#37727) converted to the 0.11.2 supercombo by tools/legacy_policy_swap.py (policy + retrained hidden-state summarizer); test driven on 0.11.2 (BMW E90, routes 517-534, 2026-11-04..09)"
     }
   ],
   "dm": [

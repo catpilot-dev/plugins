@@ -295,10 +295,13 @@ class TestShippedCatalog:
     m = next(e for e in c['dm'] if e['id'] == 'stock_dm_0.11.2')
     assert (m['sha256'], m['size']) == ('dee5a294e8afaacc9295ac5d100e00733ecac278e79264b96331e40a3ede1b04', 7844499)
 
-  def test_shipped_catalog_lists_pop_as_converted_and_untested(self, cat):
+  def test_shipped_catalog_lists_pop_as_converted_and_verified(self, cat):
+    """POP was test driven on 0.11.2 (routes 517-534) and is offered there,
+    but is never the baseline: the release's own model stays the fallback."""
     c = cat.load_catalog()
     pop = next(e for e in c['driving'] if e['id'] == 'pop_supercombo_37727')
-    assert pop['source'] == 'converted' and pop['verified_on'] == []
+    assert pop['source'] == 'converted' and pop['verified_on'] == ['0.11.2']
+    assert pop.get('baseline_for', []) == []
     f = pop['files'][0]
     assert f['name'] == 'driving_supercombo.onnx'
     assert (f['sha256'], f['size']) == ('98be77d66621ce26a064d71af6f81b36b04389b5106cee8dfdbd2a973d40fee5', 60926942)
