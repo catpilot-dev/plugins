@@ -48,7 +48,7 @@ ramp are 0, so every engagement ramps from 0.
 |---|---|---|
 | `CONTROL_HORIZON_S` | 0.65 s | cadence and ramp spread are each half of it |
 | `T_CAP_BASE_NM`, `T_CAP_SLOPE_BASE` | 2.0 Nm, 1.0 | `t_cap = min(STEER_MAX, BASE + SLOPE·kappa_scale·v²·|delta_ref|)` |
-| `T_CAP_SCALE_KAPPA` / `_BP` | [1e-3, 1e-2, 2e-2] → [1.25, 2.5, 3.0] | gain scale on `|kappa_ref|` (straight 1.25 since 2026-10-21, trial) |
+| `T_CAP_SCALE_KAPPA` / `_BP` | [1e-3, 1e-2, 2e-2] → [1.5, 2.5, 3.0] | gain scale on `|kappa_ref|` (straight 1.0 → 1.25 2026-10-21, → 1.5 2026-11-09) |
 | `V_GAIN_FLOOR` | 2.778 m/s | gain reference speed floor |
 | `CF_AY0`, `CF_GAIN`, `CF_MAX_NM` | 0.2 m/s², 1.4 Nm per m/s², 2.0 Nm | curve feed-forward deadband, gain, cap (raised 2026-11-01) |
 | `RELAX_DWELL_TICKS`, `RELAX_DWELL_KAPPA` | 20 ticks, 0.010 1/m | dwell length, deep-curve threshold |
@@ -84,6 +84,18 @@ speed and bend direction, outside drift, torque reversals, slow weave in long
 bends. `CI_KI` is 75, half the first cut: in the same (unvalidated) bench,
 understeer reduction and 0.1-0.5 Hz weave both scaled about linearly with it
 (150: -0.15e-3 / +70 %, 75: -0.09e-3 / +35 %, 40: -0.05e-3 / +21 %).
+
+**A/B result (route 531, 2026-11-09): switched off.** `ci_nm` built into every
+bend (0.1–0.3 Nm) and cut mild-bend understeer ~0.1e-3 at the same places as
+530, but the driver felt more swinging between the lane lines on straights:
+0.1–0.3 Hz lane-offset rms 5.9 → 10.4 cm (50–80 km/h; unchanged above 80, where
+it rarely ran). The bench, re-fitted to 531, reproduces both (integrator torque
+0.24/0.24/0.19 vs 0.17/0.20/0.19 Nm recorded; straight sway +40/+67 %). No gate
+separates road curvature from lane-centring corrections: low-passed or
+sustained `a_ref` gates at any threshold lie on the same understeer-vs-sway
+line. The sway is extra loop gain on the plan at 0.1–0.3 Hz, and a feed-forward
+increase pays it too (2–3× less per unit of understeer). More P gain on the
+error does not — see the 2026-11-09 entry below.
 
 **Verification.** Unit tests in `tests/test_latcontroller.py` and
 `tests/test_takeup.py`; a differential replay against the previous build is the
@@ -1088,6 +1100,20 @@ Service names follow openpilot 0.11.2 throughout (`deviceMotion`,
 > Open-loop on 510/511: the demand turns against each lane-change lobe
 > 0.20–0.25 s earlier. Verify next drive: lane changes with a third ≥ 4° swing
 > (511: 50 %), yaw lag (0.70 s), no new wobble mid-change.
+
+> **2026-11-09 — straight / gentle-bend gain 1.25 → 1.5 (routes 530/531).** Mild
+> bends (|κ_ref| 0.5–1e-3) still ran ~0.4e-3 wide on the 515/530/531 road, and the
+> curve integrator that fixed part of it doubled the straight sway (see Curve
+> integrator). Closed-loop bench on the 530 / 531 windows (rack re-fitted to 531),
+> mild-bend understeer and 0.1–0.3 Hz straight sway: 1.25 → 0.41 / 0.39e-3,
+> 5.4 / 5.7 cm; 1.5 → 0.36 / 0.34e-3, 5.3 / 5.9 cm; 1.75 → 0.31 / 0.28e-3,
+> 5.0 / 7.4 cm; 2.0 → curve-exit overshoot and torque reversals up — too far.
+> Raising only the mild-bend breakpoint (1.25 kept below 0.5e-3) swayed more than
+> raising the whole near-centre gain. Torque reversals +10–15 % at 1.5 in the
+> bench, which has no lash (4.8° now). 1.5 rang near-straight on route 326 under
+> the pre-Direct controller. Verify next drive: straight sway (530: 5.9 cm),
+> torque reversals, mild-bend understeer, lash. Next step if clean: 1.5 below
+> 0.5e-3 rising to 1.8 at 1e-3.
 
 ---
 

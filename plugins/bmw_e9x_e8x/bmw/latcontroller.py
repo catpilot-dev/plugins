@@ -191,15 +191,19 @@ def on_lat_controller_init(result, lac, CP):
   # Plant-inversion gain, linear tire regime: tau_Nm = T_CAP_SLOPE * v^2 * delta
   # drives both the target and the authority cap
   #   t_cap = min(STEER_MAX, T_CAP_BASE_NM + T_CAP_SLOPE_BASE*kappa_scale*v^2*|delta_ref|).
-  # kappa_scale raises the gain from 1.25 on straights to 3.0 at |kappa_ref| >=
-  # 0.02, where the planner must be chased. Straight 1.25 (trial, route 4ed):
-  # near centre the rack breaks free at ~0.45 Nm, so gentle-bend errors sat at
-  # ~4e-4 before it moved; the error needed scales with 1/gain. 1.5 rang
-  # near-straight on route 326 (pre-Direct controller).
+  # kappa_scale raises the gain from 1.5 on straights and gentle bends to 3.0 at
+  # |kappa_ref| >= 0.02, where the planner must be chased. Near centre the rack
+  # breaks free at ~0.45 Nm, so the curvature error needed to move it scales
+  # with 1/gain (route 4ed: 1.0 -> 1.25). 1.25 -> 1.5 (2026-11-09, routes
+  # 530/531): mild bends still ran ~0.4e-3 wide; the closed-loop bench cuts that
+  # 0.05e-3 with no added 0.1-0.3 Hz straight sway, where a feed-forward or
+  # integral term on the reference adds sway. 1.5 rang near-straight on route
+  # 326 under the pre-Direct controller: on-car check = straight sway and
+  # torque reversals.
   T_CAP_BASE_NM = 2.0
   T_CAP_SLOPE_BASE = 1.0
   T_CAP_SCALE_KAPPA = [0.001, 0.01, 0.02]        # |kappa_ref| breakpoints (1/m)
-  T_CAP_SCALE_BP    = [1.25, 2.5, 3.0]          # scale factor on T_CAP_SLOPE_BASE
+  T_CAP_SCALE_BP    = [1.5, 2.5, 3.0]           # scale factor on T_CAP_SLOPE_BASE
 
   # Per-decision torque step cap (frac): human-style gradual steering, 1.2 Nm
   # per decision up to 54 km/h (~4 Nm/s) tapering to 0.6 Nm at 100 km/h, where
