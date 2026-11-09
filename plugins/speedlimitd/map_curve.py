@@ -1,0 +1,148 @@
+"""Map curve cap — a G/S-only curve speed limit from mapd's road-ahead path.
+
+Pure and stateless: no I/O, no clock, no globals, and no import of speedlimitd.
+speedlimitd passes in its own a_y target, braking deceleration, tight-curve
+derate and straight-road gate, so this cap and the vision curve cap
+(`curvature_speed_cap`) always share one budget.
+
+The input is `MapdExtendedOut.path`: mapd's current way plus its predicted next
+ways as (lat, lon) points in travel order. Only speedlimitd's G/S mode ever
+calls this (see docs/superpowers/specs/2026-11-09-mapd-gs-curve-lookahead-design.md):
+OSM geometry is trustworthy on G/S expressways and not on Chinese city roads.
+
+Curvature is recomputed from the geometry rather than taken from mapd's
+per-point `curvature`. mapd derives that value from consecutive OSM nodes, so a
+single misplaced node reads as a sharp curve. Here a vertex's curvature is the
+NET heading change across a window of `window_m` metres of path centred on it:
+a one-node zig-zag turns one way and straight back, so it largely cancels,
+while a real arc accumulates. The cancellation is partial for windows whose
+edge falls inside the zig-zag: on 20 m node spacing a single node misplaced by
+up to ~3.5 m stays under the 0.003 straight-road gate, a larger one does not.
+A wider window would hide that but loses sparse-node arcs (60 m spacing,
+R=400 reads as straight at 80 m), so 50 m is the compromise.
+"""
+import math
+from bisect import bisect_right
+from dataclasses import dataclass
+from typing import Sequence
+
+MAP_CURVE_WINDOW_M = 50.0
+MAP_CURVE_MAX_LOOKAHEAD_M = 800.0
+
+_R_EARTH = 6371000.0
+_MIN_SEGMENT_M = 0.1
+_END_MARGIN_M = 0.5
+
+
+@dataclass(frozen=True)
+class MapCurveResult:
+  cap_kph: float          # 0.0 = no curve above the gate within the look-ahead
+  dist_m: float           # along-path distance to the binding point (0.0 if none)
+  kappa: float            # curvature at the binding point, 1/m (0.0 if none)
+  lat: float | None       # binding point position (None if none)
+  lon: float | None
+  path_ahead_m: float     # path length ahead of the car, capped at max_lookahead_m
+  lateral_m: float        # car's perpendicular distance from the path
+
+
+def _interp(x: float, xp: Sequence[float], fp: Sequence[float]) -> float:
+  if x <= xp[0]:
+    return fp[0]
+  if x >= xp[-1]:
+    return fp[-1]
+  for i in range(len(xp) - 1):
+    if xp[i] <= x <= xp[i + 1]:
+      f = (x - xp[i]) / (xp[i + 1] - xp[i])
+      return fp[i] + f * (fp[i + 1] - fp[i])
+  return fp[-1]
+
+
+def _wrap_pi(a: float) -> float:
+  return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def map_curve_cap(points: Sequence[tuple[float, float]], car_lat: float, car_lon: float, *,
+                  max_lat_accel: float, comfort_brake: float, tight_curve_factor: float,
+                  curve_gate: float, window_m: float = MAP_CURVE_WINDOW_M,
+                  max_lookahead_m: float = MAP_CURVE_MAX_LOOKAHEAD_M) -> MapCurveResult | None:
+  """The lowest speed allowed now so `comfort_brake` still makes every curve ahead.
+
+  Per vertex ahead of the car with curvature κ ≥ curve_gate:
+    target_ay = max_lat_accel · interp(κ, [0.02, 0.035], [1, tight_curve_factor])
+    v_now     = √(target_ay/κ + 2·comfort_brake·d)
+  The cap is the minimum v_now, in km/h, unrounded and with no 100 km/h cut-off.
+
+  Returns None when the car cannot be placed on the path with path ahead of it.
+  """
+  if not (math.isfinite(car_lat) and math.isfinite(car_lon)):
+    return None
+  cos_lat = math.cos(math.radians(car_lat))
+
+  # Local metres around the car; drop non-finite points and duplicates.
+  xy: list[tuple[float, float]] = []
+  ll: list[tuple[float, float]] = []
+  for lat, lon in points:
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+      continue
+    x = math.radians(lon - car_lon) * _R_EARTH * cos_lat
+    y = math.radians(lat - car_lat) * _R_EARTH
+    if xy and math.hypot(x - xy[-1][0], y - xy[-1][1]) < _MIN_SEGMENT_M:
+      continue
+    xy.append((x, y))
+    ll.append((lat, lon))
+  if len(xy) < 2:
+    return None
+
+  # Cumulative arc length and per-segment bearing.
+  cum = [0.0]
+  heading = []
+  for (x0, y0), (x1, y1) in zip(xy, xy[1:]):
+    cum.append(cum[-1] + math.hypot(x1 - x0, y1 - y0))
+    heading.append(math.atan2(x1 - x0, y1 - y0))
+  total = cum[-1]
+
+  # Project the car (at the origin) onto the polyline.
+  best_d = math.inf
+  s_car = 0.0
+  for k, ((x0, y0), (x1, y1)) in enumerate(zip(xy, xy[1:])):
+    dx, dy = x1 - x0, y1 - y0
+    seg_len2 = dx * dx + dy * dy
+    t = max(0.0, min(1.0, (-x0 * dx - y0 * dy) / seg_len2))
+    d = math.hypot(x0 + t * dx, y0 + t * dy)
+    if d < best_d:
+      best_d = d
+      s_car = cum[k] + t * (cum[k + 1] - cum[k])
+  if s_car >= total - _END_MARGIN_M:
+    return None
+
+  def heading_at(s: float) -> float:
+    k = min(max(bisect_right(cum, s) - 1, 0), len(heading) - 1)
+    return heading[k]
+
+  half = window_m / 2.0
+  horizon = s_car + max_lookahead_m
+  cap_ms = None
+  bind = (0.0, 0.0, None, None)
+  for i in range(1, len(xy) - 1):
+    s_i = cum[i]
+    if s_i <= s_car:
+      continue
+    if s_i > horizon:
+      break
+    h = min(half, s_i, total - s_i)
+    if h < window_m / 4.0:
+      continue
+    kappa = abs(_wrap_pi(heading_at(s_i + h) - heading_at(s_i - h))) / (2.0 * h)
+    if kappa < curve_gate:
+      continue
+    target_ay = max_lat_accel * _interp(kappa, [0.02, 0.035], [1.0, tight_curve_factor])
+    d_i = s_i - s_car
+    v_now = math.sqrt(target_ay / kappa + 2.0 * comfort_brake * d_i)
+    if cap_ms is None or v_now < cap_ms:
+      cap_ms = v_now
+      bind = (d_i, kappa, ll[i][0], ll[i][1])
+
+  path_ahead = min(total - s_car, max_lookahead_m)
+  if cap_ms is None:
+    return MapCurveResult(0.0, 0.0, 0.0, None, None, path_ahead, best_d)
+  return MapCurveResult(cap_ms * 3.6, bind[0], bind[1], bind[2], bind[3], path_ahead, best_d)
