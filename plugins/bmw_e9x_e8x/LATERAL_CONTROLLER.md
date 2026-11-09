@@ -24,9 +24,7 @@ with no filtering of its own.
     P_nm      = T_CAP_SLOPE_BASE · kappa_scale(|kappa_ref|) · v² · delta_err
     a_ref     = v_true² · kappa_ref                          reference lateral accel (m/s²)
     ff_nm     = clip(CF_GAIN · sign(a_ref) · max(|a_ref| − CF_AY0, 0), ±CF_MAX_NM)
-    demand    = ff_nm + P_nm (+ sl_bias) (+ ci_nm)          every deviceMotion tick
-    ci_nm    += CI_KI · delta_err · dt   while |a_ref| ≥ CI_AY_ON, v ≥ CI_MIN_V, no lane change, unpressed
-              ·= exp(−dt / CI_TAU_LEAK_S) otherwise;  clip ±CI_MAX_NM;  0 on a kappa_ref side change and on disengage
+    demand    = ff_nm + P_nm (+ sl_bias)                    every deviceMotion tick
 
 **Decision**, every `CONTROL_HORIZON_S / 2` (6 deviceMotion ticks, 300 ms) while active, in order:
 the demand on the full error (no on-target band — a sub-friction target is a
@@ -57,45 +55,10 @@ ramp are 0, so every engagement ramps from 0.
 | `LANE_CHANGE_STATES` | laneChangeStarting, laneChangeFinishing | `drivingModelData.meta` states with the flat 0.10 step cap (2026-11-02) |
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
 | `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
-| `CI_AY_ON`, `CI_MIN_V`, `CI_KI`, `CI_MAX_NM`, `CI_TAU_LEAK_S` | 0.15 m/s² (= `SL_AY_MAX`), 40 km/h, 75 Nm/(rad·s), 0.5 Nm, 1.5 s | Curve integrator (`CurveIntegrator` switch, default off, 2026-11-08 A/B) |
 | `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
 
 **Switches** (Driving panel, param files under `bmw_e9x_e8x/data/`):
-`SlopeCompensation` and `CurveIntegrator` (each read at each engagement), default off.
-
-**Curve integrator (2026-11-08, A/B behind `CurveIntegrator`).** In a steady
-curve P supplies what the feed-forward leaves out only by holding a standing
-error, and rack friction grows with load, so the car settles wide. The 515/530
-same-road study (`bmw_lat_control` vs CAN yaw) found understeer of +0.1..+0.7e-3
-below 90 km/h on every drive, falling with speed (515: +0.64 at 50-70 km/h,
-+0.11 at 80-90), right bends worse than left (515: +0.73 vs -0.03e-3), and
-not a 0.11.2 regression at matched speed. A stick-slip rack fitted from six
-routes gives breakaway ~0.33 + 0.67·|a_y| Nm and self-aligning torque
-~1.7 Nm per m/s². A fixed feed-forward increase cannot match a need that
-varies by bend direction and road (a lower `CF_AY0` over-supplied gentle right
-bends in 55-91 % of windows, 2026-10-21), so `ci_nm` learns it per bend.
-Unlike the July hold-bias (37e34b7) nothing freezes it: an overshoot reverses
-delta_err and it integrates down at the same rate. Its gate is the complement
-of the slope-bias learn gate (`|a_ref|` ≥ vs < 0.15 m/s²), so the two never
-learn on the same tick. The closed-loop bench built for it did not validate
-(rack model 1.04° rms against a ~0.6° effect; the left/right split came out
-reversed), so the evidence is an on-car A/B on the 515/530 road: understeer by
-speed and bend direction, outside drift, torque reversals, slow weave in long
-bends. `CI_KI` is 75, half the first cut: in the same (unvalidated) bench,
-understeer reduction and 0.1-0.5 Hz weave both scaled about linearly with it
-(150: -0.15e-3 / +70 %, 75: -0.09e-3 / +35 %, 40: -0.05e-3 / +21 %).
-
-**A/B result (route 531, 2026-11-09): switched off.** `ci_nm` built into every
-bend (0.1–0.3 Nm) and cut mild-bend understeer ~0.1e-3 at the same places as
-530, but the driver felt more swinging between the lane lines on straights:
-0.1–0.3 Hz lane-offset rms 5.9 → 10.4 cm (50–80 km/h; unchanged above 80, where
-it rarely ran). The bench, re-fitted to 531, reproduces both (integrator torque
-0.24/0.24/0.19 vs 0.17/0.20/0.19 Nm recorded; straight sway +40/+67 %). No gate
-separates road curvature from lane-centring corrections: low-passed or
-sustained `a_ref` gates at any threshold lie on the same understeer-vs-sway
-line. The sway is extra loop gain on the plan at 0.1–0.3 Hz, and a feed-forward
-increase pays it too (2–3× less per unit of understeer). More P gain on the
-error does not — see the 2026-11-09 entry below.
+`SlopeCompensation` (read at each engagement), default off.
 
 **Verification.** Unit tests in `tests/test_latcontroller.py` and
 `tests/test_takeup.py`; a differential replay against the previous build is the
@@ -1101,10 +1064,30 @@ Service names follow openpilot 0.11.2 throughout (`deviceMotion`,
 > 0.20–0.25 s earlier. Verify next drive: lane changes with a third ≥ 4° swing
 > (511: 50 %), yaw lag (0.70 s), no new wobble mid-change.
 
+> **2026-11-08 — curve integrator (9cbeaab), A/B on route 531, retired
+> 2026-11-09.** Idea: in a steady curve P supplies what the feed-forward leaves
+> out only by holding a standing error, and rack friction grows with load
+> (breakaway ~0.33 + 0.67·|a_y| Nm), so the car settles wide (515/530: +0.1..+0.7e-3
+> below 90 km/h). `ci_nm += CI_KI·delta_err·dt` (KI 75, cap 0.5 Nm) while
+> |a_ref| ≥ 0.15 m/s², v ≥ 40 km/h, no lane change, unpressed; leak τ 1.5 s
+> otherwise; reset on a side change and on disengage; behind a default-off
+> `CurveIntegrator` switch. On 531 it built 0.1–0.3 Nm into every bend and cut
+> mild-bend understeer ~0.1e-3 at the same places as 530, but the driver felt
+> more swinging between the lane lines: 0.1–0.3 Hz straight sway 5.9 → 10.4 cm
+> (50–80 km/h). Lane-centring corrections open the |a_ref| gate on straights.
+> The bench, re-fitted to 531, reproduced both; no gate (low-passed or
+> sustained a_ref, any threshold) left the understeer-vs-sway line. Any torque
+> proportional to the plan's curvature — integral or feed-forward — adds gain to
+> the vision → plan → car loop, which has lag, and that is the sway; more P on
+> the error does not (2026-11-09 entry). Switched off after 531, removed
+> (code, switch, Driving panel row, telemetry field `ci_nm`) once 532/534 showed
+> the 1.5 gain matched its curve gain without the sway. Do not revive an
+> integral or curvature-FF term for mild-bend understeer.
+
 > **2026-11-09 — straight / gentle-bend gain 1.25 → 1.5 (routes 530/531).** Mild
 > bends (|κ_ref| 0.5–1e-3) still ran ~0.4e-3 wide on the 515/530/531 road, and the
-> curve integrator that fixed part of it doubled the straight sway (see Curve
-> integrator). Closed-loop bench on the 530 / 531 windows (rack re-fitted to 531),
+> curve integrator that fixed part of it doubled the straight sway (see the
+> 2026-11-08 entry). Closed-loop bench on the 530 / 531 windows (rack re-fitted to 531),
 > mild-bend understeer and 0.1–0.3 Hz straight sway: 1.25 → 0.41 / 0.39e-3,
 > 5.4 / 5.7 cm; 1.5 → 0.36 / 0.34e-3, 5.3 / 5.9 cm; 1.75 → 0.31 / 0.28e-3,
 > 5.0 / 7.4 cm; 2.0 → curve-exit overshoot and torque reversals up — too far.
@@ -1114,6 +1097,12 @@ Service names follow openpilot 0.11.2 throughout (`deviceMotion`,
 > the pre-Direct controller. Verify next drive: straight sway (530: 5.9 cm),
 > torque reversals, mild-bend understeer, lash. Next step if clean: 1.5 below
 > 0.5e-3 rising to 1.8 at 1e-3.
+> On car (routes 532/534, partly different roads, so not a same-place A/B):
+> straight sway 9.0 / 4.8 cm (532's follows its plan wobble, 0.129 vs 530's
+> 0.098e-3; offset per unit plan wobble ~60–70 on every drive), mild-bend
+> understeer 0.35 / 0.21e-3 (530: 0.41, 531 with the integrator: 0.35), torque
+> reversals 73–79 → 94 /min on both drives (+20–28 %). Kept at 1.5; the 1.8
+> schedule waits for a like-for-like drive on the 530/531 road.
 
 ---
 
@@ -1427,7 +1416,6 @@ Published each deviceMotion tick. The exact field set is pinned by
 | `sl_bias` | learned straight-road torque (Nm) |
 | `sl_learn` | slope-bias learn gate open this tick |
 | `kappa_pred` | yaw-predictor curvature added to `measured` in the P law (1/m); 0 outside lane changes |
-| `ci_nm` | curve integrator torque added to the demand (Nm); 0 when `CurveIntegrator` is off |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
 

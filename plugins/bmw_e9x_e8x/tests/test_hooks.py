@@ -216,13 +216,17 @@ class TestVehicleSettingsRows:
     under any title.
 
     'Stall Breakaway' (2026-08-15) was retired the same way on 2026-10-23:
-    its shadow trips on routes 4ee-4f7 were ordinary turn-ins. Both retired
-    titles stay pinned out below."""
+    its shadow trips on routes 4ee-4f7 were ordinary turn-ins.
+
+    'Curve Integrator' (2026-11-08) was retired on 2026-11-09: it doubled
+    straight sway on route 531, and the 1.5 straight gain matched its curve
+    gain without it. All retired titles stay pinned out below."""
     titles = [r.title for r in self._rows(monkeypatch, param_dir)]
-    assert titles == ['Temperature Overlay', 'Slope Compensation', 'Curve Integrator',
+    assert titles == ['Temperature Overlay', 'Slope Compensation',
                       'Resume Button Repurposed']
     assert 'Steering Push Budget' not in titles
     assert 'Stall Breakaway' not in titles
+    assert 'Curve Integrator' not in titles
 
   def test_non_bmw_gets_no_rows(self, mock_deps, monkeypatch, param_dir):
     import register
@@ -277,18 +281,6 @@ class TestVehicleSettingsRows:
     assert (param_dir / 'SlopeCompensation').read_text() == '1'
     row.callback(False)
     assert (param_dir / 'SlopeCompensation').read_text() == '0'
-
-  def test_curve_integrator_row_state_and_callback(self, mock_deps, monkeypatch, param_dir):
-    """Default-OFF (`== '1'`), persisted to the param file latcontroller
-    reads at each engagement."""
-    assert self._row(monkeypatch, param_dir, 'Curve Integrator').initial_state is False
-    (param_dir / 'CurveIntegrator').write_text('1')
-    assert self._row(monkeypatch, param_dir, 'Curve Integrator').initial_state is True
-    row = self._row(monkeypatch, param_dir, 'Curve Integrator')
-    row.callback(False)
-    assert (param_dir / 'CurveIntegrator').read_text() == '0'
-    row.callback(True)
-    assert (param_dir / 'CurveIntegrator').read_text() == '1'
 
   def test_slope_compensation_absent_for_non_bmw(self, mock_deps, monkeypatch, param_dir):
     import register

@@ -164,12 +164,6 @@ def _set_slope_compensation(state):
   _write_param('SlopeCompensation', '1' if state else '0')
 
 
-def _set_curve_integrator(state):
-  """Persist the CurveIntegrator switch (param file only); latcontroller reads
-  it at each engagement, so it applies at the next engagement."""
-  _write_param('CurveIntegrator', '1' if state else '0')
-
-
 def on_vehicle_settings(items, CP):
   """Hook callback: populate the Driving panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
@@ -192,16 +186,6 @@ def on_vehicle_settings(items, CP):
     "slope, alignment) and apply it. Applies at the next engagement.",
     _read_param('SlopeCompensation') == '1',
     callback=_set_slope_compensation,
-  ))
-
-  # Default-OFF like Slope Compensation: an absent param file reads as off.
-  items.append(toggle_item(
-    "Curve Integrator",
-    "In curves, learn the extra steering torque the car still needs to follow "
-    "the plan and add it, so mild bends are not taken wide. Applies at the "
-    "next engagement.",
-    _read_param('CurveIntegrator') == '1',
-    callback=_set_curve_integrator,
   ))
 
   items.append(toggle_item(
