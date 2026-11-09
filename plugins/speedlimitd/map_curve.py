@@ -24,10 +24,12 @@ R=400 reads as straight at 80 m), so 50 m is the compromise.
 import math
 from bisect import bisect_right
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 MAP_CURVE_WINDOW_M = 50.0
 MAP_CURVE_MAX_LOOKAHEAD_M = 800.0
+TILE_BLIP_TOLERANCE_S = 2.0   # the tile reader may lose the G/S ref this long
+PATH_FRESH_S = 2.5            # mapdExtendedOut.position must change this often (1 Hz)
 
 _R_EARTH = 6371000.0
 _MIN_SEGMENT_M = 0.1
@@ -146,3 +148,42 @@ def map_curve_cap(points: Sequence[tuple[float, float]], car_lat: float, car_lon
   if cap_ms is None:
     return MapCurveResult(0.0, 0.0, 0.0, None, None, path_ahead, best_d)
   return MapCurveResult(cap_ms * 3.6, bind[0], bind[1], bind[2], bind[3], path_ahead, best_d)
+
+
+def refs_share_gs(a: str, b: str, is_gs: Callable[[str], bool]) -> bool:
+  """True iff some ';'-separated part (whitespace stripped) is in both refs and is G/S.
+
+  OSM joins concurrent designations with ';' (e.g. 'G1503;S20'), and mapd and
+  the tile reader need not list them alike. A shared part that is NOT a G/S
+  expressway (the guodao in 'G312;S20' vs a bare 'G312') does not count.
+  """
+  parts_a = {p.strip() for p in a.split(';') if p.strip()}
+  parts_b = {p.strip() for p in b.split(';') if p.strip()}
+  return any(is_gs(p) for p in parts_a & parts_b)
+
+
+def map_curve_gate(*, gs_mode: bool, gps_valid: bool, tile_ref: str, tile_ref_age_s: float,
+                   mapd_ok: bool, mapd_sel_type: str, refs_match: bool,
+                   path_ok: bool, path_age_s: float) -> str:
+  """'ok', or the first failing reason, in the order the checks are listed.
+
+  The cap may only be computed while the tile reader puts the car on a G/S
+  expressway (within TILE_BLIP_TOLERANCE_S) AND mapd is matched to that same
+  road AND mapd's path is fresh: a path mapd built along a ramp or cross
+  street must never yield a G/S cap.
+  """
+  if not gs_mode:
+    return 'off_gs'
+  if not gps_valid:
+    return 'no_gps'
+  if not tile_ref or tile_ref_age_s > TILE_BLIP_TOLERANCE_S:
+    return 'tile_lapsed'
+  if not mapd_ok:
+    return 'mapd_absent'
+  if mapd_sel_type not in ('current', 'predicted'):
+    return 'sel_type'
+  if not refs_match:
+    return 'ref_mismatch'
+  if not path_ok or path_age_s > PATH_FRESH_S:
+    return 'path_stale'
+  return 'ok'

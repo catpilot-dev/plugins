@@ -160,3 +160,41 @@ def test_lateral_distance_reported():
 def test_degenerate_paths_do_not_raise(pts):
   r = map_curve.map_curve_cap(pts, *ORIGIN, **K)
   assert r is None or (math.isfinite(r.cap_kph) and math.isfinite(r.lateral_m))
+
+
+# ── gate ──────────────────────────────────────────────────────────────────────
+
+OK = dict(gs_mode=True, gps_valid=True, tile_ref='S20', tile_ref_age_s=0.0, mapd_ok=True,
+          mapd_sel_type='current', refs_match=True, path_ok=True, path_age_s=0.0)
+
+
+def test_gate_all_pass_is_ok():
+  assert map_curve.map_curve_gate(**OK) == 'ok'
+
+
+@pytest.mark.parametrize('override,reason', [
+  ({'gs_mode': False}, 'off_gs'), ({'gps_valid': False}, 'no_gps'),
+  ({'tile_ref': ''}, 'tile_lapsed'), ({'mapd_ok': False}, 'mapd_absent'),
+  ({'mapd_sel_type': 'extended'}, 'sel_type'), ({'mapd_sel_type': 'fail'}, 'sel_type'),
+  ({'refs_match': False}, 'ref_mismatch'), ({'path_ok': False}, 'path_stale'),
+  ({'path_age_s': 2.6}, 'path_stale')])
+def test_gate_each_condition_alone(override, reason):
+  assert map_curve.map_curve_gate(**{**OK, **override}) == reason
+
+
+def test_gate_predicted_selection_passes():
+  assert map_curve.map_curve_gate(**{**OK, 'mapd_sel_type': 'predicted'}) == 'ok'
+
+
+def test_tile_blip_tolerance_is_2s():
+  assert map_curve.map_curve_gate(**{**OK, 'tile_ref_age_s': 1.9}) == 'ok'
+  assert map_curve.map_curve_gate(**{**OK, 'tile_ref_age_s': 2.1}) == 'tile_lapsed'
+
+
+def test_refs_share_gs_multi_ref():
+  gs = lambda r: r in ('S20', 'G1503', 'G2')
+  assert map_curve.refs_share_gs('G1503;S20', 'S20', gs)
+  assert map_curve.refs_share_gs('S20', 'G1503; S20', gs)
+  assert not map_curve.refs_share_gs('G312;S20', 'G312', gs)   # shared part is not G/S
+  assert not map_curve.refs_share_gs('S20', 'G2', gs)
+  assert not map_curve.refs_share_gs('', 'S20', gs)
