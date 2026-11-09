@@ -26,3 +26,4 @@
   highwayClass @24 :HighwayClass;
   wayId @25 :Int64;
   conditionalSpeedLimit @26 :Text;
+  isForward @27 :Bool;

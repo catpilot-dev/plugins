@@ -1,10 +1,10 @@
 # Mapd — OpenStreetMap Data
 
-**Status: DORMANT again since 2026-08-21 — v2.3.1 crashes too, in a new place.**
-
-The binary does not run: `plugin.json` declares no process. The cereal interface
-is deliberately kept warm — slots 17-19 and the `mapdOut` service stay injected,
-so the plugin remains installed and `.enforced` and is NOT `.disabled`.
+**Status: RE-ACTIVATED on v2.4.0 (2026-11-09), pending a drive.** `plugin.json`
+declares the process again, and `mapdOut` is now registered at mapd's own 2 MB
+queue size. That size mismatch is the suspected cause of the v2.3.1 SIGBUS (see
+[the root cause](#root-cause-mapdout-queue-size-mismatch)). Nothing is confirmed
+on the road yet.
 
 Nothing in the control path notices. speedlimitd has always derived every control
 decision from the offline tile reader (`osm_query.OsmTileReader`); it consumes
@@ -51,9 +51,9 @@ binaries are kept in `/data/media/0/osm/mapd_backups/`.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| MapdVersion | string | v2.3.1 | Version tracked/pinned by `mapd_manager.py` |
+| MapdVersion | string | v2.4.0 | Version tracked/pinned by `mapd_manager.py` |
 
-The v2.3.1 pin is deliberate, for two independent reasons.
+The v2.4.0 pin is deliberate, for three independent reasons.
 
 **Schema coupling.** Cap'n Proto is additive, so a newer binary publishing into
 our `cereal/slot17-19.capnp` silently drops any field we have not declared —
@@ -80,7 +80,47 @@ itself, and plugind respawns it with speedlimitd degrading to vision-only
 meanwhile. Do not set any of them slotted without re-auditing the slot
 budget of that queue AND fixing the slot leak upstream.
 
-## DORMANT — v2.3.1 activation attempt, 2026-08-21
+**Queue size coupling.** mapd creates `mapdOut` at its own hardcoded size
+(`ServiceQueueSize` in upstream `settings/const.go`, MEDIUM = 2 MB), and the
+4th element of our `services.mapdOut` entry must equal it. See below.
+
+## Root cause: mapdOut queue size mismatch
+
+Found 2026-11-09 while reviewing v2.4.0 (issue #31). It is a hypothesis that
+fits every observation, but no drive has confirmed it.
+
+- mapd creates `mapdOut` at 2 MB. We registered it as `[true, 20.0, 20]`, so
+  openpilot's `Service` defaulted it to `QueueSize.SMALL`, 250 KB. speedlimitd's
+  SubMaster opens it at that size.
+- Every msgq opener, C++ and gomsgq alike, `ftruncate`s the shared
+  `/dev/shm/msgq_mapdOut` to **its own** size. A reader opening after mapd
+  shrinks the file under mapd's 2 MB mmap.
+- mapd's first write past 250 KB is then a write beyond EOF, which raises
+  `SIGBUS code=0x2` (BUS_ADRERR), exactly the trace below. A parked `mapdOut` is
+  about 170 B, so 250 KB is about 1,500 messages, or about 75 s at 20 Hz. The
+  observed figure was "~80 s, ≈1600 msgs".
+- Not yet confirmed: what shrinks the file again after each respawn. The likely
+  candidate is speedlimitd, whose 250 KB mapping cannot reach mapd's offsets, so
+  it would crash and respawn on the same cycle. Check speedlimitd's spawn cadence
+  if this recurs.
+- Nobody has reported a SIGBUS upstream, which suggests forks that register
+  `mapdOut` at MEDIUM never hit this.
+
+The fix is `"mapdOut": [true, 20.0, 20, 2097152]`. `plugins/services.py` now
+**rewrites** a stale plugin entry instead of skipping any name already present.
+Before this, a device that already carried the 3-tuple would have kept 250 KB
+across every reinstall, because `services.py` is edited in place and never reset.
+
+v2.4.0's msgq change, reader capacity auto-detection, is unrelated: our
+`NUM_READERS` is 15, the same as gomsgq's fallback. `mapd_defaults.json` sets
+`msgq_queue_size: 0` (auto-detect) rather than hardcoding 15, so mapd follows
+the msgq.h actually on the device.
+
+**Schema delta adopted with the pin.** v2.4.0 added `isForward @27 :Bool` to
+`MapdOut` ("travel follows the way's stored node order"). It is declared in
+`cereal/slot19.capnp`. `MapdIn` and `MapdExtendedOut` are unchanged.
+
+## History: DORMANT after the v2.3.1 activation attempt, 2026-08-21
 
 Activated and reverted the same day. **v2.3.1 fixes the bug we waited for and
 introduces a different one.**
@@ -115,16 +155,18 @@ respawn, so a crash trace is erased ~85 s later. To catch one, poll
 `/tmp/plugin_logs/plugin_mapd.log` every second and copy it the moment it is
 non-empty.
 
-### Re-activation, when a release fixes the publisher fault
-1. Restore the process entry in `plugins/mapd/plugin.json`:
-   `"processes": [{"name": "mapd", "module": "mapd_runner", "condition": "always_run"}]`
-2. Bump `MAX_ALLOWED_VERSION` in `mapd_manager.py`, paired with a slot schema diff.
-3. Keep every `subscriber` entry on `shadow: true` (see above).
-4. Deploy, then **reboot** — plugind freezes manifests at discovery, so a
+### Verifying the v2.4.0 re-activation
+1. Deploy, then **reboot**. plugind freezes manifests at discovery, so a
    `processes` change needs plugind restarted, not just `.needs_restart`.
-5. Success criterion: one long-lived mapd PID across a whole drive. Watch the
+2. Check that the `mapdOut` line in the installed `cereal/services.py`
+   (`/data/openpilot/cereal/` or `/data/openpilot/openpilot/cereal/`) reads
+   `(True, 20.0, 20, 2097152)`, and that
+   `ls -l /dev/shm/msgq_mapdOut` is 2 MB plus the header, not about 250 KB.
+3. Success criterion: one long-lived mapd PID across a whole drive. Watch the
    spawn cadence in swaglog (`plugin process 'mapd' spawned`), which is how the
-   ~85 s flap was measured.
+   ~85 s flap was measured. Watch speedlimitd's cadence too.
+4. If it still flaps, revert to dormant (empty `processes`) and use the
+   debugging note above to capture the trace.
 
 ### History: why it was dormant before this attempt (2026-08-19)
 
@@ -171,7 +213,7 @@ exists so a permanently-expected warning never desensitises the reader to a real
 failure.
 
 An upstream release is watched automatically — see `.github/scripts/mapd_watch.py`,
-which files a GitHub Issue with the schema and crash-fix verdicts precomputed.
+which files a GitHub Issue with the schema verdict and a bump checklist precomputed.
 
 ## Settings
 

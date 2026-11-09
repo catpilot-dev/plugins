@@ -29,7 +29,7 @@
     "standalone_schema": "cereal/standalone.capnp"
   },
   "services": {
-    "mapdOut": [true, 20.0, 20]
+    "mapdOut": [true, 20.0, 20, 2097152]
   },
   "panel": false,
   "hooks": {
@@ -39,11 +39,11 @@
       "priority": 50
     }
   },
-  "processes": [],
+  "processes": [{"name": "mapd", "module": "mapd_runner", "condition": "always_run"}],
   "params": {
     "MapdVersion": {
       "type": "string",
-      "default": "v2.3.1",
+      "default": "v2.4.0",
       "label": "Mapd Version"
     }
   }

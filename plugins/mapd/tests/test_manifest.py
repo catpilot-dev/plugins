@@ -51,24 +51,34 @@ class TestService:
     assert entry[1] == 20.0          # frequency (Hz)
     assert entry[2] == 20            # decimation
 
+  def test_queue_size_matches_what_mapd_creates(self):
+    """mapd creates mapdOut at QUEUE_SIZE_MEDIUM, 2 MB (settings/const.go,
+    ServiceQueueSize, unchanged v2.3.1 through v2.4.0). Every opener of a msgq
+    queue ftruncates the shared /dev/shm file to ITS OWN size, so a reader
+    opened at openpilot's default SMALL (250 KB) shrinks the file under mapd's
+    2 MB mmap. mapd's next write past 250 KB then takes a SIGBUS (BUS_ADRERR),
+    which is the suspected cause of v2.3.1's ~80 s publisher fault.
+    If mapd ever changes this size, change it here in the same commit."""
+    entry = _manifest()['services']['mapdOut']
+    assert len(entry) == 4
+    assert entry[3] == 2 * 1024 * 1024
+
 
 class TestProcess:
-  def test_no_process_declared_binary_is_dormant(self):
-    """mapd declares NO process, so the Go binary never launches.
+  def test_mapd_process_is_declared(self):
+    """Re-activated on v2.4.0 (2026-11-09) with mapdOut's queue_size set to 2 MB.
 
-    Dormant since 2026-08-19 and again since 2026-08-21. v2.3.0 died on gomsgq
-    v0.1.10's shadow-reader panic; v2.3.1 fixes that and then SIGBUSes in its new
-    publisher thread (`autoPublishLoop`) ~80 s after start, so plugind respawns it
-    every ~85 s. Neither release survives a drive.
-
-    This assertion is a tripwire: re-activating mapd must be a deliberate edit
-    here, never silent drift. Flip it only alongside a release that fixes the
-    publisher fault — see the re-activation checklist in README.md.
+    Dormant 2026-08-19 to 2026-11-09. v2.3.0 died on gomsgq v0.1.10's
+    shadow-reader panic. v2.3.1 fixed that, then SIGBUSed in its publisher
+    ~80 s after start, which is now attributed to our mapdOut queue being
+    registered at 250 KB against mapd's 2 MB (see TestService). Removing this
+    entry again must be a deliberate edit here, never silent drift.
     """
-    assert _manifest()['processes'] == []
+    assert _manifest()['processes'] == [
+        {'name': 'mapd', 'module': 'mapd_runner', 'condition': 'always_run'}]
 
-  def test_interface_survives_the_dormant_binary(self):
-    """The cereal slots and mapdOut service MUST stay declared while dormant.
+  def test_interface_is_declared(self):
+    """The cereal slots and mapdOut service stay declared, running or dormant.
 
     This is why mapd is enforced rather than .disabled: .disabled makes
     custom_capnp.py revert the slots to CustomReservedN and services.py drop
@@ -87,7 +97,7 @@ class TestHooks:
 
 
 class TestVersionPin:
-  """The pin is v2.3.1, and it is stated in two files that must never drift.
+  """The pin is v2.4.0, and it is stated in two files that must never drift.
 
   MapdVersion is what mapd_manager downloads; MAX_ALLOWED_VERSION is the
   ceiling it refuses to exceed. A default ABOVE the ceiling installs nothing at
@@ -106,10 +116,10 @@ class TestVersionPin:
     return match.group(1)
 
   def test_manifest_default_is_the_active_pin(self):
-    assert _manifest()['params']['MapdVersion']['default'] == 'v2.3.1'
+    assert _manifest()['params']['MapdVersion']['default'] == 'v2.4.0'
 
   def test_manager_max_allowed_is_the_active_pin(self):
-    assert self._max_allowed_version() == 'v2.3.1'
+    assert self._max_allowed_version() == 'v2.4.0'
 
   def test_pin_and_manifest_default_never_drift(self):
     assert self._max_allowed_version() == \
@@ -143,6 +153,19 @@ class TestDefaults:
     # Upstream default. Shadow consumes no reader slot; the torn-read panic is
     # contained by plugind respawn plus speedlimitd degrading to vision-only.
     assert self._defaults()['subscriber']['shadow_car_state'] is True
+
+  def test_every_subscriber_stays_shadow(self):
+    # gomsgq still has no deregistration: a slotted reader leaks a slot per
+    # mapd death, and overflowing NUM_READERS zeroes the reader table and kills
+    # loggerd (route 410 seg 4). See README.md.
+    sub = self._defaults()['subscriber']
+    assert sub and all(v is True for v in sub.values())
+
+  def test_msgq_reader_capacity_is_auto_detected(self):
+    """v2.4.0 setting. 0 = read NUM_READERS from openpilot's msgq.h (fallback
+    15). A hardcoded number would silently mis-lay-out the queue header the
+    day openpilot changes NUM_READERS (upstream already moved 15 -> 25)."""
+    assert self._defaults()['msgq_queue_size'] == 0
 
 
 class TestRunnerSettings:

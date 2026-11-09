@@ -79,6 +79,16 @@ class TestMapdOut:
     fields = schema.MapdOut.schema.fieldnames
     assert fields[24:27] == ('highwayClass', 'wayId', 'conditionalSpeedLimit')
 
+  def test_has_v240_is_forward(self, schema):
+    # v2.4.0: travel follows the way's stored node order.
+    fields = schema.MapdOut.schema.fieldnames
+    assert fields[27] == 'isForward'
+    assert len(fields) == 28
+    msg = schema.MapdOut.new_message()
+    msg.isForward = True
+    with schema.MapdOut.from_bytes(msg.to_bytes()) as out:
+      assert out.isForward is True
+
   def test_roundtrip_new_fields(self, schema):
     msg = schema.MapdOut.new_message()
     msg.wayRef = 'S20'
