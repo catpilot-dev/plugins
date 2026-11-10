@@ -402,6 +402,9 @@ class CarController(CarControllerBase):
         cruise_cmd(CruiseStalk.cancel, SINGLE_INTERVAL)
       elif CC.enabled:
         if CS.out.gasPressed:
+          # Intended: the driver speeds the car up to override openpilot's
+          # setpoint. plus1 goes out continuously while the pedal is down
+          # (1 km/h per 200 ms slot) and the setpoint law below is bypassed.
           cruise_cmd(CruiseStalk.plus1, SINGLE_INTERVAL)
         else:
           # Setpoint target: v_target (planner vTarget ~0.5 s ahead, not the

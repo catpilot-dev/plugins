@@ -1287,6 +1287,70 @@ class TestSetpointBias:
     assert acts & {'minus1', 'minus5'}, acts
 
 
+class TestGasPedalRaisesSetpoint:
+  """Driver on the gas while engaged: plus1 is sent continuously.
+
+  Intended behaviour (original port, confirmed 2026-11-10): the driver speeds
+  the car up to override openpilot's setpoint. The pedal takes the stalk
+  channel from the setpoint law, whatever the planner is asking for, and the
+  setpoint climbs for as long as the pedal is down.
+  """
+
+  SZL_TICK = 0.2
+  STEP = 0.01
+  KPH = 1 / 3.6
+  ACTION = TestSetpointBias.ACTION
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _run(self, accel, v_target_kmh, gas=True, enabled=True, dur=1.0):
+    """Hold one operating point at 86 km/h (setpoint 86) with the pedal down.
+    Returns (action names sent, counter steps within bursts, longest gap
+    between frames in s — None if fewer than two went out)."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, _ = _make_cc()
+    v_ego = setpoint = 86.0 * self.KPH
+    t, szl, sent = 0.0, 0, []
+    for _ in range(int(round(dur / self.STEP))):
+      t += self.STEP
+      if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+        szl = (szl + 1) % 15
+      cs = make_stalk_carstate(szl, v_ego=v_ego, setpoint=setpoint)
+      cs.out.gasPressed = gas
+      _, msgs = cc.update(make_stalk_carcontrol(accel, v_target_kmh * self.KPH, enabled=enabled),
+                          cs, int(round(t * 1e9)))
+      sent += [(t, dat[1] & 0xF, dat[2]) for addr, dat, _bus in msgs if addr == 404]
+    acts = {self.ACTION[b] for _, _, a2 in sent for b in self.ACTION if a2 & (1 << b)}
+    gaps = [sent[i + 1][0] - sent[i][0] for i in range(len(sent) - 1)]
+    return acts, _steps_within_bursts(sent), (max(gaps) if gaps else None)
+
+  def test_gas_sends_plus1_where_the_law_is_silent(self):
+    """Setpoint on target, no demand: nothing to send without the pedal."""
+    acts, _, _ = self._run(accel=0.0, v_target_kmh=86.0, gas=False)
+    assert acts == set()
+    acts, steps, max_gap = self._run(accel=0.0, v_target_kmh=86.0)
+    assert acts == {'plus1'}
+    assert steps == {1}
+    # One unbroken burst at SINGLE_INTERVAL (20 Hz), not a tap per slot.
+    assert max_gap == pytest.approx(0.05, abs=0.011)
+
+  def test_gas_overrides_a_braking_plan(self):
+    """The pedal wins over the decel-side law: no minus commands go out."""
+    acts, steps, _ = self._run(accel=-1.0, v_target_kmh=76.0)
+    assert acts == {'plus1'}
+    assert steps == {1}
+
+  def test_gas_does_nothing_when_not_engaged(self):
+    acts, _, _ = self._run(accel=0.0, v_target_kmh=86.0, enabled=False)
+    assert 'plus1' not in acts
+
+
 class TestSetpointDebtLedger:
   """Every downward bias is borrowed and has to be repaid.
 

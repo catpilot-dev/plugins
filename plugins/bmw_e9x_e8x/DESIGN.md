@@ -167,6 +167,12 @@ current speed and the DCC set-speed, and issues stalk pulses:
   The **accel** side is gated by `V_ERROR_DEADZONE` (~0.5 km/h) plus accel sign
   and set-speed headroom. The **decel** side is gated by the setpoint deadzone
   instead — see *The setpoint is a torque request* below.
+- **Gas pedal raises the setpoint** — while engaged with the driver on the
+  gas, `plus1` is sent continuously at `SINGLE_INTERVAL` and the setpoint law
+  is bypassed, whatever the planner asks for. This is intended: the driver
+  speeds the car up to override openpilot's setpoint, which climbs 1 km/h per
+  200 ms slot for as long as the pedal is down. The law takes over again on
+  release. Pinned by `TestGasPedalRaisesSetpoint`.
 - **Cadence** — two frame rates. `SINGLE_INTERVAL` (50 ms, measures 20.1 Hz)
   carries every command except one: accelerating with `accel >=
   ACCEL_HOLD_THRESHOLD` uses `HOLD_INTERVAL`. That constant is 25 ms, which is
