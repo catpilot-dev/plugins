@@ -375,7 +375,8 @@ class TestUnwindStepBoost:
 
   So below LKA_MAX_V, and ONLY while the step moves torque toward zero, the
   cap is multiplied by UNWIND_STEP_GAIN. Building torque is untouched at every
-  speed, and so is everything at or above 30 km/h.
+  speed, and so is everything at or above 30 km/h. The boost sheds at most the
+  standing torque: it ends at zero and never carries onto the new side.
 
   Deliberately NOT gated on curvature: kappa_meas collapses through
   RELAX_DWELL_KAPPA partway through the exit (route 417 seg 2: 0.037 -> 0.003
@@ -422,6 +423,20 @@ class TestUnwindStepBoost:
     """Past zero the step is building in the NEW direction — normal cap."""
     got, mod = self._target(monkeypatch, 5.0, torque=-0.05)
     assert got == pytest.approx(-0.05 - 0.10, abs=1e-6), got
+
+  def test_boost_does_not_carry_a_small_residual_past_zero(self, monkeypatch):
+    """A reversal from 0.24 Nm of residual torque: the 0.10 cap bounds the
+    whole step, as it does above the LKA band. The boost applied to the full
+    step put 3.4 Nm on the new side in one decision (cap 1.2 Nm)."""
+    got, mod = self._target(monkeypatch, 5.0, torque=0.02)
+    assert got == pytest.approx(0.02 - 0.10, abs=1e-6), got
+
+  def test_boosted_shed_ends_at_zero(self, monkeypatch):
+    """Standing torque between the plain cap and the boosted one: the boost
+    sheds all of it and stops at zero; the new side builds from the next
+    decision under the plain cap."""
+    got, mod = self._target(monkeypatch, 5.0, torque=0.15)
+    assert got == 0.0, got
 
 
 def _dwell_tick(monkeypatch, *, v, relax_ticks):

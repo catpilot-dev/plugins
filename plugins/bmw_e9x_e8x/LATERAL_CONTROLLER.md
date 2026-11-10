@@ -34,7 +34,7 @@ measured curve (the current torque is held through a reference dip, within
 `t_cap`); the noise guard (a sign change of the demand commands 0 until the new
 sign has persisted `GUARD_PERSIST_S`);
 `STEP_MAX` toward the target (flat 0.10 while the model runs a lane change;
-×`UNWIND_STEP_GAIN` when shedding in the LKA regime). The torque ramps to the target over the next 300 ms, one CAN tick
+×`UNWIND_STEP_GAIN` when shedding in the LKA regime, and that boost ends at zero). The torque ramps to the target over the next 300 ms, one CAN tick
 at a time. The free-play take-up (`bmw/takeup.py`) commands `TAKEUP_NM` across
 the servo lash on a change of push direction once the contacts are learned,
 then hands back to the ramp. Inactive: no decision runs; torque, target and
@@ -1103,6 +1103,23 @@ Service names follow openpilot 0.11.2 throughout (`deviceMotion`,
 > understeer 0.35 / 0.21e-3 (530: 0.41, 531 with the integrator: 0.35), torque
 > reversals 73–79 → 94 /min on both drives (+20–28 %). Kept at 1.5; the 1.8
 > schedule waits for a like-for-like drive on the 530/531 road.
+
+> **2026-11-10 — the unwind boost ends at zero (code review, no route).** The
+> LKA-regime boost multiplied the whole step cap whenever the step moved the
+> torque toward zero, including the part of the step past zero. A reversal the
+> noise guard had already passed, taken from a small residual torque, therefore
+> applied up to 3 × `STEP_MAX` on the new side in one decision: 3.4 Nm below
+> 30 km/h from 0.24 Nm of residual, against the 1.2 Nm cap that bounds
+> application at every other speed. The step cap while shedding is now
+> `max(STEP_MAX, min(UNWIND_STEP_GAIN · STEP_MAX, |torque|))`: the boost sheds
+> at most the standing torque and stops at zero, and a step that crosses zero
+> is bounded by the plain cap as above the band. A standing torque between the
+> two caps lands on exactly 0 and the new side builds from the next decision.
+> Sheds that stay on their side (the route 417 case) are unchanged; a
+> differential fuzz (synthetic inputs) against the previous build diverges
+> only at boosted zero crossings (new-side torque 3.44 → 1.18 Nm at worst).
+> Verify next drive: reversals below 43 km/h (roundabout and S-turn exits) —
+> no slower shed, no kick on the new side.
 
 ---
 

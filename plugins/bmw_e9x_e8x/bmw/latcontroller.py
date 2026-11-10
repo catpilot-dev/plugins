@@ -424,10 +424,13 @@ def on_lat_controller_init(result, lac, CP):
         # 30 km/h (SAT cannot fling the freed wheel, stiction holds it) and a
         # ~3.9 Nm hold otherwise takes ~1 s to shed against the driver's return
         # of the wheel (route 417). Not gated on curvature: kappa_meas collapses
-        # through RELAX_DWELL_KAPPA partway through an exit.
+        # through RELAX_DWELL_KAPPA partway through an exit. The boost ends at
+        # zero: it never carries the torque onto the new side, where the
+        # plain cap bounds the application as at every other speed.
         if (target_frac - state['torque']) * state['torque'] < 0.0:
-          step_max *= float(np.interp(v_true, [LKA_MAX_V, LKA_BLEND_V],
-                                      [UNWIND_STEP_GAIN, 1.0]))
+          shed_max = step_max * float(np.interp(v_true, [LKA_MAX_V, LKA_BLEND_V],
+                                                [UNWIND_STEP_GAIN, 1.0]))
+          step_max = max(step_max, min(shed_max, abs(state['torque'])))
         step = float(np.clip(target_frac - state['torque'], -step_max, step_max))
         target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
 
