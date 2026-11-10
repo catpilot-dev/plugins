@@ -1153,6 +1153,14 @@ class TestSetpointBias:
                            v_target_kmh=35.0, v_target_rate=0.0)
     assert 'minus1' not in acts and 'minus5' not in acts, acts
 
+  def test_setpoint_at_the_dcc_minimum_is_not_cancelled(self):
+    """openpilot never takes DCC to standby for low speed. Its own law stops
+    3 km/h above DCC's minimum on the dash (31 raw = 33 shown, minimum 30), so
+    a setpoint down at the minimum is the driver's, and DCC holds it. Only the
+    driver disengages there, by braking or stalk cancel."""
+    acts, _, _ = self._run(accel=0.0, v_ego_kmh=28.0, setpoint_kmh=28.0)
+    assert 'cancel' not in acts, acts
+
   # ---- restore -----------------------------------------------------------
 
   def test_restores_with_plus1_when_demand_releases(self):

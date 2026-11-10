@@ -40,7 +40,9 @@ class BmwFlags(IntFlag):
 
 class CruiseSettings:
   CLUSTER_OFFSET = 2 # kph
-  MIN_SPEED_BUFFER = 1.0  # km/h - add to minEnableSpeed to avoid disengagement
+  # km/h above minEnableSpeed for the lowest setpoint openpilot commands:
+  # 31 raw = 33 on the dash, 3 above DCC's minimum of 30.
+  MIN_SPEED_BUFFER = 1.0
   MIN_ENABLE_SPEED_KPH = 30.  # CC and DCC both refuse to engage below this
 
 class CanBus:

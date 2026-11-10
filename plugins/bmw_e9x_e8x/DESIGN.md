@@ -172,6 +172,15 @@ current speed and the DCC set-speed, and issues stalk pulses:
   speeds the car up to override openpilot's setpoint, which climbs 1 km/h per
   200 ms slot for as long as the pedal is down. The law takes over again on
   release. Pinned by `TestGasPedalRaisesSetpoint`.
+- **openpilot never cancels DCC for low speed** — the law's lowest setpoint is
+  `min_cruise_setpoint`: 31 km/h raw, 33 on the dash, 3 above DCC's minimum of
+  30. Below it the decel branch is blocked and only the driver disengages, by
+  braking or stalk cancel. `cancel` is sent on an openpilot disengage and
+  nowhere else. A second cancel from the original port — setpoint at DCC's
+  minimum with the car under 29.4 km/h — was removed 2026-11-10: the law cannot
+  put the setpoint there (route 515: lowest setpoint 31.00 km/h over 87,654
+  DCC-enabled frames, condition true on none), so it could only fire on a
+  setpoint the driver had stalked down to 30, which DCC now simply holds.
 - **Cadence** — two frame rates. `SINGLE_INTERVAL` (50 ms, measures 20.1 Hz)
   carries every command except one: accelerating with `accel >=
   ACCEL_HOLD_THRESHOLD` uses `HOLD_INTERVAL`. That constant is 25 ms, which is
@@ -603,8 +612,8 @@ plus5:   land = 10 * (floor((setpoint + PHASE) / 10) + 1) - PHASE
 `STEP5_GRID_PHASE` = 2 km/h places the grid in `cruiseState.speed`'s own units:
 every measured landing sits at `speed ≡ 8 (mod 10)`. It is **not**
 `CruiseSettings.CLUSTER_OFFSET`, even though both are 2 today — that one is
-cosmetic (`vEgoCluster`, `speedCluster`, the disengage guard), while this one
-decides where the landings are and carries the overshoot guard. Retuning the
+cosmetic (`vEgoCluster`, `speedCluster`), while this one decides where the
+landings are and carries the overshoot guard. Retuning the
 display must not silently move the control grid, so a test pins them apart.
 
 Exact on **54 of 54** minus5 landings and **32 of 32** plus5 landings. Some

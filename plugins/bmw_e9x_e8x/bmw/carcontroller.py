@@ -139,8 +139,9 @@ class CarController(CarControllerBase):
   def __init__(self, dbc_name, CP):
     super().__init__(dbc_name, CP)
     self.flags = CP.flags
-    self.min_cruise_speed = CP.minEnableSpeed
-    self.min_cruise_setpoint = self.min_cruise_speed + CruiseSettings.MIN_SPEED_BUFFER * CV.KPH_TO_MS
+    # Lowest setpoint the law commands. openpilot never cancels DCC for low
+    # speed; below this only the driver disengages (brake or stalk cancel).
+    self.min_cruise_setpoint = CP.minEnableSpeed + CruiseSettings.MIN_SPEED_BUFFER * CV.KPH_TO_MS
 
     self.cruise_cancel = False
     self.cruise_enabled_prev = False
@@ -332,9 +333,6 @@ class CarController(CarControllerBase):
       return 1 <= delta <= 7
 
     if not CC.enabled and self.cruise_enabled_prev:
-      self.cruise_cancel = True
-    if (CS.out.cruiseState.speedCluster - self.min_cruise_speed) < 0.1 \
-      and CS.out.vEgoCluster - self.min_cruise_speed < 0.4:
       self.cruise_cancel = True
     if not CS.out.cruiseState.enabled:
       self.cruise_cancel = False
