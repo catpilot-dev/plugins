@@ -27,7 +27,6 @@ BURST_LIVE_WINDOW = 0.5       # s — burst considered live until this long with
 # Accel side — DESIGN.md: "DCC cruise-stalk control" (cadence encodes magnitude)
 V_ERROR_DEADZONE = 0.5 / 3.6   # m/s — accel-side entry gate
 ACCEL_HOLD_THRESHOLD = 0.3     # m/s² — HOLD above, SINGLE below
-ACCEL_STEP5_THRESHOLD = 0.6    # m/s² — plus5 offered above; its landing test decides
 # The accel side inverts the plant too — DESIGN.md: "The accel side inverts the
 # plant". 0.11.2's vTarget never implies more acceleration than aTarget, so it
 # sits ~1 km/h ahead of the car, inside DCC's dead band. Measured refit over
@@ -62,10 +61,11 @@ BRAKE_LATCH_BELOW_KMH = 1.0
 
 # Command selection: one decision per SZL slot, keyed on the setpoint error
 # left after what is still in flight (setpoint_pending). minus1 is a 1 km/h
-# step; minus5/plus5 snap to a 10 km/h grid and are used only when the landing
-# point does not pass the target. DESIGN.md: "Command selection — one decision
-# per SZL slot", "±1 is a step; ±5 snaps to a grid", "±5 needs no threshold".
-STEP5_GRID_KMH = 10.0         # DCC snaps to this grid on plus5 and minus5
+# step; minus5 snaps to a 10 km/h grid and is used only when the landing point
+# does not pass the target. plus5 snaps up the same grid and is never sent.
+# DESIGN.md: "Command selection — one decision per SZL slot", "±1 is a step;
+# ±5 snaps to a grid", "±5 needs no threshold".
+STEP5_GRID_KMH = 10.0         # DCC snaps to this grid on minus5 (and plus5)
 STEP5_MIN_USEFUL_KMH = 2.0    # below this it is the ±1 command's job anyway
 # Measured grid position in cruiseState.speed units (speed ≡ 8 mod 10). NOT
 # CruiseSettings.CLUSTER_OFFSET, which is cosmetic — a test pins them apart.
@@ -132,15 +132,6 @@ def minus5_landing_kmh(setpoint_kmh):
   """
   raw = round(setpoint_kmh + STEP5_GRID_PHASE)
   land = STEP5_GRID_KMH * ((raw - 1) // STEP5_GRID_KMH)
-  return land - STEP5_GRID_PHASE
-
-
-def plus5_landing_kmh(setpoint_kmh):
-  """The mirror: plus5 snaps UP to the next multiple of STEP5_GRID_KMH strictly
-  above. Exact on 32 of 32 measured landings, gain 1-10 km/h — from 49 you get
-  1, from 50 you get 10, same command."""
-  raw = round(setpoint_kmh + STEP5_GRID_PHASE)
-  land = STEP5_GRID_KMH * ((raw // STEP5_GRID_KMH) + 1)
   return land - STEP5_GRID_PHASE
 
 
@@ -435,15 +426,8 @@ class CarController(CarControllerBase):
           decel_gate = self.setpoint_braking and setpoint_error < -active_deadzone
 
           if v_error > V_ERROR_DEADZONE and accel > 0 and setpoint_error > 0:
-            cmd = CruiseStalk.plus1
-            if accel >= ACCEL_STEP5_THRESHOLD:
-              # plus5 only when its grid landing does not pass the target.
-              sp_now_kmh = CS.out.cruiseState.speed * 3.6
-              gain_kmh = plus5_landing_kmh(sp_now_kmh) - sp_now_kmh
-              if STEP5_MIN_USEFUL_KMH <= gain_kmh <= setpoint_error * 3.6:
-                cmd = CruiseStalk.plus5
             interval = HOLD_INTERVAL if accel >= ACCEL_HOLD_THRESHOLD else SINGLE_INTERVAL
-            cruise_cmd(cmd, interval)
+            cruise_cmd(CruiseStalk.plus1, interval)
 
           elif accel < 0 and decel_gate and CS.out.cruiseState.speed > self.min_cruise_setpoint:
             headroom_kmh = (CS.out.cruiseState.speed - self.min_cruise_setpoint) * 3.6

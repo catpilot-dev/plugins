@@ -696,19 +696,17 @@ class TestSetpointBias:
 
   def test_grid_phase_is_independent_of_the_display_offset(self):
     """STEP5_GRID_PHASE and CruiseSettings.CLUSTER_OFFSET are both 2 today and
-    must stay separate. The first decides where minus5/plus5 actually land and
-    the overshoot guard is built on it; the second only shifts vEgoCluster and
+    must stay separate. The first decides where minus5 actually lands and the
+    overshoot guard is built on it; the second only shifts vEgoCluster and
     speedCluster for the display. Retuning the display must not silently move
     the control grid."""
     import bmw.carcontroller as mod
     from bmw.values import CruiseSettings
     before = [mod.minus5_landing_kmh(v) for v in range(60, 100)]
-    before += [mod.plus5_landing_kmh(v) for v in range(60, 100)]
     real = CruiseSettings.CLUSTER_OFFSET
     try:
       CruiseSettings.CLUSTER_OFFSET = real + 5
       after = [mod.minus5_landing_kmh(v) for v in range(60, 100)]
-      after += [mod.plus5_landing_kmh(v) for v in range(60, 100)]
     finally:
       CruiseSettings.CLUSTER_OFFSET = real
     assert before == after, "the display offset moved the landing grid"
@@ -1181,8 +1179,7 @@ class TestSetpointBias:
   # ---- the accel branch ---------------------------------------------------
 
   @pytest.mark.parametrize('accel', [0.2, 0.5])
-  def test_accel_branch_uses_plus1_below_the_step5_threshold(self, accel):
-    """Under ACCEL_STEP5_THRESHOLD only plus1 is on the table."""
+  def test_accel_branch_uses_plus1(self, accel):
     acts, _, _ = self._run(accel=accel, v_target_kmh=92.0, setpoint_kmh=86.0)
     assert acts == {'plus1'}, acts
 
@@ -1194,45 +1191,14 @@ class TestSetpointBias:
     assert slow > 35, f"gentle accel should use SINGLE cadence, got {slow:.0f} ms"
     assert fast < 35, f"firm accel should use HOLD cadence, got {fast:.0f} ms"
 
-  def test_plus5_landing_is_the_next_multiple_of_ten_above(self):
-    """plus5 is minus5 mirrored: it snaps UP to the next multiple of 10
-    strictly above. These pairs are measured landings from routes 452-45b
-    (32 of 32 exact)."""
-    import bmw.carcontroller as mod
-    off = mod.STEP5_GRID_PHASE
-    for before_cluster, after_cluster in [(35, 40), (41, 50), (49, 50), (50, 60),
-                                          (58, 60), (59, 60), (60, 70), (67, 70),
-                                          (70, 80), (43, 50)]:
-      got = mod.plus5_landing_kmh(before_cluster - off)
-      assert got == after_cluster - off, (before_cluster, after_cluster, got + off)
-
-  def test_plus5_only_fires_when_it_lands_at_or_below_the_target(self):
-    """The accel-side twin of the minus5 guard. A plus5 just under a grid line
-    jumps up to 10 km/h; it is only the right tool when that lands at or below
-    the target. Demand is the same in both cases — only grid position differs.
-    """
-    # accel +1.0 -> ask 10 km/h, v_target 100 -> sp_target 96 from vEgo 86.
-    # Setpoint 86 (cluster 88) lands on cluster 90, i.e. 88: a 2 km/h gain
-    # inside the 10 km/h error, so plus5 fits.
-    acts, _, _ = self._run(accel=1.0, v_ego_kmh=86.0, setpoint_kmh=86.0,
-                           v_target_kmh=100.0)
-    assert 'plus5' in acts, acts
-    # Setpoint 94 (cluster 96) lands on cluster 100, i.e. 98 — past the 96
-    # target, so plus1 must be used instead.
-    acts, _, _ = self._run(accel=1.0, v_ego_kmh=86.0, setpoint_kmh=94.0,
-                           v_target_kmh=100.0)
-    assert 'plus5' not in acts, acts
-
-  def test_plus5_never_overshoots_whatever_the_grid_position(self):
-    """Sweep the setpoint across a whole grid period: whenever plus5 is used,
-    its landing point must be at or below the target."""
-    import bmw.carcontroller as mod
+  def test_accel_side_never_sends_plus5(self):
+    """plus5 snaps the setpoint up to the next multiple of 10 in one slot. The
+    accel side climbs with plus1 only, whatever the demand and wherever the
+    setpoint sits on that grid."""
     for setpoint in [86.0 + d for d in range(0, 10)]:
       acts, _, _ = self._run(accel=1.0, v_ego_kmh=86.0, setpoint_kmh=setpoint,
                              v_target_kmh=100.0)
-      if 'plus5' in acts:
-        land = mod.plus5_landing_kmh(setpoint)
-        assert land <= 100.0 + 0.01, (setpoint, land)
+      assert acts == {'plus1'}, (setpoint, acts)
 
   def test_accel_target_is_v_target_not_the_ask(self):
     """The accel side must chase the full v_target gap. Capping it at the
@@ -1255,7 +1221,7 @@ class TestSetpointBias:
     for a in (0.4, 0.8):
       acts, _, _ = self._run(accel=a, v_ego_kmh=86.0, setpoint_kmh=86.0,
                              v_target_kmh=92.0)
-      assert acts & {'plus1', 'plus5'}, (a, acts)
+      assert 'plus1' in acts, (a, acts)
 
   # ---- the safety invariant ----------------------------------------------
 

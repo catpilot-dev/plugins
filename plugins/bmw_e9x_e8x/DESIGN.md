@@ -154,12 +154,11 @@ startup-only. Rule: anything below ~5 Hz or sent on change gets declared.
 
 openpilot has no direct set-speed channel on this car, so longitudinal
 control is done by **emulating cruise-stalk (0x194) presses** — `plus1`,
-`plus5`, `minus1`, `minus5`, `cancel`. The controller compares
+`minus1`, `minus5`, `cancel` (`plus5` is never sent). The controller compares
 `actuators.speed` (= planner `vTarget`, injected by `post_actuators`) against
 current speed and the DCC set-speed, and issues stalk pulses:
 
-- **Command selection** — accel side: `plus5` vs `plus1` offered by accel
-  magnitude, `plus5` taken only when its grid landing fits; decel side: by the
+- **Command selection** — accel side: `plus1` only; decel side: by the
   setpoint error left (see below); decel is blocked below the cruise minimum +
   buffer.
   `minus1` is a one-slot tap followed by an idle slot, never a hold (see
@@ -749,11 +748,27 @@ burst too early).
 The floor guard is now the landing point rather than a headroom margin: minus5
 is used only if `land` is at or above `min_cruise_setpoint`.
 
-**plus5 gets the identical guard, mirrored.** It is used only when its landing
-point is at or below `sp_target`, so a plus5 sitting just under a grid line can
-no longer jump up to 10 km/h past the target — the accel-side twin of the
-route-45b cut-in. The step is still offered only above
-`ACCEL_STEP5_THRESHOLD`; the landing test decides whether it is taken.
+**plus5 is not sent (removed 2026-11-10).** It had the same guard mirrored,
+offered above `ACCEL_STEP5_THRESHOLD` (0.6 m/s²), and fired rarely: 7 bursts in
+26 min on route 45b, none on 45c. DCC's acceleration is capped near +0.5 m/s²,
+reached at a ~6 km/h gap, and `plus1` builds that gap at 1 km/h per 200 ms
+slot, so the snap bought only the first second. Closed loop on the plant model
+(`a = 0.107·(sp − v − 1.17)`, cap +0.5, no engine lag), for a +1.0 m/s² ask
+from ten grid positions:
+
+| | with plus5 | plus1 only |
+|---|---|---|
+| time to 0.4 m/s² | 0.33 s where the landing fit, else 1.14 s | 1.14 s |
+| accel 1 s / 2 s after the ask | 0.46 / 0.50 | 0.37 / 0.50 |
+| speed gained in 7 s | 11.8 km/h | 11.2 km/h |
+
+What it removes is a setpoint jump of up to 10 km/h whose size depended on grid
+position rather than on demand, and the `plus5_landing_kmh` /
+`ACCEL_STEP5_THRESHOLD` machinery. The grid rule above stays as a record of the
+car. Open-loop differential against the previous build (40 seeds × 12,000
+ticks, synthetic inputs): 665 frames went from `plus5` to `plus1` on the same
+tick with the same counter, nothing else changed. On-car check: pull-away when
+a lead clears or the limit rises is no slower than about a second.
 
 ### Only the decel side inverts the plant
 
@@ -791,7 +806,8 @@ problem. It belongs at the latch, or at a rate limit on the climb, not at the
 destination. Unfixed for now; the lag it caused was worse than the flapping it
 cured.
 
-The plus5 landing guard is independent of all this and stays.
+The plus5 landing guard is independent of all this and stays. *(plus5 itself
+was removed 2026-11-10, see "±5 needs no threshold".)*
 
 ### The accel side inverts the plant (0.11.2)
 
