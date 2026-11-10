@@ -538,7 +538,7 @@ class TestCruiseBurstCounter:
 
 
 class TestSetpointBias:
-  """Accel-derived setpoint on the decel side.
+  """Accel-derived setpoint: ask DCC for the gap the demand needs.
 
   Before this, the setpoint was driven to v_target and stopped there. That gate
   is a clamp, not a rate limit: measured over routes 452 + 453 the setpoint
@@ -548,10 +548,15 @@ class TestSetpointBias:
   0.0912 on the accel side), so ask for the gap the demand actually needs.
 
   The invariants worth holding onto:
-    - the accel branch is untouched (sp_target == v_target whenever accel >= 0),
-      so the setpoint is never pushed above the driver's set speed;
+    - the braking bias only deepens the target: while braking is latched it is
+      at or below v_target;
+    - outside a braking episode the target is v_target, lifted while
+      accelerating to the gap that delivers aTarget (0.11.2). The lift needs
+      vTarget ahead of the car, so the planner still decides whether to
+      accelerate; while it does, the setpoint can sit above the driver's set
+      speed, and a vTarget below the car latches braking to bring it back;
     - counter steps stay +1 (the 5ECE/CD95 axis);
-    - every downward bias is repaid, with plus1 and not plus5.
+    - every downward bias is repaid, with plus1 (plus5 is never sent).
   """
 
   SZL_TICK = 0.2
