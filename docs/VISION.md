@@ -30,7 +30,7 @@ A plugin architecture that turns forks into composable, drop-in modules:
 
 ## Hook Points
 
-24 hook call sites implemented across controls, car, planning, device
+19 hook call sites implemented across controls, car, planning, device
 health, and UI — plus plugin-dispatched hooks (e.g. car plugins populate
 ui_mod's Driving panel). See `docs/HOOK_INTEGRATION_POINTS.md` for the
 authoritative list.
@@ -68,14 +68,11 @@ These are the minimal touch points in upstream code:
 |------|---------|-------------|
 | `openpilot/selfdrive/controls/controlsd.py` | `controls.lat_controller_init`, `controls.curvature_correction`, `controls.post_actuators` | 6 |
 | `openpilot/selfdrive/controls/lib/longitudinal_planner.py` | `planner.v_cruise` | 2 |
-| `openpilot/selfdrive/controls/lib/desire_helper.py` | `desire.post_update` | 2 |
-| `openpilot/selfdrive/controls/plannerd.py` | `planner.subscriptions` | 2 |
+| `openpilot/selfdrive/selfdrived/selfdrived.py` | `selfdrived.events_filter` | 2 |
 | `openpilot/selfdrive/car/card.py` | `car.cruise_initialized` | 2 |
-| `openpilot/selfdrive/locationd/torqued.py` | `torqued.allowed_cars` | 2 |
 | `openpilot/selfdrive/ui/onroad/augmented_road_view.py` | `ui.render_overlay` | 2 |
-| `openpilot/selfdrive/ui/onroad/hud_renderer.py` | `ui.onroad_exp_button`, `ui.hud_set_speed_override`, `ui.hud_speed_color` | 6 |
+| `openpilot/selfdrive/ui/onroad/hud_renderer.py` | `ui.onroad_exp_button`, `ui.hud_set_speed_override` | 4 |
 | `openpilot/selfdrive/ui/ui_state.py` | `ui.state_subscriptions`, `ui.state_tick` | 4 |
-| `openpilot/selfdrive/ui/layouts/sidebar.py` | `ui.connectivity_check` | 2 |
 | `openpilot/selfdrive/ui/layouts/settings/settings.py` | `ui.network_settings_extend`, `ui.settings_extend` | 4 |
 | `openpilot/selfdrive/ui/layouts/settings/software.py` | `ui.software_settings_extend` | 2 |
 | `openpilot/selfdrive/ui/layouts/main.py` | `ui.main_extend` | 2 |
@@ -85,7 +82,7 @@ These are the minimal touch points in upstream code:
 | `cereal/custom.capnp` | (schema definitions, injected at boot by builder.py) | ~50 |
 | `cereal/services.py` | (service registration, injected at boot) | ~5 |
 
-**Total upstream diff: ~100 lines** across ~17 files for the full 24-hook
+**Total upstream diff: ~90 lines** across ~14 files for the full 19-hook
 ecosystem. cereal changes are injected at boot by `builder.py` — no static
 upstream patch needed. Car interfaces register by monkey-patching at plugin
 load, so opendbc needs **zero** changes. (The 0.11 rebase retired the

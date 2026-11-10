@@ -20,8 +20,8 @@ Fork of openpilot with the plugin framework built-in. Contains:
 - `selfdrive/plugins/plugind.py` — Boot-time plugin manager process (also dispatches `device.health_check`)
 - `selfdrive/plugins/builder.py` — Boot-time capnp/services/events injection
 - `selfdrive/plugins/plugin_bus.py` — ZMQ IPC pub/sub (PluginPub/PluginSub)
-- `selfdrive/plugins/api.py`, `plugin_base.py`, `update_checker.py` — plugin API surface, process base class, update checks
-- Hook call sites in: controlsd, plannerd, card, longitudinal_planner, desire_helper, torqued, ui layouts, ui_state, hud/onroad renderers, application — 24 in total, listed in `HOOK_INTEGRATION_POINTS.md`
+- `selfdrive/plugins/api.py`, `update_checker.py` — localhost REST API for COD (plugin list, enable/disable), plugins-repo update check
+- Hook call sites in: controlsd, selfdrived, card, longitudinal_planner, ui layouts, ui_state, hud/onroad renderers, application — 19 in total, listed in `HOOK_INTEGRATION_POINTS.md`
 
 No `plugins/` directory — all plugin code lives in the plugins repo.
 
@@ -159,6 +159,7 @@ Files are stored at `/data/plugins-runtime/<id>/data/<key>`.
 
 Key fields:
 - **device_filter**: `["tici"]` for C3-only, `["rk3588"]` for RK3588-only, omit for all devices
+- **processes**: daemons plugind spawns and supervises. `condition` is `always_run` (default), `only_onroad` (started when the device goes onroad, stopped when it goes offroad) or `only_offroad`; `requires` lists cereal services that must exist before the process is started
 - **cereal.slots**: Custom capnp struct slots 0-19 (must be unique per plugin)
 - **cereal.event_names**: Injected into `log.capnp` EventName enum at boot by `builder.py`
 - **params**: `desc` non-null = shown in Settings UI; `desc` null = internal only
@@ -193,15 +194,15 @@ openpilot manager
 
 Comma 3 hardware compatibility for AGNOS 12.8. Device filter: `tici`.
 
-**boot_patch.sh** (runs before openpilot launch):
-1. Cache symlinks: `~/.cache/pip` + `~/.cache/tinygrad` → `/data/cache/` (100MB /home overlay)
-2. **venv_sync.py**: sync Python packages against local `uv.lock` (hash-cached, <100ms when unchanged)
-3. kaitaistruct install (AGNOS system dep)
-4. DRM raylib overlay (GPU-accelerated rendering)
-5. Wayland/Weston socket permissions
-6. SPI disable (USB-only F4 panda)
-7. PATH + PYTHONPATH for scons build
-8. Crash diagnostics
+**boot_patch.sh** (sourced by the launcher after the plugin install, before the build; openpilot 0.11.2 and above):
+1. pycapnp pin and cache symlinks: `~/.cache/pip` + `~/.cache/tinygrad` → `/data/cache/` (100MB /home overlay)
+2. **venv_sync.py**: sync Python packages against local `uv.lock` (cached, <100ms when unchanged)
+3. Display on DRM: Adreno-linked raylib backend, Weston stopped, `NO_MASTER=1`
+4. PATH + PYTHONPATH for the scons build
+5. F4 panda: Python library, pandad.py, SPI disabled (USB-only), native USB transport and health packet
+6. Compiled comma three support: AR0231 camera sensor, Venus encoder wait, kernel UAPI headers, `tici` device type
+
+Details per section: `plugins/c3_compat/DESIGN.md`.
 
 **venv_sync.py**:
 - Parses `uv.lock` TOML, walks dependency graph, filters PEP 508 markers
@@ -213,7 +214,7 @@ Comma 3 hardware compatibility for AGNOS 12.8. Device filter: `tici`.
 ## COD Integration
 
 - **Port 80**: iptables PREROUTING + OUTPUT redirect from 80 → 8082, applied by `setup_service.sh` on every boot. Uses `iptables-legacy` on C3/AGNOS, falls back to `iptables` on other platforms.
-- **Plugin API**: plugind serves REST on `:8083` — plugin list, enable/disable, install, status
+- **Plugin API**: plugind serves REST on `127.0.0.1:8083` — plugin list, enable/disable
 - **Software panel**: CHECK → DOWNLOAD → INSTALL flow matching stock openpilot
 
 ---
