@@ -31,7 +31,6 @@ Everything below is applied automatically at every boot:
 + the display, drawn directly on the screen without the Wayland compositor
 + the comma three's panda (STM32F4) over USB, including its health reporting
 + the road and cabin cameras (AR0231 sensor) and video recording
-+ modem start-up on AGNOS 12.8
 
 ## Updating to openpilot 0.11.2
 

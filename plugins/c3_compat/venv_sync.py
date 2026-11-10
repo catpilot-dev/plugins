@@ -8,8 +8,9 @@ Primary mode (--ensure, default):
   venv is correct regardless of how the code got deployed.
 
 Fast path:
-  Caches the hash of the last successfully synced uv.lock. If the current
-  uv.lock matches, skip entirely (<100ms on normal boots).
+  Caches the hash of the last successfully synced uv.lock together with a
+  fingerprint of the venv (site-packages mtime). If both still match, skip
+  entirely (<100ms on normal boots).
 
 Usage:
   python venv_sync.py                     # ensure venv matches local uv.lock
@@ -28,14 +29,7 @@ import os
 import re
 import subprocess
 import sys
-
-try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        tomllib = None
+import tomllib
 
 log = logging.getLogger("venv_sync")
 
@@ -52,7 +46,8 @@ LOCAL_LOCK = os.path.join(OPENPILOT_DIR, "uv.lock")
 VENV_SITE = "/usr/local/venv/lib/python3.12/site-packages"
 VENV_PIP = "/usr/local/venv/bin/pip"
 VENV_PYTHON = "/usr/local/venv/bin/python3"
-HASH_CACHE = str(plugin_data_dir("c3_compat").parent / ".venv_synced_hash")
+# In the plugin's data/ dir: install.sh replaces the rest of the runtime dir on every boot
+HASH_CACHE = str(plugin_data_dir("c3_compat") / ".venv_synced_hash")
 
 # --- C3 target platform ---
 TARGET_PYTHON = "cp312"
@@ -69,39 +64,49 @@ PIP_INSTALL_TIMEOUT_S = 600
 #          boot_patch.sh downgrades to 2.1.0 before venv_sync runs.
 SKIP_PACKAGES = {"pycapnp"}
 
-# --- commaai/dependencies packages (not in uv.lock — git-sourced native libs) ---
-# These wrap pre-built native libraries and provide INCLUDE_DIR/LIB_DIR for scons.
-COMMAAI_DEPS_REPO = "https://github.com/commaai/dependencies.git@releases"
-COMMAAI_DEPS = [
-    "bzip2", "capnproto", "eigen", "ffmpeg",
-    "libjpeg", "libyuv", "ncurses", "zeromq", "zstd",
-]
-NATIVE_DEPS_CACHE = str(plugin_data_dir("c3_compat").parent / ".native_deps_installed")
-# openpilot 0.11.2 ships these as comma-deps-* wheels IN uv.lock (manylinux_2_28
-# aarch64, same module names). The normal lock sync installs them; the git
-# install above must then stand down or it would overwrite the wheels' libraries.
-COMMA_DEPS_WHEEL_RE = re.compile(r'^name = "comma-deps-', re.M)
-
 
 def sha256_of(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _read_cached_hash() -> str:
-    """Read the hash of the last successfully synced uv.lock."""
+def _venv_fingerprint() -> str:
+    """Fingerprint of the venv's installed state: the site-packages directory mtime.
+
+    pip adding/removing a package or dist-info dir changes it, and an AGNOS reflash
+    (which resets the venv but not /data) puts back the image's value. "" if it
+    can't be stat'ed — then the fast path is never taken.
+    """
     try:
-        with open(HASH_CACHE) as f:
-            return f.read().strip()
-    except FileNotFoundError:
+        return str(os.stat(VENV_SITE).st_mtime_ns)
+    except OSError:
         return ""
 
 
-def _write_cached_hash(h: str):
-    """Write the hash after a successful sync."""
+def _read_cached_state() -> tuple[str, str]:
+    """(lock hash, venv fingerprint) of the last successful sync; ("", "") if none.
+
+    A file in the old one-field format (hash only) counts as no cache.
+    """
+    try:
+        with open(HASH_CACHE) as f:
+            fields = f.read().split()
+    except OSError:
+        return "", ""
+    if len(fields) != 2:
+        return "", ""
+    return fields[0], fields[1]
+
+
+def _write_cached_state(lock_hash: str):
+    """Record a successful sync. Call after all installs: the fingerprint is read now."""
+    fingerprint = _venv_fingerprint()
+    if not fingerprint:
+        log.warning("Could not stat %s, not caching the sync", VENV_SITE)
+        return
     try:
         os.makedirs(os.path.dirname(HASH_CACHE), exist_ok=True)
         with open(HASH_CACHE, "w") as f:
-            f.write(h)
+            f.write(f"{lock_hash} {fingerprint}\n")
     except OSError as e:
         log.warning("Could not write hash cache: %s", e)
 
@@ -245,21 +250,13 @@ def _marker_applies_to_c3(marker: str) -> bool:
 def parse_lock_packages(lock_text: str, runtime_only: bool = False) -> dict[str, PackageInfo]:
     """Parse uv.lock TOML → {name: PackageInfo}.
 
-    When tomllib is available, also resolves the dependency graph to determine
-    which packages are actually needed on C3 (linux/aarch64), filtering out
-    macOS-only, Windows-only, and other platform-specific packages.
+    Resolves the dependency graph to determine which packages are actually
+    needed on C3 (linux/aarch64), filtering out macOS-only, Windows-only, and
+    other platform-specific packages.
 
     If runtime_only=True, skip optional-dependencies (dev/testing/docs/tools)
     and only include packages needed to run openpilot.
-
-    Falls back to regex parsing if tomllib unavailable (no dep graph filtering).
     """
-    if tomllib is not None:
-        return _parse_with_tomllib(lock_text, runtime_only=runtime_only)
-    return _parse_with_regex(lock_text)
-
-
-def _parse_with_tomllib(lock_text: str, runtime_only: bool = False) -> dict[str, PackageInfo]:
     data = tomllib.loads(lock_text)
 
     # Build full package index
@@ -347,36 +344,6 @@ def _walk_deps(packages: dict, needed: set, root: str | None = None,
                         queue.append(dep_name)
 
 
-def _parse_with_regex(lock_text: str) -> dict[str, PackageInfo]:
-    """Fallback regex parser — no dependency graph filtering (includes all packages)."""
-    packages = {}
-    blocks = re.split(r'\n(?=\[\[package\]\])', lock_text)
-    for block in blocks:
-        name_m = re.search(r'^name\s*=\s*"([^"]+)"', block, re.MULTILINE)
-        ver_m = re.search(r'^version\s*=\s*"([^"]+)"', block, re.MULTILINE)
-        if not name_m or not ver_m:
-            continue
-        name = name_m.group(1)
-        version = ver_m.group(1)
-
-        wheel_url = ""
-        wheel_hash = ""
-        for url_m in re.finditer(r'url\s*=\s*"([^"]+\.whl)"', block):
-            url = url_m.group(1)
-            if _wheel_matches_target(url):
-                wheel_url = url
-                hash_m = re.search(
-                    r'hash\s*=\s*"sha256:([^"]+)"',
-                    block[url_m.start() - 200:url_m.end() + 200]
-                )
-                if hash_m:
-                    wheel_hash = hash_m.group(1)
-                break
-
-        packages[name] = PackageInfo(name, version, wheel_url, wheel_hash)
-    return packages
-
-
 class PackageAction:
     __slots__ = ("name", "installed_version", "needed_version", "wheel_url", "wheel_hash", "action")
 
@@ -404,12 +371,12 @@ def _batch_get_installed_versions(names: list[str]) -> dict[str, str | None]:
         return {}
 
     # Build a Python script that checks all packages at once
-    check_script = "from importlib.metadata import version, PackageNotFoundError\n"
+    check_script = "from importlib.metadata import version\n"
     check_script += "names = %r\n" % names
     check_script += """for n in names:
     try:
         print(f"{n}={version(n)}")
-    except (PackageNotFoundError, Exception):
+    except Exception:
         print(f"{n}=__MISSING__")
 """
 
@@ -458,6 +425,13 @@ def find_actions(packages: dict[str, PackageInfo]) -> list[PackageAction]:
     return actions
 
 
+def _pip_spec(act: PackageAction) -> str:
+    """The wheel URL pip installs; with the lock's sha256 as a #sha256= fragment pip verifies it."""
+    if act.wheel_hash:
+        return f"{act.wheel_url}#sha256={act.wheel_hash}"
+    return act.wheel_url
+
+
 def install_packages(actions: list[PackageAction], dry_run: bool = False) -> dict:
     """Install packages into the AGNOS 12.8 venv.
 
@@ -496,7 +470,7 @@ def install_packages(actions: list[PackageAction], dry_run: bool = False) -> dic
             # sudo required: venv is root-owned on read-only root filesystem
             # No --target: install into venv normally so dist-info gets updated correctly
             cmd = ["sudo", "-E", VENV_PIP, "install",
-                   "--no-deps", "--no-cache-dir", "-q", act.wheel_url]
+                   "--no-deps", "--no-cache-dir", "-q", _pip_spec(act)]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT_S,
                                     env=pip_env)
             if result.returncode == 0:
@@ -529,10 +503,11 @@ def ensure_venv(check_only: bool = False, dry_run: bool = False,
     """Ensure the venv matches the local uv.lock. Primary entry point.
 
     1. Read /data/openpilot/uv.lock (or override with lock_path)
-    2. Fast path: if hash matches cached .venv_synced_hash, skip
+    2. Fast path: if the lock hash and the venv fingerprint both match the
+       cached .venv_synced_hash, skip
     3. Parse packages, batch-check installed versions
     4. Install missing/wrong-version packages
-    5. Cache hash on success
+    5. Cache lock hash + venv fingerprint on success
 
     Returns: {synced: bool, actions: [...], installed: [...], ...}
     """
@@ -547,9 +522,11 @@ def ensure_venv(check_only: bool = False, dry_run: bool = False,
 
     lock_hash = sha256_of(lock_text)
 
-    # Fast path: already synced for this exact uv.lock
-    cached = _read_cached_hash()
-    if cached == lock_hash and not check_only and not dry_run:
+    # Fast path: already synced for this exact uv.lock, and the venv is unchanged since
+    cached_hash, cached_fingerprint = _read_cached_state()
+    fingerprint = _venv_fingerprint()
+    if (fingerprint and cached_hash == lock_hash and cached_fingerprint == fingerprint
+            and not check_only and not dry_run):
         log.info("venv already synced for uv.lock %s (cached)", lock_hash[:12])
         return {"synced": True, "cached": True, "hash": lock_hash[:12]}
 
@@ -563,7 +540,7 @@ def ensure_venv(check_only: bool = False, dry_run: bool = False,
     if not actions:
         log.info("venv is in sync — all %d installable packages match", len(packages))
         if not check_only and not dry_run:
-            _write_cached_hash(lock_hash)
+            _write_cached_state(lock_hash)
         return {"synced": True, "cached": False, "hash": lock_hash[:12],
                 "checked": len(packages)}
 
@@ -584,124 +561,9 @@ def ensure_venv(check_only: bool = False, dry_run: bool = False,
 
     synced = len(result["failed"]) == 0
     if synced and not dry_run:
-        _write_cached_hash(lock_hash)
+        _write_cached_state(lock_hash)
 
     return {"synced": synced, "hash": lock_hash[:12], **result}
-
-
-def lock_ships_comma_deps(lock_text: str) -> bool:
-    """Does this uv.lock carry the comma-deps-* wheels (openpilot >= 0.11.2)?"""
-    return COMMA_DEPS_WHEEL_RE.search(lock_text) is not None
-
-
-def ensure_native_deps(dry_run: bool = False) -> dict:
-    """Install commaai/dependencies packages if missing from the venv.
-
-    These are not in uv.lock on openpilot <= 0.11.1 (git-sourced, bundling the
-    pre-built native libraries scons needs). From 0.11.2 the lock ships them as
-    comma-deps-* wheels and this step stands down. Checks a cache file to skip
-    on normal boots.
-
-    Returns: {installed: [...], failed: [...], skipped: bool}
-    """
-    try:
-        with open(LOCAL_LOCK) as f:
-            if lock_ships_comma_deps(f.read()):
-                log.info("native deps: uv.lock ships comma-deps wheels, lock sync installs them")
-                return {"installed": [], "failed": [], "skipped": True, "reason": "comma-deps wheels in uv.lock"}
-    except FileNotFoundError:
-        pass
-    # Fast path: if all were installed last time, check the cache
-    try:
-        with open(NATIVE_DEPS_CACHE) as f:
-            cached = f.read().strip().split()
-        if set(cached) >= set(COMMAAI_DEPS):
-            log.debug("native deps already installed (cached)")
-            return {"installed": [], "failed": [], "skipped": True}
-    except FileNotFoundError:
-        pass
-
-    # Check which packages are actually missing (fast importlib check)
-    import importlib
-    missing = []
-    for name in COMMAAI_DEPS:
-        try:
-            importlib.import_module(name)
-        except ImportError:
-            missing.append(name)
-
-    if not missing:
-        log.info("native deps: all %d packages present", len(COMMAAI_DEPS))
-        _write_native_deps_cache(COMMAAI_DEPS)
-        return {"installed": [], "failed": [], "skipped": True}
-
-    log.info("native deps: %d missing: %s", len(missing), missing)
-    if dry_run:
-        return {"installed": missing, "failed": [], "skipped": False, "dry_run": True}
-
-    installed = []
-    failed = []
-
-    # Remount rw — venv is root-owned on read-only root filesystem
-    subprocess.run(["sudo", "mount", "-o", "remount,rw", "/"],
-                   capture_output=True, timeout=10)
-
-    # Use /data/tmp as TMPDIR — ffmpeg static libs are ~100MB,
-    # far exceeding the 150MB /tmp tmpfs. Other packages are small.
-    pip_tmpdir = "/data/tmp/pip_native"
-    os.makedirs(pip_tmpdir, exist_ok=True)
-    pip_env = {**os.environ, "TMPDIR": pip_tmpdir, "GIT_SSL_NO_VERIFY": "1"}
-
-    # Install in one pip call (pip clones the repo once, builds all subdirs)
-    specs = [f"git+{COMMAAI_DEPS_REPO}#subdirectory={name}" for name in missing]
-    log.info("Installing: %s", ", ".join(missing))
-    try:
-        result = subprocess.run(
-            ["sudo", "-E", VENV_PIP, "install", "--no-build-isolation"] + specs,
-            capture_output=True, text=True, timeout=600, env=pip_env,
-        )
-        if result.returncode == 0:
-            installed.extend(missing)
-            log.info("native deps: installed %s", installed)
-        else:
-            # Batch failed — try each individually so one bad package doesn't block others
-            log.warning("Batch install failed, retrying individually")
-            for name in missing:
-                spec = f"git+{COMMAAI_DEPS_REPO}#subdirectory={name}"
-                r = subprocess.run(
-                    ["sudo", "-E", VENV_PIP, "install", "--no-build-isolation", spec],
-                    capture_output=True, text=True, timeout=300, env=pip_env,
-                )
-                if r.returncode == 0:
-                    installed.append(name)
-                else:
-                    err = (r.stderr or r.stdout).strip()[-200:]
-                    failed.append({"name": name, "error": err})
-                    log.error("native deps: failed to install %s: %s", name, err)
-    except subprocess.TimeoutExpired:
-        failed.append({"name": "all", "error": "timeout"})
-        log.error("native deps: install timed out")
-    except Exception as e:
-        failed.append({"name": "all", "error": str(e)})
-        log.error("native deps: install error: %s", e)
-    finally:
-        subprocess.run(["sudo", "rm", "-rf", pip_tmpdir], capture_output=True, timeout=10)
-        subprocess.run(["sudo", "mount", "-o", "remount,ro", "/"],
-                       capture_output=True, timeout=10)
-
-    if installed:
-        _write_native_deps_cache(installed)
-
-    return {"installed": installed, "failed": failed, "skipped": False}
-
-
-def _write_native_deps_cache(names: list):
-    try:
-        os.makedirs(os.path.dirname(NATIVE_DEPS_CACHE), exist_ok=True)
-        with open(NATIVE_DEPS_CACHE, "w") as f:
-            f.write("\n".join(names))
-    except OSError as e:
-        log.warning("Could not write native deps cache: %s", e)
 
 
 def main():
@@ -717,8 +579,6 @@ def main():
                         help="Output result as JSON")
     parser.add_argument("--runtime-only", action="store_true",
                         help="Only sync runtime deps (skip dev/testing/docs)")
-    parser.add_argument("--native-deps", action="store_true",
-                        help="Also install commaai/dependencies packages (not in uv.lock)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose logging")
     args = parser.parse_args()
@@ -727,18 +587,6 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="[venv_sync] %(message)s",
     )
-
-    # Install commaai/dependencies packages (scons native libs) if requested
-    if args.native_deps:
-        nd = ensure_native_deps(dry_run=args.dry_run)
-        if not nd["skipped"]:
-            if nd.get("dry_run"):
-                print(f"[dry-run] Would install native deps: {nd['installed']}")
-            else:
-                for name in nd.get("installed", []):
-                    print(f"  installed native dep: {name}")
-                for pkg in nd.get("failed", []):
-                    print(f"  FAILED native dep: {pkg['name']}: {pkg['error']}")
 
     result = ensure_venv(
         check_only=args.check_only,
