@@ -142,9 +142,8 @@ startup-only. Rule: anything below ~5 Hz or sent on change gets declared.
   a rising/falling-edge state machine times the hold. Long press
   (≥ `RESUME_LONG_PRESS_FRAMES` = 49 frames ≈ 500 ms) emits a
   `gapAdjustCruise` button event; short press while engaged sends
-  `{'action': 'toggle_confirm'}` on plugin-bus topic `speedlimit_cmd_car`
-  (and drains `speedLimitState`); short press while disengaged emits
-  `resumeCruise`.
+  `{'action': 'toggle_confirm'}` on plugin-bus topic `speedlimit_cmd_car`;
+  short press while disengaged emits `resumeCruise`.
 - A **steering-angle offset** can be supplied live on plugin-bus topic
   `steer_angle_offset`; it is persisted to the plugin data dir as
   `SteerAngleOffset` and subtracted from the reported steering angle.
@@ -168,16 +167,21 @@ current speed and the DCC set-speed, and issues stalk pulses:
   The **accel** side is gated by `V_ERROR_DEADZONE` (~0.5 km/h) plus accel sign
   and set-speed headroom. The **decel** side is gated by the setpoint deadzone
   instead — see *The setpoint is a torque request* below.
-- **Cadence encodes magnitude** — DCC infers accel magnitude from press
-  *rate*: `HOLD_INTERVAL` for large accel, `SINGLE_INTERVAL` otherwise. Note
-  the constants are 25 ms / 50 ms but 25 ms is not representable on the 10 ms
-  control grid: `dt_tx < interval - DT_CTRL / 2` puts HOLD's threshold exactly
-  on a tick, so HOLD actually transmits at ~20 ms — measured **48 Hz on-car,
-  not the 40 Hz the constant implies**. SINGLE is unaffected and measures
-  20.1 Hz. The calibration table (PLUS1+HOLD ≈ +0.4 m/s², PLUS5+HOLD ≈ +1.2,
-  MINUS1 ≈ −0.6, MINUS5 ≈ −1.2 m/s²) was measured against the real 48 Hz
-  behaviour, so do not "correct" the cadence without re-measuring it. Stock's
-  own stalk does the same thing: 5 Hz idle, 20 Hz single, 40 Hz hold.
+- **Cadence** — two frame rates. `SINGLE_INTERVAL` (50 ms, measures 20.1 Hz)
+  carries every command except one: accelerating with `accel >=
+  ACCEL_HOLD_THRESHOLD` uses `HOLD_INTERVAL`. That constant is 25 ms, which is
+  not representable on the 10 ms control grid: `dt_tx < interval - DT_CTRL / 2`
+  puts HOLD's threshold exactly on a tick, so HOLD actually transmits at
+  ~20 ms — measured **48 Hz on-car, not the 40 Hz the constant implies**.
+  Stock's own stalk runs 5 Hz idle, 20 Hz single, 40 Hz hold. The premise this
+  started from, that DCC reads accel magnitude from press *rate*, did not
+  survive measurement on the decel side: a burst is worth one step whatever
+  its cadence or length (*Command selection*), and deceleration follows the
+  setpoint gap (*The setpoint is a torque request*), so decel runs at SINGLE.
+  On the accel side cadence has not been tested in isolation; HOLD stays there
+  until an A/B drive says otherwise. The early calibration table (PLUS1+HOLD
+  ≈ +0.4 m/s², PLUS5+HOLD ≈ +1.2, MINUS1 ≈ −0.6, MINUS5 ≈ −1.2) predates the
+  gap model; read it as history.
 
 ### The setpoint is a torque request, not a speed
 
@@ -244,10 +248,11 @@ Three things to keep straight:
   binding, both still come from one MPC trajectory.
 - **The new target is min'd against the old one**, so this law can only ever
   ask for a *deeper* setpoint than the pre-2026-09 code, never a shallower one.
-- **The accel side is untouched.** Outside a braking episode
-  `sp_target == v_target`. Inside one the bias uses `min(accel, 0)`, so a
-  positive blip while latched holds the bias rather than releasing it — the
-  concordance latch is what decides to release.
+- **The braking bias stays on the decel side.** Inside a braking episode the
+  bias uses `min(accel, 0)`, so a positive blip while latched holds the bias
+  rather than releasing it — the concordance latch is what decides to release.
+  Outside one, `sp_target` is `v_target`, lifted while accelerating to the gap
+  that delivers `aTarget` (0.11.2 — *The accel side inverts the plant*).
 - **The decel gate has no `v_error` term.** It used to block 51% of the
   `a_cmd` −0.4..−0.3 band, because sitting near the plan's target speed is not
   a reason to ignore a planner asking for deceleration. The setpoint deadzone
@@ -1282,7 +1287,6 @@ cereal schemas):
 | `bmw_temps` | 0.2 Hz | `carstate.py` | `coolant`, `oil` (°C) for the HUD overlay |
 | `speedlimit_cmd_car` | on press | `carstate.py` | `{'action': 'toggle_confirm'}` to speedlimitd |
 | `steer_angle_offset` | in (1 Hz) | consumed by `carstate.py` | live steering-angle offset from any publisher |
-| `speedLimitState` | in | consumed by `carstate.py` | drained on resume-press to sync speed-limit state |
 
 ## Key files
 
@@ -1312,8 +1316,8 @@ bmw_e9x_e8x/
 - **`lagd` never converges** for this car (it correlates on
   `latcontrol_torque` telemetry the custom controller doesn't produce), so
   `lateralDelay.lateralDelay` is permanently pinned at `steerActuatorDelay + 0.2`.
-  `steerActuatorDelay` is the effective single timing knob — details in
-  LATERAL_CONTROLLER.md §2.
+  `steerActuatorDelay` is modeld's look-ahead knob; the controller's own
+  cadence is `CONTROL_HORIZON_S` — see LATERAL_CONTROLLER.md §10 and §12.
 - **DCC is the exercised cruise path.** NCC and the ACC-module variants are
   recognized and wired but far less tested; the `Footnote` strings in
   `values.py` flag this.

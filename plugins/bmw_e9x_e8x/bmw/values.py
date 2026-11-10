@@ -10,24 +10,14 @@ from opendbc.car.fw_query_definitions import LiveFwVersions, OfflineFwVersions, 
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DBC_DIR = os.path.join(_PLUGIN_DIR, 'dbc')
 
-# Steer torque limits
-
-
-class CarControllerParams: #controls running @ 100hz
+class CarControllerParams:  # steer torque limits; controls run at 100 Hz
   STEER_STEP = 1 # 100Hz
   STEER_MAX = 12  # Nm
   STEER_DELTA_UP = 0.1       # Nm/10ms
-  STEER_DELTA_DOWN = 0.1     # Nm/10ms — symmetric with DELTA_UP for incremental controller
-  STEER_ERROR_MAX = 999     # max delta between torque cmd and torque motor
-
-  # Camera visibility geometry (meters)
-  # Used to select T_IDXS for curvature measurement — camera can only see
-  # road beyond MIN_VISIBLE_DIST, below that is occluded by the bonnet.
-  # d_min = BONNET_LENGTH × CAM_HEIGHT / (CAM_HEIGHT - BONNET_EDGE_HEIGHT)
-  CAM_HEIGHT = 1.19           # from extrinsicsCalibration.height (comma3 behind windshield)
-  BONNET_LENGTH = 2.0         # camera to front edge of bonnet (est. from E90 front overhang ~820mm + windshield setback ~1180mm)
-  BONNET_EDGE_HEIGHT = 0.8    # bonnet front edge height from ground (est. from E90 overall height 1421mm, ground clearance 130mm)
-  MIN_VISIBLE_DIST = BONNET_LENGTH * CAM_HEIGHT / (CAM_HEIGHT - BONNET_EDGE_HEIGHT)  # ~6.1m
+  STEER_DELTA_DOWN = 0.1     # Nm/10ms
+  # No distance-to-measured limit in apply_dist_to_meas_limits: the panda's
+  # check is mirrored by CarController._servo_ceiling instead.
+  STEER_ERROR_MAX = 999
 
   def __init__(self, CP):
     pass
@@ -46,9 +36,6 @@ class BmwFlags(IntFlag):
   ACTIVE_CRUISE_CONTROL = 2 ** 3          # ACC $541 - LDM and ACC sensor - #! not supported
   ACTIVE_CRUISE_CONTROL_NO_ACC = 2 ** 4   # no ACC module - DSC, DME, KOMBI coded to $541, LDM coded to $544
   ACTIVE_CRUISE_CONTROL_NO_LDM = 2 ** 5   # no LDM/ACC - DSC, DME, KOMBI coded to $541
-
-  # User-Configurable Flags (set via params)
-  DCC_CALIBRATION_MODE = 2 ** 6           # Disable OP engagement, log DCC performance for tuning
 
 
 class CruiseSettings:

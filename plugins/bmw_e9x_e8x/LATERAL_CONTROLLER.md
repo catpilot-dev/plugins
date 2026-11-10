@@ -28,7 +28,7 @@ with no filtering of its own.
 
 **Decision**, every `CONTROL_HORIZON_S / 2` (6 deviceMotion ticks, 300 ms) while active, in order:
 the demand on the full error (no on-target band — a sub-friction target is a
-hold; the feed-forward supplies the steady curve torque, ~55 % of the measured
+hold; the feed-forward supplies the steady curve torque, ~80 % of the measured
 need, and P closes the rest); clip to `t_cap`; relax-dwell bridge in a deep
 measured curve (the current torque is held through a reference dip, within
 `t_cap`); the noise guard (a sign change of the demand commands 0 until the new
@@ -1106,265 +1106,23 @@ Service names follow openpilot 0.11.2 throughout (`deviceMotion`,
 
 ---
 
-## 1. Why a custom controller (not stock latcontrol_torque)
+## 1–7. Pre-Direct design (text removed 2026-11-10)
 
-> Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
+Sections 1–7 described the controller that ran before Direct Tracking
+(2026-10-20). None of it describes running code. History entries above still
+cite them by number, so the numbers are kept; the text is in git:
 
-The BMW E9x/E8x uses an **AC Delco / Ocelot stepper servo on the hydraulic rack**, not an EPS motor. The plant has two properties that make stock torque controllers misbehave:
+    git show c1d4ab4:plugins/bmw_e9x_e8x/LATERAL_CONTROLLER.md
 
-1. **High static stiction, no self-centering** — at zero applied torque the rack *holds its current angle* indefinitely. There is no aligning-torque-driven return-to-center. This is the opposite of most EPS racks, where the steering self-centers.
-2. **Kinetic friction comparable to typical control torques** — small commands (sub-FRICTION) don't move the rack at all. The rack ignores them or moves in fits.
-
-Consequence: traditional **angle/curvature-PID with feedforward on κ_des** is wrong here. FF for κ_des is the correct pattern when the plant *needs* sustained torque to maintain an angle (any EPS); it's wrong when stiction maintains the angle for free.
-
-The custom controller is a **plant-inversion design in front-wheel-angle (δ) space**: compute the torque that would move δ by `δ_err` over the model's action horizon, ramp to it, then let stiction hold.
-
-```
-δ_des  = atan(κ_des · L)        L = CP.wheelbase (BMW E90: 2.76 m)
-δ_meas = atan(κ_meas · L)        κ_meas = yawRate / v_ego
-δ_err  = δ_des − δ_meas
-target_nm = T_CAP_SLOPE_BASE · kappa_scale(|κ_des|) · v² · δ_err   # full error, no subtraction (Phase 2)
-```
-
-When `|δ_err| ≤ HOLD_BAND` the cadence decision holds (target → 0 on straight, or holds the last target on a curve) and stiction keeps the rack in place. Outside `HOLD_BAND`, the controller ramps to `target_nm` over `spread_frames` CAN ticks. When the plant runs past κ_des, `δ_err` flips sign and `target_nm` reverses on its own — tracking back to the command *is* the overshoot correction. (The old ISO comfort-guard drain-to-0 was removed 2026-07-28; a_y is bounded by speedlimitd — see the SAFETY ARCHITECTURE note at the top and §7.)
-
----
-
-## 2. Single-knob timing design
-
-> Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
-
-There is one knob — `CP.steerActuatorDelay` in `bmw/interface.py:87` — and every timing constant downstream subscribes to it via the lateralDelay chain. Change SAD and the whole stack adapts.
-
-```
-CP.steerActuatorDelay              (bmw/interface.py — THE knob; currently 0.4)
-        │
-        ▼  + 0.2 (lagd.py:181 initial_lag = SAD + 0.2)
-lateralDelay.lateralDelay             (= 0.6 s; permanently pinned for BMW —
-                                    lagd never converges because it correlates
-                                    on latcontrol_torque telemetry we don't
-                                    produce; status stays 'unestimated')
-        │
-        ├──▶ modeld lat_action_t = lat_delay + DT_MDL = 0.65 s
-        │       └──▶ get_curvature_from_plan samples κ_des on the predicted
-        │            trajectory at this horizon (modeld.py:391)
-        │
-        └──▶ controlsd lat_delay = lateralDelay + LAT_SMOOTH_SECONDS = 0.6 s
-                                    (LAT_SMOOTH_SECONDS = 0.0 on catpilot)
-                │
-                ▼  passed to LaC.update(..., lat_delay)
-        bmw/latcontroller.py update() per deviceMotion tick:
-                model_action_t = lat_delay + DT_MDL = 0.65 s   ≡ modeld's lat_action_t
-                half_horizon   = model_action_t / 2 = 0.325 s
-                action_cadence_ticks = round(half_horizon / DT_LIVEPOSE)  = 6  (300 ms)
-                spread_frames        = action_cadence_ticks × 5            = 30 (300 ms)
-                jerk_pred horizon    = model_action_t                      = 0.65 s
-```
-
-**Concrete values at SAD = 0.4 (current):**
-
-| | value |
-|---|---:|
-| `lateralDelay.lateralDelay` | 0.6 s |
-| `modeld lat_action_t` | 0.65 s |
-| `model_action_t` (in update) | 0.65 s |
-| `action_cadence_ticks` | 6 (= 300 ms decision period) |
-| `spread_frames` | 30 (= 300 ms ramp, exactly = cadence) |
-| `jerk_pred` horizon | 0.65 s |
-
-**Plant-settling check**: BMW hydraulic rack τ ≈ 130 ms → 300 ms cadence ≈ 2.3τ → ~90% step response between decisions. Margin preserved.
-
-**Why `spread_frames = action_cadence_ticks × 5`** rather than independently rounded: `DT_LIVEPOSE = 50 ms = 5 × DT_CAN_TICK (10 ms)`. Independent rounding can diverge by one tick (e.g., 6×50 = 300 ms vs 32×10 = 320 ms). Deriving spread from cadence enforces exact equality — ramp completes precisely when next decision lands.
-
-**SAD retuning range**: `[0.3, 0.5]` keeps cadence in `[5, 7]` ticks (250–350 ms), all ≥ 2τ for the BMW rack. Below 0.3 risks plant-settling adequacy; above 0.5 just adds curve-entry latency without further wobble benefit.
-
----
-
-## 3. Reference signal & filter chain
-
-> Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
-
-```
-modelV2.action.desiredCurvature   (raw model output, ~20 Hz)
-        │
-        ▼  hooks.run('controls.curvature_correction', ...)
-        │     (passthrough — no curvature corrections registered in the public build)
-        ▼
-clip_curvature() in drive_helpers.py
-        │  — rate-limited to MAX_LATERAL_JERK = 5.0 m/s³ (ISO)
-        │  — clamped to ±MAX_LATERAL_ACCEL_NO_ROLL = 3.0 m/s² (ISO, + roll comp)
-        │  — clamped to ±MAX_CURVATURE = 0.2 1/m
-        ▼
-self.LaC.update(active, CS, VM, params, steer_limited_by_safety,
-                desired_curvature, curvature_limited, lat_delay)
-        ▼
-=== bmw/latcontroller.py update() ===
-state['desired'] = float(desired_curvature)   # raw, NO filter on κ_des itself
-v               = float(lp.velocityDevice.x), floored at 8.5 m/s
-state['measured'] = float(lp.angularVelocityDevice.z) / v
-delta_des       = atan(state['desired'] · L)
-delta_meas      = atan(state['measured'] · L)
-delta_err_raw   = delta_des - delta_meas
-        │
-        ▼  Phase 2 (2026-07-22): NO filter on delta_err either.
-        │  delta_err = delta_err_raw, unconditionally — the κ-gated box
-        │  filter that used to live here (§4) is deleted. modelV2 noise is
-        │  handled upstream by the `lane_keeping` plugin's κ_des low-pass
-        │  (KAPPA_FILTER_TAU = 0.15 s) before this controller ever sees it.
-        ▼
-state['delta_err'] = delta_err                 # raw, used by controller as-is
-        │
-        ▼  a_y_meas / jerk_pred computed here — TELEMETRY ONLY since 2026-07-28.
-        │  (The ISO accel/jerk cancel guard that used to read them and drain
-        │   target_frac to 0 was REMOVED — a_y is bounded by speedlimitd; see
-        │   the SAFETY ARCHITECTURE note at the top and §7. cancel_tol, the
-        │   HOLD_BAND boundary-hygiene drain, survives and runs just below.)
-        ▼
-Cadence decision (every action_cadence_ticks):
-   if |delta_err| ≤ HOLD_BAND:
-      hold_zero (target_frac = 0, straight)   OR   hold_curve (target_frac = held_target, curve)
-   else:
-      kappa_scale = interp(|κ_des|, T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP)
-      target_nm = T_CAP_SLOPE_BASE · kappa_scale · v² · delta_err   # FULL error, no subtraction
-      target_frac = target_nm / STEER_MAX
-      cap to ±t_cap_frac; hold-floor keeps |target_frac| ≥ |held_target| when same-signed
-      action = 'ramp'
-        ▼
-Per-CAN-tick ramp: state['torque'] += ramp_step toward state['target_frac']
-        ▼
-return -state['torque']  (BMW carcontroller flips sign convention)
-```
-
----
-
-## 4. The κ-gated box filter on delta_err (DELETED 2026-07-22)
-
-**DELETED 2026-07-22 (Phase 2).** The filter described below no longer exists
-in `bmw/latcontroller.py` — `delta_err` is the raw `delta_err_raw` at all
-times, `KD_GATE` and `kd_filter_window` are gone, and there is no `de_buffer`.
-Its job (suppressing modelV2 κ_des wobble on near-straight) now belongs to
-the `lane_keeping` plugin's κ_des low-pass (`KAPPA_FILTER_TAU = 0.15 s`),
-which filters upstream of this controller instead of on `delta_err` inside
-it. The rest of this section is kept for historical context only — see the
-2026-07-22 header note.
-
-**Purpose (historical)**: suppress high-rate sign-flips in `delta_err` caused by vision-only κ_des wobble on near-straight (no position-feedback layer running). Each sign-flip across the tolerance band triggers `cancel_tol` / `brake_zero` with a counter-direction FRICTION pulse — those are the felt "swaying" pulses.
-
-**Target choice**: filter applied to `delta_err`, **not** to raw κ_des. Keeps `state['desired']` raw so:
-- Reference is always fresh — no held bias → no drift accumulation
-- `kappa_scale`, `jerk_pred`, ISO guards all see raw κ_des magnitude (true model intent)
-- Only the cadence decision's tolerance check sees the smoothed error
-
-**Gate**: `KD_GATE = 0.002` 1/m. Filter active only when `|raw κ_des| < KD_GATE`. Above gate (real curves) → bypass, buffer flushed. Also bypassed during `modelV2.meta.laneChangeState != off`.
-
-**Window**: `kd_filter_window = action_cadence_ticks = 6` samples (300 ms box, 150 ms group delay).
-
-**Output**: equal-weight uniform box average.
-
-```python
-raw_kd = float(desired_curvature)
-lane_change_active = (_sm['modelV2'].meta.laneChangeState != log.LaneChangeState.off)
-if abs(raw_kd) >= KD_GATE or lane_change_active:
-    state['de_buffer'].clear()
-    delta_err = delta_err_raw
-else:
-    state['de_buffer'].append(delta_err_raw)
-    if len(state['de_buffer']) > action_cadence_ticks:
-        state['de_buffer'].pop(0)
-    delta_err = sum(state['de_buffer']) / len(state['de_buffer'])
-state['delta_err']     = delta_err
-state['delta_err_raw'] = delta_err_raw    # both published in telemetry
-```
-
-**Design rule (the filter exists for ONE job)**: suppress sign-flips on near-straight. Never compromise real correction. Hence gate at 0.002 (below typical wobble peak amplitude ±0.003) — the filter operates only at zero-crossing windows where sign-flips actually happen; wobble peaks pass through raw.
-
-**Field-measured sign-flip reduction**: ~60% on highway-dominant routes.
-
----
-
-## 5. The kinematic deadzone
-
-> Superseded by **Current law** at the top of this document (2026-10-20); kept as history.
-
-**DELETED 2026-07-22 (Phase 2).** The kinematic `DRIFT_M` deadzone, the
-σ-observer noise floor and the sign-persistence gate are gone. They existed
-because the controller was the only loop closing against drift; that job now
-belongs to the `lane_keeping` position loop, which also owns modelV2 noise.
-
-What remains is `HOLD_BAND = 0.001` rad — **not** a deadzone. P acts on the full
-`delta_err` at all times; `HOLD_BAND` only decides when the rack is "on target"
-so the curvature hold (§ hold_curve) can take over. It is sized by stiction:
-below `FRICTION·STEER_MAX / (T_CAP_SLOPE·kappa_scale·v²)` ≈ 0.001 rad at 25 m/s
-the P term commands less than rack breakaway, so the wheel cannot move anyway.
-
-Historical note: a constant-angle deadzone was tried in 2026-05 and reverted
-(route 31b, 1.3–1.7 m drift) precisely because no position-feedback layer
-existed. That constraint is now satisfied — but note the resolution was to
-delete the deadzone, not to widen it.
-
----
-
-## 6. T_CAP_SCALE — curvature-dependent gain
-
-```python
-T_CAP_BASE_NM     = 2.0    # stiction floor (Nm)
-T_CAP_SLOPE_BASE  = 1.0    # base aligning-torque gain
-T_CAP_SCALE_KAPPA = [0.001, 0.01,  0.02]   # |κ_des| breakpoints (1/m)
-T_CAP_SCALE_BP    = [1.0,   2.5,   3.0]    # multiplicative scale on T_CAP_SLOPE_BASE
-
-kappa_scale = np.interp(|κ_des|, T_CAP_SCALE_KAPPA, T_CAP_SCALE_BP)
-target_nm   = T_CAP_SLOPE_BASE · kappa_scale · v² · delta_err   # full error, Phase 2
-t_cap_nm    = T_CAP_BASE_NM + T_CAP_SLOPE_BASE · kappa_scale · v² · |δ_des|  (≤ STEER_MAX=12)
-```
-
-**Design rule**: curvature awareness must enter as a **multiplicative gain scale** on `T_CAP_SLOPE_BASE`, NOT as a feedforward additive term on κ_des. The stiction-holds-at-zero plant doesn't need continuous holding torque; an additive FF would over-push and induce stiction-locked overshoots.
-
-**Tuning history of `T_CAP_SCALE_BP[0]` (small-κ gain)**:
-- Originally 1.0 (matches T_CAP_SLOPE_BASE — neutral baseline)
-- Bumped to 1.5 for more aggressive small-κ tracking
-- **Returned to 1.0** (commit bba4454, 2026-05-22): the 1.5 caused over-correction in the small-κ regime → overshoots → cancel_jerk pulses. Route 326: cancel_jerk per lane change dropped from 25 to 5.3 with no compromise to lane offset.
-
-Higher-κ scale points (2.5 @ 0.01, 3.0 @ 0.02) unchanged so tight-curve tracking authority is preserved.
-
----
-
-## 7. ISO 11270 comfort guards — HISTORICAL (removed 2026-07-28)
-
-> **This entire section is historical.** The in-controller ISO accel/jerk
-> cancel guard was removed on 2026-07-28 — see the SAFETY ARCHITECTURE note at
-> the top of this document. ISO 11270 lateral-acceleration limiting is now a
-> **system-level** responsibility of speedlimitd (curve-speed capping of
-> `vEgo`), not of the lateral controller, which tracks the commanded curvature
-> unconditionally. The code, constants (`accel_guard_threshold`,
-> `ACCEL_GUARD_*`, `LATERAL_CURVATURE`, `LATERAL_JERK_BP`,
-> `ISO_LATERAL_ACCEL/JERK`), and the `cancel_accel`/`cancel_jerk` actions
-> described below **no longer exist in `bmw/latcontroller.py`**. Kept for the
-> design history and the reasoning that led to the removal.
-
-```python
-ISO_LATERAL_ACCEL = 3.0    # m/s²  (from opendbc.car.lateral)
-ISO_LATERAL_JERK  = 5.0    # m/s³
-
-LATERAL_CURVATURE = [0.001, 0.005, 0.01, 0.02]
-LATERAL_JERK_BP   = [1.5,   1.5,   3.0,  ISO_LATERAL_JERK]    # half-ISO at small κ, full at tight
-
-# ACCEL_GUARD_* — module scope (bmw/latcontroller.py, near HOLD_AY_BP)
-ACCEL_GUARD_FLOOR  = 1.5    # m/s² — small-a_y tightened floor (2026-05-22, route 326 class)
-ACCEL_GUARD_RATIO  = 1.25   # fire only when measured exceeds commanded by 25%...
-ACCEL_GUARD_MARGIN = 0.2    # ...plus 0.2 m/s² absolute headroom
-
-def accel_guard_threshold(a_y_des_abs):
-    return min(ISO_LATERAL_ACCEL, max(ACCEL_GUARD_FLOOR,
-                                       ACCEL_GUARD_RATIO * a_y_des_abs + ACCEL_GUARD_MARGIN))
-```
-
-Fire only when **the plant has actually overshot** `(κ_des - κ_meas) · κ_meas < 0` AND the relevant signal exceeds its threshold:
-- **jerk** — unchanged, still the κ-indexed `LATERAL_CURVATURE` / `LATERAL_JERK_BP` table (`jerk_pred` is already error-relative, so it wasn't the thing cycling).
-- **accel** (2026-07-27) — `BMW_LATERAL_ACCEL = accel_guard_threshold(v² · |κ_des|)`, referenced to **commanded** lateral accel rather than a κ-indexed table. Action on fire: drain `target_frac` to 0 (reverse-FRICTION unwind pulse removed 2026-07-03 — see §8).
-
-**Why the accel guard moved off the κ table (2026-07-27, route 3ce)**: curves whose commanded a_y sat within ~5% of the old κ-interpolated threshold were getting `cancel_accel`'d by normal ±15–20% measurement tracking noise on the overshoot side — a drain-rebuild hunting cycle at 54% zero-torque. The old table encoded a fixed curvature→threshold mapping tuned at city speed; since both SAT and achievable a_y scale with v², that mapping is outrun once v² ≥ ~210 (above ~14.5 m/s), collapsing the margin. `accel_guard_threshold()` instead keeps headroom proportional to what was actually commanded (25% ratio + 0.2 m/s² absolute margin) at any speed, floored at 1.5 m/s² (carries forward the 2026-05-22 near-straight tightening below) and capped at `ISO_LATERAL_ACCEL` (3.0) via `min()`. Reference points: route 3ce seg 26 (commanded 1.82 → threshold ≈2.475, clear of wobble reach) and seg 15 (commanded 2.34 → threshold caps at ISO 3.0).
-
-**Bug history (worth remembering)**: `LATERAL_CURVATURE` second value was originally `0.05` (out of order), making `np.interp` non-monotonic. Effect: thresholds were stuck at the small-κ value (2.0 at the time) all the way through `|κ|=0.02`, then jumped discontinuously to ISO at the boundary. cancel_jerk / cancel_accel were firing more aggressively than designed during real moderate curves. Fixed in commit 633a146 along with the small-κ tightening (2.0 → 1.5). Verified positive on routes 32a/32d: `cancel_accel` essentially eliminated (114 on route 326 → 0/18), post-LC max torque cut from 4.3 N to 2.1 N. (This history now applies to the jerk table; the accel side carries the same 1.5 floor forward as `ACCEL_GUARD_FLOOR`.)
+| § | was | live equivalent |
+|---|---|---|
+| 1 | why a custom controller; the plant-inversion law with `HOLD_BAND` | **Current law**; §10 for the rack |
+| 2 | timing derived from `lat_delay` (`action_cadence_ticks`, `spread_frames`) | **Current law** (`CONTROL_HORIZON_S`); §10 for `lagd` |
+| 3 | reference signal and filter chain | **Current law**, *Signal path* |
+| 4 | κ-gated box filter on `delta_err` | none — deleted 2026-07-22 |
+| 5 | kinematic deadzone and `HOLD_BAND` | none — Direct has no on-target band |
+| 6 | `T_CAP_SCALE` schedule and its tuning history | **Current law**, constants table |
+| 7 | ISO 11270 comfort guards | none — removed 2026-07-28; `a_y` belongs to speedlimitd |
 
 ---
 
@@ -1449,60 +1207,55 @@ These were tried, deployed, and reverted. Each appears here so future maintainer
 
 ## 12. Retuning recipes (current operating point)
 
-Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user: "solid in straight, agile and accurate in turns"). Only retune if a new failure mode appears.
+The operating point is the constants table under **Current law**; the dated
+History entries carry the route evidence for each value. Only retune if a new
+failure mode appears.
 
-### To change the controller's overall timing (cadence, ramp, jerk horizon, modeld lookahead all together):
+### To change the controller's overall timing:
 - `CONTROL_HORIZON_S` (0.65 s): the decision cadence and the ramp spread are
   each half of it. It does not follow `lat_delay`. modeld's own look-ahead is
   `CP.steerActuatorDelay` in `bmw/interface.py`, a separate knob.
 
-### To suppress more wobble at near-straight (filter):
+### To suppress more wobble at near-straight:
 - The reference is conditioned in `lane_keeping`: the arc look-ahead schedule
   (`ARC_H_SPEED_V` / `ARC_H_SPEED`, pulled back by `ARC_K_AHEAD_BP`) and the
   low-pass `LaneKeepKappaFilterTau` (0.15 s). Longer removes more wander and
   adds delay or early turn-in. This controller has no near-straight knob of its
   own beyond its straight gain `T_CAP_SCALE_BP[0]`.
 
-### If lane-change overshoot reappears on the post-LC phase:
-- Look at `bmw_lat_control` log for that LC: is `de_at_end_raw > 0.3°`? Is post-LC `|torque|` > 3 N?
-- The mechanism is one of: spurious cancel_jerk suppressing controller during LC (small κ, |κ_meas| < 0.001 — see seg 10 of route 326 for pattern) OR rack stiction → catch-up overshoot (see seg 42 ev2 for pattern).
-- Don't apply a global LC torque cap — most LCs are fine. Targeted options exist (magnitude-gated cancel, soft post-LC re-engagement); see commit history around routes 326/32a/32d for the analysis.
-
 ### If straights feel less smooth than today:
 - Compare `kappa_ref` against `kappa_in` in the `lane_keeping` topic first (the
   reference's share of the model wobble), then the noise guard's `tu_guarded`
   rate and the take-ups per minute in `bmw_lat_control`.
 
+### If lane-change swings reappear:
+- The lane-change specifics here are the flat 0.10 step cap
+  (`LANE_CHANGE_STATES`) and the yaw predictor (`YAW_PRED_*`), both in the
+  2026-11-02 entries. Check `kappa_pred` and the `target_frac` steps in
+  `bmw_lat_control` for that lane change before touching either.
+
 ### If real-curve tracking feels under-aggressive:
-- Increase `T_CAP_SCALE_BP[1]` or `T_CAP_SCALE_BP[2]` (currently 2.5, 3.0 at `|κ| = 0.01, 0.02`).
-- **Don't** increase `T_CAP_SCALE_BP[0]` past 1.0 — that's where route 326's over-correction lived (was 1.5, now back to 1.0).
+- `T_CAP_SCALE_BP[1]` / `[2]` (2.5, 3.0 at `|κ|` = 0.01, 0.02) scale the P gain
+  in real curves; `CF_GAIN` / `CF_AY0` set the steady curve torque (2026-11-01
+  entry).
+- Gentle bends sit on the straight point `T_CAP_SCALE_BP[0]` (1.5 since
+  2026-11-09; that entry has its cost in torque reversals). A curve integrator
+  was tried for the same symptom and retired (2026-11-08 entry).
 
 ### If lateral acceleration feels too high in curves:
-- This is **no longer a lateral-controller tuning problem** (2026-07-28). The lateral controller tracks the commanded curvature and does not limit `a_y`. Lower the curve-speed target in **speedlimitd** (curve-speed capping) — it owns `vEgo`, hence `a_y = v²·κ`. Recipes for the old in-controller ISO cancel guard (`LATERAL_ACCEL_BP` / `LATERAL_JERK_BP` / `BMW_LATERAL_*`) are obsolete; that machinery was removed.
+- Not a lateral-controller tuning problem (2026-07-28). The controller tracks
+  the commanded curvature and does not limit `a_y`. Lower the curve-speed
+  target in **speedlimitd** — it owns `vEgo`, hence `a_y = v²·κ`.
 
-### ~~To toggle `AngleBudget` (the push-budget mechanism)~~ — GONE 2026-08-14
-- The push budget was **retired** (route 3f4 A/B; see the dated note in the
-  header and the §11 row). There is no `AngleBudget` param, no
-  `angle_budget` bus topic, no "Steering Push Budget" toggle and no
-  `ui.state_tick` heartbeat hook in this plugin any more — nothing to
-  toggle, nothing to write, no procedure to follow.
-- A leftover `AngleBudget` param file on a device is inert; delete it at
-  your convenience (`rm /data/plugins-runtime/bmw_e9x_e8x/data/AngleBudget`).
-- **The hot-toggle pattern itself is still the right one** should another
-  mid-drive-switchable knob appear here: panel toggle → immediate
-  `PluginPub` send **plus** a 1 Hz heartbeat republishing the param file
-  (ZMQ PUB drops edge-triggered sends to a not-yet-connected subscriber, so
-  the heartbeat is what makes it reliable), with the controller polling at
-  deviceMotion rate — tmpfs + memory only, never a param-file read on the RT
-  thread. Git history around commits fbb899b / 7afd501 has the working
-  implementation.
-
-### ~~To toggle `StallBreakaway` (stall/breakaway v2 displacement trip)~~ — GONE 2026-10-23
-- Stall/breakaway v2 was **removed** (see the 2026-10-23 dated note and the
-  §11 row). There is no `StallBreakaway` param, no "Stall Breakaway" toggle
-  and no `sb_*` telemetry any more.
-- A leftover `StallBreakaway` param file on a device is inert; delete it at
-  your convenience (`rm /data/plugins-runtime/bmw_e9x_e8x/data/StallBreakaway`).
+### To add a switch that applies mid-drive:
+- `SlopeCompensation` is read at each engagement, which is enough for it. A
+  knob that must switch while engaged needs the hot-toggle pattern: panel
+  toggle → immediate `PluginPub` send **plus** a 1 Hz heartbeat republishing
+  the param file (ZMQ PUB drops edge-triggered sends to a not-yet-connected
+  subscriber, so the heartbeat is what makes it reliable), with the controller
+  polling at deviceMotion rate — tmpfs + memory only, never a param-file read
+  on the RT thread. Git history around commits fbb899b / 7afd501 has a working
+  implementation (the retired `AngleBudget` switch).
 
 ### Slope Compensation (`SlopeCompensation`, 2026-10-19 entry):
 - **Why**: Direct is P-only, so the steady torque a straight needs against a
@@ -1544,7 +1297,7 @@ Current configuration is field-verified stable (2026-05-24, routes 32a/32d, user
 | `on_lat_controller_init` | module | R10 guard, `config.read_plugin_param` import, cadence/gain/step/dwell constants, the state dict, `update` closure |
 | Engagement edge | top of `update()` | `SlopeCompensation` latch, guard reset; inactive zeroes torque/target/ramp |
 | deviceMotion tick | `update()` | reference, speeds, `delta_err`, `kappa_scale`, `a_ref`/`ff_nm`, slope-bias learning, `demand_nm`, guard observe, relax-dwell |
-| Decision | `update()`, every `action_cadence_ticks` while active | demand → `t_cap` → dwell bridge → guard → `STEP_MAX` |
+| Decision | `update()`, every `ACTION_CADENCE_TICKS` while active | demand → `t_cap` → dwell bridge → guard → `STEP_MAX` |
 | Contact learning, take-up | `update()`, every CAN tick | `ContactLearner.observe`, `FreePlayTakeUp.step`, handover |
 | Ramp and telemetry | end of `update()` | per-frame ramp step, zero snap, `bmw_lat_control` payload (§9) |
 
@@ -1563,7 +1316,7 @@ cd /data/openpilot && source /usr/local/venv/bin/activate
 # Load a route's bmw_lat_control + modelV2:
 python -c "
 import zstandard, json
-from cereal import log
+from openpilot.cereal import log
 ev = list(log.Event.read_multiple_bytes(zstandard.ZstdDecompressor().decompress(
     open('/data/media/0/realdata/<ROUTE>--<SEG>/rlog.zst','rb').read(),
     max_output_size=600*1024*1024)))
@@ -1573,14 +1326,14 @@ ev = list(log.Event.read_multiple_bytes(zstandard.ZstdDecompressor().decompress(
 ```
 
 Key metrics to compute per route:
-- **Reference-smoothing efficacy** (Phase 2: this now lives in `lane_keeping`, not `latcontroller`): compare `kappa_in` vs `kappa_ref` sign-flips per second from the `lane_keeping` telemetry topic — `delta_err_raw` no longer exists in `bmw_lat_control` telemetry, since the box filter it fed was deleted from this controller.
-- **Lane offset**: from `modelV2.laneLines[1].y[0]` and `modelV2.laneLines[2].y[0]` averaged. RMS should be 0.30-0.45 m on healthy drives.
-- **`de_at_end_raw`**: δ_err at the moment laneChangeState flips back to `off`. Should be < 0.3° on healthy LCs.
-- **`post_tq_max`**: peak `|output·STEER_MAX|` in the 1.5 s after each LC end. Should be < 2-3 Nm.
+- **Reference-smoothing efficacy** (lives in `lane_keeping`): `kappa_in` vs `kappa_ref` sign-flips per second from the `lane_keeping` telemetry topic.
+- **Lane offset**: from `modelV2.laneLines[1].y[0]` and `modelV2.laneLines[2].y[0]` averaged.
+- **δ_err at lane-change end**: `delta_err` at the moment laneChangeState flips back to `off`.
+- **`post_tq_max`**: peak `|output·STEER_MAX|` in the 1.5 s after each lane change ends.
 
-Reference baselines (field-verified, 2026-05):
-- Route 31c: lane offset rms 0.33 m, filter reduction 59% — the "nearly perfect" baseline
-- Routes 32a / 32d: 0 flagged LC events out of 39 LCs, filter reduction 65-66%, cancel_accel essentially eliminated — current stable operating point
+Baselines: the most recent History entries carry the numbers for the current
+law (2026-11-09: routes 530–534). Figures in entries dated before 2026-10-20
+were measured on earlier laws.
 
 > **Design law (user, 2026-07-28): the lateral controller never gives up in
 > curves.** A last-resort measured-a_y backstop (fire only >3.0 m/s² sustained

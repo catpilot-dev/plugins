@@ -45,8 +45,7 @@ V_GAIN_FLOOR = 2.778
 # LKA regime: DCC cannot engage below 30 km/h, so v_true < LKA_MAX_V is lateral-
 # only driving. Its two behaviours (relax-dwell length, unwind step boost)
 # blend in over [LKA_MAX_V, LKA_BLEND_V] because the plant does not step at
-# 30 km/h
-# (route 41b: a hard threshold switched the law mid-turn).
+# 30 km/h (route 41b: a hard threshold switched the law mid-turn).
 LKA_MAX_V = 8.5            # m/s (30 km/h) -- lower edge of the blend band
 LKA_BLEND_V = 12.0         # m/s (43 km/h) -- upper edge of the blend band (user choice)
 UNWIND_STEP_GAIN = 3.0     # step-cap multiplier while shedding torque in LKA: stiction
@@ -166,10 +165,13 @@ def on_lat_controller_init(result, lac, CP):
 
   # Decision cadence (deviceMotion ticks) and CAN-rate ramp spread: both are half
   # of CONTROL_HORIZON_S, so two decision-and-ramp cycles fit one horizon and
-  # each ramp completes as the next decision lands. Panda enforces wire-rate.
-  DT_DEVICE_MOTION = 0.05                        # one deviceMotion tick (s)
+  # each ramp completes as the next decision lands (6 ticks = 30 CAN frames =
+  # 300 ms: >= 2.5 tau of the rack's ~130 ms response, so the plant has
+  # answered the previous step). Panda enforces wire-rate.
+  DT_DEVICE_MOTION = 0.05                   # one deviceMotion tick (s)
   DT_CAN_TICK = 0.01                        # one CAN tick at 100 Hz (s)
-  ACTION_CADENCE_TICKS_FALLBACK = 5         # state-init only: primes the first decision
+  ACTION_CADENCE_TICKS = max(1, round(0.5 * CONTROL_HORIZON_S / DT_DEVICE_MOTION))
+  SPREAD_FRAMES = ACTION_CADENCE_TICKS * round(DT_DEVICE_MOTION / DT_CAN_TICK)
   # Plant-inversion gain, linear tire regime: tau_Nm = T_CAP_SLOPE * v^2 * delta
   # drives both the target and the authority cap
   #   t_cap = min(STEER_MAX, T_CAP_BASE_NM + T_CAP_SLOPE_BASE*kappa_scale*v^2*|delta_ref|).
@@ -229,7 +231,7 @@ def on_lat_controller_init(result, lac, CP):
     'target_frac': 0.0,        # plant-inversion target set each decision (cadence = CONTROL_HORIZON_S/2)
     'ramp_step': 0.0,          # per-frame torque increment = (target − torque) / spread_frames
     'ramp_frames': 0,          # CAN frames left in current ramp
-    'tick_count': ACTION_CADENCE_TICKS_FALLBACK,  # primed so first deviceMotion tick fires cadence immediately (no engagement gap)
+    'tick_count': ACTION_CADENCE_TICKS,  # deviceMotion ticks since the last decision; primed so the first tick decides
     'action': 'init',          # debug: ramp / relax_dwell / idle / take_up
     'delta_err': 0.0,          # debug: front-wheel-angle error (rad), what controller acts on
     'lat_pub': None,
@@ -277,26 +279,22 @@ def on_lat_controller_init(result, lac, CP):
         state['action'] = state['tu_resume']
     state['was_active'] = active
 
-    # steeringAngleDeg carries a constant alignment offset (~-1.58 deg): the
-    # take-up reads angle deltas only, so it never needs to know it.
-    # getattr: CS is a stub in some test paths.
+    # Steering-side signals, read once (getattr: CS is a stub in some test
+    # paths). steeringAngleDeg (+ = LEFT) carries a constant alignment offset
+    # (~-1.58 deg): the take-up reads angle deltas only, so it never needs to
+    # know it. _gap is column - servo angle: the lash position.
     _angle = float(getattr(CS, 'steeringAngleDeg', 0.0))
+    _gap = float(getattr(CS, 'steeringAngleOffsetDeg', 0.0))
+    _rate = float(getattr(CS, 'steeringRateDeg', 0.0))
+    _pressed = bool(getattr(CS, 'steeringPressed', False))
 
     _sm.update(0)
     lp = _sm['deviceMotion']
     motion_updated = _sm.updated['deviceMotion']
 
-    # deviceMotion tick (20 Hz): measured and desired every tick, a decision every
-    # action_cadence_ticks (6 ticks, 300 ms: >= 2.5 tau of the rack's ~130 ms response,
-    # so the plant has answered the previous step). CAN tick (100 Hz): ramp.
+    # deviceMotion tick (20 Hz): measured and desired every tick, a decision
+    # every ACTION_CADENCE_TICKS. CAN tick (100 Hz): ramp.
     if motion_updated:
-      # Cadence and ramp length, both half of CONTROL_HORIZON_S; spread_frames
-      # is derived from the cadence (5 CAN ticks per deviceMotion tick) so the ramp
-      # ends exactly when the next decision lands (6 ticks = 30 frames = 300 ms).
-      half_horizon = 0.5 * CONTROL_HORIZON_S
-      action_cadence_ticks = max(1, round(half_horizon / DT_DEVICE_MOTION))
-      spread_frames = action_cadence_ticks * int(DT_DEVICE_MOTION / DT_CAN_TICK)
-
       # No filtering here: desired_curvature is already the lane_keeping Arc
       # reference, low-passed upstream. This controller tracks it faithfully.
       state['desired'] = float(desired_curvature)
@@ -323,9 +321,7 @@ def on_lat_controller_init(result, lac, CP):
       # Front-wheel-angle error (rear-axle bicycle model).
       delta_des = math.atan(state['desired'] * L)
       delta_meas = math.atan((state['measured'] + state['kappa_pred']) * L)
-      delta_err_raw = delta_des - delta_meas
-
-      delta_err = delta_err_raw
+      delta_err = delta_des - delta_meas
       state['delta_err'] = delta_err
 
       # Curvature scale for the P term and caps, keyed on |kappa_ref|.
@@ -342,7 +338,7 @@ def on_lat_controller_init(result, lac, CP):
       # Slope bias learning (see SL_TAU_S): integrate the P term alone on
       # straights. The gate never looks at the error's sign.
       state['sl_learn'] = bool(
-        state['slope'] and active and not getattr(CS, 'steeringPressed', False)
+        state['slope'] and active and not _pressed
         and v_true > SL_MIN_V
         and abs(state['desired']) < SL_KAPPA_DES and abs(state['measured']) < SL_KAPPA_MEAS
         and abs(a_ref) < SL_AY_MAX
@@ -355,10 +351,10 @@ def on_lat_controller_init(result, lac, CP):
       state['demand_nm'] = state['ff_nm'] + _p_nm + (state['sl_bias'] if state['slope'] else 0.0)
 
       # The noise guard judges reversal persistence on the 20 Hz sign of the
-      # whole demand, as an error-equivalent (Direct spec §3): on delta_err
-      # alone a steady small error against the feed-forward or the bias would
-      # hold the target at 0 and drop them.
-      state['guard'].observe(state['demand_nm'] / (T_CAP_SLOPE_BASE * kappa_scale * v * v))
+      # whole demand (Direct spec §3): on delta_err alone a steady small error
+      # against the feed-forward or the bias would hold the target at 0 and
+      # drop them.
+      state['guard'].observe(state['demand_nm'])
 
       # Relax-dwell: the model's reference dips mid-hairpin while the measured
       # curvature holds (route 3a0 seg 8: 40-50 % for ~1 s; on the Arc
@@ -387,12 +383,11 @@ def on_lat_controller_init(result, lac, CP):
       if state['ramp_frames'] == 0 and state['action'] in ('ramp', 'relax_dwell'):
         state['action'] = 'idle'
 
-      if active and state['tick_count'] >= action_cadence_ticks:
+      if active and state['tick_count'] >= ACTION_CADENCE_TICKS:
         state['tick_count'] = 0
 
         # The demand of this deviceMotion tick, on the FULL error — no on-target
         # band, a sub-friction target is in effect a hold (Direct spec §2).
-        _tu_demand = None   # the decision's demand before the step cap (take-up size gate)
         target_frac = state['demand_nm'] / CCP.STEER_MAX
         state['action'] = 'ramp'
         # Authority cap, v^2*|delta_ref|-scaled and clipped at STEER_MAX:
@@ -417,7 +412,7 @@ def on_lat_controller_init(result, lac, CP):
         # The take-up sizes the reversal on this demand, not on the step-capped
         # target: a zero crossing under STEP_MAX can land a few hundredths
         # past zero and the next decision is already past it.
-        _tu_demand = target_frac
+        state['tu_demand'] = target_frac
         # Per-decision step cap: move at most STEP_MAX toward the target, let
         # the plant respond one cadence, re-measure and step again (route 385
         # seg 27: single 8.3 Nm decisions drove 150 deg/s wheel bursts).
@@ -437,18 +432,15 @@ def on_lat_controller_init(result, lac, CP):
         target_frac = float(np.clip(state['torque'] + step, -t_cap_frac, t_cap_frac))
 
         state['target_frac'] = target_frac
-        state['tu_demand'] = target_frac if _tu_demand is None else _tu_demand
-        state['ramp_step'] = (target_frac - state['torque']) / spread_frames
-        state['ramp_frames'] = spread_frames
+        state['ramp_step'] = (target_frac - state['torque']) / SPREAD_FRAMES
+        state['ramp_frames'] = SPREAD_FRAMES
 
     # Contact learning (100 Hz, observe only): the servo-column gap under the
     # torque commanded last tick (state['torque'] has not advanced yet).
     # Guarded (ruling R12): an exception here must never break lateral.
-    _gap = float(getattr(CS, 'steeringAngleOffsetDeg', 0.0))
     try:
-      state['learner'].observe(_gap, state['torque'] * CCP.STEER_MAX,
-                               float(getattr(CS, 'steeringRateDeg', 0.0)),
-                               ok=active and not getattr(CS, 'steeringPressed', False))
+      state['learner'].observe(_gap, state['torque'] * CCP.STEER_MAX, _rate,
+                               ok=active and not _pressed)
     except Exception:
       pass
 
@@ -458,7 +450,6 @@ def on_lat_controller_init(result, lac, CP):
     # the remaining ramp re-aims at target_frac from that level.
     _ramp_held = False
     tu = state['takeup']
-    _pressed = bool(getattr(CS, 'steeringPressed', False))
     # Driver override: end the take-up and resume the held ramp (as on
     # handover) — driver-driven SZL motion must not confirm a contact and
     # hand over against the driver. No new take-up fires while pressed.
@@ -548,10 +539,10 @@ def on_lat_controller_init(result, lac, CP):
           'a_ref': float(state['a_ref']),                       # reference lateral accel (m/s^2)
           'relax_ticks': int(state['relax_ticks']),
           # Steering-side signals for drive analysis.
-          'angle': float(getattr(CS, 'steeringAngleDeg', 0.0)),            # wheel angle, deg, + = LEFT (BMW)
-          'servo_gap': float(getattr(CS, 'steeringAngleOffsetDeg', 0.0)),  # column - servo angle, deg: slack/windup
-          'steer_rate': float(getattr(CS, 'steeringRateDeg', 0.0)),
-          'pressed': bool(getattr(CS, 'steeringPressed', False)),
+          'angle': _angle,                                    # wheel angle, deg, + = LEFT (BMW)
+          'servo_gap': _gap,                                  # column - servo angle, deg: slack/windup
+          'steer_rate': _rate,
+          'pressed': _pressed,
           'lat_delay': float(lat_delay) if lat_delay else 0.0,             # s, as given by controlsd
           # Take-up (Direct spec §5). Contacts 0.0 = not known yet this drive.
           'tu_state': state['takeup'].state,                  # right / left (seated) / taking_up / unknown

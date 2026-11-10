@@ -1,6 +1,6 @@
 """Tests for BMW E9x/E8x plugin — VIN detection, CAN checksums, DBC paths, resume button."""
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 import importlib
 import sys
 import os
@@ -10,7 +10,7 @@ _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PLUGIN_DIR not in sys.path:
   sys.path.insert(0, _PLUGIN_DIR)
 
-from test_helpers import make_opendbc_mocks, make_cereal_mocks, install_all_mocks
+from test_helpers import make_cereal_mocks, install_all_mocks
 
 
 @pytest.fixture(autouse=True)
@@ -88,51 +88,40 @@ class TestVINDetection:
 
 class TestCANChecksums:
   def _get_checksums(self):
-    from bmw.bmwcan import calc_checksum_8bit, calc_checksum_4bit, calc_checksum_cruise
-    return calc_checksum_8bit, calc_checksum_4bit, calc_checksum_cruise
+    from bmw.bmwcan import calc_checksum_8bit, calc_checksum_cruise
+    return calc_checksum_8bit, calc_checksum_cruise
 
   def test_checksum_8bit_zero_data(self, mock_opendbc):
-    calc_8bit, _, _ = self._get_checksums()
+    calc_8bit, _ = self._get_checksums()
     result = calc_8bit(bytearray([0, 0, 0, 0]), 0)
     assert result == 0
 
   def test_checksum_8bit_with_msg_id(self, mock_opendbc):
-    calc_8bit, _, _ = self._get_checksums()
+    calc_8bit, _ = self._get_checksums()
     # msg_id 0xA8 with zero data
     result = calc_8bit(bytearray([0, 0, 0, 0]), 0xA8)
     assert result == 0xA8
 
   def test_checksum_8bit_overflow_wraps(self, mock_opendbc):
-    calc_8bit, _, _ = self._get_checksums()
+    calc_8bit, _ = self._get_checksums()
     # 0xFF * 4 = 0x3FC, msg_id = 0 → (0xFC + 0x03) & 0xFF = 0xFF
     result = calc_8bit(bytearray([0xFF, 0xFF, 0xFF, 0xFF]), 0)
     assert result == 0xFF
 
   def test_checksum_8bit_carry(self, mock_opendbc):
-    calc_8bit, _, _ = self._get_checksums()
+    calc_8bit, _ = self._get_checksums()
     # Test carry from upper byte: sum > 0xFF
     result = calc_8bit(bytearray([0x80, 0x80]), 0)
     assert result == (0x00 + 0x01) & 0xFF  # 0x100 → carry 1 + 0x00 = 1
     assert result == 1
 
-  def test_checksum_4bit(self, mock_opendbc):
-    _, calc_4bit, _ = self._get_checksums()
-    result = calc_4bit(bytearray([0, 0, 0, 0]), 0)
-    assert result == 0
-
-  def test_checksum_4bit_nibble_wrap(self, mock_opendbc):
-    _, calc_4bit, _ = self._get_checksums()
-    result = calc_4bit(bytearray([0, 0, 0, 0]), 0x130)
-    # 0x130 → (0x30 + 0x01) = 0x31 → (0x1 + 0x3) = 0x4
-    assert result == 4
-
   def test_checksum_cruise_uses_zero_init(self, mock_opendbc):
-    calc_8bit, _, calc_cruise = self._get_checksums()
+    calc_8bit, calc_cruise = self._get_checksums()
     data = bytearray([0x10, 0x20, 0x30])
     assert calc_cruise(data) == calc_8bit(data, 0)
 
   def test_checksum_8bit_deterministic(self, mock_opendbc):
-    calc_8bit, _, _ = self._get_checksums()
+    calc_8bit, _ = self._get_checksums()
     data = bytearray([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE])
     r1 = calc_8bit(data, 0xA8)
     r2 = calc_8bit(data, 0xA8)
@@ -1675,6 +1664,88 @@ class TestTempsPayload:
     from bmw.carstate import temps_payload
     pt = self._cp({'EngineData': {'TEMP_ENG': 88.4, 'TEMP_EOI': 95.6}})
     assert temps_payload(pt, None, servo=False) == {'coolant': 88, 'oil': 96}
+
+
+# ============================================================
+# steer_angle_offset subscription
+# ============================================================
+
+class TestSteerAngleOffsetSub:
+  """carstate follows a steer_angle_offset publisher when its plugin-bus socket
+  exists. The socket is looked for once a second; the subscription is drained
+  every frame."""
+
+  @pytest.fixture
+  def rig(self, monkeypatch, tmp_path):
+    from types import ModuleType, SimpleNamespace
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    import bmw.carstate as cs_mod
+
+    class FakeSub:
+      made = []
+      def __init__(self, topics):
+        self.topics, self.queue, self.closed = topics, [], False
+        FakeSub.made.append(self)
+      def drain(self, topic):
+        return (topic, self.queue.pop(0)) if self.queue else None
+      def close(self):
+        self.closed = True
+
+    bus = ModuleType('openpilot.selfdrive.plugins.plugin_bus')
+    bus.PluginSub = FakeSub
+    monkeypatch.setitem(sys.modules, 'openpilot.selfdrive.plugins.plugin_bus', bus)
+
+    probes = []
+    real_os = cs_mod.os
+
+    class _Path:
+      def exists(self, p):
+        probes.append(p)
+        return real_os.path.exists(p)
+      def __getattr__(self, name):
+        return getattr(real_os.path, name)
+
+    class _Os:
+      path = _Path()
+      def __getattr__(self, name):
+        return getattr(real_os, name)
+
+    monkeypatch.setattr(cs_mod, 'os', _Os())
+    sock = tmp_path / 'steer_angle_offset'
+    monkeypatch.setattr(cs_mod, 'STEER_OFFSET_SOCKET', str(sock), raising=False)
+    listener = cs_mod.SteerOffsetListener()
+    step = lambda n=1: [listener.poll() for _ in range(n)]
+    return SimpleNamespace(listener=listener, step=step, sock=sock, probes=probes, subs=FakeSub.made)
+
+  def test_socket_is_probed_once_a_second_not_every_frame(self, rig):
+    rig.step(300)
+    assert len(rig.probes) == 3, len(rig.probes)
+    assert set(rig.probes) == {str(rig.sock)}
+
+  def test_publisher_is_subscribed_and_drained_every_frame(self, rig):
+    rig.sock.touch()
+    assert rig.step() == [None]
+    assert len(rig.subs) == 1 and rig.subs[0].topics == ['steer_angle_offset']
+    rig.subs[0].queue.append({'offset': 1.5})
+    assert rig.step(2) == [1.5, None]
+
+  def test_publisher_appearing_later_is_found_within_a_second(self, rig):
+    rig.step(50)
+    assert not rig.subs
+    rig.sock.touch()
+    rig.step(100)
+    assert len(rig.subs) == 1
+
+  def test_vanished_publisher_is_dropped_within_a_second(self, rig):
+    rig.sock.touch()
+    rig.step()
+    rig.sock.unlink()
+    rig.step(100)
+    assert rig.subs[0].closed
+    rig.sock.touch()
+    rig.step(100)
+    assert len(rig.subs) == 2, "a returning publisher gets a fresh subscription"
 
 
 # ============================================================

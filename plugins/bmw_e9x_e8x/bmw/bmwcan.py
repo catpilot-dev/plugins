@@ -39,19 +39,6 @@ def create_steer_command(frame: int, mode: SteeringModes, steer_tq: float = 0, s
     return packer.make_can_msg("STEERING_COMMAND", CanBus.SERVO_CAN, values)
 
 
-def calc_checksum_4bit(work_data: bytearray, msg_id: int):  # 0x130
-  checksum = msg_id
-  for byte in work_data:  # checksum is stripped from the dat
-    checksum += byte  # add up all the bytes
-
-  checksum = (checksum & 0xFF) + (checksum >> 8)  # add upper and lower Bytes
-  checksum &= 0xFF  # throw away anything in upper Byte
-
-  checksum = (checksum & 0xF) + (checksum >> 4)  # add first and second nibble
-  checksum &= 0xF  # throw away anything in upper nibble
-  return checksum
-
-
 def calc_checksum_8bit(work_data: bytearray, msg_id: int):  # 0xb8 0x1a0 0x19e 0xaa 0xbf
   checksum = msg_id
   for byte in work_data:  # checksum is stripped from the data

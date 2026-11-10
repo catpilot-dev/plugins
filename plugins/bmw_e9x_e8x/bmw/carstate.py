@@ -1,10 +1,11 @@
-import numpy as np
+import os
+import time
+
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs, create_button_events
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
 from bmw.values import DBC, CanBus, BmwFlags, CruiseSettings
-import openpilot.cereal.messaging as messaging
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
@@ -93,26 +94,58 @@ def temps_payload(cp_PT, cp_aux, servo):
   return out
 
 
+STEER_OFFSET_SOCKET = '/tmp/plugin_bus/steer_angle_offset'
+STEER_OFFSET_PROBE_FRAMES = 100   # look for the publisher's socket once a second
+
+
+class SteerOffsetListener:
+  """Follows a steer_angle_offset publisher on the plugin bus (1 Hz), if one is
+  running. The socket is looked for every STEER_OFFSET_PROBE_FRAMES; the
+  subscription is drained every frame."""
+
+  def __init__(self):
+    self._sub = None
+    self._probe_in = 0
+
+  def poll(self):
+    """The offset published since the last call, or None. Called every frame."""
+    try:
+      self._probe_in -= 1
+      if self._probe_in <= 0:
+        self._probe_in = STEER_OFFSET_PROBE_FRAMES
+        present = os.path.exists(STEER_OFFSET_SOCKET)
+        if self._sub is not None and not present:
+          try:
+            self._sub.close()
+          except Exception:
+            pass
+          self._sub = None
+        elif self._sub is None and present:
+          from openpilot.selfdrive.plugins.plugin_bus import PluginSub
+          self._sub = PluginSub(['steer_angle_offset'])
+      if self._sub is not None:
+        msg = self._sub.drain('steer_angle_offset')
+        if msg is not None and 'offset' in msg[1]:
+          return float(msg[1]['offset'])
+    except Exception:
+      pass
+    return None
+
+
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
     can_define = CANDefine(DBC[CP.carFingerprint]['pt'])
     self.shifter_values = can_define.dv["TransmissionDataDisplay"]['ShiftLeverPosition']
-    self.gas_kickdown = False
-
-    self.cluster_min_speed = CruiseSettings.CLUSTER_OFFSET
 
     self.is_metric = None
     self.cruise_stalk_speed = 0
     self.cruise_stalk_resume = False
     self.cruise_stalk_cancel = False
-    self.cruise_stalk_cancel_up = False
-    self.cruise_stalk_cancel_dn = False
     self.cruise_stalk_counter = 0
     self.prev_cruise_stalk_speed = 0
     self.prev_cruise_stalk_resume = self.cruise_stalk_resume
     self.prev_cruise_stalk_cancel = self.cruise_stalk_cancel
-    self.prev_cruise_enabled = False  # Track previous openpilot cruise state for resume button logic
     self.resume_button_hold_frames = 0
     self.resume_press_engaged = False  # Was cruise engaged when resume button was first pressed?
     self.steer_fault_counter = 0  # Debounce: consecutive frames with raw fault bits set
@@ -121,21 +154,17 @@ class CarState(CarStateBase):
     # on it (DESIGN.md: "Servo re-arm after soft-off").
     self.servo_soft_off = False
     self.steer_angle_offset = self._load_steer_angle_offset()
-    self._offset_sub = None
+    self._offset_listener = SteerOffsetListener()
 
-    self.right_blinker_pressed = False
-    self.left_blinker_pressed = False
     self.other_buttons = False
     self.prev_other_buttons = False
     self.prev_gas_pressed = False
     self.cruise_state_enabled = False
     self.dtc_mode = False
 
-    # Subscribe to radarState, lateralDelay
-    self.sm = messaging.SubMaster(['radarState', 'lateralDelay'])
-    from openpilot.selfdrive.plugins.plugin_bus import PluginSub
-    self._sl_sub = PluginSub(['speedLimitState'])
-    self._sl_data = None
+    # bmw_temps publisher (plugin bus), built on first use; 0.2 Hz.
+    self._temp_pub = None
+    self._last_temp_write = float('-inf')
 
   def update(self, can_parsers) -> structs.CarState:
     cp_PT = can_parsers[Bus.pt]
@@ -158,7 +187,6 @@ class CarState(CarStateBase):
     ret.brakePressed = cp_PT.vl["EngineAndBrake"]['BrakePressed'] != 0
     ret.parkingBrake = cp_PT.vl["Status_contact_handbrake"]["Handbrake_pulled_up"] != 0
     ret.gasPressed = cp_PT.vl['AccPedal']["AcceleratorPedalPressed"] != 0 or cp_PT.vl['AccPedal']["KickDownPressed"] != 0
-    self.gas_kickdown = cp_PT.vl['AccPedal']["KickDownPressed"] != 0
 
     ret.vEgoRaw = cp_PT.vl['Speed']["VehicleSpeed"] * CV.KPH_TO_MS
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
@@ -172,8 +200,6 @@ class CarState(CarStateBase):
     blinker_on = cp_PT.vl["TurnSignals"]['TurnSignalActive'] != 0 and cp_PT.vl["TurnSignals"]['TurnSignalIdle'] == 0
     ret.leftBlinker = blinker_on and cp_PT.vl["TurnSignals"]['LeftTurn'] != 0
     ret.rightBlinker = blinker_on and cp_PT.vl["TurnSignals"]['RightTurn'] != 0
-    self.right_blinker_pressed = not blinker_on and cp_PT.vl["TurnSignals"]['RightTurn'] != 0
-    self.left_blinker_pressed = not blinker_on and cp_PT.vl["TurnSignals"]['LeftTurn'] != 0
 
     self.dtc_mode = cp_PT.vl['StatusDSC_KCAN']['DTC_on'] != 0
 
@@ -215,9 +241,7 @@ class CarState(CarStateBase):
       self.cruise_stalk_speed = 0
     self.cruise_stalk_resume = cruise_control_stal_msg['resume'] != 0
     self.cruise_stalk_cancel = cruise_control_stal_msg['cancel'] != 0
-    self.cruise_stalk_cancel_up = cruise_control_stal_msg['cancel_lever_up'] != 0
     self.cruise_stalk_counter = cruise_control_stal_msg['Counter_0x194']
-    self.cruise_stalk_cancel_dn = self.cruise_stalk_cancel and not self.cruise_stalk_cancel_up
 
     if self.is_metric is None and ret.cruiseState.enabled and ret.vEgo > 5:
       speed_ratio = ret.cruiseState.speed / ret.vEgo
@@ -234,12 +258,11 @@ class CarState(CarStateBase):
 
     # Temps are not in stock CarState capnp — share via plugin bus for UI overlay
     # Publish at 0.2 Hz (every 5s) — temps change slowly
-    import time
     now = time.monotonic()
-    if not hasattr(self, '_last_temp_write') or now - self._last_temp_write >= 5.0:
+    if now - self._last_temp_write >= 5.0:
       self._last_temp_write = now
       try:
-        if not hasattr(self, '_temp_pub'):
+        if self._temp_pub is None:
           from openpilot.selfdrive.plugins.plugin_bus import PluginPub
           self._temp_pub = PluginPub('bmw_temps')
         self._temp_pub.send(temps_payload(cp_PT, cp_aux, bool(self.CP.flags & BmwFlags.STEPPER_SERVO_CAN)))
@@ -256,7 +279,7 @@ class CarState(CarStateBase):
 
     self.prev_gas_pressed = ret.gasPressed
 
-    # Resume button duration-based logic (v6)
+    # Resume button: duration-based logic
     resume_button_events = []
 
     if self.cruise_stalk_resume:
@@ -279,9 +302,6 @@ class CarState(CarStateBase):
         ))
       elif self.resume_press_engaged:
         # Short press while engaged: toggle speed limit confirm
-        msg = self._sl_sub.drain('speedLimitState')
-        if msg is not None:
-          _, self._sl_data = msg
         toggle_speed_limit_confirm()
       else:
         resume_button_events.append(structs.CarState.ButtonEvent(
@@ -302,7 +322,6 @@ class CarState(CarStateBase):
       ]
 
     self.cruise_state_enabled = ret.cruiseState.enabled
-    self.prev_cruise_enabled = ret.cruiseState.enabled
     self.prev_other_buttons = self.other_buttons
     return ret
 
@@ -321,37 +340,19 @@ class CarState(CarStateBase):
       from config import read_plugin_param
       val = read_plugin_param('bmw_e9x_e8x', 'SteerAngleOffset')
       return float(val) if val else 0.0
-    except (ValueError, Exception):
+    except Exception:
       return 0.0
 
   def _update_steer_angle_offset(self):
     """Update offset from any registered publisher on the steer_angle_offset topic."""
-    try:
-      import os
-      socket_path = '/tmp/plugin_bus/steer_angle_offset'
-      if self._offset_sub is not None and not os.path.exists(socket_path):
-        try:
-          self._offset_sub.close()
-        except Exception:
-          pass
-        self._offset_sub = None
-      if self._offset_sub is None and os.path.exists(socket_path):
-        from openpilot.selfdrive.plugins.plugin_bus import PluginSub
-        self._offset_sub = PluginSub(['steer_angle_offset'])
-      if self._offset_sub is not None:
-        msg = self._offset_sub.drain('steer_angle_offset')
-        if msg is not None:
-          _, data = msg
-          new_offset = float(data.get('offset', self.steer_angle_offset))
-          if new_offset != self.steer_angle_offset:
-            self.steer_angle_offset = new_offset
-            try:
-              from config import write_plugin_param
-              write_plugin_param('bmw_e9x_e8x', 'SteerAngleOffset', '%.4f' % new_offset)
-            except Exception:
-              pass
-    except Exception:
-      pass
+    new_offset = self._offset_listener.poll()
+    if new_offset is not None and new_offset != self.steer_angle_offset:
+      self.steer_angle_offset = new_offset
+      try:
+        from config import write_plugin_param
+        write_plugin_param('bmw_e9x_e8x', 'SteerAngleOffset', '%.4f' % new_offset)
+      except Exception:
+        pass
 
   @staticmethod
   def get_can_parsers(CP):

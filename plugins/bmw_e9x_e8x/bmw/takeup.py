@@ -2,9 +2,10 @@
 
 Design: docs/superpowers/specs/2026-10-18-bmw-direct-tracking-design.md.
 
-The servo drives the column through ~12-13 deg of lash (route 4e5, re-printed
-gears: servo-column gap ~ +77.6..77.8 deg under right torque, ~65 deg under
-left torque; contacts stable within +/-1 deg inside a drive).  ContactLearner
+The servo drives the column through the printed gears' lash: 12-21 deg with
+the jigsaw hubs (routes 4e5-4ff; on 4e5 the servo-column gap sat at ~ +77.7 deg
+under right torque and ~65 deg under left), 3.4-5 deg since the clamped v21 hub
+(2026-11-01). Contacts are stable within +/-1 deg inside a drive.  ContactLearner
 estimates the two contact gaps online from samples taken while a firm torque
 presses the gear against one flank and the wheel is stationary. Contacts are
 learned afresh each drive: the servo's zero moves at every power-up, so a
@@ -94,7 +95,8 @@ def _sign(x):
 
 class SignGuard:
   """Commits to a push side; an opposite-side target passes only once the
-  desired-error sign has been opposite for persist_s (call observe at 20 Hz)."""
+  demand's sign has been opposite for persist_s (call observe at 20 Hz; only
+  the sign of the observed value is read)."""
 
   def __init__(self, persist_s=GUARD_PERSIST_S, dt=0.05):
     self._need = round(persist_s / dt)
@@ -102,8 +104,8 @@ class SignGuard:
     self.suppressed = 0
     self._opp = 0
 
-  def observe(self, delta_err):
-    s = _sign(delta_err)
+  def observe(self, demand):
+    s = _sign(demand)
     if self.side != 0 and s == -self.side:
       self._opp += 1
     else:
@@ -129,8 +131,7 @@ class SignGuard:
     self.side = 0
     self._opp = 0
 
-  # Value equality: controller state snapshots compare guards by content
-  # (controller state snapshots compare by content).
+  # Value equality: controller state snapshots compare guards by content.
   __hash__ = None
 
   def __eq__(self, other):
