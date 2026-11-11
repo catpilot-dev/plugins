@@ -57,9 +57,6 @@ When a BMW is detected, the vehicle section of **Settings → Driving** adds:
 - **Temperature Overlay** — coolant and oil temperature at the bottom right of
   the driving screen, colored blue through red from cold to critical. On by
   default.
-- **Slope Compensation** — learns the small steady steering torque the car
-  needs to drive straight (road camber, alignment) and applies it. Off by
-  default; applies at the next engagement.
 - **Resume Button Repurposed** — On this car the
   cruise stalk's resume button does double duty: a short press resumes cruise
   when disengaged, or confirms/cancels a detected speed limit when engaged; a

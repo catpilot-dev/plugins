@@ -1,6 +1,6 @@
 # BMW Direct Tracking — straight-road slope bias (design)
 
-Status: draft for user review, 2026-10-19. Builds on
+Status: RETIRED 2026-11-11 (code, switch and Driving-panel row removed). Was: draft for user review, 2026-10-19. Builds on
 `2026-10-18-bmw-direct-tracking-design.md`.
 
 ## Problem

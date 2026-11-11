@@ -10,7 +10,7 @@ The law, per deviceMotion tick (20 Hz) and per CAN tick (100 Hz):
   P_nm      = T_CAP_SLOPE_BASE * kappa_scale * v^2 * delta_err
   a_ref     = v_true^2 * kappa_ref                          reference lateral accel
   ff_nm     = curve_ff_nm(a_ref)                            steady curve torque
-  demand    = ff_nm + P_nm (+ sl_bias)
+  demand    = ff_nm + P_nm
 Every CONTROL_HORIZON_S/2 a decision takes the demand through t_cap, relax-dwell
 (a deep measured curve holds its torque through a reference dip), the noise
 guard and STEP_MAX, and the torque ramps to it over the next half horizon; the
@@ -67,19 +67,6 @@ def curve_ff_nm(a_ref):
 # the cadence to ~500 ms of added lag (route 4d8).
 CONTROL_HORIZON_S = 0.65
 
-# Slope bias (SlopeCompensation switch; docs/superpowers/specs/2026-10-19-bmw-
-# slope-bias-design.md). P alone needs a standing error to hold the steady
-# torque a straight road asks for (route 4e9: ~0.08 Nm, the car +0.15 m right
-# of the plan), so sl_bias integrates the P term on straights and is added to
-# the P target everywhere. The learn gate is the driving situation only, never
-# the error's sign: anti-windup must never block the unwind (37e34b7).
-SL_TAU_S = 20.0            # integration time constant on the P term (s)
-SL_BIAS_MAX_NM = 0.25      # route 4ea: roads with roll >= 2.3 deg need 0.20-0.25; well below breakaway
-SL_MIN_V = 40 / 3.6        # learn only above 40 km/h (m/s)
-SL_KAPPA_DES = 1e-3        # straight: |kappa_ref| below this (1/m)
-SL_KAPPA_MEAS = 1.5e-3     # and |kappa_meas| below this (1/m)
-SL_AY_MAX = 0.15           # and |a_ref| below this (m/s^2): gentle bends charged the bias on route 4ec
-
 # Curve feed-forward (docs/superpowers/specs/2026-10-20-bmw-curve-feedforward-
 # and-audit-design.md). Above ~0.3 m/s^2 a curve needs steady torque this
 # hydraulic rack's stiction does not supply (440 steady windows on 4e9-4ec:
@@ -93,7 +80,7 @@ SL_AY_MAX = 0.15           # and |a_ref| below this (m/s^2): gentle bends charge
 # at 0.6 m/s^2, so mild curves and lane changes waited on P's standing error
 # (car at ~0.7 s lag, 0.6-0.9 m outward on mild curves). 1.4 / 0.2 gives ~80 %
 # and stays under the need at every a_ref.
-CF_AY0 = 0.2               # m/s^2 deadband: below it stiction holds the angle at zero torque; above SL_AY_MAX
+CF_AY0 = 0.2               # m/s^2 deadband: below it stiction holds the angle at zero torque
 CF_GAIN = 1.4              # Nm per m/s^2 beyond the deadband (measured need ~1.4)
 CF_MAX_NM = 2.0            # cap (Nm); t_cap and STEER_MAX still apply
 
@@ -121,7 +108,7 @@ def on_lat_controller_init(result, lac, CP):
   Demand, every deviceMotion tick, on the full error:
     P_nm   = T_CAP_SLOPE_BASE * kappa_scale(|kappa_ref|) * v^2 * delta_err
     ff_nm  = curve_ff_nm(v_true^2 * kappa_ref)
-    demand = ff_nm + P_nm (+ sl_bias)
+    demand = ff_nm + P_nm
   Decision, every CONTROL_HORIZON_S/2 while active:
     target = demand, clipped to t_cap, bridged by relax-dwell in a deep
              measured curve, sign changes gated by the noise guard, moved at
@@ -150,18 +137,6 @@ def on_lat_controller_init(result, lac, CP):
     except Exception:
       pass
     return result
-
-  # Plugin params are never read per tick: a file read on controlsd's 100 Hz
-  # thread can cost a control frame under eMMC contention. The import is at
-  # function scope so a missing config.py (install.sh copies it in a later
-  # step) defaults the switch instead of failing the hook module.
-  try:
-    from config import read_plugin_param
-  except Exception:
-    pass
-  # SlopeCompensation is read at each engagement edge in update() (a rare
-  # event, not a per-tick read), so the user can A/B by re-engaging.
-  # Default off; a failed read (incl. read_plugin_param unbound) is off.
 
   # Decision cadence (deviceMotion ticks) and CAN-rate ramp spread: both are half
   # of CONTROL_HORIZON_S, so two decision-and-ramp cycles fit one horizon and
@@ -246,10 +221,7 @@ def on_lat_controller_init(result, lac, CP):
     'tu_demand': 0.0,        # last decision's target before STEP_MAX (take-up size gate)
     'a_ref': 0.0,            # reference lateral accel v_true^2 * kappa_ref (m/s^2)
     'ff_nm': 0.0,            # curve feed-forward (Nm)
-    'demand_nm': 0.0,        # ff_nm + P_nm (+ sl_bias): what the decision targets
-    'slope': False,          # SlopeCompensation latched at the engagement edge
-    'sl_bias': 0.0,          # learned straight-road torque (Nm); kept across engagements, never persisted
-    'sl_learn': False,       # learn gate open this deviceMotion tick (telemetry)
+    'demand_nm': 0.0,        # ff_nm + P_nm: what the decision targets
     'lane_change': False,    # model runs a lane change this deviceMotion tick (LANE_CHANGE_STATES)
     'wheel_hist': deque(maxlen=YAW_PRED_TICKS + 1),  # wheel angle (deg) at the last deviceMotion ticks
     'kappa_pred': 0.0,       # yaw-predictor curvature added to the P law's measured (1/m)
@@ -259,16 +231,10 @@ def on_lat_controller_init(result, lac, CP):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 11
 
-    # Engagement edge: latch the SlopeCompensation switch (read here only, so
-    # the law never changes while pushing); the guard starts uncommitted.
+    # Engagement edge: the guard starts uncommitted.
     if active and not state['was_active']:
-      try:
-        state['slope'] = read_plugin_param('bmw_e9x_e8x', 'SlopeCompensation', '') == '1'
-      except Exception:
-        state['slope'] = False
       state['guard'].reset()
     elif not active:
-      state['slope'] = False
       # Inactive: the law does not run on the state. Torque, target and ramp
       # are zeroed so the next engagement ramps from 0 under STEP_MAX on its
       # first deviceMotion tick instead of jumping to a torque built while the
@@ -335,25 +301,12 @@ def on_lat_controller_init(result, lac, CP):
       state['ff_nm'] = curve_ff_nm(a_ref)
       _p_nm = T_CAP_SLOPE_BASE * kappa_scale * v * v * delta_err
 
-      # Slope bias learning (see SL_TAU_S): integrate the P term alone on
-      # straights. The gate never looks at the error's sign.
-      state['sl_learn'] = bool(
-        state['slope'] and active and not _pressed
-        and v_true > SL_MIN_V
-        and abs(state['desired']) < SL_KAPPA_DES and abs(state['measured']) < SL_KAPPA_MEAS
-        and abs(a_ref) < SL_AY_MAX
-        and state['takeup'].state != 'taking_up')
-      if state['sl_learn']:
-        state['sl_bias'] = float(np.clip(state['sl_bias'] + (_p_nm / SL_TAU_S) * DT_DEVICE_MOTION,
-                                         -SL_BIAS_MAX_NM, SL_BIAS_MAX_NM))
-
       # The demand the decision targets.
-      state['demand_nm'] = state['ff_nm'] + _p_nm + (state['sl_bias'] if state['slope'] else 0.0)
+      state['demand_nm'] = state['ff_nm'] + _p_nm
 
       # The noise guard judges reversal persistence on the 20 Hz sign of the
       # whole demand (Direct spec §3): on delta_err alone a steady small error
-      # against the feed-forward or the bias would hold the target at 0 and
-      # drop them.
+      # against the feed-forward would hold the target at 0 and drop it.
       state['guard'].observe(state['demand_nm'])
 
       # Relax-dwell: the model's reference dips mid-hairpin while the measured
@@ -555,8 +508,6 @@ def on_lat_controller_init(result, lac, CP):
           'tu_ms': float(state['takeup'].last_ms),            # last take-up duration
           'tu_timeouts': int(state['takeup'].timeouts),       # cumulative take-ups ended by TAKEUP_TIMEOUT_S
           'tu_guarded': int(state['guard'].suppressed),       # cumulative reversals held at 0 by the noise guard
-          'sl_bias': float(state['sl_bias']),                  # learned straight-road torque (Nm)
-          'sl_learn': bool(state['sl_learn']),                 # slope-bias learn gate open
           'kappa_pred': float(state['kappa_pred']),            # yaw predictor, added to measured in the P law (1/m)
         }
         state['lat_pub'].send(payload)

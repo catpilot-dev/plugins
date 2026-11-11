@@ -24,7 +24,7 @@ with no filtering of its own.
     P_nm      = T_CAP_SLOPE_BASE · kappa_scale(|kappa_ref|) · v² · delta_err
     a_ref     = v_true² · kappa_ref                          reference lateral accel (m/s²)
     ff_nm     = clip(CF_GAIN · sign(a_ref) · max(|a_ref| − CF_AY0, 0), ±CF_MAX_NM)
-    demand    = ff_nm + P_nm (+ sl_bias)                    every deviceMotion tick
+    demand    = ff_nm + P_nm                                every deviceMotion tick
 
 **Decision**, every `CONTROL_HORIZON_S / 2` (6 deviceMotion ticks, 300 ms) while active, in order:
 the demand on the full error (no on-target band — a sub-friction target is a
@@ -54,11 +54,10 @@ ramp are 0, so every engagement ramps from 0.
 | `YAW_PRED_TICKS`, `YAW_PRED_SR` | 6 deviceMotion ticks (0.3 s), 25 | lane-change yaw predictor window and wheel/front-wheel ratio (2026-11-02) |
 | `LANE_CHANGE_STATES` | laneChangeStarting, laneChangeFinishing | `drivingModelData.meta` states with the flat 0.10 step cap (2026-11-02) |
 | `LKA_MAX_V`, `LKA_BLEND_V`, `UNWIND_STEP_GAIN` | 8.5, 12.0 m/s, 3.0 | LKA regime blend band (dwell length, unwind boost) |
-| `SL_TAU_S`, `SL_BIAS_MAX_NM`, `SL_MIN_V`, `SL_KAPPA_DES`, `SL_KAPPA_MEAS`, `SL_AY_MAX` | 20 s, 0.25 Nm, 40 km/h, 1e-3, 1.5e-3, 0.15 m/s² | Slope Compensation (`SlopeCompensation` switch, default off) |
 | `GUARD_PERSIST_S`, `TAKEUP_NM`, `TAKEUP_TIMEOUT_S` | 0.15 s, 0.35 Nm, 0.4 s | noise guard, take-up (bmw/takeup.py) |
 
-**Switches** (Driving panel, param files under `bmw_e9x_e8x/data/`):
-`SlopeCompensation` (read at each engagement), default off.
+**Switches**: none. Slope Compensation (`SlopeCompensation`, default off) was
+retired 2026-11-11; its history entry stays in §12.
 
 **Verification.** Unit tests in `tests/test_latcontroller.py` and
 `tests/test_takeup.py`; a differential replay against the previous build is the
@@ -1188,8 +1187,6 @@ Published each deviceMotion tick. The exact field set is pinned by
 | `c_right`, `c_left` | learned contacts (deg); 0.0 = not known yet this drive |
 | `tu_fires`, `tu_ms`, `tu_timeouts` | cumulative take-ups, last duration, cumulative timeouts |
 | `tu_guarded` | cumulative reversals held at 0 by the noise guard |
-| `sl_bias` | learned straight-road torque (Nm) |
-| `sl_learn` | slope-bias learn gate open this tick |
 | `kappa_pred` | yaw-predictor curvature added to `measured` in the P law (1/m); 0 outside lane changes |
 
 Multiply `output` or `torque` by `STEER_MAX = 12 Nm` for Nm.
@@ -1265,8 +1262,9 @@ failure mode appears.
   target in **speedlimitd** — it owns `vEgo`, hence `a_y = v²·κ`.
 
 ### To add a switch that applies mid-drive:
-- `SlopeCompensation` is read at each engagement, which is enough for it. A
-  knob that must switch while engaged needs the hot-toggle pattern: panel
+- A knob read once at each engagement (the pattern the retired
+  `SlopeCompensation` used, 2026-10-19 to 2026-11-11) cannot change while
+  pushing. A knob that must switch while engaged needs the hot-toggle pattern: panel
   toggle → immediate `PluginPub` send **plus** a 1 Hz heartbeat republishing
   the param file (ZMQ PUB drops edge-triggered sends to a not-yet-connected
   subscriber, so the heartbeat is what makes it reliable), with the controller
@@ -1274,7 +1272,12 @@ failure mode appears.
   on the RT thread. Git history around commits fbb899b / 7afd501 has a working
   implementation (the retired `AngleBudget` switch).
 
-### Slope Compensation (`SlopeCompensation`, 2026-10-19 entry):
+### Slope Compensation (`SlopeCompensation`, 2026-10-19 entry; RETIRED 2026-11-11):
+- **Retired** 2026-11-11 (user call): default off on every drive since the
+  curve feed-forward (2026-10-20) and the 1.5 straight gain (ff4223c); code,
+  switch, Driving-panel row, telemetry and tests removed. The notes below are
+  history. The removed telemetry fields `sl_bias` / `sl_learn` appear only in
+  logs from before the removal.
 - **Why**: Direct is P-only, so the steady torque a straight needs against a
   constant pull (road slope, alignment) comes only from a standing error. On
   route 4e9 that was δ_err ≈ −2.2e-4 rad / ~0.08 Nm left, and the car sat
@@ -1310,10 +1313,10 @@ failure mode appears.
 
 | section | where | content |
 |---|---|---|
-| Module constants | top of file | `V_GAIN_FLOOR`, LKA band, `CONTROL_HORIZON_S`, `SL_*`, `CF_*` + `curve_ff_nm`, the lane_keeping readiness check (R10) |
-| `on_lat_controller_init` | module | R10 guard, `config.read_plugin_param` import, cadence/gain/step/dwell constants, the state dict, `update` closure |
-| Engagement edge | top of `update()` | `SlopeCompensation` latch, guard reset; inactive zeroes torque/target/ramp |
-| deviceMotion tick | `update()` | reference, speeds, `delta_err`, `kappa_scale`, `a_ref`/`ff_nm`, slope-bias learning, `demand_nm`, guard observe, relax-dwell |
+| Module constants | top of file | `V_GAIN_FLOOR`, LKA band, `CONTROL_HORIZON_S`, `CF_*` + `curve_ff_nm`, the lane_keeping readiness check (R10) |
+| `on_lat_controller_init` | module | R10 guard, cadence/gain/step/dwell constants, the state dict, `update` closure |
+| Engagement edge | top of `update()` | guard reset; inactive zeroes torque/target/ramp |
+| deviceMotion tick | `update()` | reference, speeds, `delta_err`, `kappa_scale`, `a_ref`/`ff_nm`, `demand_nm`, guard observe, relax-dwell |
 | Decision | `update()`, every `ACTION_CADENCE_TICKS` while active | demand → `t_cap` → dwell bridge → guard → `STEP_MAX` |
 | Contact learning, take-up | `update()`, every CAN tick | `ContactLearner.observe`, `FreePlayTakeUp.step`, handover |
 | Ramp and telemetry | end of `update()` | per-frame ramp step, zero snap, `bmw_lat_control` payload (§9) |

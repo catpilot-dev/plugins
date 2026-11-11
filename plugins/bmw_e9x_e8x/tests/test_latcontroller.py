@@ -3,8 +3,8 @@
 
 The controller tracks the commanded curvature with Direct Tracking as its only
 law: no rest state or hold band, the P target on the full error every decision,
-sign-guarded reversals with free-play take-up, the LKA-regime unwind boost,
-Slope Compensation. It never drains torque to respect an a_y ceiling (speedlimitd
+sign-guarded reversals with free-play take-up, the LKA-regime unwind boost.
+It never drains torque to respect an a_y ceiling (speedlimitd
 owns a_y through v); the P-law reversing on overshoot IS the correction.
 
 Harness notes:
@@ -75,29 +75,14 @@ class FakeSubMaster:
     return self.dmd if key == 'drivingModelData' else self.lp
 
 
-def _make_controller(monkeypatch, wheelbase=2.66, slope=None):
+def _make_controller(monkeypatch, wheelbase=2.66):
   """Load bmw.latcontroller and construct a controller instance wired to a
-  FakeSubMaster. Returns (lac, fake_sm, mod, state).
-
-  slope: if not None, SlopeCompensation reads as '1' (True) or '0' (False).
-  Patched on the `config` module BEFORE on_lat_controller_init runs (the
-  controller does `from config import read_plugin_param` at function scope and
-  reads SlopeCompensation at each engagement edge). The stub dispatches on the
-  param KEY; a kwarg left None falls through to the production default ('').
-  """
+  FakeSubMaster. Returns (lac, fake_sm, mod, state)."""
   import openpilot.cereal.messaging as messaging
   fake_sm = FakeSubMaster([])
   monkeypatch.setattr(messaging, 'SubMaster', lambda services: fake_sm)
 
   import bmw.latcontroller as mod
-  if slope is not None:
-    import config
-    def _param_stub(plugin_id, key, default=''):
-      if key == 'SlopeCompensation' and slope is not None:
-        return '1' if slope else '0'
-      return default
-    monkeypatch.setattr(config, 'read_plugin_param', _param_stub)
-
   CP = SimpleNamespace(wheelbase=wheelbase, steerActuatorDelay=0.4)
   lac = SimpleNamespace()
   result = SimpleNamespace()
@@ -956,13 +941,6 @@ def test_curve_ff_zero_inside_deadband():
   assert curve_ff_nm(0.19) == 0.0 == curve_ff_nm(-0.19) == curve_ff_nm(0.0)
 
 
-def test_curve_ff_deadband_above_slope_learning_gate():
-  # Slope Compensation learns only below SL_AY_MAX; the feed-forward must stay
-  # zero there or the bias would integrate against it on gentle bends.
-  from bmw.latcontroller import CF_AY0, SL_AY_MAX
-  assert CF_AY0 > SL_AY_MAX
-
-
 def test_curve_ff_sign_and_gain():
   from bmw.latcontroller import curve_ff_nm
   assert curve_ff_nm(1.2) == pytest.approx(1.4)
@@ -1009,19 +987,6 @@ class TestDirectTracking:
     lac = SimpleNamespace(update=sentinel); result = SimpleNamespace()
     out = mod.on_lat_controller_init(result, lac, SimpleNamespace(wheelbase=2.66, steerActuatorDelay=0.4))
     assert lac.update is sentinel and out is result
-
-  def test_slope_latches_at_engagement(self, monkeypatch):
-    import config
-    params = {'SlopeCompensation': '1'}
-    monkeypatch.setattr(config, 'read_plugin_param',
-                        lambda plugin_id, key, default='': params.get(key, default))
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    assert state['slope']
-    _call_update(lac, 0.0, v_ego=25.0, active=False)
-    assert not state['slope']
-    params['SlopeCompensation'] = '0'
-    _call_update(lac, 0.0, v_ego=25.0, active=True)
-    assert not state['slope']
 
   def test_disengage_zeroes_the_ramp_state(self, monkeypatch):
     """While lateral is inactive the law does not run on the state: disengaging
@@ -1376,7 +1341,7 @@ class TestDirectTracking:
     assert set(pay[-1]) == {
       'desired', 'measured', 'err', 'delta_err', 'target_frac', 'ramp_step', 'ramp_frames', 'action',
       'torque', 'output', 'vEgo', 'active', 'ff_nm', 'a_ref', 'relax_ticks', 'angle',
-      'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right', 'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'sl_bias', 'sl_learn', 'kappa_pred'}
+      'servo_gap', 'steer_rate', 'pressed', 'lat_delay', 'tu_state', 'c_right', 'c_left', 'tu_fires', 'tu_ms', 'tu_timeouts', 'tu_guarded', 'kappa_pred'}
 
   def test_telemetry_has_steering_signals(self, monkeypatch):
     """Steering-side signals ride the plugin bus with the controller state:
@@ -1547,147 +1512,3 @@ class TestDirectTracking:
     _call_update(lac, 0.002, v_ego=25.0, gap_deg=65.0, pressed=True)
     assert state['takeup'].fires == 0
     assert state['torque'] == pytest.approx(0.002)         # plain ramp
-
-
-# ============================================================
-# Slope bias (docs/superpowers/specs/2026-10-19-bmw-slope-bias-design.md):
-# a slow, bounded torque bias learned from the P term on straights while
-# Direct Tracking is latched, added to Direct's P target.
-# ============================================================
-
-class TestSlopeBias:
-  V = 25.0
-  L = 2.66
-
-
-  def _engaged(self, monkeypatch, slope=True, v=V):
-    lac, fake_sm, mod, state = _make_controller(monkeypatch, slope=slope)
-    _set_measured(fake_sm, v, 0.0)
-    _call_update(lac, 0.0, v_ego=v, active=False)
-    _call_update(lac, 0.0, v_ego=v, active=True)
-    return lac, fake_sm, mod, state
-
-  def _p_nm(self, kappa_meas, v=V):
-    # T_CAP_SLOPE_BASE 1.0 x kappa_scale 1.5 (straight) x v^2 x delta_err
-    return 1.5 * v * v * (0.0 - math.atan(kappa_meas * self.L))
-
-  def _run(self, lac, fake_sm, n, desired=0.0, kappa_meas=0.0, v=V, **kw):
-    _set_measured(fake_sm, v, kappa_meas)
-    for _ in range(n):
-      fake_sm.updated = {'deviceMotion': True}
-      _call_update(lac, desired, v_ego=v, **kw)
-
-  @pytest.mark.parametrize('kappa_meas', [2e-4, -2e-4])
-  def test_learns_toward_standing_p_both_signs(self, monkeypatch, kappa_meas):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    b0 = state['sl_bias']
-    self._run(lac, fake_sm, 10, kappa_meas=kappa_meas)
-    expect = 10 * self._p_nm(kappa_meas) * 0.05 / mod.SL_TAU_S
-    assert state['sl_bias'] - b0 == pytest.approx(expect, rel=0.15)
-    assert math.copysign(1.0, state['sl_bias']) == -math.copysign(1.0, kappa_meas)
-    self._run(lac, fake_sm, 2000, kappa_meas=kappa_meas)
-    assert state['sl_bias'] == pytest.approx(-math.copysign(mod.SL_BIAS_MAX_NM, kappa_meas))
-
-  def test_clamp_covers_steep_road_need(self, monkeypatch):
-    """Route 4ea: roads with roll >= 2.3 deg need -0.20..-0.25 Nm; the 0.15
-    clamp pinned the bias and left the car +0.3 m right on them."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    self._run(lac, fake_sm, 4000, kappa_meas=2e-4)
-    assert state['sl_bias'] == pytest.approx(-0.25)
-    assert mod.SL_BIAS_MAX_NM < 0.5   # still well below rack breakaway
-
-  def test_bias_added_to_p_target(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    state.update(sl_bias=-0.1, torque=-0.1 / 12.0, tick_count=999)
-    _set_measured(fake_sm, self.V, 0.0)
-    fake_sm.updated = {'deviceMotion': True}
-    _call_update(lac, 0.0, v_ego=self.V)
-    assert state['target_frac'] * 12.0 == pytest.approx(-0.1, abs=1e-6)
-
-  def test_curve_holds_bias_without_learning(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    state['sl_bias'] = -0.05
-    self._run(lac, fake_sm, 200, desired=3e-3, kappa_meas=2e-3)
-    assert state['sl_bias'] == -0.05 and state['sl_learn'] is False
-
-  def test_low_speed_no_learning(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, v=10.0)
-    self._run(lac, fake_sm, 100, kappa_meas=2e-4, v=10.0)
-    assert state['sl_bias'] == 0.0
-
-  @pytest.mark.parametrize('kappa_meas', [2e-4, -2e-4])
-  def test_press_freezes_bias(self, monkeypatch, kappa_meas):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    state['sl_bias'] = 0.03
-    self._run(lac, fake_sm, 100, kappa_meas=kappa_meas, pressed=True)
-    assert state['sl_bias'] == 0.03
-
-  def test_takeup_closes_gate(self, monkeypatch):
-    """A take-up in flight closes the gate."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    self._run(lac, fake_sm, 1, kappa_meas=1.2e-3)   # straight, a clear error
-    state['sl_bias'] = 0.03
-    for _ in range(20):
-      state['takeup'].state = 'taking_up'
-      fake_sm.updated = {'deviceMotion': True}
-      _call_update(lac, 0.0, v_ego=self.V)
-      assert state['sl_bias'] == 0.03 and state['sl_learn'] is False
-
-  def test_bias_survives_reengage(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    self._run(lac, fake_sm, 50, kappa_meas=2e-4)
-    b = state['sl_bias']
-    assert b < 0.0
-    _set_measured(fake_sm, self.V, 0.0)          # zero error: no learning on the re-engage tick
-    _call_update(lac, 0.0, v_ego=self.V, active=False)
-    assert not state['slope']
-    _call_update(lac, 0.0, v_ego=self.V, active=True)
-    assert state['slope'] and state['sl_bias'] == b
-
-  def test_bias_frozen_above_a_ref_gate(self, monkeypatch):
-    """A gentle bend above SL_AY_MAX (kappa 4e-4 at 25 m/s = 0.25 m/s^2) does
-    not charge the bias although |kappa| < SL_KAPPA_DES; below the gate
-    (2e-4 = 0.125 m/s^2) learning runs."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    self._run(lac, fake_sm, 1, desired=4e-4, kappa_meas=4e-4)
-    assert state['sl_learn'] is False
-    self._run(lac, fake_sm, 1, desired=2e-4, kappa_meas=2e-4)
-    assert state['sl_learn'] is True
-
-  def test_guard_judges_the_full_demand(self, monkeypatch):
-    """Final review, Important 1: the noise guard must observe the same
-    demand it judges. With a left bias (-0.1 Nm) and the guard committed right
-    after a correction, a steady small positive error (P +0.05 Nm) asks for
-    P + b = -0.05 Nm. The error itself never turns negative, so a guard that
-    observes delta_err alone would hold the target at 0 and drop the bias."""
-    lac, fake_sm, mod, state = self._engaged(monkeypatch)
-    state['sl_bias'] = -0.10
-    state['guard'].side = +1
-    kappa = -math.tan(0.05 / (self.V * self.V)) / self.L     # P = +0.05 Nm
-    targets = []
-    _set_measured(fake_sm, self.V, kappa)
-    for _ in range(40):
-      fake_sm.updated = {'deviceMotion': True}
-      _call_update(lac, 0.0, v_ego=self.V)
-      if state['tick_count'] == 0:
-        targets.append(state['target_frac'] * 12.0)
-    assert state['guard'].side == -1
-    assert min(targets) < -0.01
-
-  def _mixed(self, lac, fake_sm):
-    out = []
-    for i in range(300):
-      v = 25.0 if i < 200 else 9.0
-      desired = 3e-3 if 60 <= i < 120 else 0.0
-      _set_measured(fake_sm, v, 2e-4 if i % 40 < 20 else -1e-4)
-      fake_sm.updated = {'deviceMotion': i % 5 == 0}
-      _call_update(lac, desired, v_ego=v, pressed=150 <= i < 170)
-      out.append(lac.update.__closure__ and _closure_state(lac.update)['torque'])
-    return out
-
-
-  def test_slope_off_bit_identical(self, monkeypatch):
-    lac, fake_sm, mod, state = self._engaged(monkeypatch, slope=False)
-    a = self._mixed(lac, fake_sm)
-    lac2, fake_sm2, _, _ = self._engaged(monkeypatch, slope=None)
-    assert a == self._mixed(lac2, fake_sm2)

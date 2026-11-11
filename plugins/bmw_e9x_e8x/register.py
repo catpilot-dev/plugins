@@ -155,15 +155,6 @@ def _write_param(key, value):
     f.write(value)
 
 
-def _set_slope_compensation(state):
-  """Persist the SlopeCompensation switch (param file only).
-
-  Read by latcontroller at each engagement, so it applies at the next
-  engagement; no bus topic or heartbeat to keep in sync.
-  """
-  _write_param('SlopeCompensation', '1' if state else '0')
-
-
 def on_vehicle_settings(items, CP):
   """Hook callback: populate the Driving panel with BMW-specific toggles."""
   if CP.brand != 'bmw':
@@ -176,16 +167,6 @@ def on_vehicle_settings(items, CP):
     "Show coolant and oil temperature at the bottom-right corner of the onroad HUD.",
     _read_param('TemperatureOverlay') != '0',
     callback=lambda state: _write_param('TemperatureOverlay', '1' if state else '0'),
-  ))
-
-  # Default-OFF polarity (`== '1'`), deliberately the opposite of the
-  # TemperatureOverlay row above: an absent param file must read as off.
-  items.append(toggle_item(
-    "Slope Compensation",
-    "Learn the small steady torque the car needs to drive straight (road "
-    "slope, alignment) and apply it. Applies at the next engagement.",
-    _read_param('SlopeCompensation') == '1',
-    callback=_set_slope_compensation,
   ))
 
   items.append(toggle_item(

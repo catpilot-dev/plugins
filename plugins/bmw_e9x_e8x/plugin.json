@@ -17,10 +17,6 @@
     "TemperatureOverlay": {
       "default": true,
       "description": "Show coolant and oil temperature on the onroad HUD"
-    },
-    "SlopeCompensation": {
-      "default": false,
-      "description": "Learn and apply the steady straight-road torque (road slope, alignment). Write 1 to enable. Read at each engagement."
     }
   },
   "cereal": {

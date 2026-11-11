@@ -220,13 +220,17 @@ class TestVehicleSettingsRows:
 
     'Curve Integrator' (2026-11-08) was retired on 2026-11-09: it doubled
     straight sway on route 531, and the 1.5 straight gain matched its curve
-    gain without it. All retired titles stay pinned out below."""
+    gain without it.
+
+    'Slope Compensation' (2026-10-19, default off) was retired on 2026-11-11:
+    the curve feed-forward and the 1.5 straight gain left it nothing to do.
+    All retired titles stay pinned out below."""
     titles = [r.title for r in self._rows(monkeypatch, param_dir)]
-    assert titles == ['Temperature Overlay', 'Slope Compensation',
-                      'Resume Button Repurposed']
+    assert titles == ['Temperature Overlay', 'Resume Button Repurposed']
     assert 'Steering Push Budget' not in titles
     assert 'Stall Breakaway' not in titles
     assert 'Curve Integrator' not in titles
+    assert 'Slope Compensation' not in titles
 
   def test_non_bmw_gets_no_rows(self, mock_deps, monkeypatch, param_dir):
     import register
@@ -240,10 +244,7 @@ class TestVehicleSettingsRows:
 
   def test_temperature_overlay_row_reflects_the_param(self, mock_deps, monkeypatch, param_dir):
     """Default-ON polarity (`!= '0'`): absent file and '1' both read as on,
-    only an explicit '0' reads as off. The adjacent Slope Compensation row
-    uses the opposite (`== '1'`) predicate, so this pins that the two did not
-    get mixed up — copying this row's predicate onto that one would silently
-    enable it on fresh installs."""
+    only an explicit '0' reads as off."""
     assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is True
     (param_dir / 'TemperatureOverlay').write_text('0')
     assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is False
@@ -266,26 +267,6 @@ class TestVehicleSettingsRows:
     row.callback(True)
     assert (param_dir / 'TemperatureOverlay').read_text() == '1'
     assert self._row(monkeypatch, param_dir, 'Temperature Overlay').initial_state is True
-
-  def test_slope_compensation_row_state_and_callback(self, mock_deps, monkeypatch, param_dir):
-    """Default-OFF (`== '1'`), persisted to the param file latcontroller
-    reads at each engagement."""
-    assert self._row(monkeypatch, param_dir, 'Slope Compensation').initial_state is False
-    (param_dir / 'SlopeCompensation').write_text('1')
-    assert self._row(monkeypatch, param_dir, 'Slope Compensation').initial_state is True
-    (param_dir / 'SlopeCompensation').write_text('0')
-    row = self._row(monkeypatch, param_dir, 'Slope Compensation')
-    assert row.initial_state is False
-
-    row.callback(True)
-    assert (param_dir / 'SlopeCompensation').read_text() == '1'
-    row.callback(False)
-    assert (param_dir / 'SlopeCompensation').read_text() == '0'
-
-  def test_slope_compensation_absent_for_non_bmw(self, mock_deps, monkeypatch, param_dir):
-    import register
-    items = register.on_vehicle_settings([], SimpleNamespace(brand='toyota'))
-    assert [r for r in items if getattr(r, 'title', None) == 'Slope Compensation'] == []
 
   def test_write_param_creates_a_missing_data_dir(self, mock_deps, monkeypatch, tmp_path):
     """`_write_param` does `os.makedirs(..., exist_ok=True)` — on a fresh
