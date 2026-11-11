@@ -573,6 +573,19 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   property is given up at exactly one instant, and the ramp is a pure function
   of the limit from there on. Bite delay across the real route-45f drops went
   from 3.7–22.2 s to one tick.
+
+  **Floor-release re-anchor (2026-11-11).** The ceiling keeps descending while a
+  floor (baseline or gas) holds the output at the car's speed, so when the floor
+  released the output fell in one update to a ceiling that had never been in
+  effect — route 536: a road change reset the baseline and `vCruiseOut` went
+  68.1 → 54.4 km/h at a request near 0, braking −1.08 m/s². The rule: on the
+  tick a floor that was holding the output above the ceiling lets go, the
+  ceiling re-anchors to `min(held output, max(v_ego, target))` — only upward,
+  never above what was being output, never below the target — and descends from
+  there at its normal rate. A rising limit is still immediate, and **safety caps
+  are excluded** (they assign the target directly and keep acting at once, so a
+  gas floor cleared under a source-4 cap still drops to the cap). Logged in
+  `anchored`/`anchorFrom`/`anchorTo` (here `anchorTo` > `anchorFrom`).
 - **Comfort offset** (`_effective_offset_percent`): the enforced target is the
   limit **+15%** below 80 km/h, **+10%** at/above 80 km/h, and **+0%** (exact)
   when `safetyCapped`. *(This corrects the old README's +40/+30/+10 tiers,

@@ -492,3 +492,145 @@ class TestEnforcementTelemetry:
     ph._pub_ok = True
     self._sl(ph, 80, source=1)
     assert ph.on_v_cruise(100 / 3.6, 20.0, self._sm()) == pytest.approx(88 / 3.6, abs=0.01)
+
+
+class TestFloorReleaseReanchor:
+  """When a floor that was holding the output releases, the ceiling re-anchors
+  at the car's speed instead of letting the output fall to a ceiling that kept
+  descending in the background (route 536, 2026-11-11: 68 -> 54 km/h in one
+  update on a road change, -1.08 m/s2 at a request near 0).
+  """
+  _sm = TestCeilingInOnVCruise._sm
+  _sl = TestCeilingInOnVCruise._sl
+  _clock = TestCeilingInOnVCruise._clock
+
+  def _tick(self, ph, clk, v_cruise_kph, v_kph, sm=None, n=1):
+    out = None
+    for _ in range(n):
+      clk['t'] += DT
+      out = ph.on_v_cruise(v_cruise_kph / 3.6, v_kph / 3.6, sm or self._sm())
+    return out
+
+  def _baseline_hold(self, ph, clk, hold_s=7.0):
+    """Inferred limit dropped 80 -> 40 while the car was at 56; the car then
+    runs at 68 with the baseline floor (92) holding the output at v_ego while
+    the ceiling descends underneath."""
+    self._sl(ph, 80, source=2, road='A')
+    self._tick(ph, clk, 100, 56)
+    self._sl(ph, 40, source=2, road='A')
+    self._tick(ph, clk, 100, 56)
+    out = self._tick(ph, clk, 100, 68, n=int(hold_s / DT))
+    assert out == pytest.approx(68 / 3.6, abs=1e-6), 'baseline floor should hold at v_ego'
+    assert ph._ceiling_ms < 62 / 3.6, 'ceiling should have descended under the hold'
+
+  def test_baseline_floor_release_does_not_step_the_output_down(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._baseline_hold(ph, clk)
+    v = 68 / 3.6
+    self._sl(ph, 40, source=2, road='B')          # road change drops the baseline
+    out = self._tick(ph, clk, 100, 68)
+    assert v - out <= ph.CEIL_A_DOWN * DT + 1e-9, 'output stepped down on floor release'
+
+  def test_baseline_floor_release_then_descends_at_the_ceiling_rate_from_v_ego(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._baseline_hold(ph, clk)
+    v = 68 / 3.6
+    self._sl(ph, 40, source=2, road='B')
+    prev = self._tick(ph, clk, 100, 68)
+    for _ in range(100):
+      out = self._tick(ph, clk, 100, 68)
+      assert out <= prev + 1e-9
+      assert prev - out <= ph.CEIL_A_DOWN * DT + 1e-9
+      prev = out
+    # 5 s after the release it is still on the ramp from v_ego, nowhere near the old ceiling
+    assert prev < v - 0.5
+    assert prev > 58 / 3.6
+
+  def test_empty_road_id_release_does_not_step_down_either(self, ph, monkeypatch):
+    """Route 536 seg 1: road name goes '' -> baseline cleared -> floor gone."""
+    clk = self._clock(ph, monkeypatch)
+    self._baseline_hold(ph, clk)
+    self._sl(ph, 40, source=2, road='')
+    out = self._tick(ph, clk, 100, 68)
+    assert 68 / 3.6 - out <= ph.CEIL_A_DOWN * DT + 1e-9
+
+  def test_release_is_recorded_in_the_anchor_telemetry(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    ph._pub = type("P", (), {"send": staticmethod(lambda d: sent.append(dict(d)))})()
+    ph._pub_ok = True
+    sent = []
+    self._baseline_hold(ph, clk)
+    ceil_before = ph._ceiling_ms * 3.6
+    self._sl(ph, 40, source=2, road='B')
+    self._tick(ph, clk, 100, 68)
+    m = sent[-1]
+    assert m['anchored'] is True
+    assert m['anchorFrom'] == pytest.approx(ceil_before, abs=0.2)
+    assert m['anchorTo'] == pytest.approx(68.0, abs=0.1)
+    self._tick(ph, clk, 100, 68)
+    assert sent[-1]['anchored'] is False
+
+  def test_gas_floor_release_does_not_step_the_output_down(self, ph, monkeypatch):
+    """Non-safety limit; the driver's gas floor holds at 68 while the ceiling
+    descends; a road change clears it."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=1, road='A')
+    self._tick(ph, clk, 100, 68)
+    self._sl(ph, 40, source=1, road='A')
+    self._tick(ph, clk, 100, 68, sm=self._sm(gas=True), n=int(7.0 / DT))
+    out = self._tick(ph, clk, 100, 68, n=2)
+    assert out == pytest.approx(68 / 3.6, abs=1e-6), 'gas floor should hold'
+    assert ph._ceiling_ms < 66 / 3.6
+    self._sl(ph, 40, source=1, road='B')
+    out = self._tick(ph, clk, 100, 68)
+    assert 68 / 3.6 - out <= ph.CEIL_A_DOWN * DT + 1e-9
+
+  def test_safety_cap_still_acts_at_once_when_a_floor_releases(self, ph, monkeypatch):
+    """A curve cap (source 4) arriving on the release tick is applied exactly,
+    on that tick — the re-anchor never delays or raises it."""
+    clk = self._clock(ph, monkeypatch)
+    self._baseline_hold(ph, clk)
+    self._sl(ph, 50, source=4, safety=True, road='A')
+    out = self._tick(ph, clk, 100, 68)
+    assert out == pytest.approx(50 / 3.6, abs=1e-6)
+    assert ph._ceiling_ms == pytest.approx(50 / 3.6, abs=1e-6)
+
+  def test_gas_floor_release_under_a_safety_cap_is_not_reanchored(self, ph, monkeypatch):
+    """Route 536 seg 0 (src 4, limit 50): the gas floor clears on a road change
+    and the output goes straight to the safety cap. Unchanged."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 50, source=4, safety=True, road='')
+    self._tick(ph, clk, 100, 62.8, sm=self._sm(gas=True))
+    out = self._tick(ph, clk, 100, 62.8, n=5)
+    assert out == pytest.approx(62.8 / 3.6, abs=1e-6)
+    self._sl(ph, 50, source=4, safety=True, road='X')
+    out = self._tick(ph, clk, 100, 62.8)
+    assert out == pytest.approx(50 / 3.6, abs=1e-6)
+
+  def test_rising_limit_right_after_a_release_is_immediate(self, ph, monkeypatch):
+    """Route 536 seg 4 +7.2: limit 40 -> 60 (69 km/h) 0.2 s after the release."""
+    clk = self._clock(ph, monkeypatch)
+    self._baseline_hold(ph, clk)
+    self._sl(ph, 40, source=2, road='B')
+    self._tick(ph, clk, 100, 68, n=4)
+    self._sl(ph, 60, source=2, road='B')
+    out = self._tick(ph, clk, 100, 68)
+    assert out == pytest.approx(69 / 3.6, abs=1e-6)
+    assert ph._ceiling_ms == pytest.approx(69 / 3.6, abs=1e-6)
+
+  def test_never_exceeds_v_cruise_in(self, ph, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._baseline_hold(ph, clk)
+    self._sl(ph, 40, source=2, road='B')
+    out = self._tick(ph, clk, 60, 68)      # cruise set below the car's speed
+    assert out <= 60 / 3.6 + 1e-9
+
+  def test_no_reanchor_when_the_car_slows_through_the_ceiling(self, ph, monkeypatch):
+    """A floor that simply ends because the car has caught the descending
+    ceiling must not lift the ceiling."""
+    clk = self._clock(ph, monkeypatch)
+    self._baseline_hold(ph, clk)
+    c = ph._ceiling_ms
+    self._sl(ph, 40, source=2, road='B')
+    self._tick(ph, clk, 100, 45)           # car already below the ceiling
+    assert ph._ceiling_ms <= c + 1e-9

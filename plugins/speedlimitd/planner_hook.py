@@ -47,6 +47,7 @@ _ceiling_ms = None    # jerk-limited allowed-speed ceiling (m/s); None = uniniti
 _ceiling_rate = 0.0   # its current slope (m/s², signed)
 _last_t = None        # monotonic timestamp of the last ceiling advance
 _prev_target_ms = None  # previous tick's raw target, to detect a fresh drop
+_floor_held_ms = None   # output the previous tick held ABOVE the ceiling via a floor
 
 # Enforcement telemetry. The daemon publishes what the LIMIT is; without this
 # the enforcement side — ceiling, anchor, floors, whether the cap even bound —
@@ -184,9 +185,10 @@ def _reset_all():
   invalid limits). Clearing the ceiling means the next valid limit is applied
   immediately rather than ramped from a stale value."""
   global _baseline_ms, _gas_floor_ms, _ceiling_ms, _ceiling_rate, _last_t
-  global _prev_target_ms
+  global _prev_target_ms, _floor_held_ms
   _baseline_ms = None
   _gas_floor_ms = None
+  _floor_held_ms = None
   _ceiling_ms = None
   _ceiling_rate = 0.0
   _last_t = None
@@ -195,7 +197,7 @@ def _reset_all():
 
 def on_v_cruise(v_cruise, v_ego, sm):
   global _baseline_ms, _gas_floor_ms, _road_id, _ceiling_ms, _ceiling_rate, _last_t
-  global _prev_target_ms
+  global _prev_target_ms, _floor_held_ms
 
   KPH = CV.MS_TO_KPH
   tl = {'state': 'no_data', 'vEgo': round(v_ego * KPH, 1),
@@ -282,6 +284,7 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # hold floor to current speed so enforcement resumes from here on release.
   if _gas_pressed(sm):
     _gas_floor_ms = v_ego
+    _floor_held_ms = None
     return _emit(v_cruise, 'gas')
 
   # Ratchet the gas floor down with the driver; clear once eased to the limit.
@@ -306,6 +309,24 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # ("highest seen on this road", "driver's held speed"), not about the ramp.
   floors = [f for f in (baseline_floor, _gas_floor_ms) if f is not None]
   effective_floor = max(floors) if floors else None
+
+  # Floor release re-anchor. The ceiling keeps descending while a floor holds
+  # the output at the car's speed (it is a pure function of the limit), so the
+  # moment the floor lets go the output would fall straight to a ceiling that
+  # was never in effect — route 536: 68 -> 54 km/h in one update. Re-anchor the
+  # ceiling at the car's speed instead, capped at what was actually being
+  # output (never a higher cap than before) and never below the target; the
+  # descent restarts from there at its normal rate. Safety caps are excluded:
+  # they assign the target directly above and must keep acting at once.
+  if _floor_held_ms is not None and not safety_capped \
+      and (effective_floor is None or effective_floor <= _ceiling_ms):
+    anchored = min(_floor_held_ms, max(v_ego, target_ms))
+    if anchored > _ceiling_ms:
+      tl.update(anchored=True,
+                anchorFrom=tl['anchorFrom'] if tl['anchored'] else round(_ceiling_ms * KPH, 2),
+                anchorTo=round(anchored * KPH, 2))
+      _ceiling_ms, _ceiling_rate = anchored, 0.0
+  _floor_held_ms = effective_floor if effective_floor is not None and effective_floor > _ceiling_ms else None
   floored_target = _ceiling_ms if effective_floor is None else max(_ceiling_ms, effective_floor)
 
   # Fast lead suggests a non-safety confirmed limit is wrong — skip. Not for
