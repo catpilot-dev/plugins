@@ -2,6 +2,7 @@
 import os
 import pytest
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 import sys
 import importlib
 
@@ -706,13 +707,14 @@ class TestPlannerHook:
 
   # helpers -------------------------------------------------
 
-  def _sm(self, gas=False, lead_status=False, lead_vLead=0.0):
+  def _sm(self, gas=False, lead_present=False, lead_vLead=0.0):
     """SubMaster mock exposing carState.gasPressed and radarState.leadOne."""
     cs = MagicMock()
     cs.gasPressed = gas
-    lead = MagicMock()
-    lead.status = lead_status
-    lead.vLead = lead_vLead
+    # Shaped like 0.11.2's RadarState.LeadData: `present` (renamed from
+    # `status`, upstream #38339). A strict object, so reading a field the
+    # schema does not have raises as capnp does on the car.
+    lead = SimpleNamespace(present=lead_present, vLead=lead_vLead)
     radar = MagicMock()
     radar.leadOne = lead
     sm = MagicMock()
@@ -796,18 +798,18 @@ class TestPlannerHook:
 
   def test_lead_override_fast_lead_skips(self, hook):
     self._sl(hook, 80, source=1)
-    sm = self._sm(lead_status=True, lead_vLead=95 / 3.6)
+    sm = self._sm(lead_present=True, lead_vLead=95 / 3.6)
     assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == 100 / 3.6
 
   def test_lead_override_slow_lead_keeps(self, hook):
     self._sl(hook, 80, source=1)
-    sm = self._sm(lead_status=True, lead_vLead=84 / 3.6)
+    sm = self._sm(lead_present=True, lead_vLead=84 / 3.6)
     assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
 
   def test_safety_cap_ignores_fast_lead(self, hook):
     """Route-2fd: a fast lead must not bypass a safety cap."""
     self._sl(hook, 40, source=4, safety=True)
-    sm = self._sm(lead_status=True, lead_vLead=60 / 3.6)
+    sm = self._sm(lead_present=True, lead_vLead=60 / 3.6)
     assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == pytest.approx(40 / 3.6, abs=0.1)
 
   def test_reactive_cap_survives_fast_lead(self, hook):
@@ -815,7 +817,7 @@ class TestPlannerHook:
     it is in the same protected class as the proactive curve cap — a faster
     lead can never lift it (a fast lead doesn't make a real curve less tight)."""
     self._sl(hook, 50, source=4, safety=True)   # reactive cap → 50 km/h
-    sm = self._sm(lead_status=True, lead_vLead=90 / 3.6)  # lead way over limit
+    sm = self._sm(lead_present=True, lead_vLead=90 / 3.6)  # lead way over limit
     assert hook.on_v_cruise(100 / 3.6, 25.0, sm) == pytest.approx(50 / 3.6, abs=0.1)
 
   # universal gas suspend -----------------------------------

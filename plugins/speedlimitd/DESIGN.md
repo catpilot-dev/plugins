@@ -603,6 +603,9 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   (`LEAD_OVERRIDE_THRESHOLD`) above the limit, a *non-safety, non-inferred*
   confirmed limit is skipped (likely wrong data). It does **not** bypass safety
   caps, inferred limits, or an active gas hold.
+  The lead is read from `leadOne.present` (0.11.2 renamed `status`, upstream
+  #38339). Until 2026-11-11 the hook still read `status`, which raises on
+  0.11.2 and was swallowed, so the override never fired there (routes 517–536).
 - **Confirmation** is sticky, starts **True** onroad, and toggles only on an
   explicit `toggle_confirm` command (UI sign tap → `speedlimit_cmd_ui`, or a
   steering-wheel command → `speedlimit_cmd_car`), 1 s debounced. It never

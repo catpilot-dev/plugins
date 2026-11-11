@@ -164,7 +164,9 @@ def _lead_overrides_limit(sm, speed_limit_kph):
   """Return True if lead vehicle speed suggests the speed limit data is wrong."""
   try:
     lead = sm['radarState'].leadOne
-    if not lead.status:
+    # 0.11.2 renamed LeadData.status to `present` (upstream #38339); the old name
+    # raises here and the except below would silently disable the override.
+    if not lead.present:
       return False
     # lead.vLead is absolute speed in m/s
     lead_kph = lead.vLead * CV.MS_TO_KPH

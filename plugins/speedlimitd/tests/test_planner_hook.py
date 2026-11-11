@@ -7,6 +7,7 @@ import sys
 import importlib
 import pytest
 from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 _PLUGINS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _PLUGINS_DIR not in sys.path:
@@ -147,12 +148,13 @@ class TestAdvanceCeiling:
 class TestCeilingInOnVCruise:
   """The ceiling as on_v_cruise actually drives it, with a fake clock."""
 
-  def _sm(self, gas=False, lead_status=False, lead_vLead=0.0):
+  def _sm(self, gas=False, lead_present=False, lead_vLead=0.0):
     cs = MagicMock()
     cs.gasPressed = gas
-    lead = MagicMock()
-    lead.status = lead_status
-    lead.vLead = lead_vLead
+    # Shaped like 0.11.2's RadarState.LeadData: `present` (renamed from
+    # `status`, upstream #38339). A strict object, so reading a field the
+    # schema does not have raises as capnp does on the car.
+    lead = SimpleNamespace(present=lead_present, vLead=lead_vLead)
     radar = MagicMock()
     radar.leadOne = lead
     sm = MagicMock()
@@ -480,7 +482,7 @@ class TestEnforcementTelemetry:
   def test_lead_override_is_visible(self, ph, bus, monkeypatch):
     self._clock(ph, monkeypatch)
     self._sl(ph, 80, source=1)
-    ph.on_v_cruise(100 / 3.6, 25.0, self._sm(lead_status=True, lead_vLead=100 / 3.6))
+    ph.on_v_cruise(100 / 3.6, 25.0, self._sm(lead_present=True, lead_vLead=100 / 3.6))
     assert bus[-1]['state'] == 'lead_override'
     assert bus[-1]['capActive'] is False
 
