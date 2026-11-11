@@ -19,8 +19,8 @@ from fonts import get_font, measure
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Layout — positioned at bottom-right corner
-FONT_SIZE = 56
-LINE_HEIGHT = 62
+FONT_SIZE = 64
+LINE_HEIGHT = 72
 RIGHT_MARGIN = 30
 BOTTOM_MARGIN = 30
 

@@ -18,7 +18,7 @@ from collections import OrderedDict
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
-FONT_SIZE = 56
+FONT_SIZE = 64
 BOTTOM_MARGIN = 30
 MAX_NAME_CHARS = 16   # longer road names are cut, to stay clear of the HUD's corners
 

@@ -313,3 +313,9 @@ def test_a_glyph_missing_from_the_system_font_falls_back_to_the_ref(overlay, sta
   stage.rl.absent_codepoints = {ord('𰻝')}
   rl = stage.draw('S20', '𰻝𰻝面路')
   assert [(how, font, text) for how, font, text, *_ in rl.draws] == [('patched', stage.ui_font, 'S20')]
+
+
+def test_glyphs_are_rasterized_at_least_as_large_as_they_are_drawn(overlay):
+  # FONT_SCALE is 1.242 on the comma three's big UI; an atlas smaller than the
+  # drawn size would be scaled up, and blur
+  assert overlay.ATLAS_SIZE >= overlay.FONT_SIZE * 1.242 * overlay.SYSTEM_FONT_SCALE
