@@ -187,8 +187,13 @@ so their labels are legible. A background thread downloads them sequentially,
 darkens each with COD's `.map-tiles-dark` CSS filter (`darken()`: invert,
 hue-rotate 180°, brightness 0.95, contrast 1.1, saturate 0.15, clamped per
 step) and stores the result in `PLUGINS_RUNTIME_DIR/map_tiles/osm-dark/z/x/y.png`;
-the main thread loads them as raylib textures. Following OSM's tile usage
-policy, tiles are cached and reused: a cached tile is touched when used, and
+the main thread loads them as raylib textures. While any tile is missing the
+pass repeats, after `RETRY_DELAYS_S` (10 s up to 5 min): the trace loads at
+UI start, when the network is usually down and the clock still unsynced (so
+TLS fails too). A newer trace or `cleanup()` bumps a generation counter that
+ends the old thread. Following OSM's tile usage
+policy, tiles are cached and reused: a cached tile is touched when used (never
+back in time, so an unsynced clock at boot cannot age it into a prune), and
 tiles unused for `TILE_MAX_AGE_DAYS` (30) are pruned, along with empty
 directories (which also removes the old `cartodb/` cache). On top it draws
 the trace polyline, green/red start/end markers, a small URL caption, and the

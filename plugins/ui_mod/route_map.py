@@ -34,6 +34,9 @@ USER_AGENT = 'catpilot/1.0'
 # OSM's tile policy asks clients to cache tiles (7 days at least); repeat drives
 # reuse them, and tiles unused for this long are deleted.
 TILE_MAX_AGE_DAYS = 30
+# Seconds between download passes while tiles are missing. At boot the network is
+# down and the clock unsynced (TLS fails), so the first pass usually gets nothing.
+RETRY_DELAYS_S = (10, 30, 60, 120, 300)   # the last one repeats
 
 TRACE_COLOR = rl.Color(70, 91, 234, 255)
 TRACE_WIDTH = 8.0
@@ -142,8 +145,6 @@ class RouteMapRenderer:
   def __init__(self):
     self._textures = {}   # (z, x, y) -> Texture2D
     self._tile_keys = []  # tiles to load
-    self._downloading = False
-    self._download_done = False
     self._zoom = 0
     self._tx0 = self._tx1 = self._ty0 = self._ty1 = 0
     self._center_tx = 0.0  # fractional tile x of center point
@@ -151,6 +152,7 @@ class RouteMapRenderer:
     self._trace = []
     self._rect_w = 0
     self._rect_h = 0
+    self._gen = 0  # bumped by cleanup(): a download thread of an older trace stops
 
   def load_trace(self, trace, rect_w=1500, rect_h=900):
     """Set GPS trace, fit entire route in view, and start downloading tiles."""
@@ -198,9 +200,7 @@ class RouteMapRenderer:
       for y in range(self._ty0, self._ty1 + 1)
     ]
 
-    self._downloading = True
-    self._download_done = False
-    threading.Thread(target=self._download_tiles, daemon=True).start()
+    threading.Thread(target=self._download_tiles, args=(self._gen,), daemon=True).start()
 
   def render(self, rect):
     """Render map with trace into the given rect."""
@@ -293,13 +293,27 @@ class RouteMapRenderer:
         except OSError:
           pass
 
-  def _download_tiles(self):
+  def _download_tiles(self, gen=None):
+    """Fetch the trace's tiles, passes repeated with backoff until all are there or the trace changes."""
+    gen = self._gen if gen is None else gen
+    keys = self._tile_keys
     self._prune_cache()
-    for z, x, y in self._tile_keys:
+    attempt = 0
+    while self._fetch_missing(keys, gen) and gen == self._gen:
+      time.sleep(RETRY_DELAYS_S[min(attempt, len(RETRY_DELAYS_S) - 1)])
+      attempt += 1
+
+  def _fetch_missing(self, keys, gen):
+    """One download pass. True if some tile is still missing."""
+    missing = False
+    for z, x, y in keys:
+      if gen != self._gen:
+        return True
       path = self._tile_path(z, x, y)
       if os.path.exists(path):
         try:
-          os.utime(path)  # in use: keep it past the next prune
+          if time.time() > os.path.getmtime(path):  # never back in time, when the clock is unsynced at boot
+            os.utime(path)  # in use: keep it past the next prune
         except OSError:
           pass
         continue
@@ -314,9 +328,8 @@ class RouteMapRenderer:
           f.write(data)
         os.replace(tmp, path)
       except Exception:
-        pass
-    self._download_done = True
-    self._downloading = False
+        missing = True
+    return missing
 
   def _load_pending(self):
     for key in self._tile_keys:
@@ -333,6 +346,7 @@ class RouteMapRenderer:
           pass
 
   def cleanup(self):
+    self._gen += 1
     for tex in self._textures.values():
       if rl.is_texture_valid(tex):
         rl.unload_texture(tex)

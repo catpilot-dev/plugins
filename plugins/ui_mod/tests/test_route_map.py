@@ -212,3 +212,58 @@ class TestTileCache:
     r._download_tiles()
     assert not os.path.exists(stale)
     assert not (tmp_path / 'cartodb').exists()
+
+  def _flaky_urlopen(self, route_map, monkeypatch, fails):
+    """urlopen that raises for the first `fails` calls (no network yet at boot), then serves a white tile."""
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new('RGB', (256, 256), (255, 255, 255)).save(buf, 'PNG')
+    calls = []
+
+    class Resp(io.BytesIO):
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *a):
+        return False
+
+    def fake(req, timeout=None):
+      calls.append(req.full_url)
+      if len(calls) <= fails:
+        raise OSError('network unreachable')
+      return Resp(buf.getvalue())
+    monkeypatch.setattr(route_map.urllib.request, 'urlopen', fake)
+    monkeypatch.setattr(route_map.time, 'sleep', lambda s: None)
+    return calls
+
+  def test_failed_download_retried(self, route_map, tmp_path, monkeypatch):
+    # at boot the network is down (and the clock unsynced): the tiles must still arrive later
+    calls = self._flaky_urlopen(route_map, monkeypatch, fails=3)
+    r = self._renderer(route_map, tmp_path, monkeypatch, [(12, 1, 2), (12, 1, 3)])
+    r._download_tiles()
+    assert os.path.exists(r._tile_path(12, 1, 2))
+    assert os.path.exists(r._tile_path(12, 1, 3))
+    assert len(calls) == 5
+
+  def test_retry_stops_when_trace_replaced(self, route_map, tmp_path, monkeypatch):
+    calls = self._flaky_urlopen(route_map, monkeypatch, fails=10**6)
+    r = self._renderer(route_map, tmp_path, monkeypatch, [(12, 1, 2)])
+    monkeypatch.setattr(route_map.time, 'sleep', lambda s: r.cleanup())  # new trace / map closed while waiting
+    r._download_tiles()
+    assert len(calls) == 1
+
+  def test_cached_tile_not_touched_back_in_time(self, route_map, tmp_path, monkeypatch):
+    # at boot the clock may sit months in the past: touching a tile then would age it into the next prune
+    import time
+    calls = []
+    self._fake_urlopen(route_map, monkeypatch, calls)
+    r = self._renderer(route_map, tmp_path, monkeypatch, [(12, 1, 2)])
+    path = r._tile_path(12, 1, 2)
+    os.makedirs(os.path.dirname(path))
+    open(path, 'wb').close()
+    later = time.time() + 200 * 86400
+    os.utime(path, (later, later))
+    r._download_tiles()
+    assert os.path.getmtime(path) == later
+    assert calls == []
