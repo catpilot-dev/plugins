@@ -1,16 +1,22 @@
-"""Static route map renderer using CartoDB dark tiles and raylib.
+"""Static route map renderer using OpenStreetMap tiles and raylib.
 
-Downloads tiles to disk in a background thread, loads them as raylib textures
-on the main thread, and draws a GPS trace polyline on top.
+Downloads tiles in a background thread, darkens them there with the same CSS
+filter COD's map applies to light basemaps, and keeps them on disk; the main
+thread loads them as raylib textures and draws a GPS trace polyline on top.
+(CARTO's dark basemap, used before, now answers keyless requests with an
+"API KEY REQUIRED" tile.)
 
 Map is centered on the route endpoint at a zoom level that fills the render
 rect completely — no black borders.
 """
+import io
 import math
 import os
-import random
 import threading
+import time
 import urllib.request
+
+import numpy as np
 
 from config import PLUGINS_RUNTIME_DIR
 
@@ -21,9 +27,13 @@ from openpilot.system.ui.lib.text_measure import measure_text_cached
 
 TILE_CACHE_DIR = os.path.join(PLUGINS_RUNTIME_DIR, 'map_tiles')
 TILE_SIZE = 256
-CARTODB_URL = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png'
-CARTODB_SUBDOMAINS = 'abcd'
+TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+TILE_SOURCE = 'osm-dark'   # cache subdirectory: OSM tiles after darken()
+ATTRIBUTION = '(c) OpenStreetMap contributors'   # the UI font has no "©"
 USER_AGENT = 'catpilot/1.0'
+# OSM's tile policy asks clients to cache tiles (7 days at least); repeat drives
+# reuse them, and tiles unused for this long are deleted.
+TILE_MAX_AGE_DAYS = 30
 
 TRACE_COLOR = rl.Color(70, 91, 234, 255)
 TRACE_WIDTH = 8.0
@@ -38,8 +48,11 @@ URL_BAR_HEIGHT = 48
 URL_BAR_COLOR = rl.Color(0, 0, 0, 160)
 URL_FONT_SIZE = 36
 URL_COLOR = rl.Color(180, 180, 180, 255)
+ATTRIBUTION_FONT_SIZE = 24
+ATTRIBUTION_MARGIN = 12
 
-# @2x tiles are 512px
+# OSM tiles are 256 px, drawn at 2x (as a browser at devicePixelRatio 2 does)
+# so the map's labels are legible on the C3 screen.
 TILE_PX = 512
 # Zoom limits
 MAX_ZOOM = 16
@@ -73,6 +86,52 @@ def _tiles_for_rect(center_lat, center_lng, zoom, rect_w, rect_h):
   ty1 = int(math.ceil(cy + half_h))
 
   return tx0, tx1, ty0, ty1, cx, cy
+
+
+# ============================================================
+# Darkening: COD's .map-tiles-dark CSS filter
+#   invert(1) hue-rotate(180deg) brightness(0.95) contrast(1.1) saturate(0.15)
+# ============================================================
+
+def _hue_rotate_matrix(deg):
+  c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+  return np.array([
+    [0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928],
+    [0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283],
+    [0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072],
+  ])
+
+
+def _saturate_matrix(v):
+  return np.array([
+    [0.213 + 0.787 * v, 0.715 - 0.715 * v, 0.072 - 0.072 * v],
+    [0.213 - 0.213 * v, 0.715 + 0.285 * v, 0.072 - 0.072 * v],
+    [0.213 - 0.213 * v, 0.715 - 0.715 * v, 0.072 + 0.928 * v],
+  ])
+
+
+_HUE_ROTATE_180 = _hue_rotate_matrix(180)
+_SATURATE_015 = _saturate_matrix(0.15)
+
+
+def darken(rgb):
+  """HxWx3 uint8 sRGB -> the same, filtered step by step and clamped as a browser does."""
+  c = rgb.astype(np.float32) / 255.0
+  c = 1.0 - c                                       # invert(1)
+  c = np.clip(c @ _HUE_ROTATE_180.T, 0.0, 1.0)      # hue-rotate(180deg)
+  c = np.clip(c * 0.95, 0.0, 1.0)                   # brightness(0.95)
+  c = np.clip((c - 0.5) * 1.1 + 0.5, 0.0, 1.0)      # contrast(1.1)
+  c = np.clip(c @ _SATURATE_015.T, 0.0, 1.0)        # saturate(0.15)
+  return np.rint(c * 255.0).astype(np.uint8)
+
+
+def _darken_png(data):
+  """PNG bytes of a light tile -> PNG bytes of its dark version."""
+  from PIL import Image
+  rgb = np.asarray(Image.open(io.BytesIO(data)).convert('RGB'))
+  out = io.BytesIO()
+  Image.fromarray(darken(rgb), 'RGB').save(out, 'PNG')
+  return out.getvalue()
 
 
 # ============================================================
@@ -195,6 +254,12 @@ class RouteMapRenderer:
     ty = bar_rect.y + (bar_rect.height - text_size.y) / 2
     rl.draw_text_ex(font, url_text, rl.Vector2(tx, ty), URL_FONT_SIZE, 0, URL_COLOR)
 
+    # Map data credit, required by OSM, top-right clear of the trace caption
+    attr_size = measure_text_cached(font, ATTRIBUTION, ATTRIBUTION_FONT_SIZE)
+    ax = rect.x + rect.width - attr_size.x - ATTRIBUTION_MARGIN - CORNER_BORDER
+    ay = rect.y + ATTRIBUTION_MARGIN + CORNER_BORDER
+    rl.draw_text_ex(font, ATTRIBUTION, rl.Vector2(ax, ay), ATTRIBUTION_FONT_SIZE, 0, URL_COLOR)
+
     rl.end_scissor_mode()
 
     # Rounded border on top to mask square corners
@@ -208,25 +273,42 @@ class RouteMapRenderer:
     return rl.Vector2(sx, sy)
 
   def _tile_path(self, z, x, y):
-    return os.path.join(TILE_CACHE_DIR, 'cartodb', str(z), str(x), f'{y}.png')
+    return os.path.join(TILE_CACHE_DIR, TILE_SOURCE, str(z), str(x), f'{y}.png')
+
+  @staticmethod
+  def _prune_cache():
+    """Delete tiles unused for TILE_MAX_AGE_DAYS, then directories left empty (a retired source's too)."""
+    cutoff = time.time() - TILE_MAX_AGE_DAYS * 86400
+    for root, _dirs, files in os.walk(TILE_CACHE_DIR, topdown=False):
+      for name in files:
+        path = os.path.join(root, name)
+        try:
+          if os.path.getmtime(path) < cutoff:
+            os.remove(path)
+        except OSError:
+          pass
+      if root != TILE_CACHE_DIR:
+        try:
+          os.rmdir(root)  # only succeeds when empty
+        except OSError:
+          pass
 
   def _download_tiles(self):
-    # Wipe old tiles — we only display the last drive
-    import shutil
-    if os.path.isdir(TILE_CACHE_DIR):
-      shutil.rmtree(TILE_CACHE_DIR, ignore_errors=True)
-    os.makedirs(TILE_CACHE_DIR, exist_ok=True)
+    self._prune_cache()
     for z, x, y in self._tile_keys:
       path = self._tile_path(z, x, y)
       if os.path.exists(path):
+        try:
+          os.utime(path)  # in use: keep it past the next prune
+        except OSError:
+          pass
         continue
       try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        s = random.choice(CARTODB_SUBDOMAINS)
-        url = CARTODB_URL.format(s=s, z=z, x=x, y=y)
+        url = TILE_URL.format(z=z, x=x, y=y)
         req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
         with urllib.request.urlopen(req, timeout=10) as resp:
-          data = resp.read()
+          data = _darken_png(resp.read())
         tmp = path + '.tmp'
         with open(tmp, 'wb') as f:
           f.write(data)
@@ -245,6 +327,7 @@ class RouteMapRenderer:
         try:
           tex = rl.load_texture(path)
           if rl.is_texture_valid(tex):
+            rl.set_texture_filter(tex, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)  # drawn at 2x
             self._textures[key] = tex
         except Exception:
           pass

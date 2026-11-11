@@ -172,19 +172,28 @@ the whole label, road number included, is drawn in that font:
 
 ## Route map rendering (`route_map.py`)
 
-`RouteMapRenderer` draws a static map of the last drive from **CartoDB dark
-raster tiles** — this is the deployed choice. (An offline vector basemap was
+`RouteMapRenderer` draws a static map of the last drive from **OpenStreetMap
+raster tiles, darkened** — the same source and look as COD's map. (CARTO's
+dark basemap, used before, now returns an "API KEY REQUIRED" tile to keyless
+requests. An offline vector basemap was
 tried and reverted — polylines were impractical on the C3; `offline_basemap.py`
 is gone, only stale `__pycache__`/test artifacts remain.)
 
 Web-Mercator math (`_lat_lng_to_tile_xy`, `_tiles_for_rect`) picks the zoom
 (clamped `MIN_ZOOM`..`MAX_ZOOM`) that fits the whole trace within
 `FIT_PADDING` of the rect, centered on the trace bounding-box midpoint. Tiles
-are `@2x` (512 px) from `{s}.basemaps.cartocdn.com/dark_all/...`, downloaded to
-`PLUGINS_RUNTIME_DIR/map_tiles/cartodb/z/x/y.png` on a background thread (old
-cache wiped first — only the last drive is kept) and loaded as raylib textures
-on the main thread. On top it draws the trace polyline, green/red
-start/end markers, and a small URL caption.
+are 256 px from `tile.openstreetmap.org`, drawn at 2x (`TILE_PX` 512, bilinear)
+so their labels are legible. A background thread downloads them sequentially,
+darkens each with COD's `.map-tiles-dark` CSS filter (`darken()`: invert,
+hue-rotate 180°, brightness 0.95, contrast 1.1, saturate 0.15, clamped per
+step) and stores the result in `PLUGINS_RUNTIME_DIR/map_tiles/osm-dark/z/x/y.png`;
+the main thread loads them as raylib textures. Following OSM's tile usage
+policy, tiles are cached and reused: a cached tile is touched when used, and
+tiles unused for `TILE_MAX_AGE_DAYS` (30) are pruned, along with empty
+directories (which also removes the old `cartodb/` cache). On top it draws
+the trace polyline, green/red start/end markers, a small URL caption, and the
+required "(c) OpenStreetMap contributors" credit, top-right (the UI font has
+no "©").
 
 ## Plugin-bus topics & external endpoints consumed
 

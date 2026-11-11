@@ -1,6 +1,5 @@
 """Tests for route_map Web Mercator math and tile logic."""
 import importlib.util
-import math
 import os
 import pytest
 
@@ -18,6 +17,9 @@ def route_map():
   pyray_mock = MagicMock()
   pyray_mock.Color = lambda r, g, b, a: (r, g, b, a)
   sys.modules.setdefault('pyray', pyray_mock)
+  plugins_dir = os.path.dirname(os.path.dirname(mod_path))
+  if plugins_dir not in sys.path:  # plugins/config.py, on the path at runtime
+    sys.path.insert(0, plugins_dir)
   for mod_name in [
     'openpilot', 'openpilot.system', 'openpilot.system.ui',
     'openpilot.system.ui.lib', 'openpilot.system.ui.lib.application',
@@ -101,9 +103,112 @@ class TestTilePaths:
   def test_tile_path_structure(self, route_map):
     r = route_map.RouteMapRenderer()
     path = r._tile_path(12, 550, 335)
-    assert path.endswith('/cartodb/12/550/335.png')
+    assert path.endswith('/osm-dark/12/550/335.png')
 
   def test_tile_path_cache_dir(self, route_map):
     r = route_map.RouteMapRenderer()
     path = r._tile_path(14, 100, 200)
     assert route_map.TILE_CACHE_DIR in path
+
+
+# ============================================================
+# Tile source: OpenStreetMap, darkened like COD's map
+# ============================================================
+
+class TestTileSource:
+  def test_osm_url_no_carto(self, route_map):
+    # CARTO basemaps now answer every keyless request with an "API KEY REQUIRED" tile
+    assert route_map.TILE_URL.format(z=12, x=3430, y=1673) == 'https://tile.openstreetmap.org/12/3430/1673.png'
+    assert 'carto' not in route_map.TILE_URL
+
+  def test_attribution_is_drawable_ascii(self, route_map):
+    # the UI font holds printable ASCII, not "©"
+    assert 'OpenStreetMap' in route_map.ATTRIBUTION
+    assert all(32 <= ord(c) < 127 for c in route_map.ATTRIBUTION)
+
+
+class TestDarken:
+  def _px(self, route_map, rgb):
+    import numpy as np
+    return tuple(int(v) for v in route_map.darken(np.array([[rgb]], dtype=np.uint8))[0, 0])
+
+  def test_white_becomes_black(self, route_map):
+    assert self._px(route_map, (255, 255, 255)) == (0, 0, 0)
+
+  def test_black_becomes_light(self, route_map):
+    # invert → 1, brightness 0.95, contrast 1.1 → 0.995
+    assert self._px(route_map, (0, 0, 0)) == (254, 254, 254)
+
+  def test_osm_land_becomes_dark_and_muted(self, route_map):
+    r, g, b = self._px(route_map, (0xf2, 0xef, 0xe9))  # OSM land background
+    assert max(r, g, b) < 40
+    assert max(r, g, b) - min(r, g, b) < 10
+
+  def test_png_roundtrip(self, route_map):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new('P', (256, 256), 0).save(buf, 'PNG')  # OSM tiles are palette PNGs
+    out = Image.open(io.BytesIO(route_map._darken_png(buf.getvalue())))
+    assert out.size == (256, 256)
+    assert out.mode == 'RGB'
+
+
+class TestTileCache:
+  def _renderer(self, route_map, tmp_path, monkeypatch, keys):
+    monkeypatch.setattr(route_map, 'TILE_CACHE_DIR', str(tmp_path))
+    r = route_map.RouteMapRenderer()
+    r._tile_keys = keys
+    return r
+
+  def _fake_urlopen(self, route_map, monkeypatch, calls):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new('RGB', (256, 256), (255, 255, 255)).save(buf, 'PNG')
+
+    class Resp(io.BytesIO):
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *a):
+        return False
+
+    def fake(req, timeout=None):
+      calls.append(req.full_url)
+      return Resp(buf.getvalue())
+    monkeypatch.setattr(route_map.urllib.request, 'urlopen', fake)
+
+  def test_downloads_missing_tile_darkened(self, route_map, tmp_path, monkeypatch):
+    from PIL import Image
+    calls = []
+    self._fake_urlopen(route_map, monkeypatch, calls)
+    r = self._renderer(route_map, tmp_path, monkeypatch, [(12, 1, 2)])
+    r._download_tiles()
+    assert calls == ['https://tile.openstreetmap.org/12/1/2.png']
+    assert Image.open(r._tile_path(12, 1, 2)).getpixel((0, 0)) == (0, 0, 0)
+
+  def test_fresh_cached_tile_not_refetched(self, route_map, tmp_path, monkeypatch):
+    calls = []
+    self._fake_urlopen(route_map, monkeypatch, calls)
+    r = self._renderer(route_map, tmp_path, monkeypatch, [(12, 1, 2)])
+    os.makedirs(os.path.dirname(r._tile_path(12, 1, 2)))
+    with open(r._tile_path(12, 1, 2), 'wb') as f:
+      f.write(b'cached')
+    r._download_tiles()
+    assert calls == []
+
+  def test_old_tiles_and_retired_sources_pruned(self, route_map, tmp_path, monkeypatch):
+    import time
+    calls = []
+    self._fake_urlopen(route_map, monkeypatch, calls)
+    r = self._renderer(route_map, tmp_path, monkeypatch, [])
+    stale = r._tile_path(12, 1, 2)
+    os.makedirs(os.path.dirname(stale))
+    open(stale, 'wb').close()
+    old = time.time() - (route_map.TILE_MAX_AGE_DAYS + 1) * 86400
+    os.utime(stale, (old, old))
+    os.makedirs(tmp_path / 'cartodb' / '12' / '1')  # left by the retired CARTO source
+    r._download_tiles()
+    assert not os.path.exists(stale)
+    assert not (tmp_path / 'cartodb').exists()
