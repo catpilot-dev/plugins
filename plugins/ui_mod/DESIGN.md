@@ -141,13 +141,34 @@ with a 2 s visual hold on the new state.
 
 ## Road info overlay (`road_info_overlay.py`)
 
-`on_render_overlay` draws the current road identifier (highway ref, e.g.
-`S20`) bottom-center of the HUD. It reads `wayRef` / `roadName` from
-speedlimitd's `speedLimitState` topic over the plugin bus, opening a
-`PluginSub` only when the `/tmp/plugin_bus/speedLimitState` socket exists and
-dropping the sub when it disappears. Gated by ui_mod's own `RoadInfoOverlay`
-param (default off); returns early (draws nothing) when disabled or when there
-is no `wayRef`.
+`on_render_overlay` draws the current road bottom-center of the HUD: road
+number, then name (`S20 外环高速`), or whichever of the two is known. It reads
+`wayRef` / `roadName` from speedlimitd's `speedLimitState` topic over the
+plugin bus, opening a `PluginSub` only when the
+`/tmp/plugin_bus/speedLimitState` socket exists and dropping the sub when it
+disappears. Gated by ui_mod's own `RoadInfoOverlay` param (default off);
+draws nothing when disabled or when the road has neither.
+
+**Font.** The UI's fonts cannot draw road names: Inter is loaded with ASCII
+only, and the Noto Sans CJK shipped with openpilot is a subset holding the 324
+hanzi of the UI translations (it lacks 路). The AGNOS image carries the full
+Noto Sans SC at `/usr/share/fonts/NotoSansSC-Regular.otf` (27,527 hanzi; all
+11,209 Chinese road names in the 20 OSM tiles around Shanghai are covered), so
+the whole label, road number included, is drawn in that font:
+
+- `_label_font()` loads a font holding just the label's glyphs (`load_font_ex`
+  with its codepoints, rasterized at 96 px, mipmapped) and keeps the six most
+  recent labels. A new label costs 3-4 ms on the comma three, once.
+- raylib sizes a font by line height, of which the em is 0.676 in Noto Sans SC
+  and 0.826 in Inter; the label is drawn 1.2x larger so its glyphs have the
+  size `FONT_SIZE` gives in the UI font.
+- It is drawn with the unpatched `rl._orig_draw_text_ex`: gui_app's
+  `draw_text_ex` swaps in its own (subset) fallback font when the UI language
+  is Chinese.
+- Fallback: where the system font is missing, cannot be loaded, or lacks a
+  glyph of the label, Inter SemiBold draws what it can — the label if it is
+  ASCII, else the road number alone, else nothing.
+- Names longer than 16 characters are cut with an ellipsis.
 
 ## Route map rendering (`route_map.py`)
 
@@ -208,5 +229,5 @@ ui_mod/
   route_map_widget.py  # RouteMapWidget — home left column wrapper
   exp_button.py        # ExpButton — branded emblem
   road_info_overlay.py # ui.render_overlay — road name/ref from speedlimitd
-  tests/               # test_drive_tracker.py, test_route_map.py
+  tests/               # test_drive_tracker.py, test_driving_panel_map_curve.py, test_road_info_overlay.py, test_route_map.py
 ```
