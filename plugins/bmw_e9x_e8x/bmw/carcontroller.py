@@ -321,6 +321,13 @@ class CarController(CarControllerBase):
       can_sends.append(bmwcan.create_accel_command(self.packer, cmd, self.cruise_bus, self.tx_cruise_stalk_counter))
       self.last_cruise_tx_timestamp = now_nanos
       tx_this_cycle = True
+      # A slot's command released on the wire is never resumed in that slot:
+      # DCC reads the late frame as a new press. Only once it has had a frame
+      # out -- idle frames ahead of its first one (trailing overwrite at HOLD
+      # cadence) must not cancel it. slot_decided_ns is kept, so the next
+      # decision waits for the slot to end.
+      if cmd is not self.slot_cmd and self.slot_cmd_frames > 0:
+        self.slot_cmd = None
       return True
 
     def cruise_burst_release_safe():

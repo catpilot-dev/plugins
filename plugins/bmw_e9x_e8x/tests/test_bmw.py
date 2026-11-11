@@ -1266,6 +1266,134 @@ class TestSetpointBias:
     assert acts & {'minus1', 'minus5'}, acts
 
 
+class TestSlotCommandNotResumedAfterRelease:
+  """A slot's command that has been released on the wire is never resumed in
+  that slot (routes 535 / 534). Route 535: minus5 frame 1 landed (52 -> 48),
+  the error fell inside the hold deadzone, the trailing overwrite sent idle,
+  and 90 ms later the gate reopened inside the SAME 200 ms slot. slot_cmd was
+  still minus5 with one frame sent, so a "second frame" went out; DCC read it
+  as a NEW press and took a second grid step.
+  """
+
+  KPH = 1 / 3.6
+  STEP = 0.01
+  T0 = 1.0
+  ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _drive(self, accel_open, accel_closed, sp_start, sp_after, interrupt=True,
+             until=0.6):
+    """Steady 86 km/h, braking asked from T0. After the first transmitted
+    decel frame the setpoint readback drops to sp_after and, if interrupt, the
+    demand is eased so the gate closes; it is deepened again 60 ms after the
+    first idle frame. Returns [(t, action name or None)] for every 0x194 frame
+    after T0, plus the time of the first decel frame."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, _ = _make_cc()
+    v_ego = 86.0 * self.KPH
+    t, szl, sp = 0.0, 0, sp_start
+    accel_now = accel_open
+    first_decel = first_idle = None
+    frames = []
+    while t < self.T0 + until:
+      t += self.STEP
+      if abs(t / 0.2 - round(t / 0.2)) < 1e-9:
+        szl = (szl + 1) % 15
+      a = 0.0 if t < self.T0 else accel_now
+      # vTarget keeps ramping at the opening demand so the braking latch holds.
+      vt = v_ego + (0.0 if t < self.T0 else accel_open * (t - self.T0))
+      _, msgs = cc.update(make_stalk_carcontrol(a, vt),
+                          make_stalk_carstate(szl, v_ego=v_ego, setpoint=sp * self.KPH),
+                          int(round(t * 1e9)))
+      for addr, dat, _bus in msgs:
+        if addr != 404 or t < self.T0:
+          continue
+        names = [self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)]
+        name = names[0] if names else None
+        frames.append((t, name))
+        if name in ('minus1', 'minus5') and first_decel is None:
+          first_decel = t
+          sp = sp_after
+          if interrupt:
+            accel_now = accel_closed
+        elif name is None and first_decel is not None and first_idle is None:
+          first_idle = t
+      if first_idle is not None and t >= first_idle + 0.06:
+        accel_now = accel_open
+    return frames, first_decel, first_idle
+
+  def _check_not_resumed(self, name, **kw):
+    frames, first_decel, first_idle = self._drive(**kw)
+    assert first_decel is not None, frames
+    assert first_idle is not None, "setup: no idle frame followed the first decel frame"
+    slot = [n for t, n in frames if first_decel <= t < first_decel + 0.2 - 0.01]
+    assert slot.count(name) == 1, (first_decel, first_idle, frames)
+
+  def test_minus5_is_not_resumed_in_its_slot_after_an_idle_frame(self):
+    self._check_not_resumed('minus5', accel_open=-1.2, accel_closed=-0.7,
+                            sp_start=86.0, sp_after=78.0)
+
+  def test_minus1_is_not_resumed_in_its_slot_after_an_idle_frame(self):
+    self._check_not_resumed('minus1', accel_open=-0.5, accel_closed=-0.1,
+                            sp_start=86.0, sp_after=85.0)
+
+  def test_uninterrupted_minus5_is_two_consecutive_frames(self):
+    frames, first_decel, _ = self._drive(accel_open=-1.2, accel_closed=-1.2,
+                                         sp_start=86.0, sp_after=86.0,
+                                         interrupt=False)
+    names = [n for t, n in frames if t >= first_decel]
+    assert names[:2] == ['minus5', 'minus5'], frames
+    assert names[2:3] != ['minus5'], frames
+
+  def test_fresh_minus5_is_decided_in_the_next_slot(self):
+    """The release only closes the slot it happened in: with the target still a
+    grid step below, the following slot decides a new minus5."""
+    frames, first_decel, first_idle = self._drive(
+        accel_open=-1.2, accel_closed=-0.7, sp_start=86.0, sp_after=84.0,
+        until=0.8)
+    later = [n for t, n in frames if t >= first_decel + 0.2]
+    assert 'minus5' in later, frames
+
+  def test_command_delayed_behind_trailing_idle_is_still_sent(self):
+    """Only a command that has had a frame on the wire can be released. After
+    plus1 at HOLD cadence the trailing overwrite runs every 25 ms, so a decel
+    decision's first frame waits for the lead window while idle frames go out.
+    Those idle frames must not cancel it: braking would be starved for as long
+    as the trailing overwrite runs."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, _ = _make_cc()
+    v_ego, sp = 83.0 * self.KPH, 85.0 * self.KPH
+    t, szl = 0.0, 0
+    flip = 0.92                      # mid-slot, one tick after a HOLD-cadence plus1
+    frames = []
+    while t < flip + 0.25:
+      t += self.STEP
+      if abs(t / 0.2 - round(t / 0.2)) < 1e-9:
+        szl = (szl + 1) % 15
+      a = 0.32 if t < flip else -0.17
+      # vTarget above the car but falling, so the braking latch sets at the flip.
+      _, msgs = cc.update(make_stalk_carcontrol(a, v_ego + (14.0 - 0.5 * t) * self.KPH),
+                          make_stalk_carstate(szl, v_ego=v_ego, setpoint=sp),
+                          int(round(t * 1e9)))
+      for addr, dat, _bus in msgs:
+        if addr == 404:
+          names = [self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)]
+          frames.append((round(t, 2), names[0] if names else None))
+    before = [n for t, n in frames if t < flip]
+    after = [n for t, n in frames if t >= flip]
+    assert before.count('plus1') >= 10, "setup: no HOLD-cadence plus1 burst before the flip"
+    decel = [i for i, n in enumerate(after) if n in ('minus1', 'minus5')]
+    assert decel, f"no decel frame within 250 ms of the braking demand: {after}"
+    assert None in after[:decel[0]], f"setup: no idle frame preceded the decel frame: {after}"
+
+
 class TestGasPedalRaisesSetpoint:
   """Driver on the gas while engaged: plus1 is sent continuously.
 

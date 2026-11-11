@@ -690,6 +690,22 @@ that moved the setpoint *not at all* rose 5% → 11%. Two frames is what was
 measured never to double-step, so ask for exactly that and let the cadence take
 as long as it needs.
 
+**A released slot is never resumed (2026-11-11).** Route 535: `minus5` frame 1
+at 11.341 landed (setpoint 52 → 48 at 11.390), the error fell inside the hold
+deadzone, the trailing overwrite sent idle at 11.391 and 11.431, and the gate
+reopened at 11.482 inside the same 200 ms slot. `slot_cmd` was still `minus5`
+with one frame sent, so a "second frame" went out; DCC read it as a **new**
+press (48 → 38), ended 12.7 km/h under the car and braked at −1.85 m/s² against
+−0.4 asked. The rule now enforced: once the slot's command has had a frame
+out, any other frame `cruise_cmd` transmits clears `slot_cmd`, so a released
+command is not resumed in that slot (minus1 included); `slot_decided_ns` is
+kept, and the next decision still waits for the slot to expire. Idle frames
+*ahead* of the command's first frame do not count: after plus1 at HOLD cadence
+the trailing overwrite runs every 25 ms and the first decel frame waits for the
+lead window, so cancelling there would starve braking. Known residual,
+not covered: route 534 seg 7 +36.8 s, two consecutive `minus5` frames with a
+single SZL idle frame between them also double-stepped (50 → 48 → 38).
+
 ### minus1 is a tap, never a hold
 
 A held `minus1` can cost the whole braking episode's setpoint. Out of a hold
