@@ -651,6 +651,32 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   steering-wheel command → `speedlimit_cmd_car`), 1 s debounced. It never
   auto-resets on limit change, disengage, or process restart.
 
+**Safety-cap bound on the capped path (2026-11-12 follow-up).** The hook sees only
+the daemon's minimum, so a safety-class cap ABOVE a guessed limit (not
+`safetyCapped`) was enforced by nothing outside the lead override while the
+ceiling descended toward the guess or the baseline floor held the car at v_ego
+(route 537 seg 10: the cap tightened 80/60/50/40 under the floor and the hook
+acted only when it reached the guess; 538 seg 28 52.9 -> 50). With `safetyCap` > 0
+in the payload: (1) the ceiling is clamped to the cap once (`_ceiling_ms,
+_ceiling_rate = cap, 0.0`), after the lead-release and floor-release anchors and
+before the floors are applied, so nothing lifts it back and the descent resumes
+from the cap; (2) the output is `min(max(ceiling, floor), max(cap, held gas
+floor))` - only a held gas floor may stay above the cap (user decision; it is
+most of the measured above-cap time), the baseline floor may not; (3)
+`_floor_held_ms` records the bounded output, so a floor release with the cap
+clearing on the same tick anchors at or below the previous output. A cap
+appearing below the current output steps it to the cap at once (curve caps stay
+immediate). Telemetry `safetyBound` marks those ticks. A missing field or
+`safetyCap` 0 leaves the path unchanged (the override path still fails closed).
+Side effect: a safety cap at or below the guess that the daemon does not flag
+`safetyCapped` (a map-curve cap snapped to the guess, e.g. guess 40 / cap 40) now
+binds without the comfort offset (46 -> 40), as a visible safety cap does.
+Masked-to-visible hand-over: while the cap is masked, the clamped ceiling keeps
+descending toward the guess at <= 0.5 m/s2, so the output can sit below the cap
+(after ~12 s masked it reaches the guess target, e.g. 46). When the cap later
+becomes the visible minimum (the guess rose above it) the output rises to the cap:
+the normal release of a risen limit, present before this change too.
+
 ### Enforcement telemetry (`speedLimitEnforce` topic)
 
 `speedLimitState` describes what the **limit** is. The enforcement side — the
@@ -664,6 +690,7 @@ enforcement.
 | field | meaning |
 |-------|---------|
 | `state` | `no_data` / `unconfirmed` / `no_limit` / `gas` / `lead_override` (ON and qualifying) / `lead_hold` (ON, inside the 1 s hold) / `capped` / `not_binding` |
+| `safetyBound` | True on a tick where the safety-cap bound moved the ceiling or lowered the output (False on every other tick, incl. gas / no_data / unconfirmed); also True on `lead_override` / `lead_hold` ticks whose output the cap lowered below `v_cruise` |
 | `leadKph` | `leadOne.vLead` in km/h when `present`, else 0.0 |
 | `vEgo`, `vCruiseIn`, `vCruiseOut` | km/h; `capActive` = did the hook actually lower it |
 | `limit`, `source`, `safetyCapped`, `safetyCap` | echo of the driving `speedLimitState` sample, so the series is self-contained |

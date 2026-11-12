@@ -1020,3 +1020,223 @@ class TestLeadOverrideDebounced:
     assert out == pytest.approx(60 / 3.6, abs=1e-6)
     outs = self._run(ph, clk, 40, 70.0, self._lead(70))
     assert all(o * 3.6 <= 60.1 for o in outs)
+
+
+class TestSafetyCapBoundsTheCappedPath:
+  """A safety cap ABOVE a guessed limit (safetyCap > 0, not safetyCapped) also
+  bounds the capped / not_binding path, as a visible minimum cap would
+  (follow-up of 118e078, 2026-11-12). Only a held GAS floor may stay above it.
+  See DESIGN.md, the 2026-11-12 safety-cap bound paragraph.
+  """
+  _sm = TestCeilingInOnVCruise._sm
+  _clock = TestCeilingInOnVCruise._clock
+  _sl = TestLeadOverrideDebounced._sl
+  _lead = TestLeadOverrideDebounced._lead
+  _run = TestLeadOverrideDebounced._run
+  _states = TestLeadOverrideDebounced._states
+
+  @pytest.fixture
+  def bus(self, ph):
+    sent = []
+    ph._pub = type("P", (), {"send": staticmethod(lambda d: sent.append(dict(d)))})()
+    ph._pub_ok = True
+    return sent
+
+  def _drop(self, ph, clk, road, car, cap=0, n_hi=5, n_lo=20):
+    """Guess 80 (target 88) for a few ticks, then 40, car at `car` km/h."""
+    self._sl(ph, 80, source=2, road=road)
+    self._run(ph, clk, n_hi, car, self._sm())
+    self._sl(ph, 40, source=2, road=road, cap=cap)
+    return self._run(ph, clk, n_lo, car, self._sm())
+
+  # (a)
+  def test_cap_above_the_descending_ceiling_binds_at_once(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._drop(ph, clk, '', 75.0)
+    assert bus[-1]['safetyBound'] is False
+    self._sl(ph, 40, source=2, road='', cap=60)
+    out = self._run(ph, clk, 1, 75.0, self._sm())[0]
+    assert out == pytest.approx(60 / 3.6, abs=1e-6)
+    assert bus[-1]['ceiling'] == pytest.approx(60.0, abs=0.01)
+    assert bus[-1]['safetyBound'] is True and bus[-1]['state'] == 'capped'
+
+  # (b)
+  def test_cap_clearing_never_raises_the_output(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._drop(ph, clk, '', 75.0)
+    self._sl(ph, 40, source=2, road='', cap=60)
+    prev = self._run(ph, clk, 5, 75.0, self._sm())[-1]
+    self._sl(ph, 40, source=2, road='', cap=0)
+    for o in self._run(ph, clk, 60, 75.0, self._sm()):
+      assert o <= prev + 1e-9
+      assert o - prev >= -ph.CEIL_A_DOWN * DT - 1e-6
+      prev = o
+
+  # (c)
+  def test_baseline_floor_cannot_hold_above_the_cap(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    outs = self._drop(ph, clk, 'A', 70.0)
+    assert outs[-1] * 3.6 == pytest.approx(70.0, abs=0.1)     # baseline floor holds the car
+    self._sl(ph, 40, source=2, road='A', cap=60)
+    out = self._run(ph, clk, 1, 70.0, self._sm())[0]
+    assert out == pytest.approx(60 / 3.6, abs=1e-6) and bus[-1]['safetyBound'] is True
+
+  # (d)
+  def test_held_gas_floor_stays_above_the_cap(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 40, source=2, road='', cap=60)
+    self._run(ph, clk, 3, 65.0, self._sm(gas=True))
+    out = self._run(ph, clk, 10, 65.0, self._sm())
+    assert ph._gas_floor_ms is not None
+    assert all(o * 3.6 == pytest.approx(65.0, abs=0.1) for o in out)
+    assert bus[-1]['safetyBound'] is False
+
+  # (e)
+  @pytest.mark.parametrize('cap', [90, 120])
+  def test_cap_above_the_ceiling_is_identical_to_no_cap(self, ph, bus, monkeypatch, cap):
+    clk = self._clock(ph, monkeypatch)
+    base = self._drop(ph, clk, '', 75.0, cap=0, n_lo=60)
+    ph._reset_all()
+    with_cap = self._drop(ph, clk, '', 75.0, cap=cap, n_lo=60)
+    assert with_cap == base
+    assert not any(m['safetyBound'] for m in bus)
+
+  # (f)
+  def test_missing_field_is_identical_to_today(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    base = self._drop(ph, clk, 'A', 70.0, cap=0, n_lo=40)
+    ph._reset_all()
+    ph._road_id = ''
+    ph._baseline_ms = None
+    none = self._drop(ph, clk, 'A', 70.0, cap=None, n_lo=40)
+    assert none == base
+    assert not any(m['safetyBound'] for m in bus)
+
+  # (g)
+  def test_named_road_lead_release_is_bounded_by_the_cap(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._drop(ph, clk, 'A', 70.0, cap=60, n_lo=1)
+    self._run(ph, clk, 30, 70.0, self._lead(63))
+    assert bus[-1]['state'] == 'lead_override'
+    outs = self._run(ph, clk, 40, 70.0, self._sm())
+    assert 'capped' in self._states(bus, 40)
+    rel = next(i for i, st in enumerate(self._states(bus, 40)) if st != 'lead_hold')
+    assert all(o * 3.6 <= 60.0 + 0.1 for o in outs[rel:])
+
+  # (h)
+  def test_tightening_cap_applies_the_same_tick(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._drop(ph, clk, '', 75.0)
+    self._sl(ph, 40, source=2, road='', cap=60)
+    self._run(ph, clk, 5, 75.0, self._sm())
+    self._sl(ph, 40, source=2, road='', cap=50)
+    out = self._run(ph, clk, 1, 75.0, self._sm())[0]
+    assert out == pytest.approx(50 / 3.6, abs=1e-6) and bus[-1]['safetyBound'] is True
+
+  # (i)
+  def test_gas_press_suspends_the_bound(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._drop(ph, clk, '', 75.0)
+    self._sl(ph, 40, source=2, road='', cap=60)
+    self._run(ph, clk, 3, 75.0, self._sm())
+    out = self._run(ph, clk, 1, 75.0, self._sm(gas=True))[0]
+    assert out == pytest.approx(101 / 3.6) and bus[-1]['state'] == 'gas'
+    assert bus[-1]['safetyBound'] is False
+
+  # (j)
+  def test_lead_release_on_the_tick_a_cap_appears(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 40, source=2, road='A', cap=0)
+    self._run(ph, clk, 30, 75.0, self._lead(63))
+    self._run(ph, clk, 19, 75.0, self._sm())
+    assert bus[-1]['state'] == 'lead_hold'
+    self._sl(ph, 40, source=2, road='A', cap=60)
+    rel = self._run(ph, clk, 1, 75.0, self._sm())[0]
+    assert bus[-1]['state'] == 'capped'
+    assert rel * 3.6 <= 60.0 + 0.1
+    self._sl(ph, 40, source=2, road='A', cap=0)             # cap clears next tick
+    for o in self._run(ph, clk, 20, 75.0, self._sm()):
+      assert o * 3.6 <= 60.0 + 0.1
+
+  # (k) / (l)
+  def _floor_release_setup(self, ph, clk):
+    self._drop(ph, clk, 'A', 70.0)
+    self._sl(ph, 40, source=2, road='A', cap=60)
+    return self._run(ph, clk, 5, 70.0, self._sm())[-1]
+
+  def test_floor_release_with_the_cap_on_stays_under_it(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    prev = self._floor_release_setup(ph, clk)
+    assert prev * 3.6 == pytest.approx(60.0, abs=0.1)
+    self._sl(ph, 40, source=2, road='B', cap=60)            # new road drops the baseline floor
+    for o in self._run(ph, clk, 40, 70.0, self._sm()):
+      assert o * 3.6 <= 60.0 + 0.1
+
+  def test_floor_release_with_the_cap_clearing_never_rises(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    prev = self._floor_release_setup(ph, clk)
+    self._sl(ph, 40, source=2, road='B', cap=0)
+    for o in self._run(ph, clk, 40, 70.0, self._sm()):
+      assert o <= prev + 1e-9
+      prev = o
+
+  # (m)
+  def test_unflagged_cap_at_the_guess_binds_without_the_offset(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 40, source=2, road='', cap=40)
+    outs = self._run(ph, clk, 100, 50.0, self._sm())
+    assert all(o == pytest.approx(40 / 3.6, abs=1e-6) for o in outs)
+
+  # (n)
+  def test_fresh_drop_and_cap_on_the_same_tick(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=2, road='')
+    self._run(ph, clk, 5, 75.0, self._sm())
+    self._sl(ph, 40, source=2, road='', cap=60)
+    out = self._run(ph, clk, 1, 75.0, self._sm())[0]
+    assert out == pytest.approx(60 / 3.6, abs=1e-6)
+    assert bus[-1]['ceiling'] <= 60.0 + 0.01
+
+  # (o)
+  def test_masked_cap_becoming_visible_is_continuous(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._drop(ph, clk, '', 75.0)
+    self._sl(ph, 40, source=2, road='', cap=60)
+    masked = self._run(ph, clk, 10, 75.0, self._sm())
+    self._sl(ph, 60, source=4, safety=True, road='', cap=60)
+    visible = self._run(ph, clk, 10, 75.0, self._sm())
+    # Masked: clamped to the cap, then the ceiling keeps descending toward the
+    # guess (<= 0.5 m/s2); visible: the cap is assigned directly. No step at the
+    # hand-over beyond that small descent (0.2 km/h here), none of the 15 km/h
+    # the unbounded path allowed.
+    assert all(59.5 <= o * 3.6 <= 60.0 + 1e-6 for o in masked)
+    assert all(o == pytest.approx(60 / 3.6, abs=1e-6) for o in visible)
+    assert abs(visible[0] - masked[-1]) * 3.6 <= 0.5
+
+  def test_safety_bound_is_true_on_a_bounded_override(self, ph, bus, monkeypatch):
+    """Route 539 seg 19 +5.9: a curve cap stepping an override tick 60 -> 50 was
+    logged with safetyBound False."""
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 40, source=2, road='', cap=60)
+    self._run(ph, clk, 30, 70.0, self._lead(63))
+    assert bus[-1]['state'] == 'lead_override' and bus[-1]['safetyBound'] is True
+    self._run(ph, clk, 5, 70.0, self._sm())
+    assert bus[-1]['state'] == 'lead_hold' and bus[-1]['safetyBound'] is True
+
+  @pytest.mark.parametrize('cap', [0, 120])
+  def test_safety_bound_is_false_on_an_unbounded_override(self, ph, bus, monkeypatch, cap):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 40, source=2, road='', cap=cap)           # 0 = none, 120 > v_cruise
+    outs = self._run(ph, clk, 30, 70.0, self._lead(63))
+    assert bus[-1]['state'] == 'lead_override' and outs[-1] == pytest.approx(101 / 3.6)
+    assert bus[-1]['safetyBound'] is False
+    self._run(ph, clk, 5, 70.0, self._sm())
+    assert bus[-1]['state'] == 'lead_hold' and bus[-1]['safetyBound'] is False
+
+  def test_safety_bound_defaults_false_on_every_path(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    ph._sl_data = None
+    self._run(ph, clk, 1, 50.0, self._sm())
+    self._sl(ph, 40, source=2, road='', confirmed=False)
+    self._run(ph, clk, 1, 50.0, self._sm())
+    assert [m['safetyBound'] for m in bus] == [False, False]

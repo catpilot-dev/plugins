@@ -14,7 +14,10 @@ from openpilot.common.constants import CV
 # car's speed (no step below v_ego). While ON the output is bounded by the
 # daemon's `safetyCap` (the lowest safety-class candidate, published even when a
 # guessed limit is lower than it), so a fast lead still never lifts a curve cap
-# (route 2fd). A safety-capped tick or a gas press clears the override at once;
+# (route 2fd). The same `safetyCap` also bounds the capped / not_binding path
+# (2026-11-12 follow-up, see "Safety-cap bound" in on_v_cruise): a cap above a
+# guessed limit used to be enforced by nothing outside the override.
+# A safety-capped tick or a gas press clears the override at once;
 # a gas floor still held AFTER release no longer blocks it (route 538 seg 19: the
 # floor kept it off for 6 s behind a lead at 63-67 against a target of 46).
 # The trigger is relative to the ENFORCED target (limit + offset), with hysteresis
@@ -242,7 +245,7 @@ def on_v_cruise(v_cruise, v_ego, sm):
         'source': None, 'safetyCapped': False, 'anchored': False,
         'anchorFrom': 0.0, 'anchorTo': 0.0,
         'baselineFloor': 0.0, 'gasFloor': 0.0, 'capActive': False,
-        'leadKph': round(_lead_kph(sm), 1), 'safetyCap': 0}
+        'leadKph': round(_lead_kph(sm), 1), 'safetyCap': 0, 'safetyBound': False}
 
   def _emit(out, state):
     tl['state'] = state
@@ -404,6 +407,8 @@ def on_v_cruise(v_cruise, v_ego, sm):
     if safety_cap_ms > 0:
       lead_out = min(v_cruise, max(safety_cap_ms, _gas_floor_ms or 0.0))
     _lead_held_ms = min(v_ego, lead_out)
+    if lead_out < v_cruise - 1e-9:
+      tl['safetyBound'] = True   # the cap bounded the override output
 
   # Floor release re-anchor. The ceiling keeps descending while a floor holds
   # the output at the car's speed (it is a pure function of the limit), so the
@@ -421,8 +426,32 @@ def on_v_cruise(v_cruise, v_ego, sm):
                 anchorFrom=tl['anchorFrom'] if tl['anchored'] else round(_ceiling_ms * KPH, 2),
                 anchorTo=round(anchored * KPH, 2))
       _ceiling_ms, _ceiling_rate = anchored, 0.0
-  _floor_held_ms = effective_floor if effective_floor is not None and effective_floor > _ceiling_ms else None
+
+  # Safety-cap bound (2026-11-12 follow-up of the lead override). The daemon's
+  # `safetyCap` (lowest safety-class candidate, published even when a guessed
+  # limit is lower than it) binds the capped / not_binding path exactly as a cap
+  # that is the visible minimum would: no offset, immediately. Without it a curve
+  # cap ABOVE the guess was enforced by nothing while the ceiling descended or
+  # the baseline floor held the car (route 537 seg 10: the cap tightened
+  # 80/60/50/40 under the floor; the hook acted only when it reached the guess).
+  #  1. Clamp the ceiling to the cap ONCE, after the release anchors above, so
+  #     nothing lifts it back and the descent continues from the cap.
+  #  2. Bound the output at max(cap, held GAS floor): only a held gas floor may
+  #     stay above the cap (user decision 2026-11-12); the baseline floor may not.
+  # No safetyCap (older daemon) or 0 -> no bound, identical to before.
+  cap_ms = safety_cap_ms if safety_cap_ms > 0 else None
+  if cap_ms is not None and _ceiling_ms > cap_ms:
+    _ceiling_ms, _ceiling_rate = cap_ms, 0.0
+    tl['safetyBound'] = True
   floored_target = _ceiling_ms if effective_floor is None else max(_ceiling_ms, effective_floor)
+  if cap_ms is not None:
+    bounded = min(floored_target, max(cap_ms, _gas_floor_ms or 0.0))
+    if bounded < floored_target - 1e-9:
+      tl['safetyBound'] = True
+    floored_target = bounded
+  # Record what was actually output: a floor release with the cap clearing on the
+  # same tick then anchors at <= the previous output.
+  _floor_held_ms = floored_target if effective_floor is not None and effective_floor > _ceiling_ms else None
 
   # Fast lead suggests a non-safety confirmed limit (guessed ones too) is wrong —
   # skip it, but never lift a safety cap: the daemon's safetyCap bounds the
