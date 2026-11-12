@@ -135,6 +135,9 @@ class SteerOffsetListener:
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
+    # vEgoCluster carries the dash's +CLUSTER_OFFSET; below 1 km/h the base
+    # interface shows 0, or a stopped car reads 2 km/h (route 538).
+    self.cluster_min_speed = CV.KPH_TO_MS
     can_define = CANDefine(DBC[CP.carFingerprint]['pt'])
     self.shifter_values = can_define.dv["TransmissionDataDisplay"]['ShiftLeverPosition']
 
