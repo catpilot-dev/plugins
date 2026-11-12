@@ -732,7 +732,7 @@ class TestPlannerHook:
   def _sl(self, hook, speed_limit, source=1, safety=False, confirmed=True, road='A'):
     hook._sl_data = {'confirmed': confirmed, 'speedLimit': speed_limit,
                      'safetyCapped': safety, 'source': source,
-                     'roadName': road, 'wayRef': ''}
+                     'roadName': road, 'wayRef': '', 'safetyCap': 0}
 
   def _clock(self, monkeypatch, hook, t0=1000.0):
     """Fake monotonic clock for the ceiling ramp. `.tick(dt)` advances it."""
@@ -796,10 +796,18 @@ class TestPlannerHook:
 
   # lead override (non-safety, no gas) ----------------------
 
-  def test_lead_override_fast_lead_skips(self, hook):
+  def test_lead_override_fast_lead_skips(self, hook, monkeypatch):
+    """Debounced (2026-11-12): capped on the first tick, overridden once the
+    lead has qualified for 0.5 s."""
+    clk = self._clock(monkeypatch, hook)
     self._sl(hook, 80, source=1)
     sm = self._sm(lead_present=True, lead_vLead=95 / 3.6)
-    assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == 100 / 3.6
+    assert hook.on_v_cruise(100 / 3.6, 20.0, sm) == pytest.approx(80 * 1.10 / 3.6, abs=0.1)
+    out = None
+    for _ in range(12):
+      clk.tick(0.05)
+      out = hook.on_v_cruise(100 / 3.6, 20.0, sm)
+    assert out == 100 / 3.6
 
   def test_lead_override_slow_lead_keeps(self, hook):
     self._sl(hook, 80, source=1)
@@ -1406,6 +1414,63 @@ class TestCurvatureCapEnforcementVsDisplay:
     mw.update()
     published = mw._sl_pub.send.call_args[0][0]
     assert published['curvatureCap'] == 0
+
+
+class TestSafetyCapPublished:
+  """`safetyCap`: the lowest safety-class candidate (km/h, snapped), published
+  even when the guessed limit is LOWER than it. The daemon publishes only the
+  minimum, so without this field a curve cap above the guess is invisible to
+  planner_hook and a lead override would lift it (route 2fd class)."""
+
+  _mw_for_update = TestCurvatureCapEnforcementVsDisplay._mw_for_update
+
+  def _narrow(self, sld):
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 2          # lane-count guess: 40
+    return mw
+
+  def _pub(self, mw):
+    mw.update()
+    return mw._sl_pub.send.call_args[0][0]
+
+  def test_curvature_cap_above_the_guess_is_published(self, sld):
+    mw = self._narrow(sld)
+    mw.curvature_cap = 62
+    p = self._pub(mw)
+    assert p['speedLimit'] == 40 and p['source'] == 2 and p['safetyCapped'] is False
+    assert p['safetyCap'] == sld.snap_to_standard_speed(62)
+
+  def test_reactive_cap_above_the_guess_is_published(self, sld):
+    mw = self._narrow(sld)
+    mw._react_cap_ms = 70.0 / 3.6
+    mw.react_lat_accel_threshold = 2.5
+    p = self._pub(mw)
+    assert p['speedLimit'] == 40 and p['safetyCapped'] is False
+    assert p['safetyCap'] == sld.snap_to_standard_speed(int(70.0 / 3.6 * 3.6))
+
+  def test_lowest_safety_candidate_wins(self, sld):
+    mw = self._narrow(sld)
+    mw.curvature_cap = 90
+    mw._react_cap_ms = 65.0 / 3.6
+    mw.react_lat_accel_threshold = 2.5
+    p = self._pub(mw)
+    assert p['safetyCap'] == sld.snap_to_standard_speed(int(65.0 / 3.6 * 3.6))
+    assert p['safetyCap'] < sld.snap_to_standard_speed(90)
+
+  def test_zero_without_a_safety_candidate(self, sld):
+    mw = self._narrow(sld)
+    assert self._pub(mw)['safetyCap'] == 0
+
+  def test_cap_below_the_guess_matches_the_limit(self, sld):
+    mw = self._mw_for_update(sld)
+    mw.lane_count_stable = 4
+    mw.last_road_context = 'freeway'
+    mw.last_way_ref = 'G2'
+    mw.last_highway_type = 'motorway'
+    mw.curvature_cap = 87
+    p = self._pub(mw)
+    assert p['safetyCapped'] is True
+    assert p['safetyCap'] == sld.snap_to_standard_speed(87) == p['speedLimit']
 
 
 # ============================================================
@@ -4067,6 +4132,19 @@ class TestMapCurveToggle:
     on = tick_on()
     assert on['mapCurveCap'] > off['speedLimit']        # far curve: cap above the limit
     assert (on['speedLimit'], on['source']) == (off['speedLimit'], off['source'])
+
+  def test_safety_cap_published_for_a_cap_above_the_limit(self, sld, monkeypatch):
+    """Toggle on, far curve: the cap is above the limit (nothing changes in the
+    limit) but IS published as safetyCap; toggle off publishes 0."""
+    self._toggle(monkeypatch, {'v': ''})
+    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=0)
+    assert tick_off()['safetyCap'] == 0
+    self._toggle(monkeypatch, {'v': '1'})
+    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=0)
+    on = tick_on()
+    assert on['mapCurveCap'] > on['speedLimit']
+    assert on['safetyCap'] == sld.snap_to_standard_speed(
+      int(max(round(on['mapCurveCap']), 30)))
 
   def test_toggle_has_no_effect_off_gs(self, sld, monkeypatch):
     self._toggle(monkeypatch, {'v': ''})

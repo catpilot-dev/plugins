@@ -427,7 +427,13 @@ cap forever.
 
 Both curve caps enter the same `min()` as **safety-class** (source 4) sources:
 they inherit the planner hook's gas-suspend and are in the lead-override-
-protected class — a faster lead never lifts a curve cap (route 2fd).
+protected class — a faster lead never lifts a curve cap (route 2fd). Since
+2026-11-12 the daemon also publishes `safetyCap` (km/h, snapped): the lowest
+safety-class candidate (curve cap ≥ 30, reactive cap when engaged, map-curve cap
+when enabled and shaped), 0 when none, published **even when a guessed limit is
+lower than it**. `speedLimit`/`safetyCapped` alone hide a cap above the guess,
+and a lead override of that guess would lift it; under an override the hook
+outputs `min(v_cruise, safetyCap)` (no offset, immediate) — see Lead override.
 
 ### G/S map curve look-ahead (`map_curve.py`, 2026-11-09)
 
@@ -599,10 +605,44 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   spurious downward jitter when lane lines fade. Without a road_id (unnamed
   ramp/link) the hold is invalid — the inferred/vision cap is allowed to slow
   the car.
-- **Lead override.** If `radarState.leadOne` travels >10%
-  (`LEAD_OVERRIDE_THRESHOLD`) above the limit, a *non-safety, non-inferred*
-  confirmed limit is skipped (likely wrong data). It does **not** bypass safety
-  caps, inferred limits, or an active gas hold.
+- **Lead override.** If `radarState.leadOne` travels above the ENFORCED target
+  (limit + offset), a non-safety confirmed limit of
+  ANY source (inferred included since 2026-11-12) is skipped (likely wrong data).
+  Trigger with hysteresis (2026-11-12 replay): entry needs
+  `lead_kph > target_kph x (1 + LEAD_ENTER_MARGIN)` (0.05); once ON a tick stays
+  qualifying while `lead_kph > target_kph x (1 + LEAD_STAY_MARGIN)` (0.0). The
+  old `limit x 1.10` (`LEAD_OVERRIDE_THRESHOLD`, retired) sat at or under the
+  target, so on 538 seg 25-26 (guessed 80, target 88, car at 88, lead 86-92)
+  the override flipped up to 6 times a minute; confirmed limits get the same
+  rule. A gas floor still held after release no longer blocks the override
+  (538 seg 19 +24.5-31: it stayed off for 6 s while the lead ran 63-67 against
+  a target of 46 and the car coasted 61 -> 55); a gas PRESS still clears it.
+  Route 538: a lane-count guess of 40 pulled the car 83 -> 50 km/h at -0.5 m/s²
+  while the lead ran 50-63 km/h and pulled away; the baseline floor does not
+  cover unnamed roads. Half of the measured qualifying episodes were one-to-five
+  ticks, so it is debounced with its own state (`_lead_q_s`, `_lead_on`,
+  `_lead_last_q_t`, `_lead_held_ms`; `_floor_held_ms` keeps its meaning):
+  ON after `LEAD_OVERRIDE_ENTER_S = 0.5` s of continuous qualifying ticks, OFF
+  `LEAD_OVERRIDE_HOLD_S = 1.0` s after the last one. A safety-capped tick, a gas
+  press (the gas floor owns the release) or `_reset_all` clear it at once, with
+  no hold and no re-anchor. During ON the ceiling stays a pure function of the
+  limit. On the hold-expiry tick the ceiling re-anchors once,
+  `min(v_ego at last ON tick, max(v_ego, target))`, BEFORE the floors are
+  applied, so a baseline floor below v_ego is never the release output; if v_ego
+  is below target the ceiling is untouched. While ON (override and hold) the
+  output is `min(v_cruise, max(safetyCap, held gas floor))`
+  whenever the daemon's `safetyCap` > 0 (no gas floor counts as 0), so a fast
+  lead never lifts a curve/reactive/map-curve cap, including one above the
+  guessed limit. The gas floor term keeps a masked cap below it from stepping the
+  output down under the driver (the floor is <= v_ego, so it never accelerates).
+  The baseline floor is deliberately excluded: it is `min(baseline, v_ego)` and
+  rises with the car, so under an override it would let a lead's lift carry
+  through a tightening cap. Each ON tick records `_lead_held_ms = min(v_ego, override output)`, so the
+  release anchor can never be above what the override was outputting (override
+  bounded at 50 with the car at 58 would otherwise jump to 58 on release). A
+  payload WITHOUT `safetyCap` (older daemon) fails closed: nothing qualifies, an
+  ON override is cleared, no hold. A safety-capped tick still gets the cap directly and
+  immediately.
   The lead is read from `leadOne.present` (0.11.2 renamed `status`, upstream
   #38339). Until 2026-11-11 the hook still read `status`, which raises on
   0.11.2 and was swallowed, so the override never fired there (routes 517–536).
@@ -623,9 +663,10 @@ enforcement.
 
 | field | meaning |
 |-------|---------|
-| `state` | `no_data` / `unconfirmed` / `no_limit` / `gas` / `lead_override` / `capped` / `not_binding` |
+| `state` | `no_data` / `unconfirmed` / `no_limit` / `gas` / `lead_override` (ON and qualifying) / `lead_hold` (ON, inside the 1 s hold) / `capped` / `not_binding` |
+| `leadKph` | `leadOne.vLead` in km/h when `present`, else 0.0 |
 | `vEgo`, `vCruiseIn`, `vCruiseOut` | km/h; `capActive` = did the hook actually lower it |
-| `limit`, `source`, `safetyCapped` | echo of the driving `speedLimitState` sample, so the series is self-contained |
+| `limit`, `source`, `safetyCapped`, `safetyCap` | echo of the driving `speedLimitState` sample, so the series is self-contained |
 | `target` | limit + offset, km/h — the ramp's destination |
 | `ceiling`, `ceilingRate` | the ramped cap (km/h) and its slope (m/s²) — jerk compliance is directly measurable |
 | `anchored`, `anchorFrom`, `anchorTo` | one-tick anchor event; invisible otherwise |
@@ -673,6 +714,7 @@ with an older subset; the live dict is the authoritative payload:
 | `laneWidthClass` | road-class hint from lane width |
 | `curvatureCap` | snapped proactive curve cap (km/h, 0 = none) |
 | `safetyCapped` | a safety cap is the active/binding source |
+| `safetyCap` | lowest safety-class candidate, snapped (km/h, 0 = none), published even when a guessed limit is lower; bounds the lead override |
 | `reactCapEngaged` | reactive a_y cap engaged |
 | `reactCap` | reactive cap value (km/h, 0 = off) |
 | `reactLatAccel` | filtered measured `|a_y|` (m/s²) |

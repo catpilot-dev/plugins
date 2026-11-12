@@ -5,8 +5,28 @@ from openpilot.common.constants import CV
 
 # Lead vehicle override: if lead is traveling above the speed limit,
 # the OSM/inferred limit is likely wrong — skip capping until lead slows down.
-LEAD_OVERRIDE_THRESHOLD = 0.10  # 10% above speed limit
-LEAD_MIN_STATUS = True  # lead must be tracked (status=True)
+# Applies to EVERY non-safety confirmed source, guessed (source 2) limits
+# included (2026-11-12, route 538: a lane-count guess of 40 pulled the car
+# 83 -> 50 km/h behind a lead that ran 50-63). Half of the measured qualifying
+# episodes are one-to-five-tick spikes, so the override is debounced: ON after
+# LEAD_OVERRIDE_ENTER_S of continuous qualifying ticks, OFF after
+# LEAD_OVERRIDE_HOLD_S without one. Release re-anchors the ceiling once at the
+# car's speed (no step below v_ego). While ON the output is bounded by the
+# daemon's `safetyCap` (the lowest safety-class candidate, published even when a
+# guessed limit is lower than it), so a fast lead still never lifts a curve cap
+# (route 2fd). A safety-capped tick or a gas press clears the override at once;
+# a gas floor still held AFTER release no longer blocks it (route 538 seg 19: the
+# floor kept it off for 6 s behind a lead at 63-67 against a target of 46).
+# The trigger is relative to the ENFORCED target (limit + offset), with hysteresis
+# (2026-11-12 replay, route 538): the old limit x 1.10 sat at or under the target
+# (limit x 1.15 below 80 km/h, x 1.10 from 80), so under a guessed 80 (target 88,
+# car at 88) a lead hovering at 86-92 flipped the override up to 6 times a minute.
+# Enter (debounce runs) above target x (1 + LEAD_ENTER_MARGIN); once ON a tick
+# keeps it alive above target x (1 + LEAD_STAY_MARGIN).
+LEAD_ENTER_MARGIN = 0.05
+LEAD_STAY_MARGIN = 0.0
+LEAD_OVERRIDE_ENTER_S = 0.5  # s of continuous qualifying ticks before it turns ON
+LEAD_OVERRIDE_HOLD_S = 1.0   # s since the last qualifying tick before it turns OFF
 
 # Driver-intent speed-limit enforcement. speedlimitd assists but never fights
 # the driver: a limit change may slow or hold the car but never speed it up, and
@@ -48,6 +68,12 @@ _ceiling_rate = 0.0   # its current slope (m/s², signed)
 _last_t = None        # monotonic timestamp of the last ceiling advance
 _prev_target_ms = None  # previous tick's raw target, to detect a fresh drop
 _floor_held_ms = None   # output the previous tick held ABOVE the ceiling via a floor
+
+# Lead-override state (separate from the floors: _floor_held_ms keeps its meaning).
+_lead_q_s = 0.0          # continuous qualifying time (s)
+_lead_on = False         # override active (entered the debounce, not yet released)
+_lead_last_q_t = None    # monotonic time of the last qualifying tick
+_lead_held_ms = None     # v_ego on the last tick the override was ON
 
 # Enforcement telemetry. The daemon publishes what the LIMIT is; without this
 # the enforcement side — ceiling, anchor, floors, whether the cap even bound —
@@ -160,19 +186,25 @@ def _advance_ceiling(ceiling_ms, rate_ms2, target_ms, dt):
   return ceiling_ms, rate_ms2
 
 
-def _lead_overrides_limit(sm, speed_limit_kph):
-  """Return True if lead vehicle speed suggests the speed limit data is wrong."""
+def _lead_kph(sm) -> float:
+  """leadOne speed in km/h when a lead is present, else 0.0. Never raises.
+  0.11.2 renamed LeadData.status to `present` (upstream #38339); the old name
+  raises and the except below would silently disable the override."""
   try:
     lead = sm['radarState'].leadOne
-    # 0.11.2 renamed LeadData.status to `present` (upstream #38339); the old name
-    # raises here and the except below would silently disable the override.
     if not lead.present:
-      return False
-    # lead.vLead is absolute speed in m/s
-    lead_kph = lead.vLead * CV.MS_TO_KPH
-    return lead_kph > speed_limit_kph * (1 + LEAD_OVERRIDE_THRESHOLD)
+      return 0.0
+    return float(lead.vLead * CV.MS_TO_KPH)
   except Exception:
-    return False
+    return 0.0
+
+
+def _clear_lead():
+  global _lead_q_s, _lead_on, _lead_last_q_t, _lead_held_ms
+  _lead_q_s = 0.0
+  _lead_on = False
+  _lead_last_q_t = None
+  _lead_held_ms = None
 
 
 def _gas_pressed(sm) -> bool:
@@ -188,6 +220,7 @@ def _reset_all():
   immediately rather than ramped from a stale value."""
   global _baseline_ms, _gas_floor_ms, _ceiling_ms, _ceiling_rate, _last_t
   global _prev_target_ms, _floor_held_ms
+  _clear_lead()
   _baseline_ms = None
   _gas_floor_ms = None
   _floor_held_ms = None
@@ -200,6 +233,7 @@ def _reset_all():
 def on_v_cruise(v_cruise, v_ego, sm):
   global _baseline_ms, _gas_floor_ms, _road_id, _ceiling_ms, _ceiling_rate, _last_t
   global _prev_target_ms, _floor_held_ms
+  global _lead_q_s, _lead_on, _lead_last_q_t, _lead_held_ms
 
   KPH = CV.MS_TO_KPH
   tl = {'state': 'no_data', 'vEgo': round(v_ego * KPH, 1),
@@ -207,7 +241,8 @@ def on_v_cruise(v_cruise, v_ego, sm):
         'limit': 0, 'target': 0.0, 'ceiling': 0.0, 'ceilingRate': 0.0,
         'source': None, 'safetyCapped': False, 'anchored': False,
         'anchorFrom': 0.0, 'anchorTo': 0.0,
-        'baselineFloor': 0.0, 'gasFloor': 0.0, 'capActive': False}
+        'baselineFloor': 0.0, 'gasFloor': 0.0, 'capActive': False,
+        'leadKph': round(_lead_kph(sm), 1), 'safetyCap': 0}
 
   def _emit(out, state):
     tl['state'] = state
@@ -239,6 +274,11 @@ def on_v_cruise(v_cruise, v_ego, sm):
 
   offset_pct = 0 if safety_capped else _effective_offset_percent(speed_limit)
   target_ms = speed_limit * (1 + offset_pct / 100.0) * CV.KPH_TO_MS
+  # safetyCap (km/h) from the daemon; None = an older daemon without the field,
+  # in which case the override fails closed (nothing qualifies).
+  safety_cap_kph = _sl_data.get('safetyCap')
+  safety_cap_ms = (safety_cap_kph or 0) / 3.6
+  tl.update(safetyCap=int(safety_cap_kph or 0))
   tl.update(limit=speed_limit, source=source, safetyCapped=bool(safety_capped),
             target=round(target_ms * KPH, 2))
 
@@ -255,6 +295,7 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # enforcement. Safety caps assign the target directly; a tightening curve
   # cannot wait out a 24 s ramp.
   now = time.monotonic()
+  prev_t = _last_t
   if _ceiling_ms is None or safety_capped:
     _ceiling_ms, _ceiling_rate = target_ms, 0.0
   else:
@@ -287,6 +328,7 @@ def on_v_cruise(v_cruise, v_ego, sm):
   if _gas_pressed(sm):
     _gas_floor_ms = v_ego
     _floor_held_ms = None
+    _clear_lead()   # the gas floor owns the release from here
     return _emit(v_cruise, 'gas')
 
   # Ratchet the gas floor down with the driver; clear once eased to the limit.
@@ -312,6 +354,57 @@ def on_v_cruise(v_cruise, v_ego, sm):
   floors = [f for f in (baseline_floor, _gas_floor_ms) if f is not None]
   effective_floor = max(floors) if floors else None
 
+  # Lead override (debounced). Qualifying = a non-safety confirmed limit and a
+  # lead above the enforced target (enter x1.05, stay x1.00). A gas FLOOR still
+  # held after release does not block it; a gas PRESS clears it (return above).
+  # A safety-capped tick clears it with no
+  # hold and no re-anchor (the cap was assigned directly above). The release
+  # re-anchor runs HERE, before floored_target is computed, so a baseline floor
+  # below v_ego can never be the output on the release tick.
+  lead_state = None
+  lead_out = v_cruise
+  if safety_cap_kph is None:
+    _clear_lead()   # fail closed: an older daemon cannot bound the override
+  elif safety_capped:
+    _clear_lead()
+  else:
+    margin = LEAD_STAY_MARGIN if _lead_on else LEAD_ENTER_MARGIN
+    lead_kph = _lead_kph(sm)
+    qualifying = lead_kph > 0.0 and lead_kph > target_ms * KPH * (1 + margin)
+    if qualifying:
+      cont = _lead_last_q_t is not None and _lead_last_q_t == prev_t
+      _lead_q_s = _lead_q_s + (now - _lead_last_q_t) if cont else 0.0
+      _lead_last_q_t = now
+      if not _lead_on and _lead_q_s >= LEAD_OVERRIDE_ENTER_S - 1e-9:
+        _lead_on = True
+      if _lead_on:
+        lead_state = 'lead_override'
+    else:
+      _lead_q_s = 0.0
+      if _lead_on:
+        if now - _lead_last_q_t >= LEAD_OVERRIDE_HOLD_S - 1e-9:
+          anchored = min(_lead_held_ms, max(v_ego, target_ms))
+          if anchored > _ceiling_ms:
+            tl.update(anchored=True, anchorFrom=round(_ceiling_ms * KPH, 2),
+                      anchorTo=round(anchored * KPH, 2))
+            _ceiling_ms, _ceiling_rate = anchored, 0.0
+          _clear_lead()
+        else:
+          lead_state = 'lead_hold'
+      else:
+        _lead_last_q_t = None
+
+  # Override output: v_cruise bounded by the daemon's safetyCap (no offset,
+  # immediate) but never below the held GAS floor (<= v_ego, so this never
+  # accelerates): a masked cap below it must not step the output down under the
+  # driver. NOT the baseline floor: min(baseline, v_ego) rises with the car, so
+  # it would carry a lead's lift through a tightening curve cap. _lead_held_ms records min(v_ego, output) so the
+  # release anchor can never be above what the override was outputting.
+  if lead_state is not None:
+    if safety_cap_ms > 0:
+      lead_out = min(v_cruise, max(safety_cap_ms, _gas_floor_ms or 0.0))
+    _lead_held_ms = min(v_ego, lead_out)
+
   # Floor release re-anchor. The ceiling keeps descending while a floor holds
   # the output at the car's speed (it is a pure function of the limit), so the
   # moment the floor lets go the output would fall straight to a ceiling that
@@ -331,12 +424,13 @@ def on_v_cruise(v_cruise, v_ego, sm):
   _floor_held_ms = effective_floor if effective_floor is not None and effective_floor > _ceiling_ms else None
   floored_target = _ceiling_ms if effective_floor is None else max(_ceiling_ms, effective_floor)
 
-  # Fast lead suggests a non-safety confirmed limit is wrong — skip. Not for
-  # inferred limits (the baseline floor handles those), safety caps (a fast lead
-  # doesn't make a curve less tight — route 2fd), or when a gas hold is active.
-  if not inferred and not safety_capped and _gas_floor_ms is None \
-      and _lead_overrides_limit(sm, speed_limit):
-    return _emit(v_cruise, 'lead_override')
+  # Fast lead suggests a non-safety confirmed limit (guessed ones too) is wrong —
+  # skip it, but never lift a safety cap: the daemon's safetyCap bounds the
+  # output during override AND hold, with no offset and immediately (route 2fd:
+  # a fast lead doesn't make a curve less tight). A cap ABOVE a guessed limit is
+  # invisible to safetyCapped, which is why the field exists.
+  if lead_state is not None:
+    return _emit(lead_out, lead_state)
 
   # Enforce the cap directly; DCC comfort-limits the deceleration. floored_target
   # is <= v_ego whenever the limit dropped, so the cap never commands accel.

@@ -1748,22 +1748,28 @@ class SpeedLimitMiddleware:
     # proactive curve cap, as a safety-class source (source 4). That inheritance
     # is deliberate — planner_hook's gas-override suspends it and, crucially, its
     # lead-override protection (route 2fd) does NOT bypass safety-class caps, so
-    # a faster lead can never lift the reactive curve cap.
+    # a faster lead can never lift the reactive curve cap (even when the cap is
+    # above a guessed limit: see safetyCap below).
     react_cap_kph = self._react_cap_ms * 3.6 if self._react_cap_ms > 0.0 else 0.0
     react_active = react_cap_kph >= MIN_SPEED_LIMIT
 
     # Take minimum across all available sources — most conservative valid reading wins.
     candidates = []
+    safety_vals = []   # safety-class candidate values (km/h) -> published safetyCap
     if yolo_speed >= MIN_SPEED_LIMIT:
       candidates.append((float(yolo_speed), 1, 0.8))    # yoloDetection
     if self.curvature_cap >= MIN_SPEED_LIMIT:
       candidates.append((float(self.curvature_cap), 4, 0.7))  # curvatureLookahead
+      safety_vals.append(float(self.curvature_cap))
     if react_active:
       candidates.append((react_cap_kph, 4, 0.7))  # reactiveLatAccel (safety class)
+      safety_vals.append(react_cap_kph)
     # G/S map curve cap (2026-11-09): same safety class as the vision curve cap,
     # and only when the MapdCurveLookahead toggle is on. Off, it is telemetry only.
     if self.map_curve_enabled and self._mc_shaped_ms is not None:
-      candidates.append((float(max(round(self._mc_shaped_ms * 3.6), MIN_SPEED_LIMIT)), 4, 0.7))  # mapCurveLookahead
+      mc_cap_kph = float(max(round(self._mc_shaped_ms * 3.6), MIN_SPEED_LIMIT))
+      candidates.append((mc_cap_kph, 4, 0.7))  # mapCurveLookahead
+      safety_vals.append(mc_cap_kph)
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # base inference (lane-count / gs_osm), source 2
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
@@ -1805,6 +1811,13 @@ class SpeedLimitMiddleware:
       react_active
       and snap_to_standard_speed(int(react_cap_kph)) <= self._displayed_speed_limit
     )
+
+    # safetyCap (2026-11-12): the lowest safety-class candidate, snapped, whether
+    # or not it is the minimum. The published speedLimit is only the min(), so a
+    # curve cap ABOVE a guessed (source 2) limit is otherwise invisible to
+    # planner_hook, and a lead override of that guess would lift it (route 2fd
+    # class). The hook bounds its override output by this. 0 = no safety candidate.
+    safety_cap = snap_to_standard_speed(int(min(safety_vals))) if safety_vals else 0
 
     # --- Confirmation management ---
     # Process toggle commands from carstate resume button / UI tap via plugin bus.
@@ -1860,6 +1873,7 @@ class SpeedLimitMiddleware:
       # publish site, same as speedLimit.
       'curvatureCap': snap_to_standard_speed(self.curvature_cap) if self.curvature_cap >= MIN_SPEED_LIMIT else 0,
       'safetyCapped': safety_capped,
+      'safetyCap': safety_cap,                       # km/h, 0 = no safety candidate
       # Reactive measured-a_y cap telemetry (2026-07-28).
       'reactCapEngaged': self._react_cap_ms > 0.0,
       'reactCap': round(react_cap_kph, 1),          # km/h, 0 = disengaged
