@@ -605,6 +605,28 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   spurious downward jitter when lane lines fade. Without a road_id (unnamed
   ramp/link) the hold is invalid — the inferred/vision cap is allowed to slow
   the car.
+  **Exit-intent release (2026-11-13).** The running max never decays on a named
+  road, so an exit whose lane-count guess drops (route 53a seg 52-53 and 537
+  seg 10, the 金海高架路 exit: guess 80 -> 40 at 86 km/h) was held at v_ego for
+  8-13 s until the curve cap arrived. A **right** blinker within
+  `EXIT_INTENT_S` (5 s) before the first masked tick (target more than 0.3 km/h
+  under the baseline), with the lower guess then held `EXIT_CONFIRM_S` (1 s),
+  sets the baseline to the new target (`exitRelease`). Only a right blinker
+  before the drop: a left blinker preceded an 11 s lane-line fade (538 seg 39),
+  hazards set both bits, and a blinker that starts after the drop was never an
+  exit; the intent is latched on the first masked tick. The ceiling re-anchors
+  in the release branch itself (`min(held output, max(v_ego, target))`, rate 0),
+  not in the floor-release block, so a held gas floor under v_ego cannot drop the
+  output in one tick; it then descends at `CEIL_A_DOWN`. The window clears on a
+  gas press (it restarts after the pedal), a road change, a reset, any tick the
+  baseline block does not run, and when the guess is no longer masked. Safety
+  cap bound, lead override and gas floor are unchanged. Replay of 19 routes: 32
+  releases, no strict exceed of safetyCap.
+  Known cost: a right lane change followed by a lane-count dip eases the car at
+  up to 0.5 m/s² until the guess recovers, and a guess that recovers only
+  part-way (80 -> 40 -> 60) leaves the floor released at the new target (replay
+  worst non-exit as driven 8 km/h for 4 s, 518 seg 24; lead-free 13.6 km/h on a
+  service road ahead of a turn, 51b seg 7).
 - **Lead override.** If `radarState.leadOne` travels above the ENFORCED target
   (limit + offset), a non-safety confirmed limit of
   ANY source (inferred included since 2026-11-12) is skipped (likely wrong data).
@@ -691,6 +713,7 @@ enforcement.
 |-------|---------|
 | `state` | `no_data` / `unconfirmed` / `no_limit` / `gas` / `lead_override` (ON and qualifying) / `lead_hold` (ON, inside the 1 s hold) / `capped` / `not_binding` |
 | `safetyBound` | True on a tick where the safety-cap bound moved the ceiling or lowered the output (False on every other tick, incl. gas / no_data / unconfirmed); also True on `lead_override` / `lead_hold` ticks whose output the cap lowered below `v_cruise` |
+| `exitRelease` | True on the one tick the exit-intent release set the baseline to the new target (right blinker within 5 s before the drop, lower guess held 1 s); False on every other tick, incl. gas / no_data / unconfirmed |
 | `leadKph` | `leadOne.vLead` in km/h when `present`, else 0.0 |
 | `vEgo`, `vCruiseIn`, `vCruiseOut` | km/h; `capActive` = did the hook actually lower it |
 | `limit`, `source`, `safetyCapped`, `safetyCap` | echo of the driving `speedLimitState` sample, so the series is self-contained |

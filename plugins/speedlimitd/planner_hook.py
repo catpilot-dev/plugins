@@ -59,6 +59,14 @@ CEIL_A_DOWN = 0.5    # m/s²  peak descent rate — deliberately gentler than
 CEIL_J_DOWN = 0.5    # m/s³  jerk limit on the descent
 CEIL_DT_MAX = 0.2    # s     dt clamp (plannerd ticks at DT_MDL = 0.05)
 
+# Exit intent: a right blinker shortly BEFORE a lower guess on a named road
+# releases the baseline floor (see the block in on_v_cruise).
+EXIT_INTENT_S = 5.0   # s  look-back from the first masked tick for a right blinker:
+                      #    covers a lane change into an exit (53a: 3.2 s, 537: 2.2 s
+                      #    between blinker and drop) yet not a lane change long past
+EXIT_CONFIRM_S = 1.0  # s  the lower guess must hold this long before the release,
+                      #    so a one-second lane-count dip never lets go of the floor
+
 _sl_sub = None
 _sl_data = None
 
@@ -71,6 +79,11 @@ _ceiling_rate = 0.0   # its current slope (m/s², signed)
 _last_t = None        # monotonic timestamp of the last ceiling advance
 _prev_target_ms = None  # previous tick's raw target, to detect a fresh drop
 _floor_held_ms = None   # output the previous tick held ABOVE the ceiling via a floor
+
+# Exit-intent state (baseline-floor release).
+_right_blink_t = None   # monotonic time of the last tick with the RIGHT blinker alone
+_masked_since = None    # monotonic time the guess first fell below the baseline on this road
+_exit_intent = False    # right blinker within EXIT_INTENT_S before `_masked_since` (latched)
 
 # Lead-override state (separate from the floors: _floor_held_ms keeps its meaning).
 _lead_q_s = 0.0          # continuous qualifying time (s)
@@ -222,8 +235,10 @@ def _reset_all():
   invalid limits). Clearing the ceiling means the next valid limit is applied
   immediately rather than ramped from a stale value."""
   global _baseline_ms, _gas_floor_ms, _ceiling_ms, _ceiling_rate, _last_t
-  global _prev_target_ms, _floor_held_ms
+  global _prev_target_ms, _floor_held_ms, _masked_since, _exit_intent
   _clear_lead()
+  _masked_since = None
+  _exit_intent = False
   _baseline_ms = None
   _gas_floor_ms = None
   _floor_held_ms = None
@@ -236,6 +251,7 @@ def _reset_all():
 def on_v_cruise(v_cruise, v_ego, sm):
   global _baseline_ms, _gas_floor_ms, _road_id, _ceiling_ms, _ceiling_rate, _last_t
   global _prev_target_ms, _floor_held_ms
+  global _right_blink_t, _masked_since, _exit_intent
   global _lead_q_s, _lead_on, _lead_last_q_t, _lead_held_ms
 
   KPH = CV.MS_TO_KPH
@@ -245,7 +261,8 @@ def on_v_cruise(v_cruise, v_ego, sm):
         'source': None, 'safetyCapped': False, 'anchored': False,
         'anchorFrom': 0.0, 'anchorTo': 0.0,
         'baselineFloor': 0.0, 'gasFloor': 0.0, 'capActive': False,
-        'leadKph': round(_lead_kph(sm), 1), 'safetyCap': 0, 'safetyBound': False}
+        'leadKph': round(_lead_kph(sm), 1), 'safetyCap': 0, 'safetyBound': False,
+        'exitRelease': False}
 
   def _emit(out, state):
     tl['state'] = state
@@ -291,6 +308,8 @@ def on_v_cruise(v_cruise, v_ego, sm):
     _road_id = road_id
     _baseline_ms = None
     _gas_floor_ms = None
+    _masked_since = None
+    _exit_intent = False
 
   # Advance the jerk-limited ceiling toward the target. This runs before the
   # gas early-return on purpose: the ceiling is a pure function of the limit,
@@ -326,11 +345,24 @@ def on_v_cruise(v_cruise, v_ego, sm):
   _last_t = now
   _prev_target_ms = target_ms
 
+  # Right-blinker stamp for the exit-intent release below. After the ceiling
+  # advance and BEFORE the gas early-return, so a blinker during a gas press
+  # counts. Hazards set both bits and are not an exit signal; a missing
+  # carState or attribute counts as no blinker.
+  try:
+    cs = sm['carState']
+    if cs.rightBlinker and not cs.leftBlinker:
+      _right_blink_t = now
+  except Exception:
+    pass
+
   # Gas pedal: universal suspend (all sources, incl. safety caps). Raise the
   # hold floor to current speed so enforcement resumes from here on release.
   if _gas_pressed(sm):
     _gas_floor_ms = v_ego
     _floor_held_ms = None
+    _masked_since = None   # the driver is in control; the window restarts after
+    _exit_intent = False
     _clear_lead()   # the gas floor owns the release from here
     return _emit(v_cruise, 'gas')
 
@@ -344,12 +376,48 @@ def on_v_cruise(v_cruise, v_ego, sm):
   # actually have an OSM road identity. Without one (unnamed ramp/link, e.g. an
   # interchange motorway_link) we can't assert "same road", so the hold is
   # invalid — let the inferred/vision cap control and slow the car instead.
+  #
+  # Exit intent. The floor's running max never decays on a named road, so an
+  # exit whose lane-count guess drops (route 53a seg 52-53, 537 seg 10: the
+  # 金海高架路 exit, guess 80 -> 40 at 86 km/h) was held at v_ego for 8-13 s
+  # until the curve cap arrived. A RIGHT blinker within EXIT_INTENT_S before the
+  # first masked tick (target below the baseline by more than 0.3 km/h), with the
+  # lower guess held EXIT_CONFIRM_S, releases the baseline to the new target.
+  # Left blinkers, hazards, none, a blinker that starts after the drop and a
+  # short dip keep the hold (a left blinker preceded the 11 s lane-line fade,
+  # 538 seg 39). The intent is latched on the first masked tick, so a blinker
+  # that starts later cannot trigger it. The window clears on a gas press, a
+  # road change, _reset_all, any tick this block does not run, and when the
+  # guess is no longer masked.
+  # The re-anchor runs HERE, not in the floor-release block below: a held gas
+  # floor under v_ego keeps that block from firing, and the output would drop
+  # to the gas floor in one tick (hold-out 517 s7, 530 s25).
   baseline_floor = None
   if inferred and road_id != '':
+    if _baseline_ms is not None and target_ms < _baseline_ms - 0.3 * CV.KPH_TO_MS:
+      if _masked_since is None:
+        _masked_since = now
+        _exit_intent = _right_blink_t is not None and now - _right_blink_t <= EXIT_INTENT_S + 1e-9
+      if _exit_intent and now - _masked_since >= EXIT_CONFIRM_S - 1e-9:
+        _baseline_ms = target_ms
+        if _floor_held_ms is not None:
+          anchored = min(_floor_held_ms, max(v_ego, target_ms))
+          if anchored > _ceiling_ms:
+            tl.update(anchored=True, anchorFrom=round(_ceiling_ms * KPH, 2),
+                      anchorTo=round(anchored * KPH, 2))
+            _ceiling_ms, _ceiling_rate = anchored, 0.0
+        _masked_since = None
+        _exit_intent = False
+        tl['exitRelease'] = True
+    else:
+      _masked_since = None
+      _exit_intent = False
     _baseline_ms = target_ms if _baseline_ms is None else max(_baseline_ms, target_ms)
     baseline_floor = min(_baseline_ms, v_ego)
   else:
     _baseline_ms = None
+    _masked_since = None
+    _exit_intent = False
 
   # The ramped ceiling — not the raw target — is what gets enforced. The floors
   # above still track the RAW target: they are statements about the limit

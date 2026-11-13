@@ -148,9 +148,11 @@ class TestAdvanceCeiling:
 class TestCeilingInOnVCruise:
   """The ceiling as on_v_cruise actually drives it, with a fake clock."""
 
-  def _sm(self, gas=False, lead_present=False, lead_vLead=0.0):
+  def _sm(self, gas=False, lead_present=False, lead_vLead=0.0, right=False, left=False):
     cs = MagicMock()
     cs.gasPressed = gas
+    cs.rightBlinker = right
+    cs.leftBlinker = left
     # Shaped like 0.11.2's RadarState.LeadData: `present` (renamed from
     # `status`, upstream #38339). A strict object, so reading a field the
     # schema does not have raises as capnp does on the car.
@@ -1240,3 +1242,292 @@ class TestSafetyCapBoundsTheCappedPath:
     self._sl(ph, 40, source=2, road='', confirmed=False)
     self._run(ph, clk, 1, 50.0, self._sm())
     assert [m['safetyBound'] for m in bus] == [False, False]
+
+
+class TestExitIntentReleasesBaseline:
+  """A right blinker within EXIT_INTENT_S before a lower guess on a named road
+  releases the baseline (road-continuity) floor EXIT_CONFIRM_S after the drop
+  (route 53a seg 52-53 and 537 seg 10, the 金海高架路 exit: guess 80 -> 40 with
+  the floor holding the car at 86 km/h until the curve cap arrived). Left blinker,
+  hazards, no blinker, a late blinker and a short dip keep today's hold.
+  Spec: scratchpad plan_sl_exit_intent.md (rev 3).
+  """
+  _sm = TestCeilingInOnVCruise._sm
+  _clock = TestCeilingInOnVCruise._clock
+  _sl = TestLeadOverrideDebounced._sl
+  _lead = TestLeadOverrideDebounced._lead
+
+  @pytest.fixture
+  def bus(self, ph):
+    sent = []
+    ph._pub = type("P", (), {"send": staticmethod(lambda d: sent.append(dict(d)))})()
+    ph._pub_ok = True
+    return sent
+
+  def _run(self, ph, clk, secs, v_kph, sm=None, v_cruise_kph=101.0):
+    """Tick at 20 Hz for `secs`; v_kph may be a constant or f(i). Returns outputs (m/s)."""
+    outs = []
+    for i in range(int(round(secs / DT))):
+      clk['t'] += DT
+      v = v_kph(i) if callable(v_kph) else v_kph
+      outs.append(ph.on_v_cruise(v_cruise_kph / 3.6, v / 3.6, sm or self._sm()))
+    return outs
+
+  def _until_drop(self, ph, clk, blink_before=3.0, right=True, left=False, car=86.0):
+    """Guess 80 (target 88) on road A; the blinker (if any) stops `blink_before` s
+    before the drop. The next tick must be given guess 40."""
+    self._sl(ph, 80, source=2, road='A')
+    self._run(ph, clk, 1.0, car)
+    self._run(ph, clk, 0.5, car, self._sm(right=right, left=left))
+    self._run(ph, clk, max(blink_before - DT, 0.0), car)
+
+  def _drop(self, ph, clk, secs, car=86.0, sm=None, cap=0):
+    self._sl(ph, 40, source=2, road='A', cap=cap)
+    return self._run(ph, clk, secs, car, sm)
+
+  def _releases(self, bus, n):
+    return [m['exitRelease'] for m in bus[-n:]]
+
+  # (a)
+  def test_right_blinker_releases_one_second_after_the_drop(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0)
+    n0 = len(bus)
+    outs = self._drop(ph, clk, 5.0)
+    rel = [m['exitRelease'] for m in bus[n0:]]
+    k = rel.index(True)
+    assert k == 20 and sum(rel) == 1, 'release on the first tick at/after 1.0 s, once'
+    assert bus[n0 + k]['anchored'] is True
+    assert outs[k] * 3.6 == pytest.approx(86.0, abs=0.1)     # == the no-feature output
+    assert all(o * 3.6 == pytest.approx(86.0, abs=0.1) for o in outs[:k + 1])
+    prev, prev_rate = outs[k], 0.0
+    for i in range(k + 1, len(outs)):
+      assert outs[i] <= prev + 1e-9
+      assert prev - outs[i] <= ph.CEIL_A_DOWN * DT + 1e-9
+      rate = bus[n0 + i]['ceilingRate']
+      assert abs(rate - prev_rate) <= ph.CEIL_J_DOWN * DT + 1e-3
+      prev, prev_rate = outs[i], rate
+    assert outs[-1] < outs[k] - 0.5                          # it is descending now
+
+  # (b)
+  def test_no_blinker_floor_holds(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0, right=False)
+    outs = self._drop(ph, clk, 10.0)
+    assert not any(m['exitRelease'] for m in bus)
+    assert all(o * 3.6 == pytest.approx(86.0, abs=0.1) for o in outs)
+
+  # (c)
+  def test_left_blinker_only_holds(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0, right=False, left=True)
+    outs = self._drop(ph, clk, 10.0)
+    assert not any(m['exitRelease'] for m in bus)
+    assert all(o * 3.6 == pytest.approx(86.0, abs=0.1) for o in outs)
+
+  # (d)
+  def test_hazards_hold(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0, right=True, left=True)
+    outs = self._drop(ph, clk, 10.0)
+    assert not any(m['exitRelease'] for m in bus)
+    assert all(o * 3.6 == pytest.approx(86.0, abs=0.1) for o in outs)
+
+  # (e)
+  def test_blinker_older_than_five_seconds_holds(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 5.5)
+    self._drop(ph, clk, 10.0)
+    assert not any(m['exitRelease'] for m in bus)
+
+  def test_blinker_just_inside_five_seconds_counts(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 5.0)
+    self._drop(ph, clk, 3.0)
+    assert sum(m['exitRelease'] for m in bus) == 1
+
+  # (f)
+  def test_blinker_starting_after_the_drop_holds(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0, right=False)
+    self._drop(ph, clk, 0.5)
+    self._run(ph, clk, 0.5, 86.0, self._sm(right=True))
+    self._run(ph, clk, 8.0, 86.0)
+    assert not any(m['exitRelease'] for m in bus)
+
+  # (g)
+  def test_drop_shorter_than_one_second_does_not_release(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0)
+    self._drop(ph, clk, 0.9)
+    self._sl(ph, 80, source=2, road='A')
+    outs = self._run(ph, clk, 3.0, 86.0)
+    assert not any(m['exitRelease'] for m in bus)
+    assert ph._masked_since is None and ph._exit_intent is False
+    assert all(o * 3.6 == pytest.approx(88.0, abs=0.1) for o in outs)   # target 88 again
+    # a second dip starts a fresh window: 0.9 s again, still nothing
+    self._drop(ph, clk, 0.9)
+    assert not any(m['exitRelease'] for m in bus)
+
+  # (h)
+  def test_guess_recovering_after_a_release_lifts_the_output_at_once(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0)
+    self._drop(ph, clk, 3.0, car=80.0)
+    assert sum(m['exitRelease'] for m in bus) == 1
+    self._sl(ph, 80, source=2, road='A')
+    out = self._run(ph, clk, DT, 80.0)[0]
+    assert out == pytest.approx(88 / 3.6, abs=1e-6)
+    assert ph._baseline_ms == pytest.approx(88 / 3.6)
+    self._sl(ph, 40, source=2, road='A')                       # the floor is back: no new drop is a release w/o a blinker
+    outs = self._run(ph, clk, 5.0, 80.0)
+    assert not bus[-1]['exitRelease']
+    assert all(o * 3.6 == pytest.approx(80.0, abs=0.1) for o in outs)
+
+  # (i)
+  def test_road_change_inside_the_window_clears_it(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0)
+    self._drop(ph, clk, 0.5)
+    assert ph._masked_since is not None and ph._exit_intent is True
+    self._sl(ph, 40, source=2, road='B')
+    self._run(ph, clk, 3.0, 86.0)
+    assert not any(m['exitRelease'] for m in bus)
+    assert ph._masked_since is None and ph._exit_intent is False
+
+  # (j)
+  def test_gas_press_clears_the_window_and_it_restarts_after(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 2.0)
+    self._drop(ph, clk, 0.5)
+    assert ph._masked_since is not None
+    n0 = len(bus)
+    self._run(ph, clk, 1.5, 86.0, self._sm(gas=True))
+    assert {m['state'] for m in bus[n0:]} == {'gas'}
+    assert not any(m['exitRelease'] for m in bus[n0:])
+    assert ph._masked_since is None and ph._exit_intent is False
+    gas_floor = ph._gas_floor_ms
+    assert gas_floor == pytest.approx(86 / 3.6)
+    n1 = len(bus)
+    outs = self._run(ph, clk, 3.0, 86.0)
+    rel = [m['exitRelease'] for m in bus[n1:]]
+    assert rel.index(True) == 20 and sum(rel) == 1             # restarted from scratch
+    assert all(o >= gas_floor - 1e-9 for o in outs)
+
+  # (k)
+  def test_blinker_during_a_gas_press_counts(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=2, road='A')
+    self._run(ph, clk, 1.0, 86.0)
+    self._run(ph, clk, 0.5, 86.0, self._sm(gas=True, right=True))
+    self._run(ph, clk, 2.0, 86.0)
+    self._drop(ph, clk, 3.0)
+    assert sum(m['exitRelease'] for m in bus) == 1
+
+  # (l)
+  def test_missing_car_state_or_attribute_never_releases_or_raises(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=2, road='A')
+    self._run(ph, clk, 1.0, 86.0)
+    no_attr = MagicMock()
+    no_attr.__getitem__ = MagicMock(side_effect=lambda k: SimpleNamespace(gasPressed=False))
+    self._run(ph, clk, 0.5, 86.0, no_attr)
+    no_cs = MagicMock()
+
+    def getitem(k):
+      raise KeyError(k)
+    no_cs.__getitem__ = MagicMock(side_effect=getitem)
+    self._run(ph, clk, 0.5, 86.0, no_cs)
+    self._sl(ph, 40, source=2, road='A')
+    outs = self._run(ph, clk, 4.0, 86.0, no_cs)
+    outs += self._run(ph, clk, 4.0, 86.0, no_attr)
+    assert not any(m['exitRelease'] for m in bus)
+    assert all(o * 3.6 == pytest.approx(86.0, abs=0.1) for o in outs)
+
+  # (m)
+  def test_safety_cap_binds_at_once_and_after_the_release(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0)
+    self._drop(ph, clk, 0.5)
+    self._sl(ph, 40, source=2, road='A', cap=60)
+    out = self._run(ph, clk, DT, 86.0)[0]
+    assert out == pytest.approx(60 / 3.6, abs=1e-6) and bus[-1]['safetyBound'] is True
+    n0 = len(bus)
+    outs = self._run(ph, clk, 5.0, 86.0)
+    assert sum(m['exitRelease'] for m in bus[n0:]) == 1
+    assert all(o <= 60 / 3.6 + 1e-9 for o in outs)
+
+  # (n)
+  def test_release_with_the_lead_override_on_changes_nothing_that_tick(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0)
+    self._sl(ph, 40, source=2, road='A', cap=80)
+    n0 = len(bus)
+    outs = self._run(ph, clk, 1.5, 86.0, self._lead(90))
+    states = [m['state'] for m in bus[n0:]]
+    rel = [m['exitRelease'] for m in bus[n0:]]
+    k = rel.index(True)
+    assert k == 20 and states[k] == 'lead_override'
+    assert outs[k] == pytest.approx(80 / 3.6, abs=1e-6)       # the lead output, capped by safetyCap
+    assert ph._lead_on is True and ph._lead_held_ms == pytest.approx(80 / 3.6)
+    n1 = len(bus)
+    outs = self._run(ph, clk, 6.0, 86.0)                       # lead gone
+    assert 'lead_hold' in [m['state'] for m in bus[n1:]]
+    prev = 80 / 3.6
+    for o in outs:
+      assert o <= 80 / 3.6 + 1e-9 and o <= 86 / 3.6 + 1e-9
+      assert prev - o <= ph.CEIL_A_DOWN * DT + 1e-9, 'step on lead release'
+      prev = o
+    assert outs[-1] < 80 / 3.6 - 0.3 and ph._lead_on is False
+
+  # (o)
+  def test_exit_release_false_on_every_other_tick(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0)
+    self._drop(ph, clk, 3.0)
+    assert sum(m['exitRelease'] for m in bus) == 1
+    n0 = len(bus)
+    self._run(ph, clk, 2, 86.0, self._sm(gas=True))
+    ph._sl_data = None
+    self._run(ph, clk, 2, 86.0)
+    self._sl(ph, 40, source=2, road='A', confirmed=False)
+    self._run(ph, clk, 2, 86.0)
+    self._sl(ph, 80, source=2, road='A')
+    self._run(ph, clk, 2, 86.0)
+    tail = bus[n0:]
+    assert {m['state'] for m in tail} >= {'gas', 'no_data', 'unconfirmed'}
+    assert not any(m['exitRelease'] for m in tail)
+    assert all('exitRelease' in m for m in bus)
+
+  # (p)
+  def test_after_a_release_the_output_never_exceeds_the_release_tick_output(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._until_drop(ph, clk, 3.0)
+    n0 = len(bus)
+    outs = self._drop(ph, clk, 1.05, car=lambda i: 86.0 + 0.05 * i)
+    k = [m['exitRelease'] for m in bus[n0:]].index(True)
+    rel_out = outs[k]
+    outs = self._run(ph, clk, 10.0, lambda i: 88.0 + 0.1 * i)  # car keeps accelerating
+    assert all(o <= rel_out + 1e-9 for o in outs)
+
+  # (q)
+  def test_drop_during_gas_then_release_does_not_step_down_to_the_gas_floor(self, ph, bus, monkeypatch):
+    clk = self._clock(ph, monkeypatch)
+    self._sl(ph, 80, source=2, road='A')
+    self._run(ph, clk, 1.0, 80.0)
+    self._sl(ph, 40, source=2, road='A')
+    self._run(ph, clk, 0.5, 80.0, self._sm(gas=True, right=True))
+    gas_floor = ph._gas_floor_ms
+    assert gas_floor == pytest.approx(80 / 3.6)
+    n0 = len(bus)
+    outs = self._run(ph, clk, 5.0, lambda i: min(80.0 + 0.25 * i, 90.0))   # accelerating away
+    rel = [m['exitRelease'] for m in bus[n0:]]
+    k = rel.index(True)
+    assert k == 20 and sum(rel) == 1 and bus[n0 + k]['anchored'] is True
+    assert outs[k] >= outs[k - 1] - 0.1 / 3.6, 'one-tick drop to the gas floor'
+    prev = outs[k]
+    for o in outs[k + 1:]:
+      assert o <= prev + 1e-9 and prev - o <= ph.CEIL_A_DOWN * DT + 1e-9
+      assert o >= gas_floor - 1e-9
+      prev = o
+    assert outs[-1] == pytest.approx(gas_floor, abs=1e-6)
