@@ -871,7 +871,9 @@ class TestSetpointBias:
   def test_small_error_picks_minus1(self):
     """Just over the deadzone: a minus5 here could only overshoot, its yield
     being ten times minus1's with nowhere to put it."""
-    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=87.0)
+    # 87.5, not 87.0: the braking target keeps up to 0.2 km/h of DCC's hold
+    # offset at this ask (change B), which pulled 87.0 just under the gate.
+    acts, _, _ = self._run(accel=-0.25, v_ego_kmh=86.0, setpoint_kmh=87.5)
     assert 'minus1' in acts and 'minus5' not in acts, acts
 
   def test_bias_path_decel_uses_single(self):
@@ -1366,7 +1368,9 @@ class TestSlotCommandNotResumedAfterRelease:
     as the trailing overwrite runs."""
     from test_helpers import make_stalk_carstate, make_stalk_carcontrol
     cc, _ = _make_cc()
-    v_ego, sp = 83.0 * self.KPH, 85.0 * self.KPH
+    # sp 85.5, was 85.0: change B's hold offset (0.5 km/h at -0.17) pulled the
+    # 85.0 error just under the 3 km/h gate; this test is about the idle frames.
+    v_ego, sp = 83.0 * self.KPH, 85.5 * self.KPH
     t, szl = 0.0, 0
     flip = 0.92                      # mid-slot, one tick after a HOLD-cadence plus1
     frames = []
@@ -2501,3 +2505,84 @@ class TestMinus5PhaseGate:
     cc, _ = _make_cc()
     assert mod.MINUS5_ASSERT_FRAMES == 2
     assert cc.slot_frame_budget == mod.MINUS5_ASSERT_FRAMES
+
+
+class TestBrakingHoldOffset:
+  """Change B: braking targets for small asks keep DCC's hold offset, faded
+  out by -HOLD_OFFSET_FADE m/s². Route 53a seg 50-52: 88 -> 91 -> 88 at a flat
+  vTarget."""
+
+  KPH = 1 / 3.6
+  STEP = 0.01
+  ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  @staticmethod
+  def _old(mod, v_target, v_current, accel):
+    bias = max(min(accel, 0.0) / mod.K_DCC, -mod.SETPOINT_BIAS_MAX) / 3.6
+    return min(v_target, v_current + bias)
+
+  def test_offset_values(self):
+    """(e) +1.0 km/h at -0.04, +0.78 at -0.1; gone at -0.3 and beyond."""
+    import bmw.carcontroller as mod
+    assert mod.HOLD_OFFSET_FADE == 0.3
+    assert mod.hold_offset_kmh(-0.04) == pytest.approx(1.17 * (1 - 0.04 / 0.3))
+    assert mod.hold_offset_kmh(-0.04) == pytest.approx(1.0, abs=0.02)
+    assert mod.hold_offset_kmh(-0.1) == pytest.approx(0.78)
+    assert mod.hold_offset_kmh(0.0) == pytest.approx(mod.DCC_HOLD_OFFSET_KMH)
+    assert mod.hold_offset_kmh(0.2) == pytest.approx(mod.DCC_HOLD_OFFSET_KMH)  # positive blip
+    for a in (-0.3, -0.45, -0.6, -2.0):
+      assert mod.hold_offset_kmh(a) == 0.0
+    # continuous at the fade edge, never above the plant offset
+    assert mod.hold_offset_kmh(-0.2999) < 1e-3
+    assert all(0.0 <= mod.hold_offset_kmh(-x / 100) <= mod.DCC_HOLD_OFFSET_KMH
+               for x in range(0, 100))
+
+  def _drive(self, accel, setpoint_kmh, v_ego_kmh, vt_kmh, dur):
+    """Braking latched (vTarget below the car), setpoint pinned at the
+    readback; returns the set of decel actions sent."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, _ = _make_cc()
+    cc.setpoint_braking = True
+    cc.setpoint_handback_kmh = setpoint_kmh
+    v_ego = v_ego_kmh * self.KPH
+    t, szl, acts = 0.0, 0, set()
+    while t < dur:
+      t = round(t + self.STEP, 2)
+      if abs(t / 0.2 - round(t / 0.2)) < 1e-9:
+        szl = (szl + 1) % 15
+      _, msgs = cc.update(make_stalk_carcontrol(accel, vt_kmh * self.KPH),
+                          make_stalk_carstate(szl, v_ego=v_ego, setpoint=setpoint_kmh * self.KPH),
+                          int(round(t * 1e9)))
+      for addr, dat, _bus in msgs:
+        if addr == 404:
+          acts |= {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+    return acts, cc
+
+  def test_flat_vtarget_loop_does_not_fire_at_a_tiny_ask(self):
+    """(f) 88 -> 91 -> 88: setpoint 91, v 88.2, vT 88, accel -0.04, latched:
+    no minus frame in 1 s. Without the offset the 3.1 km/h error opened the
+    gate."""
+    acts, cc = self._drive(-0.04, 91.0, 88.2, 88.0, 1.0)
+    assert cc.setpoint_braking
+    assert not acts & {'minus1', 'minus5'}, acts
+
+  def test_same_state_at_a_real_ask_still_brakes(self):
+    """(f) from the same state at accel -0.5 minus commands as before."""
+    acts, _ = self._drive(-0.5, 91.0, 88.2, 88.0, 1.0)
+    assert acts & {'minus1', 'minus5'}, acts
+
+  def test_old_law_would_have_fired_in_the_flat_loop(self):
+    """The (f) state really was over the gate before: guards the test."""
+    import bmw.carcontroller as mod
+    old = self._old(mod, 88.0 * self.KPH, 88.2 * self.KPH, -0.04) * 3.6
+    assert 91.0 - old > mod.SETPOINT_DEADZONE
+    new = old + mod.hold_offset_kmh(-0.04)
+    assert 91.0 - new < mod.SETPOINT_DEADZONE

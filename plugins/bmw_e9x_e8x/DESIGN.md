@@ -273,6 +273,23 @@ Three things to keep straight:
   replaces it: it asks whether a whole step of setpoint is worth moving, and
   is what keeps a noisy `accel` from churning commands.
 
+**Hold offset for small asks (2026-11-13).** A setpoint at vEgo is not a zero
+ask: DCC already brakes about −0.12 m/s² there (`DCC_HOLD_OFFSET_KMH` = 1.17
+below the zero-accel gap). Aimed at vEgo, a near-zero braking ask therefore got
+more braking than requested, and the error reopened the gate. Route 53a seg
+50–52: the accel side rises 88 → 91 (plus1 lands on the next integer above the
+target), braking latches on a vTarget dip, the target `min(vT, v + aT/K_DCC)` ≈
+88 ignores the offset, the 91 − 88 = 3.0 error opens the Schmitt gate and
+minus5 snaps back to 88, every 4–5 s (48 flips in 3 min; 0.7–2.4 flips/min
+elsewhere). The braking target now adds `hold_offset_kmh(accel)` =
+`DCC_HOLD_OFFSET_KMH × max(0, 1 − |min(accel, 0)| / HOLD_OFFSET_FADE)`,
+`HOLD_OFFSET_FADE` = 0.3 m/s²: +1.0 km/h at −0.04, +0.78 at −0.1, nothing at
+−0.3 and deeper. Bounded at +1.17 km/h, continuous, only asks shallower than
+−0.3; by the plant fit the delivered decel stays at or above the ask. At −0.04
+the 91 − 88 error becomes ~2 km/h, under the 3 km/h gate. (A closed-loop model
+ranks this −14 / −52 / −26 % reversals/min at grade 0.1 / 0.2 / 0.3, 12 seeds; weakest
+on near-flat roads; on-car numbers decide.)
+
 **Restore.** The bias is a debt — a setpoint left low keeps braking, because
 the plant is symmetric. As demand releases, `sp_target` rises back to
 `v_target` on its own and a third branch walks the setpoint after it with

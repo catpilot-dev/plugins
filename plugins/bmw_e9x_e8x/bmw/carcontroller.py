@@ -41,6 +41,14 @@ ACCEL_BIAS_MAX = 12.0          # km/h above vEgo, same bound as the decel side
 # lands shallow of the plant; 0.12 over the first-cut 0.1 is a comfort choice.
 K_DCC = 0.12                   # m/s² of DCC response per km/h of setpoint gap
 SETPOINT_BIAS_MAX = 12.0       # km/h below v_target — plant floor −1.12 m/s²
+# Small braking asks keep DCC's hold offset. Route 53a seg 50-52: 88 -> 91 -> 88
+# minus5/plus1 loop at a flat vTarget. A setpoint at vEgo already brakes about
+# -0.12 m/s² (DCC_HOLD_OFFSET_KMH below the zero-accel gap), so a near-zero ask
+# aimed at vEgo asked for more braking than requested and the error reopened the
+# gate. The offset fades out linearly by -HOLD_OFFSET_FADE: bounded at
+# +DCC_HOLD_OFFSET_KMH, only for asks shallower than -0.3 m/s², continuous.
+# DESIGN.md: "The setpoint is a torque request, not a speed" (hold offset).
+HOLD_OFFSET_FADE = 0.3         # m/s² — ask at which the offset is gone
 
 # Command gate: a Schmitt trigger — the full deadzone opens a braking episode,
 # the narrow one keeps it open; restore always pays the full width.
@@ -130,6 +138,12 @@ REARM_HOLDOFF_FRAMES = 5
 # under its margin. A servo that tracks the command never meets it.
 SERVO_CEILING_SAMPLES = 5
 SERVO_CEILING_MARGIN_NM = 0.875
+
+
+def hold_offset_kmh(accel):
+  """DCC_HOLD_OFFSET_KMH, faded out linearly as the braking ask deepens to
+  -HOLD_OFFSET_FADE m/s² (0 at and beyond it). Added to the braking target."""
+  return DCC_HOLD_OFFSET_KMH * max(0.0, 1.0 - abs(min(accel, 0.0)) / HOLD_OFFSET_FADE)
 
 
 def minus5_landing_kmh(setpoint_kmh):
@@ -430,7 +444,8 @@ class CarController(CarControllerBase):
           if self.setpoint_braking:
             # min(accel, 0): a positive blip holds the bias; the latch releases.
             bias = max(min(accel, 0.0) / K_DCC, -SETPOINT_BIAS_MAX) * CV.KPH_TO_MS
-            sp_target = min(v_target, v_current + bias)
+            sp_target = (min(v_target, v_current + bias)
+                         + hold_offset_kmh(accel) * CV.KPH_TO_MS)
 
           setpoint_error = sp_target - CS.out.cruiseState.speed
           active_deadzone_kmh = (SETPOINT_HOLD_DEADZONE if self.setpoint_commanding
