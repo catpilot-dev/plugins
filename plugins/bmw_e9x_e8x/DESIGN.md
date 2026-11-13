@@ -638,7 +638,7 @@ median of 6. **There was never a constant to find.** An earlier note here
 explained the scatter as a ramp running until DCC observed the release, timed
 by SZL phase; that was wrong.
 
-### minus5 is released after two frames
+### minus5 is released after frame 1 unless it went out just before SZL's tick
 
 One press is all minus5 needs, and holding it longer makes DCC auto-repeat into
 a **second** grid step. Route 45c, first drive with the landing logic:
@@ -674,21 +674,56 @@ By burst length on that route:
 | 5 | 11 | 2 |
 | ≥6 | 3 | 0 |
 
-So minus5 is asserted for `MINUS5_ASSERT_FRAMES` = 2 and released, instead of
-holding the rest of the slot. **minus1 still holds its slot**: it steps by 1
+So minus5 is asserted for at most `MINUS5_ASSERT_FRAMES` = 2 and released,
+instead of holding the rest of the slot (the phase gate below decides 1 or 2). **minus1 still holds its slot**: it steps by 1
 and has nowhere to run to, and the reason for holding — a sub-0.06 s assertion
 produced no step 80% of the time — was measured for minus1 under the old law.
 
 Route 45f confirmed it: **0 of 54** bursts double-stepped, against 7 of 38, and
 no landing overshot `sp_target` (min −0.4, median +1.9 km/h).
 
+**Frame 2 is only for the pre-tick class (2026-11-13).** With two frames at
+SINGLE cadence, SZL's 5 Hz idle frame can land between ours on F-CAN
+(`[O5 Z. O5]`), and DCC reads press, release, press: two grid steps, ~1 s of
+−0.9..−1.1 m/s² against asks of −0.15..−0.3 (route 53a, 5 cases, one followed
+by a snap-up). Measured on routes 531, 532, 534–53a (418 one/two-frame groups):
+
+| | n |
+|---|---|
+| groups whose 0x193 readback moved within 75 ms of frame 1 (before frame 2 can act) | **397** of 418 |
+| frame 1 alone, from idle, outside the pre-tick window, where the readback shows frame 1 acted | **277 of 277** landed |
+| pre-tick class (frame 1 ≤ 25 ms before SZL's tick) | 41: frame 1 alone stepped 7, frame 2 was needed in 10, 5 no step, 19 undecidable, 1 two-step |
+| two-step groups | 10 (9 split + 1), all with SZL's idle frame between our two frames |
+
+So frame 1 is what DCC acts on, and frame 2 only helps where frame 1 can be
+lost to SZL's tick. The anchor predicts that tick well (period p50 199.8 ms,
+next-tick error p1/p50/p99 −10.8 / −0.2 / +0.9 ms over 19705 ticks, 53a). When
+frame 1 of a minus5 decision is transmitted the law computes the time to the
+next tick with `cruise_cmd`'s own arithmetic (`slot_period −
+(now − anchor) % slot_period`) and sets the decision's frame budget: **2 if
+that is ≤ `MINUS5_PRETICK_S` = 25 ms** (mid-cycle on the 10 ms control grid) or
+the anchor is older than `MINUS5_ANCHOR_MAX_AGE_S` = 3.0 s (stale; measured
+age at minus5 decisions p95 0.64 s, max 2.3 s), **else 1**. A stale anchor
+reproduces the old behaviour, so a failed prediction can only fall back to it.
+The budget is per decision and resets with the slot; `cruise_cmd`, the
+counters, the lead window, the trailing overwrite and the handoff latch are
+untouched. Expected: two-step groups 10 → 0 of 418 (controller anchor-rule
+replay). Cost: 2 groups where frame 2 very likely did the work now get one
+frame (536 seg 1 at 38.8 ms, 53a seg 35 at 28.7 ms predicted), plus 10
+undecidable groups at a predicted 29-40 ms whose frame 2 followed 19-31 ms after
+frame 1; so no-step may rise by +0.5 to +2.9 points (2-12 of 418) over today's
+~2.6 %. The next drives decide it, split by predicted time-to-tick. Not covered by this: minus5 sent straight after another command with
+no idle slot between failed 6 of 68 regardless of frame count (a separate
+class). The earlier "72 of 72 single-frame groups landed" was selection (68
+were single because the readback had already closed the gate) and is not used.
+
 **Count frames, not seconds.** A 0.06 s window was tried first and 45f showed
 why it is the wrong unit: the cadence pin only transmits once the interval has
 elapsed, so a slot decision landing just after a transmission got a single
 frame out of that window. 24 of 54 bursts came out at 1 frame, and the share
-that moved the setpoint *not at all* rose 5% → 11%. Two frames is what was
-measured never to double-step, so ask for exactly that and let the cadence take
-as long as it needs.
+that moved the setpoint *not at all* rose 5% → 11%. Two frames was then what was
+measured never to double-step; the phase gate above (2026-11-13) keeps two only
+where those single-frame misses come from, the pre-tick class.
 
 **A released slot is never resumed (2026-11-11).** Route 535: `minus5` frame 1
 at 11.341 landed (setpoint 52 → 48 at 11.390), the error fell inside the hold
@@ -702,9 +737,10 @@ command is not resumed in that slot (minus1 included); `slot_decided_ns` is
 kept, and the next decision still waits for the slot to expire. Idle frames
 *ahead* of the command's first frame do not count: after plus1 at HOLD cadence
 the trailing overwrite runs every 25 ms and the first decel frame waits for the
-lead window, so cancelling there would starve braking. Known residual,
-not covered: route 534 seg 7 +36.8 s, two consecutive `minus5` frames with a
-single SZL idle frame between them also double-stepped (50 → 48 → 38).
+lead window, so cancelling there would starve braking. The route 534 seg 7
++36.8 s case (two consecutive `minus5` frames with a single SZL idle frame
+between them, 50 → 48 → 38) is the same split-pair class and is closed by the
+phase gate above: outside the pre-tick window there is no second frame.
 
 ### minus1 is a tap, never a hold
 
@@ -729,7 +765,7 @@ which is invisible at a shallow gap and a brake dropout at a deep one.
 
 So `minus1` asserts for at most `MINUS1_MAX_SLOTS` (1) slot, then one idle slot
 releases the lever before the next tap. `minus5` is unaffected: it is already
-released after two frames. A tap yields ~1–1.3 km/h (isolated runs, n = 1287,
+released after one or two frames. A tap yields ~1–1.3 km/h (isolated runs, n = 1287,
 3% zero), against ~3–4 km/h/s held — the "toggling gains nothing" row above
 measured rate against TX cadence inside a hold, not hold against tap. Two slots
 (~0.35–0.4 s) sits on the threshold and is rejected.

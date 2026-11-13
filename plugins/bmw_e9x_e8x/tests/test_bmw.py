@@ -980,7 +980,7 @@ class TestSetpointBias:
         sp_min = min(sp_min, sp_true)
     return cc, sent, max_pending, sp_true, sp_min
 
-  def test_minus5_is_released_after_two_frames(self):
+  def test_minus5_never_asserts_more_than_two_frames(self):
     """One press is all minus5 needs, and holding it longer makes DCC
     auto-repeat into a second grid step. Route 45c: 7 of 38 bursts took two
     steps, overshooting sp_target by a median 7.5 km/h — the setpoint reached
@@ -1010,13 +1010,8 @@ class TestSetpointBias:
     m5 = runs('minus5')
     assert m5, "expected minus5 to fire for this error"
     assert max(m5) <= 2, f"minus5 asserted for {max(m5)} frames; runs={m5}"
-    # Counted in frames, not seconds: a wall-clock window let the cadence pin
-    # emit a single frame when the slot decision landed just after a
-    # transmission, and route 45f showed 24 of 54 bursts coming out at 1 frame
-    # with 11% of them moving the setpoint not at all. Every burst but a
-    # truncated last one should get its full two frames.
-    assert sorted(m5)[:-1].count(2) == len(m5) - 1 or all(f == 2 for f in m5), (
-      f"short bursts emitted; runs={m5}")
+    # Whether a burst is 1 or 2 frames is the phase gate's call (frame 2 only
+    # just before SZL's tick); TestMinus5PhaseGate pins that. Here: never more.
     m1 = runs('minus1')
     if m1:
       assert max(m1) >= 3, f"minus1 should still hold its slot; runs={m1}"
@@ -1344,13 +1339,15 @@ class TestSlotCommandNotResumedAfterRelease:
     self._check_not_resumed('minus1', accel_open=-0.5, accel_closed=-0.1,
                             sp_start=86.0, sp_after=85.0)
 
-  def test_uninterrupted_minus5_is_two_consecutive_frames(self):
+  def test_uninterrupted_minus5_is_released_after_its_frame_budget(self):
     frames, first_decel, _ = self._drive(accel_open=-1.2, accel_closed=-1.2,
                                          sp_start=86.0, sp_after=86.0,
                                          interrupt=False)
     names = [n for t, n in frames if t >= first_decel]
-    assert names[:2] == ['minus5', 'minus5'], frames
-    assert names[2:3] != ['minus5'], frames
+    # This phase is far from SZL's next tick, so the phase gate (change A)
+    # releases after frame 1; the two-frame case is in TestMinus5PhaseGate.
+    assert names[:1] == ['minus5'], frames
+    assert names[1:2] != ['minus5'], frames
 
   def test_fresh_minus5_is_decided_in_the_next_slot(self):
     """The release only closes the slot it happened in: with the target still a
@@ -2352,3 +2349,155 @@ class TestLaneChangeConfirmation:
   def test_gas_is_not_a_confirmation_input(self):
     import inspect
     assert 'gas' not in ' '.join(inspect.signature(self._cs().lane_change_torque).parameters)
+
+
+class TestMinus5PhaseGate:
+  """Change A: the second minus5 frame is kept only when frame 1 went out
+  within MINUS5_PRETICK_S of SZL's next idle tick, or the anchor is stale.
+  Routes 531-53a: frame 1 is what DCC acts on; the two-step groups all had
+  SZL's idle frame between our two frames. The budget is per decision."""
+
+  KPH = 1 / 3.6
+  STEP = 0.01
+  ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _drive(self, ticks, t0, until=0.5, accel=-1.2, sp=86.0, respond=False):
+    """Steady 86 km/h, braking asked from t0. `ticks` are the times SZL's
+    counter advances (10 ms grid). Returns (frames, ticks) with frames =
+    [(t, action name or None)] for every 0x194 frame after t0. With respond
+    the setpoint readback follows minus5 (grid snap) 0.13 s after frame 1."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, _ = _make_cc()
+    v_ego = 86.0 * self.KPH
+    ticks = sorted(round(x, 2) for x in ticks)
+    t, szl, frames = 0.0, 0, []
+    land_at, land_to = None, None
+    while t < t0 + until:
+      t = round(t + self.STEP, 2)
+      if t in ticks:
+        szl = (szl + 1) % 15
+      if land_at is not None and t >= land_at:
+        sp, land_at = land_to, None
+      a = 0.0 if t < t0 else accel
+      vt = v_ego + (0.0 if t < t0 else accel * (t - t0))
+      _, msgs = cc.update(make_stalk_carcontrol(a, vt),
+                          make_stalk_carstate(szl, v_ego=v_ego, setpoint=sp * self.KPH),
+                          int(round(t * 1e9)))
+      for addr, dat, _bus in msgs:
+        if addr != 404 or t < t0:
+          continue
+        names = [self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)]
+        frames.append((t, names[0] if names else None))
+        if respond and names == ['minus5'] and land_at is None:
+          land_at, land_to = t + 0.13, round(10 * ((round(sp + 2) - 1) // 10) - 2.0)
+    return frames, ticks
+
+  @staticmethod
+  def _groups(frames):
+    """minus5 groups: [(t_first, n_frames)] split on a gap over 0.12 s."""
+    out = []
+    for t, n in frames:
+      if n != 'minus5':
+        continue
+      if out and t - out[-1][2] <= 0.12:
+        out[-1][1] += 1
+        out[-1][2] = t
+      else:
+        out.append([t, 1, t])
+    return [(g[0], g[1]) for g in out]
+
+  @staticmethod
+  def _to_tick(t1, ticks):
+    """Time to SZL's next tick as the controller predicts it at t1: from the
+    last counter advance at or before t1 (the anchor), one period on."""
+    ticks = [round(x, 2) for x in ticks]
+    last = max(x for x in ticks if x <= t1 + 1e-9)
+    el = round(t1 - last, 3)
+    return round(0.2 - el % 0.2, 3)
+
+  def _regular(self, shift, end=3.0):
+    return [shift + 0.2 * k for k in range(int(end / 0.2))]
+
+  def test_far_from_the_tick_sends_one_frame(self):
+    """(a) frame 1 more than 25 ms before SZL's tick: exactly one minus5."""
+    seen = set()
+    for shift_cs in range(0, 20):
+      ticks = self._regular(shift_cs / 100)
+      frames, _ = self._drive(ticks, t0=1.0)
+      g = self._groups(frames)
+      assert g, (shift_cs, frames)
+      tt = self._to_tick(g[0][0], ticks)
+      if tt > 0.025:
+        seen.add(shift_cs)
+        assert g[0][1] == 1, (shift_cs, tt, frames)
+    assert len(seen) >= 8, seen
+
+  def test_just_before_the_tick_keeps_two_frames(self):
+    """(b) frame 1 sent <= 25 ms before SZL's tick: two frames, as before."""
+    seen = set()
+    for shift_cs in range(0, 20):
+      ticks = self._regular(shift_cs / 100)
+      frames, _ = self._drive(ticks, t0=1.0)
+      g = self._groups(frames)
+      assert g, (shift_cs, frames)
+      tt = self._to_tick(g[0][0], ticks)
+      if tt <= 0.025:
+        seen.add(shift_cs)
+        assert g[0][1] == 2, (shift_cs, tt, frames)
+    assert seen, "setup: no phase put frame 1 inside the window"
+
+  def test_stale_anchor_keeps_two_frames_in_every_phase(self):
+    """(b) an anchor older than MINUS5_ANCHOR_MAX_AGE_S is not trusted: two
+    frames whatever the (extrapolated) phase."""
+    import bmw.carcontroller as mod
+    assert mod.MINUS5_ANCHOR_MAX_AGE_S == 3.0 and mod.MINUS5_PRETICK_S == 0.025
+    for off_cs in range(0, 20):
+      # Counter advances stop at t=0.4; braking starts 3.6 s later.
+      ticks = [0.2, 0.4]
+      frames, _ = self._drive(ticks, t0=4.0 + off_cs / 100)
+      g = self._groups(frames)
+      assert g and g[0][1] == 2, (off_cs, frames)
+
+  def test_fresh_anchor_just_inside_the_age_limit_still_gates(self):
+    """Anchor 2.5 s old (fresh): the phase gate applies. Last counter advance
+    at 1.0, braking asked at 3.5; ticks stop, so phase is extrapolated."""
+    counts = set()
+    for off_cs in range(0, 20):
+      frames, _ = self._drive([0.2, 0.4, 0.6, 0.8, 1.0], t0=3.5 + off_cs / 100)
+      g = self._groups(frames)
+      assert g, (off_cs, frames)
+      counts.add(g[0][1])
+    assert counts == {1, 2}, counts
+
+  def test_budget_is_per_decision(self):
+    """(c) the budget is set per slot decision and resets with it. SZL's tick
+    grid is shifted twice mid-drive (a 0.22 s gap, then a 0.14 s gap), so
+    successive decisions of one braking episode see different phases: one
+    frame, one frame, two (frame 1 0.01 s before the tick), then one again.
+    A 1-frame budget never carries into the next decision, nor a 2-frame one."""
+    import bmw.carcontroller as mod
+    ticks = [0.2 * k for k in range(5)]
+    ticks += [ticks[-1] + 0.22 + 0.2 * k for k in range(3)]
+    ticks += [ticks[-1] + 0.14 + 0.2 * k for k in range(15)]
+    frames, ticks = self._drive(ticks, t0=1.0, until=1.7, accel=-2.5, sp=135.0,
+                                respond=True)
+    groups = self._groups(frames)
+    assert [n for _, n in groups][:4] == [1, 1, 2, 1], groups
+    for t1, n in groups[:4]:
+      assert n == (2 if self._to_tick(t1, ticks) <= mod.MINUS5_PRETICK_S else 1), (t1, n)
+
+  def test_budget_starts_at_the_in_window_value(self):
+    """The attribute the command selection reads is armed with
+    MINUS5_ASSERT_FRAMES (the in-window budget) before any decision."""
+    import bmw.carcontroller as mod
+    cc, _ = _make_cc()
+    assert mod.MINUS5_ASSERT_FRAMES == 2
+    assert cc.slot_frame_budget == mod.MINUS5_ASSERT_FRAMES

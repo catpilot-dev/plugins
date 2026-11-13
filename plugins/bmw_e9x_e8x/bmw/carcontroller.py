@@ -71,8 +71,18 @@ STEP5_MIN_USEFUL_KMH = 2.0    # below this it is the ±1 command's job anyway
 # CruiseSettings.CLUSTER_OFFSET, which is cosmetic — a test pins them apart.
 STEP5_GRID_PHASE = 2.0        # km/h
 # Held longer, DCC auto-repeats minus5 into a second grid step. Counted in
-# frames, not seconds. DESIGN.md: "minus5 is released after two frames".
-MINUS5_ASSERT_FRAMES = 2      # transmitted frames, then release
+# frames, not seconds. DESIGN.md: "minus5 is released after frame 1 unless it
+# went out just before SZL's tick".
+MINUS5_ASSERT_FRAMES = 2      # frame budget when frame 2 may be needed, then release
+# Phase-gated second frame. Routes 531-53a: frame 1 is what DCC acts on (the
+# readback moves within 75 ms of it in 397 of 418 groups) and, from idle
+# outside the window below, it alone landed 277 of 277; the 10 two-step groups
+# all had SZL's idle frame between our two frames. Frame 2 is kept only for the
+# pre-tick class, where frame 1 went out <= MINUS5_PRETICK_S before SZL's tick
+# and can be lost to it. 25 ms is mid-cycle on the 10 ms control grid. A stale
+# or missing anchor falls back to two frames.
+MINUS5_PRETICK_S = 0.025      # frame 1 this close to SZL's next tick keeps frame 2
+MINUS5_ANCHOR_MAX_AGE_S = 3.0  # older anchor: predicted tick is not trusted
 MINUS1_YIELD_KMH = 1.0
 # minus1 is a tap, never a hold: at most this many consecutive slots, then one
 # idle slot releases the lever. Out of a hold of >= ~0.4 s DCC can reset a deep
@@ -178,6 +188,7 @@ class CarController(CarControllerBase):
     # Frames actually transmitted for the current slot's command, so minus5 can
     # be released after a counted number rather than a wall-clock window.
     self.slot_cmd_frames = 0
+    self.slot_frame_budget = MINUS5_ASSERT_FRAMES   # minus5 frames this decision
 
     # Per-slot command selection: what was decided this slot, and how much
     # setpoint we have asked for but not yet seen arrive.
@@ -440,6 +451,7 @@ class CarController(CarControllerBase):
             if (now_nanos - self.slot_decided_ns) / 1e9 >= CRUISE_STALK_IDLE_TICK_STOCK:
               self.slot_decided_ns = now_nanos
               self.slot_cmd_frames = 0
+              self.slot_frame_budget = MINUS5_ASSERT_FRAMES
               err_kmh = -setpoint_error * 3.6 - self.setpoint_pending
               # minus5's landing, from the setpoint expected once pending lands.
               sp_eff_kmh = CS.out.cruiseState.speed * 3.6 - self.setpoint_pending
@@ -465,11 +477,21 @@ class CarController(CarControllerBase):
               self.minus1_slots = (self.minus1_slots + 1
                                    if self.slot_cmd is CruiseStalk.minus1 else 0)
             if self.slot_cmd is not None:
-              # minus5 releases after MINUS5_ASSERT_FRAMES; minus1 holds its one slot.
+              # minus5 releases after its frame budget; minus1 holds its one slot.
               if (self.slot_cmd is not CruiseStalk.minus5
-                  or self.slot_cmd_frames < MINUS5_ASSERT_FRAMES):
+                  or self.slot_cmd_frames < self.slot_frame_budget):
                 if cruise_cmd(self.slot_cmd, SINGLE_INTERVAL):
                   self.slot_cmd_frames += 1
+                  if self.slot_cmd is CruiseStalk.minus5 and self.slot_cmd_frames == 1:
+                    # Frame 1 is out: frame 2 only if it went just before
+                    # SZL's tick (it may be lost) or the anchor is not trusted.
+                    slot_period_ns = CRUISE_STALK_IDLE_TICK_STOCK * 1e9
+                    to_tick_s = (slot_period_ns - (now_nanos - self.last_cruise_rx_timestamp)
+                                 % slot_period_ns) / 1e9
+                    anchor_age_s = (now_nanos - self.last_cruise_rx_timestamp) / 1e9
+                    pre_tick = to_tick_s <= MINUS5_PRETICK_S
+                    stale = self.last_cruise_rx_timestamp == 0 or anchor_age_s > MINUS5_ANCHOR_MAX_AGE_S
+                    self.slot_frame_budget = MINUS5_ASSERT_FRAMES if (pre_tick or stale) else 1
 
           # Restore: walk a parked setpoint back up with plus1 at SINGLE
           # (<= 0.19 m/s²; plus5 would lurch). DESIGN.md: "The setpoint is a
