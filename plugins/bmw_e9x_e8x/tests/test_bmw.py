@@ -2586,3 +2586,134 @@ class TestBrakingHoldOffset:
     assert 91.0 - old > mod.SETPOINT_DEADZONE
     new = old + mod.hold_offset_kmh(-0.04)
     assert 91.0 - new < mod.SETPOINT_DEADZONE
+
+
+class TestSmallAskLiftFade:
+  """Routes 53b/53e: the accel-side lift at aT ~ +0.1 put the setpoint about
+  1.6 km/h past vTarget (0.4 past its hold point); the aT / K_DCC_UP term fades
+  in linearly up to ACCEL_LIFT_FADE."""
+
+  KPH = 1 / 3.6
+  STEP = 0.01
+  ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    self._mp = monkeypatch
+
+  @staticmethod
+  def _old(mod, v_target, v_current, accel):
+    gap = min(accel / mod.K_DCC_UP + mod.DCC_HOLD_OFFSET_KMH, mod.ACCEL_BIAS_MAX)
+    return max(v_target, v_current + gap / 3.6)
+
+  def _run(self, accel, setpoint_kmh, v_ego_kmh, vt_kmh, dur, fade=None):
+    """Returns the list of actions sent (one entry per TX frame)."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, mod = _make_cc()
+    if fade is not None:
+      self._mp.setattr(mod, 'ACCEL_LIFT_FADE', fade)
+    t, szl, acts = 0.0, 0, []
+    # 1 s settled at vT = vEgo (accel 0), then the step to vT: the concordance
+    # gate needs vTarget's trend, as in the other accel-side harnesses.
+    for a, vt, n in ((0.0, v_ego_kmh, 100), (accel, vt_kmh, int(round(dur / self.STEP)))):
+      for _ in range(n):
+        t = round(t + self.STEP, 2)
+        if abs(t / 0.2 - round(t / 0.2)) < 1e-9:
+          szl = (szl + 1) % 15
+        _, msgs = cc.update(make_stalk_carcontrol(a, vt * self.KPH),
+                            make_stalk_carstate(szl, v_ego=v_ego_kmh * self.KPH,
+                                                setpoint=setpoint_kmh * self.KPH),
+                            int(round(t * 1e9)))
+        for addr, dat, _bus in msgs:
+          if addr == 404 and t > 1.0:
+            acts.extend(self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b))
+    return acts
+
+  def test_steady_cruise_target_fades_the_lift(self):
+    import bmw.carcontroller as mod
+    v_ego, vt = 25.0 * self.KPH, 25.6 * self.KPH
+    t = mod.accel_lift_target(vt, v_ego, 0.1)
+    want = max(vt, v_ego + (0.1 / 0.107 / 3 + 1.17) * self.KPH)
+    assert t == pytest.approx(want)
+    assert t < self._old(mod, vt, v_ego, 0.1) - 0.5 * self.KPH
+
+  def test_plus1_stops_at_the_faded_target(self):
+    """Readback 26.7: faded target 26.48 -> no plus1; old law 27.10 would."""
+    assert 'plus1' not in self._run(0.1, 26.7, 25.0, 25.6, 1.0)
+    old = self._run(0.1, 26.7, 25.0, 25.6, 1.0, fade=1e-9)
+    assert 'plus1' in old, old
+    assert 'plus1' in self._run(0.1, 26.3, 25.0, 25.6, 1.0)
+
+  def test_identical_to_old_law_from_the_fade_width_up(self):
+    import bmw.carcontroller as mod
+    for ve in (10.0, 25.0, 80.0):
+      for d in (0.6, 1.0, 3.0, 10.0):
+        for a in (0.3, 0.31, 0.5, 1.0, 2.0, 5.0):
+          v, vt = ve * self.KPH, (ve + d) * self.KPH
+          assert mod.accel_lift_target(vt, v, a) == pytest.approx(self._old(mod, vt, v, a))
+
+  def test_never_below_vtarget(self):
+    import bmw.carcontroller as mod
+    for ve in (10.0, 25.0, 80.0):
+      for d in (0.51, 0.6, 0.93, 1.0, 2.0, 5.0, 20.0):
+        for a in (0.001, 0.05, 0.1, 0.11, 0.3, 1.0, 2.0):
+          vt = (ve + d) * self.KPH
+          assert mod.accel_lift_target(vt, ve * self.KPH, a) >= vt - 1e-12
+
+  def test_continuous_in_accel_at_the_fade_width(self):
+    import bmw.carcontroller as mod
+    v_ego, vt = 25.0 * self.KPH, 25.6 * self.KPH
+    w = mod.ACCEL_LIFT_FADE
+    lo = mod.accel_lift_target(vt, v_ego, w - 1e-6)
+    hi = mod.accel_lift_target(vt, v_ego, w + 1e-6)
+    assert abs(hi - lo) < 1e-5
+    prev = mod.accel_lift_target(vt, v_ego, 0.0001)
+    for i in range(1, 400):
+      cur = mod.accel_lift_target(vt, v_ego, i / 400.0)
+      assert abs(cur - prev) < 0.2 * self.KPH
+      assert cur >= prev - 1e-12
+      prev = cur
+
+  def test_braking_episode_unaffected(self):
+    """A latched braking episode sends the same frames with the fade off."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    for accel, sp, ve, vt in ((-0.5, 91.0, 88.2, 88.0), (-0.04, 91.0, 88.2, 88.0)):
+      seqs = []
+      for fade in (None, 1e-9):
+        cc, m = _make_cc()
+        if fade is not None:
+          self._mp.setattr(m, 'ACCEL_LIFT_FADE', fade)
+        cc.setpoint_braking = True
+        cc.setpoint_handback_kmh = sp
+        t, szl, seq = 0.0, 0, []
+        while t < 1.5:
+          t = round(t + self.STEP, 2)
+          if abs(t / 0.2 - round(t / 0.2)) < 1e-9:
+            szl = (szl + 1) % 15
+          _, msgs = cc.update(make_stalk_carcontrol(accel, vt * self.KPH),
+                              make_stalk_carstate(szl, v_ego=ve * self.KPH,
+                                                  setpoint=sp * self.KPH),
+                              int(round(t * 1e9)))
+          seq.append([(a, bytes(d)) for a, d, _b in msgs])
+        seqs.append(seq)
+      assert seqs[0] == seqs[1]
+      if accel == -0.5:
+        assert any(seqs[0]), "the real-ask scenario must produce frames"
+
+  def test_shortfall_bounded_to_0p70_kmh(self):
+    import bmw.carcontroller as mod
+    worst = 0.0
+    for ve in (10.0, 30.0, 90.0):
+      for d in (0.51, 0.7, 1.0, 2.0, 4.0):
+        for i in range(1, 300):
+          a = i / 1000.0
+          v, vt = ve * self.KPH, (ve + d) * self.KPH
+          short = (self._old(mod, vt, v, a) - mod.accel_lift_target(vt, v, a)) * 3.6
+          assert short >= -1e-9
+          worst = max(worst, short)
+    assert worst <= 0.70 + 1e-3

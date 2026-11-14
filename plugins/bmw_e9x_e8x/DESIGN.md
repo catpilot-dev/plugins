@@ -906,11 +906,13 @@ So while accelerating the setpoint chases the gap that delivers `aTarget`, or
 sp_target = max(v_target, vEgo + min(accel / K_DCC_UP + DCC_HOLD_OFFSET_KMH, ACCEL_BIAS_MAX))
 ```
 
+Small asks fade the lift in (see "Small-ask lift fade" below).
+
 The `max` keeps the 45c lesson — the destination is never capped at the ask —
 and the lift applies only while `v_error > V_ERROR_DEADZONE`, the same gate
 the plus branch has, so `vTarget` decides *whether* to accelerate and
 `aTarget` *how hard*. (Lifting regardless would let the restore branch chase
-the gap past that gate once `aTarget` ≥ ~0.2 asks for more than its deadzone.) `K_DCC_UP` is the
+the gap past that gate once `aTarget` ≥ ~0.25 asks for more than its deadzone.) `K_DCC_UP` is the
 measured 0.107, not shaded like the decel side's `K_DCC`: there is no
 overshoot-into-the-car to fear on the way up. There is no pending ledger on the
 accel side, so steps in flight overshoot the gap by up to ~2 km/h at HOLD
@@ -938,6 +940,59 @@ scale with how strongly the surrogate planner answers the car's own speed
 (6.0 with none, 11.2 at the strongest tried; 454's chatter was 19.3), which the
 bench cannot know: **the on-car check is accel/brake pumping**, alongside
 under-speed time and overspeed past `vCruiseOut`.
+
+#### Small-ask lift fade
+
+**Evidence (routes 53b/53e).** Every remaining setpoint flip contains an
+accel-side up leg fired at `vT − vEgo ≈ 0.5 km/h`, the `V_ERROR_DEADZONE`:
+`vTarget` leads the car by about 0.5 km/h in steady cruise. At `aT ≈ +0.1` the
+lift put the setpoint at about `vEgo + 2.1 km/h`: about 1.6 km/h past
+`vTarget` (0.4 km/h past its hold point `vT + DCC_HOLD_OFFSET_KMH`), enough that
+the car overshot `vT` and the decel side took it back: a ±3 km/h cycle every
+3–6 s.
+
+**Formula** (`accel_lift_target`, `ACCEL_LIFT_FADE = 0.3`, the width of
+`HOLD_OFFSET_FADE`):
+
+```
+lift_kmh  = accel / K_DCC_UP * min(1, accel / ACCEL_LIFT_FADE)
+sp_target = max(v_target, vEgo + min(lift_kmh + DCC_HOLD_OFFSET_KMH, ACCEL_BIAS_MAX))
+```
+
+The lift term fades in linearly, so it is unchanged at `aT ≥ 0.3`; at `aT` 0.1
+it is 0.31 km/h instead of 0.93. Continuous in `accel`.
+
+**The floor keeps the 45c lesson.** The outer `max(v_target, ...)` stays: the
+destination is never capped below `vTarget`, only the lift past it is faded.
+
+**Bound.** The shortfall against the old law is `(a / K_DCC_UP)(1 − a / 0.3)`,
+at most 0.70 km/h, at `aT` 0.15, and zero from 0.3 up.
+
+**Dropped variant.** A hard cap at `vT` + hold offset + (aT − 0.1)/K_DCC_UP
+(A0 = 0.1) was tried first and dropped: the informal replay sim gave only −1 to
+−7 % flips. The same sim predicts the fade at flips −13 to −20 % and small-ask
+delivery −6 to −13 % (unvalidated).
+
+**On-car criteria.** Flips are judged per stratum, mix-standardised to the
+53b/53e lead share (0.62). Baselines: lead-following 2.78/min, free road
+1.08/min, standardised 2.13/min.
+
+- Success: standardised ≤ 1.3/min (−40 %) and the driver no longer notices.
+- Partial (the expected outcome): a 15–40 % flip cut.
+- Under 15 %: revert.
+
+Revert if any of these:
+
+- small-ask delivery (aT 0.1–0.3, off flat) < 0.71;
+- lead-following flips > 3.34/min;
+- free-road under-vCruiseOut time > 20 s per DCC-min (1.5× the pooled 13.3);
+- over-vT share > 1 %;
+- hard/min > 2× baseline (0.27);
+- any 0x194 reject while DCC is enabled;
+- the driver reports sluggish acceleration;
+- a flip cut under 15 %.
+
+Rollback target: 3b21068.
 
 ### The command gate is a Schmitt trigger
 

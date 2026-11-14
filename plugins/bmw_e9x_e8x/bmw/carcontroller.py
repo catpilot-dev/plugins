@@ -35,6 +35,19 @@ ACCEL_HOLD_THRESHOLD = 0.3     # m/s² — HOLD above, SINGLE below
 K_DCC_UP = 0.107               # m/s² per km/h of setpoint gap (measured, not shaded)
 DCC_HOLD_OFFSET_KMH = 1.17     # readback above vEgo at zero accel
 ACCEL_BIAS_MAX = 12.0          # km/h above vEgo, same bound as the decel side
+# Small-ask lift fade — DESIGN.md: "Small-ask lift fade". Routes 53b/53e: every
+# remaining setpoint flip contains an accel-side up leg fired at vT - vEgo ~
+# 0.5 km/h, the V_ERROR_DEADZONE (vTarget leads the car by about 0.5 km/h in
+# steady cruise). At aT ~ +0.1 the lift put the setpoint at about vEgo + 2.1
+# km/h: about 1.6 km/h past vTarget (0.4 km/h past its hold point vT +
+# DCC_HOLD_OFFSET_KMH), enough that the car overshot vT and the decel side took
+# it back, a +-3 km/h cycle every 3-6 s.
+# The lift's aT / K_DCC_UP term fades in linearly up to ACCEL_LIFT_FADE, so it
+# is unchanged at aT >= 0.3; at aT 0.1 it is 0.31 km/h instead of 0.93. The
+# shortfall is at most 0.70 km/h, at aT 0.15; max(vT, ...) stays (route 45c).
+# An informal replay sim predicted flips -13 to -20 %, small-ask delivery -6 to
+# -13 % (unvalidated).
+ACCEL_LIFT_FADE = 0.3          # m/s² — ask at which the lift is fully in
 
 # Decel setpoint inverts the plant — DESIGN.md: "The setpoint is a torque
 # request, not a speed". K_DCC is stiffer than the measured 0.0935 so every ask
@@ -144,6 +157,15 @@ def hold_offset_kmh(accel):
   """DCC_HOLD_OFFSET_KMH, faded out linearly as the braking ask deepens to
   -HOLD_OFFSET_FADE m/s² (0 at and beyond it). Added to the braking target."""
   return DCC_HOLD_OFFSET_KMH * max(0.0, 1.0 - abs(min(accel, 0.0)) / HOLD_OFFSET_FADE)
+
+
+def accel_lift_target(v_target, v_current, accel):
+  """Accel-side setpoint target (m/s): the gap that delivers `accel`, its lift
+  term faded in linearly up to ACCEL_LIFT_FADE, never below v_target. Caller
+  gates on accel > 0 and v_error > V_ERROR_DEADZONE."""
+  lift_kmh = accel / K_DCC_UP * min(1.0, accel / ACCEL_LIFT_FADE)
+  gap_kmh = min(lift_kmh + DCC_HOLD_OFFSET_KMH, ACCEL_BIAS_MAX)
+  return max(v_target, v_current + gap_kmh * CV.KPH_TO_MS)
 
 
 def minus5_landing_kmh(setpoint_kmh):
@@ -439,8 +461,8 @@ class CarController(CarControllerBase):
             # never cap the destination at the ask (route 45c). Only while
             # vTarget is ahead of the car, or the restore branch below would
             # chase the gap past the vTarget guard.
-            gap_kmh = min(accel / K_DCC_UP + DCC_HOLD_OFFSET_KMH, ACCEL_BIAS_MAX)
-            sp_target = max(v_target, v_current + gap_kmh * CV.KPH_TO_MS)
+            # Lift faded in for small asks (accel_lift_target).
+            sp_target = accel_lift_target(v_target, v_current, accel)
           if self.setpoint_braking:
             # min(accel, 0): a positive blip holds the bias; the latch releases.
             bias = max(min(accel, 0.0) / K_DCC, -SETPOINT_BIAS_MAX) * CV.KPH_TO_MS
