@@ -470,3 +470,67 @@ class TestUpdateRegistryFromGithub:
     assert rc in (0, None)
     # Only the initial commits-list request happened — no PR-fallback lookup.
     assert len(calls) == 1
+
+
+class TestUpstreamLayout:
+  """openpilot nested its tree under openpilot/ (#38219, 2026-06-21) and moved
+  Git LFS hosting to Hugging Face (#38841); GitHub and GitLab LFS return 404
+  for newer objects (Cheddar, #39255)."""
+
+  def test_lfs_resolution_tries_huggingface_first(self, monkeypatch):
+    tried = []
+    class Resp:
+      def __init__(self, url): self.url = url
+      def raise_for_status(self): pass
+      def json(self):
+        if 'huggingface.co' in self.url:
+          return {'objects': [{'actions': {'download': {'href': 'https://cdn.example/obj'}}}]}
+        return {'objects': [{'error': {'code': 404, 'message': 'Object does not exist'}}]}
+    def post(url, **k):
+      tried.append(url); return Resp(url)
+    monkeypatch.setattr(md.requests, 'post', post)
+    assert md._resolve_lfs_url('f' * 64, 10) == 'https://cdn.example/obj'
+    assert tried == ['https://huggingface.co/commaai/openpilot-lfs.git/info/lfs/objects/batch']
+
+  def test_lfs_falls_back_to_older_servers(self, monkeypatch):
+    tried = []
+    class Resp:
+      def __init__(self, url): self.url = url
+      def raise_for_status(self): pass
+      def json(self):
+        if 'github.com' in self.url:
+          return {'objects': [{'actions': {'download': {'href': 'https://gh.example/obj'}}}]}
+        return {'objects': [{'error': {'code': 404, 'message': 'Object does not exist'}}]}
+    def post(url, **k):
+      tried.append(url); return Resp(url)
+    monkeypatch.setattr(md.requests, 'post', post)
+    assert md._resolve_lfs_url('f' * 64, 10) == 'https://gh.example/obj'
+    assert 'huggingface.co' in tried[0] and 'github.com' in tried[-1]
+
+  def test_download_uses_the_nested_openpilot_path(self, dl_env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(md, 'download_file', lambda url, dest, desc=None: calls.append(url))
+    assert md.download_model(md.ModelType.DRIVING, 'good_model') == 0
+    assert calls == [f"https://raw.githubusercontent.com/commaai/openpilot/{'c' * 40}"
+                     "/openpilot/selfdrive/modeld/models/driving_supercombo.onnx"]
+
+  def test_download_falls_back_to_the_pre_nesting_path_on_404(self, dl_env, monkeypatch):
+    calls = []
+    def fake(url, dest, desc=None):
+      calls.append(url)
+      if '/openpilot/selfdrive/' in url:
+        resp = MagicMock(status_code=404)
+        raise md.requests.HTTPError('404 Not Found', response=resp)
+    monkeypatch.setattr(md, 'download_file', fake)
+    assert md.download_model(md.ModelType.DRIVING, 'good_model') == 0
+    assert len(calls) == 2
+    assert calls[1].endswith(f"{'c' * 40}/selfdrive/modeld/models/driving_supercombo.onnx")
+
+  def test_non_404_error_does_not_try_the_other_path(self, dl_env, monkeypatch):
+    calls = []
+    def fake(url, dest, desc=None):
+      calls.append(url)
+      raise md.requests.HTTPError('500', response=MagicMock(status_code=500))
+    monkeypatch.setattr(md, 'download_file', fake)
+    assert md.download_model(md.ModelType.DRIVING, 'good_model') == 1
+    assert len(calls) == 1

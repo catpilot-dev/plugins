@@ -36,10 +36,13 @@ Models are openpilot's own model files, pulled at a specific **GitHub commit**:
   the UI, and every gate, read `compatible_models.json` through `catalog.py`
   instead (see Compatibility gating below).
 - **Download** fetches each ONNX from
-  `raw.githubusercontent.com/commaai/openpilot/<commit>/selfdrive/modeld/models/<file>`.
+  `raw.githubusercontent.com/commaai/openpilot/<commit>/openpilot/selfdrive/modeld/models/<file>`,
+  and on a 404 from the pre-nesting path `…/<commit>/selfdrive/modeld/models/<file>`
+  (openpilot moved its tree under `openpilot/` on 2026-06-21, #38219; `_RAW_MODEL_DIRS`).
   These files are Git LFS pointers; `download_file` detects the pointer, parses
   `oid`/`size`, and resolves the real object through the LFS batch API, trying
-  **GitHub first, then GitLab** (`_LFS_BATCH_URLS`). The resolved blob is written
+  **Hugging Face first** (openpilot's LFS host since #38841), **then GitHub, then
+  GitLab** (`_LFS_BATCH_URLS`). The resolved blob is written
   to the model dir, and a `model_info.json` is written alongside.
 - Catalog entries with `source: converted` skip GitHub commits entirely: each
   `files` item carries a direct `url`, `sha256` and `size`. Bytes are streamed to
@@ -301,7 +304,7 @@ Settings → Plugins toggle. The moving parts are file locations:
 | `CATALOG_FILE` | `<plugin root>/compatible_models.json` | `catalog.py` | The curated compatibility gate |
 | `VERSION_H` | `/data/openpilot/openpilot/common/version.h` | `catalog.py` | Running openpilot version (source of truth) |
 | `UNLOCK_MARKER` | `<PLUGINS_RUNTIME_DIR>/model_selector/data/.unlocked` | `catalog.py` | Maintainer unlock for untested models |
-| `_LFS_BATCH_URLS` | GitHub, then GitLab | `model_download.py` | LFS resolve order |
+| `_LFS_BATCH_URLS` | Hugging Face, then GitHub, then GitLab | `model_download.py` | LFS resolve order |
 | `PYTHON_BIN` | `/usr/local/venv/bin/python` | `ui.py` | Interpreter for the download subprocess |
 
 ## Key files

@@ -50,8 +50,10 @@ def load_registry():
     return registry.get('driving_models', {}), registry.get('dm_models', {})
 
 
-# openpilot LFS servers — try GitHub first (older models), fall back to GitLab
+# openpilot LFS servers. Hugging Face hosts openpilot's LFS since #38841
+# (openpilot/.lfsconfig); GitHub and GitLab hold only older objects.
 _LFS_BATCH_URLS = [
+    "https://huggingface.co/commaai/openpilot-lfs.git/info/lfs/objects/batch",
     "https://github.com/commaai/openpilot.git/info/lfs/objects/batch",
     "https://gitlab.com/commaai/openpilot-lfs.git/info/lfs/objects/batch",
 ]
@@ -80,6 +82,21 @@ def _resolve_lfs_url(oid: str, size: int) -> str:
         except Exception as e:
             last_error = str(e)
     raise Exception(last_error or "LFS object not found on any server")
+
+
+# Model directories in the openpilot tree, newest layout first.
+_RAW_MODEL_DIRS = ["openpilot/selfdrive/modeld/models", "selfdrive/modeld/models"]
+
+
+def _download_from_commit(base_urls: list, filename: str, dest: Path):
+    """Download filename from the first base URL that has it; only a 404 moves on."""
+    for i, base in enumerate(base_urls):
+        try:
+            return download_file(f"{base}/{filename}", dest, filename)
+        except requests.HTTPError as e:
+            not_found = e.response is not None and e.response.status_code == 404
+            if not not_found or i == len(base_urls) - 1:
+                raise
 
 
 def download_file(url: str, dest: Path, desc: str = None):
@@ -285,8 +302,10 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
     print(f"Output: {output_dir}")
     print()
 
-    # Download ONNX files from GitHub
-    base_url = f"https://raw.githubusercontent.com/commaai/openpilot/{commit}/selfdrive/modeld/models"
+    # Download ONNX files from GitHub. openpilot nested its tree under openpilot/
+    # in #38219 (2026-06-21); commits before that keep the old path, so a 404 on
+    # the nested path falls back to it.
+    base_urls = [f"https://raw.githubusercontent.com/commaai/openpilot/{commit}/{d}" for d in _RAW_MODEL_DIRS]
 
     all_files = model_info['files']
 
@@ -304,7 +323,7 @@ def download_model(model_type: ModelType, model_id: str, output_dir: Path = None
             if isinstance(item, dict):
                 download_direct(item['url'], dest, item['sha256'], item['size'])
             else:
-                download_file(f"{base_url}/{filename}", dest, filename)
+                _download_from_commit(base_urls, filename, dest)
         except Exception as e:
             print(f"    ❌ Failed: {e}")
             dest.with_name(dest.name + '.part').unlink(missing_ok=True)
