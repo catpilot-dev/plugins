@@ -32,18 +32,20 @@ def _law():
 RISE_RATE = 0.25      # m/s^3
 FALL_RATE = 1.0       # m/s^3
 DT_MAX = 0.2          # s
-LEAD_HOLD_S = 1.0     # s, lead gates stay tripped this long after the condition clears
+SOFT_HOLD_S = 2.0     # s, a soft gate stays tripped this long after its condition clears
 PARAM_MAX_AGE_S = 1.0
 STRENGTH_MAX = 0.6
-LEAD_GATES = ('lead_gap', 'lead_closing')
+SOFT_GATES = ('plan_decel', 'curve', 'lead_gap', 'lead_closing')
 
 _clock = time.monotonic
 
 # State.
 _lift = 0.0
 _last_t = None
-_lead_hold_until = 0.0
-_lead_hold_gate = ''
+_soft_hold_until = 0.0
+_soft_hold_gate = ''
+_gap_latched = False       # lead_gap tripped: the law uses the wider clear threshold
+_closing_latched = False   # lead_closing tripped: same
 _params = None
 _params_t = None
 
@@ -53,11 +55,14 @@ _pub_ok = True
 
 
 def _reset_state():
-  global _lift, _last_t, _lead_hold_until, _lead_hold_gate, _params, _params_t
+  global _lift, _last_t, _soft_hold_until, _soft_hold_gate, _gap_latched, _closing_latched
+  global _params, _params_t
   _lift = 0.0
   _last_t = None
-  _lead_hold_until = 0.0
-  _lead_hold_gate = ''
+  _soft_hold_until = 0.0
+  _soft_hold_gate = ''
+  _gap_latched = False
+  _closing_latched = False
   _params = None
   _params_t = None
 
@@ -142,7 +147,7 @@ def on_e2e_accel(a_e2e, v_ego, v_cruise, a_cruise, sm):
 
 
 def _on_e2e_accel(a_e2e, v_ego, v_cruise, a_cruise, sm):
-  global _lift, _last_t, _lead_hold_until, _lead_hold_gate
+  global _lift, _last_t, _soft_hold_until, _soft_hold_gate, _gap_latched, _closing_latched
   law = _law()
   now = _clock()
   dt = 0.0 if _last_t is None else min(DT_MAX, max(0.0, now - _last_t))
@@ -173,10 +178,25 @@ def _on_e2e_accel(a_e2e, v_ego, v_cruise, a_cruise, sm):
   if gate is None:
     mv = sm['modelV2']
     lead = sm['radarState'].leadOne
+    present = bool(lead.present)
+    if not present:
+      _gap_latched = _closing_latched = False
     target, gate = law.lift_target(
       a_in, float(v_ego), float(v_cruise), strength, t_follow,
       mv.velocity.t, mv.velocity.x, mv.orientationRate.z,
-      bool(mv.action.shouldStop), bool(lead.present), float(lead.dRel), float(lead.vRel))
+      bool(mv.action.shouldStop), present, float(lead.dRel), float(lead.vRel),
+      lead_gap_margin_s=law.LEAD_GAP_CLEAR_MARGIN_S if _gap_latched else law.LEAD_MARGIN_S,
+      lead_closing_vrel=law.LEAD_CLOSING_CLEAR_VREL if _closing_latched else law.LEAD_CLOSING_VREL)
+    # Latches follow the law's verdict, but only when it got as far as the lead
+    # checks (an earlier plan/curve gate leaves them as they were).
+    if gate == 'lead_gap':
+      _gap_latched = True
+    elif gate in ('lead_closing', 'active', 'none_needed'):
+      _gap_latched = False
+    if gate == 'lead_closing':
+      _closing_latched = True
+    elif gate in ('active', 'none_needed'):
+      _closing_latched = False
 
   hard = gate in ('disabled', 'off', 'gas', 'brake', 'standstill', 'stop',
                   'ask_decel', 'no_model')
@@ -185,13 +205,13 @@ def _on_e2e_accel(a_e2e, v_ego, v_cruise, a_cruise, sm):
     target = 0.0
     out = a_in if math.isfinite(a_in) else float(a_e2e)
   else:
-    # Lead gates hold for LEAD_HOLD_S after the condition clears, so a flapping
-    # vision lead does not pump the lift.
-    if gate in LEAD_GATES:
-      _lead_hold_until = now + LEAD_HOLD_S
-      _lead_hold_gate = gate
-    elif gate in ('active', 'none_needed') and now < _lead_hold_until:
-      gate = _lead_hold_gate
+    # Soft gates hold for SOFT_HOLD_S after their condition clears, so a flapping
+    # plan, curve or vision lead does not pump the lift. Hard resets never get here.
+    if gate in SOFT_GATES:
+      _soft_hold_until = now + SOFT_HOLD_S
+      _soft_hold_gate = gate
+    elif gate in ('active', 'none_needed') and now < _soft_hold_until:
+      gate = _soft_hold_gate
       target = 0.0
 
     if target > _lift:

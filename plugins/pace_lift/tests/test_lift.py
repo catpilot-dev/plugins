@@ -14,12 +14,12 @@ T_LONG = [i * 0.5 for i in range(21)]  # 0..10 s
 
 def call(a_e2e=0.1, v_ego=22.0, v_cruise=27.0, strength=0.4, t_follow=1.25,
          plan_t=None, plan_v=None, plan_yaw=None, should_stop=False,
-         lead_present=False, lead_d=0.0, lead_vrel=0.0):
+         lead_present=False, lead_d=0.0, lead_vrel=0.0, **kw):
   plan_t = T if plan_t is None else plan_t
   plan_v = [v_ego] * len(plan_t) if plan_v is None else plan_v
   plan_yaw = [0.0] * len(plan_t) if plan_yaw is None else plan_yaw
   return lift.lift_target(a_e2e, v_ego, v_cruise, strength, t_follow, plan_t, plan_v, plan_yaw,
-                          should_stop, lead_present, lead_d, lead_vrel)
+                          should_stop, lead_present, lead_d, lead_vrel, **kw)
 
 
 def test_constants():
@@ -73,11 +73,14 @@ def test_should_stop_gate():
 
 
 def test_plan_decel_gate():
+  assert lift.PLAN_DECEL_MARGIN == 2.0
   v = [22.0] * len(T)
-  v[T.index(4.0)] = 22.0 - 1.5
+  v[T.index(4.0)] = 22.0 - 1.5   # a 1.5 m/s dip no longer trips (V8 margin 2.0)
+  assert call(plan_v=v)[1] == 'active'
+  v[T.index(4.0)] = 22.0 - 2.5
   assert call(plan_v=v) == (0.0, 'plan_decel')
   v2 = [22.0] * len(T_LONG)
-  v2[T_LONG.index(7.0)] = 22.0 - 1.5
+  v2[T_LONG.index(7.0)] = 22.0 - 2.5   # the same dip at t 7 s is outside the 6 s window
   assert call(plan_t=T_LONG, plan_v=v2)[1] == 'active'
 
 
@@ -103,7 +106,7 @@ def test_lead_closing_gate():
 
 def test_gate_order():
   v = [22.0] * len(T)
-  v[3] = 20.0
+  v[3] = 19.0
   assert call(plan_v=v, plan_yaw=[0.07] * len(T), lead_present=True, lead_d=10.0)[1] == 'plan_decel'
   assert call(plan_yaw=[0.07] * len(T), lead_present=True, lead_d=10.0)[1] == 'curve'
   assert call(should_stop=True, a_e2e=-0.5)[1] == 'stop'
@@ -132,3 +135,20 @@ def test_nonfinite_inputs():
 
 def test_no_model_precedes_stop():
   assert call(should_stop=True, v_cruise=float('nan')) == (0.0, 'no_model')
+
+
+def test_lead_gap_hysteresis_kwarg():
+  # aggressive, v 22: trip 27.5 + 6 + 0.5*22 = 44.5, clear margin 0.8 s -> 51.1
+  assert lift.LEAD_GAP_CLEAR_MARGIN_S == 0.8
+  assert call(lead_present=True, lead_d=50.0)[1] == 'active'
+  assert call(lead_present=True, lead_d=50.0, lead_gap_margin_s=0.8) == (0.0, 'lead_gap')
+  assert call(lead_present=True, lead_d=51.0, lead_gap_margin_s=0.8)[1] == 'lead_gap'
+  assert call(lead_present=True, lead_d=51.2, lead_gap_margin_s=0.8)[1] == 'active'
+
+
+def test_lead_closing_hysteresis_kwarg():
+  assert lift.LEAD_CLOSING_CLEAR_VREL == -0.2
+  kw = dict(lead_present=True, lead_d=90.0)
+  assert call(lead_vrel=-0.3, **kw)[1] == 'active'
+  assert call(lead_vrel=-0.3, lead_closing_vrel=-0.2, **kw) == (0.0, 'lead_closing')
+  assert call(lead_vrel=-0.1, lead_closing_vrel=-0.2, **kw)[1] == 'active'

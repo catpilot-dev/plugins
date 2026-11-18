@@ -173,18 +173,18 @@ def test_lead_cut_in_and_hold(hook):
   tick(hook, sm=cut_in)
   assert last_gate(hook) == 'lead_gap'
   assert prev - hook._lift <= 0.05 + 1e-9
-  # lead leaves: gate is held for 1.0 s, lift keeps falling to 0 and stays there
+  # lead leaves: gate is held for 2.0 s, lift keeps falling to 0 and stays there
   clear = make_sm()
-  for _ in range(19):
+  for _ in range(38):
     tick(hook, sm=clear)
     assert last_gate(hook) == 'lead_gap'
     assert hook._lift <= prev
   assert hook._lift == 0.0
-  # after the 1.0 s hold the lift rebuilds at the rise rate
-  for _ in range(3):
+  # after the 2.0 s hold the lift rebuilds at the rise rate
+  for _ in range(4):
     tick(hook, sm=clear)
   assert last_gate(hook) == 'active'
-  assert 0.0 < hook._lift <= 0.05
+  assert 0.0 < hook._lift <= 0.10
 
 
 def test_lead_closing_hold(hook):
@@ -193,6 +193,108 @@ def test_lead_closing_hold(hook):
   assert last_gate(hook) == 'lead_closing'
   tick(hook, sm=make_sm())
   assert last_gate(hook) == 'lead_closing'
+
+
+def _soft_sm(gate):
+  return {
+    'plan_decel': make_sm(plan_v=[22.0, 22.0, 22.0, 19.0] + [22.0] * (len(T) - 4)),
+    'curve': make_sm(yaw=[0.07] * len(T)),
+    'lead_gap': make_sm(lead={'present': True, 'd': 30.0, 'vrel': 0.0}),
+    'lead_closing': make_sm(lead={'present': True, 'd': 90.0, 'vrel': -1.0}),
+  }[gate]
+
+
+@pytest.mark.parametrize('gate', ['plan_decel', 'curve', 'lead_gap', 'lead_closing'])
+def test_soft_gate_hold_two_seconds(hook, gate):
+  assert hook.SOFT_HOLD_S == 2.0
+  build_lift(hook)
+  tick(hook, sm=_soft_sm(gate))
+  assert last_gate(hook) == gate
+  clear = make_sm()
+  for _ in range(38):   # 1.9 s after the trip: still held, target 0
+    tick(hook, sm=clear)
+    assert last_gate(hook) == gate
+    assert hook._pub.sent[-1]['target'] == 0.0
+  for _ in range(4):    # past 2.0 s: released
+    tick(hook, sm=clear)
+  assert last_gate(hook) == 'active'
+  assert hook._pub.sent[-1]['target'] > 0.0
+
+
+@pytest.mark.parametrize('case', ['gas', 'brake', 'standstill', 'stop', 'ask_decel', 'disabled'])
+def test_hard_reset_during_hold_is_instant(hook, cfg, case):
+  build_lift(hook)
+  tick(hook, sm=_soft_sm('curve'))
+  assert last_gate(hook) == 'curve'
+  a, sm = 0.1, make_sm()
+  if case == 'gas':
+    sm = make_sm(gas=True)
+  elif case == 'brake':
+    sm = make_sm(brake=True)
+  elif case == 'standstill':
+    sm = make_sm(standstill=True)
+  elif case == 'stop':
+    sm = make_sm(should_stop=True)
+  elif case == 'ask_decel':
+    a = -0.5
+  elif case == 'disabled':
+    (cfg / 'PaceLiftEnabled').write_text('0')
+    hook._clock_state.t += 1.5
+  out = tick(hook, a=a, sm=sm)
+  assert out == a
+  assert hook._lift == 0.0
+  assert last_gate(hook) == case
+
+
+def _no_hold(hook, monkeypatch):
+  monkeypatch.setattr(hook, 'SOFT_HOLD_S', 0.0)
+
+
+def test_lead_gap_hysteresis(hook, monkeypatch):
+  _no_hold(hook, monkeypatch)
+  lead = lambda d: make_sm(lead={'present': True, 'd': d, 'vrel': 0.0})   # aggressive, v 22
+  tick(hook, sm=lead(50.0))
+  assert last_gate(hook) == 'active'          # not tripped: 50 > 44.5
+  tick(hook, sm=lead(44.0))
+  assert last_gate(hook) == 'lead_gap'        # trips below 44.5
+  tick(hook, sm=lead(50.0))
+  assert last_gate(hook) == 'lead_gap'        # latched: clears only at 27.5 + 6 + 0.8*22 = 51.1
+  tick(hook, sm=lead(51.0))
+  assert last_gate(hook) == 'lead_gap'
+  tick(hook, sm=lead(51.2))
+  assert last_gate(hook) == 'active'
+  tick(hook, sm=lead(50.0))
+  assert last_gate(hook) == 'active'          # latch is gone
+
+
+def test_lead_closing_hysteresis(hook, monkeypatch):
+  _no_hold(hook, monkeypatch)
+  lead = lambda vr: make_sm(lead={'present': True, 'd': 90.0, 'vrel': vr})
+  tick(hook, sm=lead(-0.3))
+  assert last_gate(hook) == 'active'
+  tick(hook, sm=lead(-0.6))
+  assert last_gate(hook) == 'lead_closing'
+  tick(hook, sm=lead(-0.3))
+  assert last_gate(hook) == 'lead_closing'    # latched until vRel >= -0.2
+  tick(hook, sm=lead(-0.1))
+  assert last_gate(hook) == 'active'
+  tick(hook, sm=lead(-0.3))
+  assert last_gate(hook) == 'active'
+
+
+def test_latch_reset_when_lead_disappears(hook, monkeypatch):
+  _no_hold(hook, monkeypatch)
+  lead = lambda d, vr=0.0: make_sm(lead={'present': True, 'd': d, 'vrel': vr})
+  tick(hook, sm=lead(44.0))
+  assert last_gate(hook) == 'lead_gap'
+  tick(hook, sm=make_sm())                    # lead gone: latch resets
+  tick(hook, sm=lead(50.0))
+  assert last_gate(hook) == 'active'
+  tick(hook, sm=lead(90.0, -0.6))
+  assert last_gate(hook) == 'lead_closing'
+  tick(hook, sm=make_sm())
+  tick(hook, sm=lead(90.0, -0.3))
+  assert last_gate(hook) == 'active'
 
 
 def test_output_bounded_by_a_cruise(hook):

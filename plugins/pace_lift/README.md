@@ -33,11 +33,15 @@ shouldStop), `ask_decel` (ask at or below -0.10 m/s2), `no_model` (short or
 non-finite inputs, including a_cruise).
 
 Soft gates (target 0, the lift falls at up to 1.0 m/s3), first match reported:
-`plan_decel` (model plan drops more than 1 m/s below v_ego within 6 s), `curve`
+`plan_decel` (model plan drops more than 2 m/s below v_ego within 6 s), `curve`
 (planned lateral accel 1.5 m/s2 or more within 6 s), `lead_gap` (lead closer
 than T_FOLLOW * v + 6 m + 0.5 s * v; T_FOLLOW 1.25 / 1.45 / 1.75 s), `lead_closing`
-(lead closing faster than 0.5 m/s), `none_needed` (the ramps give 0). The lead
-gates hold for 1.0 s after their condition clears.
+(lead closing faster than 0.5 m/s), `none_needed` (the ramps give 0).
+
+Lead hysteresis: a tripped `lead_gap` clears only at T_FOLLOW * v + 6 m + 0.8 s * v;
+a tripped `lead_closing` clears only when the closing speed is under 0.2 m/s.
+Both latches reset when there is no lead. After any soft gate trips, the target
+stays 0 until no soft gate has tripped for 2.0 s (hard resets are never delayed).
 
 ### Bounds and rates
 
