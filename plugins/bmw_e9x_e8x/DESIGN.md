@@ -994,6 +994,39 @@ Revert if any of these:
 
 Rollback target: 3b21068.
 
+**Result on 545 + 546 (f571a02).** Flips −19 % standardised (partial), flat
+cruise −91 %, no logged revert line crossed. The driver reported sluggish
+catch-up on 546, a revert line. The overall delivery figure (0.84) hid where
+the loss sat: on asks at aT 0.03–0.10 the car got 0.28–0.30 of the ask against
+0.77–0.82 before, and 0.70–0.74 against 0.87–0.93 at 0.10–0.20.
+
+**Sustained asks get the full lift back** (`ACCEL_LIFT_FADE_HOLD = 2.0` s,
+`ACCEL_LIFT_FADE_RAMP = 1.0` s, `accel_ask_age`). The flips and the
+sluggishness separate by how long the positive ask has lasted, not by where the
+car is against vCruiseOut (the fade's flip cut was lead-following more than
+3 km/h under vCruiseOut, 2.62 → 1.51/min; near vCruiseOut it cut nothing):
+
+| | 53b/53e | 545/546 (fade) |
+|---|---|---|
+| flips with the up leg within 2 s of the ask turning positive | 80 / 96 | 60 / 71 |
+| small-ask time with the ask older than 3 s | 56–61 % | 56–63 % |
+| delivery on those asks (aEgo 1 s later / aT) | 0.83–0.93 | 0.63–0.67 |
+
+```
+fade      = min(1, accel / ACCEL_LIFT_FADE)
+sustained = clip((ask_age − ACCEL_LIFT_FADE_HOLD) / ACCEL_LIFT_FADE_RAMP, 0, 1)
+lift_kmh  = accel / K_DCC_UP * (fade + (1 − fade) * sustained)
+```
+
+`ask_age` is the time since `actuators.accel` last turned positive; any
+non-positive ask, a gas press or disengagement restarts it. Up to 2 s the law is
+the fade; from 3 s it is the pre-fade law (3b21068); between, a linear ramp of at
+most 0.7 km/h per second. The floor and the 0.70 km/h shortfall bound are
+unchanged. Rough expectation from the logged split (not a validated sim): flips
+about 1.55/min unstandardised against 2.20 before (fade 1.40), sustained-ask
+delivery back near 0.83–0.93. On-car criteria and revert lines as above, with
+the driver's catch-up feel the deciding check. Rollback target: f571a02.
+
 ### The command gate is a Schmitt trigger
 
 A band wide enough to stop noise *starting* a braking episode is also wide

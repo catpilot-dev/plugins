@@ -48,6 +48,15 @@ ACCEL_BIAS_MAX = 12.0          # km/h above vEgo, same bound as the decel side
 # An informal replay sim predicted flips -13 to -20 %, small-ask delivery -6 to
 # -13 % (unvalidated).
 ACCEL_LIFT_FADE = 0.3          # m/s² — ask at which the lift is fully in
+# The fade holds only while the positive ask is fresh — DESIGN.md: "Small-ask
+# lift fade" (sustained asks). Routes 545/546: 80/96 flips before the fade and
+# 60/71 with it fired their up leg within 2 s of the ask turning positive, but
+# 56-63 % of small-ask time is asks older than 3 s (catch-up), whose delivery
+# the fade cut from 0.83-0.93 to 0.63-0.67. After ACCEL_LIFT_FADE_HOLD s of a
+# positive ask the faded share of the lift ramps back in over
+# ACCEL_LIFT_FADE_RAMP s (continuous, at most 0.7 km/h per second).
+ACCEL_LIFT_FADE_HOLD = 2.0     # s — fresh-ask window that keeps the fade
+ACCEL_LIFT_FADE_RAMP = 1.0     # s — then the full lift is back in
 
 # Decel setpoint inverts the plant — DESIGN.md: "The setpoint is a torque
 # request, not a speed". K_DCC is stiffer than the measured 0.0935 so every ask
@@ -159,11 +168,15 @@ def hold_offset_kmh(accel):
   return DCC_HOLD_OFFSET_KMH * max(0.0, 1.0 - abs(min(accel, 0.0)) / HOLD_OFFSET_FADE)
 
 
-def accel_lift_target(v_target, v_current, accel):
+def accel_lift_target(v_target, v_current, accel, ask_age=0.0):
   """Accel-side setpoint target (m/s): the gap that delivers `accel`, its lift
-  term faded in linearly up to ACCEL_LIFT_FADE, never below v_target. Caller
-  gates on accel > 0 and v_error > V_ERROR_DEADZONE."""
-  lift_kmh = accel / K_DCC_UP * min(1.0, accel / ACCEL_LIFT_FADE)
+  term faded in linearly up to ACCEL_LIFT_FADE, never below v_target. The fade
+  holds for the first ACCEL_LIFT_FADE_HOLD s of a positive ask (`ask_age`, s),
+  then ramps out over ACCEL_LIFT_FADE_RAMP s. Caller gates on accel > 0 and
+  v_error > V_ERROR_DEADZONE."""
+  fade = min(1.0, accel / ACCEL_LIFT_FADE)
+  sustained = min(1.0, max(0.0, (ask_age - ACCEL_LIFT_FADE_HOLD) / ACCEL_LIFT_FADE_RAMP))
+  lift_kmh = accel / K_DCC_UP * (fade + (1.0 - fade) * sustained)
   gap_kmh = min(lift_kmh + DCC_HOLD_OFFSET_KMH, ACCEL_BIAS_MAX)
   return max(v_target, v_current + gap_kmh * CV.KPH_TO_MS)
 
@@ -218,6 +231,8 @@ class CarController(CarControllerBase):
     # Concordance state: vTarget history for its trend, and the braking latch.
     self.v_target_hist = deque(maxlen=int(round(DV_WINDOW / DT_CTRL)) + 1)
     self.setpoint_braking = False
+    self.accel_ask_start_ns = None   # start of the current positive accel ask
+    self.accel_ask_age = 0.0         # s, kept for logging and tests
     # True once this braking episode has sent a down command: narrows the gate
     # to SETPOINT_HOLD_DEADZONE until the episode ends.
     self.setpoint_commanding = False
@@ -315,6 +330,16 @@ class CarController(CarControllerBase):
     v_error = v_target - v_current
 
     accel = actuators.accel
+
+    # Age of the positive ask (accel_lift_target's fade hold). Restarts on any
+    # non-positive ask, a gas press or disengagement.
+    if CC.enabled and accel > 0 and not CS.out.gasPressed:
+      if self.accel_ask_start_ns is None:
+        self.accel_ask_start_ns = now_nanos
+      self.accel_ask_age = (now_nanos - self.accel_ask_start_ns) / 1e9
+    else:
+      self.accel_ask_start_ns = None
+      self.accel_ask_age = 0.0
 
     # Anchor SZL's idle phase on an RX counter advance our own TX can't explain.
     if CS.cruise_stalk_counter != self.rx_cruise_stalk_counter_last:
@@ -461,8 +486,8 @@ class CarController(CarControllerBase):
             # never cap the destination at the ask (route 45c). Only while
             # vTarget is ahead of the car, or the restore branch below would
             # chase the gap past the vTarget guard.
-            # Lift faded in for small asks (accel_lift_target).
-            sp_target = accel_lift_target(v_target, v_current, accel)
+            # Lift faded in for small, fresh asks (accel_lift_target).
+            sp_target = accel_lift_target(v_target, v_current, accel, self.accel_ask_age)
           if self.setpoint_braking:
             # min(accel, 0): a positive blip holds the bias; the latch releases.
             bias = max(min(accel, 0.0) / K_DCC, -SETPOINT_BIAS_MAX) * CV.KPH_TO_MS

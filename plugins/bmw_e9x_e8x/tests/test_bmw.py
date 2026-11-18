@@ -2717,3 +2717,132 @@ class TestSmallAskLiftFade:
           assert short >= -1e-9
           worst = max(worst, short)
     assert worst <= 0.70 + 1e-3
+
+
+class TestSustainedAskFullLift:
+  """Routes 545/546: the fade cut delivery of sustained small asks (catch-up,
+  56-63 % of small-ask time is asks older than 3 s) from 0.83-0.93 to
+  0.63-0.67, while 80/96 (before) and 60/71 (fade) flips fired their up leg
+  within 2 s of the positive ask starting. The fade holds for the first
+  ACCEL_LIFT_FADE_HOLD s of a positive ask, then ramps to the full lift over
+  ACCEL_LIFT_FADE_RAMP s."""
+
+  KPH = 1 / 3.6
+  STEP = 0.01
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  @staticmethod
+  def _old(mod, v_target, v_current, accel):
+    gap = min(accel / mod.K_DCC_UP + mod.DCC_HOLD_OFFSET_KMH, mod.ACCEL_BIAS_MAX)
+    return max(v_target, v_current + gap / 3.6)
+
+  @staticmethod
+  def _faded(mod, v_target, v_current, accel):
+    lift = accel / mod.K_DCC_UP * min(1.0, accel / mod.ACCEL_LIFT_FADE)
+    return max(v_target, v_current + min(lift + mod.DCC_HOLD_OFFSET_KMH, mod.ACCEL_BIAS_MAX) / 3.6)
+
+  def test_constants(self):
+    import bmw.carcontroller as mod
+    assert mod.ACCEL_LIFT_FADE_HOLD == 2.0
+    assert mod.ACCEL_LIFT_FADE_RAMP == 1.0
+
+  def test_fresh_ask_keeps_the_fade(self):
+    import bmw.carcontroller as mod
+    for ve, d in ((25.0, 0.6), (80.0, 1.0)):
+      v, vt = ve * self.KPH, (ve + d) * self.KPH
+      for a in (0.02, 0.1, 0.15, 0.25):
+        for age in (0.0, 1.0, 1.99, 2.0):
+          assert mod.accel_lift_target(vt, v, a, age) == pytest.approx(self._faded(mod, vt, v, a))
+      # default age = fresh ask
+      assert mod.accel_lift_target(vt, v, 0.1) == pytest.approx(self._faded(mod, vt, v, 0.1))
+
+  def test_sustained_ask_gets_the_full_lift(self):
+    import bmw.carcontroller as mod
+    for ve, d in ((25.0, 0.6), (80.0, 1.0)):
+      v, vt = ve * self.KPH, (ve + d) * self.KPH
+      for a in (0.02, 0.1, 0.15, 0.25, 0.5):
+        for age in (3.0, 5.0, 60.0):
+          assert mod.accel_lift_target(vt, v, a, age) == pytest.approx(self._old(mod, vt, v, a))
+
+  def test_ramp_is_linear_in_age(self):
+    import bmw.carcontroller as mod
+    v, vt, a = 25.0 * self.KPH, 25.6 * self.KPH, 0.1
+    lo, hi = self._faded(mod, vt, v, a), self._old(mod, vt, v, a)
+    assert mod.accel_lift_target(vt, v, a, 2.5) == pytest.approx((lo + hi) / 2)
+    prev = mod.accel_lift_target(vt, v, a, 0.0)
+    for i in range(1, 401):
+      cur = mod.accel_lift_target(vt, v, a, i / 100.0)
+      assert cur >= prev - 1e-12
+      assert cur - prev < 0.02 * self.KPH   # <= 0.7 km/h per second, 10 ms steps
+      prev = cur
+
+  def test_bounds_hold_at_every_age(self):
+    import bmw.carcontroller as mod
+    for ve in (10.0, 30.0, 90.0):
+      for d in (0.51, 1.0, 4.0):
+        v, vt = ve * self.KPH, (ve + d) * self.KPH
+        for i in range(1, 300, 7):
+          a = i / 1000.0
+          for age in (0.0, 2.3, 2.7, 9.0):
+            t = mod.accel_lift_target(vt, v, a, age)
+            assert t >= vt - 1e-12
+            assert self._faded(mod, vt, v, a) - 1e-12 <= t <= self._old(mod, vt, v, a) + 1e-12
+
+  def _run(self, phases, setpoint_kmh=26.7, v_ego_kmh=25.0, gas_at=None):
+    """phases: list of (accel, vt_kmh, seconds) after a 1 s settle at vT = vEgo.
+    Returns [(t, action)] for TX frames after the settle, and the controller."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, mod = _make_cc()
+    act_bits = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
+    t, szl, out = 0.0, 0, []
+    for a, vt, dur in [(0.0, v_ego_kmh, 1.0)] + phases:
+      for _ in range(int(round(dur / self.STEP))):
+        t = round(t + self.STEP, 2)
+        if abs(t / 0.2 - round(t / 0.2)) < 1e-9:
+          szl = (szl + 1) % 15
+        cs = make_stalk_carstate(szl, v_ego=v_ego_kmh * self.KPH, setpoint=setpoint_kmh * self.KPH)
+        if gas_at is not None and gas_at[0] <= t < gas_at[1]:
+          cs.out.gasPressed = True
+        _, msgs = cc.update(make_stalk_carcontrol(a, vt * self.KPH), cs, int(round(t * 1e9)))
+        for addr, dat, _bus in msgs:
+          if addr == 404 and t > 1.0:
+            out.extend((t, n) for b, n in act_bits.items() if dat[2] & (1 << b))
+    return out, cc
+
+  def test_sustained_small_ask_sends_plus1_after_the_hold(self):
+    """Readback 26.7, vEgo 25.0, vT 25.6, aT 0.1: faded target 26.48 (no
+    plus1), full lift 27.10 (plus1) — reached once the ask is ~2.5 s old."""
+    acts, _ = self._run([(0.1, 25.6, 4.0)])
+    plus = [t for t, n in acts if n == 'plus1']
+    assert plus, acts
+    assert min(plus) >= 1.0 + 2.0
+    assert not [n for _, n in acts if n != 'plus1']
+
+  def test_dip_in_the_ask_restarts_the_hold(self):
+    acts, _ = self._run([(0.1, 25.6, 1.9), (0.0, 25.6, 0.05), (0.1, 25.6, 1.9)])
+    assert 'plus1' not in [n for _, n in acts]
+
+  def test_age_tracks_and_resets(self):
+    _, cc = self._run([(0.1, 25.6, 1.5)])
+    assert cc.accel_ask_age == pytest.approx(1.5, abs=0.02)
+    _, cc = self._run([(0.1, 25.6, 1.5), (-0.1, 25.6, 0.05)])
+    assert cc.accel_ask_age == 0.0
+    # gas press restarts the hold
+    _, cc = self._run([(0.1, 25.6, 3.0)], gas_at=(2.0, 2.5))
+    assert cc.accel_ask_age == pytest.approx(1.5, abs=0.02)
+
+  def test_disengaged_has_no_age(self):
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, _ = _make_cc()
+    for i in range(1, 400):
+      cc.update(make_stalk_carcontrol(0.1, 25.6 * self.KPH, enabled=False),
+                make_stalk_carstate(i // 20 % 15, v_ego=25 * self.KPH, setpoint=26.7 * self.KPH),
+                int(i * 1e7))
+    assert cc.accel_ask_age == 0.0
