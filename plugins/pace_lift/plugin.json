@@ -1,0 +1,44 @@
+{
+  "id": "pace_lift",
+  "name": "Pace Lift",
+  "version": "0.11.2",
+  "type": "hook",
+  "author": "catpilot",
+  "description": "In experimental mode, lifts the e2e accel ask toward the planner's speed target in proportion to the gap, scaled by driving personality.",
+  "min_openpilot": "0.11.2",
+  "max_openpilot": "0.11.99",
+  "conflicts": [],
+  "dependencies": [],
+  "hooks": {
+    "planner.e2e_accel": {
+      "module": "hook",
+      "function": "on_e2e_accel",
+      "priority": 50
+    },
+    "device.health_check": {
+      "module": "hook",
+      "function": "on_health_check",
+      "priority": 50
+    }
+  },
+  "params": {
+    "PaceLiftEnabled": {
+      "type": "bool",
+      "default": true,
+      "label": "Pace Lift",
+      "desc": "Lift the e2e accel ask toward the speed target in experimental mode"
+    },
+    "PaceLiftAggressive": {
+      "type": "string",
+      "default": "0.40",
+      "label": "Pace Lift strength, Aggressive (m/s2)",
+      "desc": "Maximum lift on Aggressive personality, 0 to 0.6"
+    },
+    "PaceLiftStandard": {
+      "type": "string",
+      "default": "0.20",
+      "label": "Pace Lift strength, Standard (m/s2)",
+      "desc": "Maximum lift on Standard personality, 0 to 0.6"
+    }
+  }
+}

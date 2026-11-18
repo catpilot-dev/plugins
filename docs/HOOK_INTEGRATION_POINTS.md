@@ -29,6 +29,7 @@ call site exists but no current plugin registers on it.
 | Hook | File | Plugin | Signature |
 |------|------|--------|-----------|
 | `planner.v_cruise` | `openpilot/selfdrive/controls/lib/longitudinal_planner.py` | speedlimitd | `(v_cruise, v_ego, sm) → v_cruise` |
+| `planner.e2e_accel` | `openpilot/selfdrive/controls/lib/longitudinal_planner.py` | pace_lift | `(a_e2e, v_ego, v_cruise, a_cruise, sm) → a_e2e` |
 
 ### Device Health
 
