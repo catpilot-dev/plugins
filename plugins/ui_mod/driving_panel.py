@@ -150,6 +150,18 @@ class DrivingLayout(Widget):
     )
     items.append(self._personality)
 
+    # --- Pace Lift (if plugin enabled) ---
+    if _plugin_enabled('pace_lift'):
+      current = read_plugin_param('pace_lift', 'PaceLiftEnabled') != '0'
+      self._pace_lift = toggle_item(
+        "Pace Lift",
+        "In experimental mode, speeds up toward the speed target when the driving model is slower than it. "
+        "Strength follows Driving Personality: strongest on Aggressive, off on Relaxed.",
+        current,
+        callback=self._on_pace_lift,
+      )
+      items.append(self._pace_lift)
+
     # --- Lane Centering in Turns (if plugin enabled) ---
     if _plugin_enabled('lane_centering'):
       current = read_plugin_param('lane_centering', 'LaneCenteringEnabled') != '0'
@@ -255,6 +267,9 @@ class DrivingLayout(Widget):
 
   def _on_lane_centering(self, state):
     write_plugin_param('lane_centering', 'LaneCenteringEnabled', '1' if state else '0')
+
+  def _on_pace_lift(self, state):
+    write_plugin_param('pace_lift', 'PaceLiftEnabled', '1' if state else '0')
 
   def _on_speed_limit_sign(self, state):
     write_plugin_param('speedlimitd', 'ShowSpeedLimitSign', '1' if state else '0')
