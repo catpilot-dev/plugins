@@ -1,6 +1,6 @@
 # Pace lift: gap-driven lift on the e2e accel ask, tied to personality
 
-Date: 2026-11-19. Status: rev 2, for Director gate 1, round 2 (round 1 = REVISE).
+Date: 2026-11-19. Status: V8 built; Director gate 1 and gate 2 APPROVE; on-car drive pending (branch pace-lift).
 
 ## Problem
 On the BMW E90 (always experimental/e2e, no stock FCW, `radarUnavailable = True`, so leads are
