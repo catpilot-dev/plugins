@@ -985,7 +985,7 @@ Revert if any of these:
 
 - small-ask delivery (aT 0.1–0.3, off flat) < 0.71;
 - lead-following flips > 3.34/min;
-- free-road under-vCruiseOut time > 20 s per DCC-min (1.5× the pooled 13.3);
+- free-road lag behind vTarget (more than 2 km/h under vCruiseOut **and** more than 1 km/h behind vTarget) > 25 s per free-road minute (1.5× the 53b/53e pooled 16.9). Replaces the under-vCruiseOut line on 2026-11-18: on free road the e2e model sets the pace 99–100 % of the time (aT p50 +0.07..+0.13), so under-vCruiseOut time measures the model, not this controller. Route 545: 19.5;
 - over-vT share > 1 %;
 - hard/min > 2× baseline (0.27);
 - any 0x194 reject while DCC is enabled;
