@@ -637,11 +637,25 @@ idle slot after a tap or with a tap in flight closing the error. Shallower asks
 keep the old guard; at -0.8..-0.6 most ticks already sit inside the deadzone
 and that band is unchanged.
 
-**It cannot trip restore.** The landing is at most `SETPOINT_DEADZONE` below
+**It cannot trip restore at the decision instant.** The landing is at most `SETPOINT_DEADZONE` below
 the current target, and restore sends plus1 only at `setpoint_error >
 SETPOINT_DEADZONE`. While the car slows the target falls, so the overshoot
 shrinks. If the planner eases off, the target rises and restore follows the
 new ask: a real ask change, not a law loop.
+
+**Bench (2026-11-19, Director gate 2 approved with stated deviations).** A
+replay bench drove the real `CarController.update` over 545/546/547. It failed
+its absolute validation gate by small margins (shallow-bin delivery optimistic
+by 0.10-0.14), so only base-vs-rule deltas were judged, under the spec plant
+and a refit (K 0.095, offset 0.9, the headline), with and without a planner
+surrogate. Delivered/asked at -1.5..-1.0: 0.64-0.75 -> 0.77-0.89; median time
+to -0.6 m/s²: 0.43-0.67 -> 0.17-0.36 s; worst over-brake while aT <= -0.8:
+-0.32 m/s²; tail and guard-band delivery unchanged. At -0.8 two approved guards
+fail under the surrogate: plus1 within 2 s of a minus5 (rule-fired minus5 draw
+one in 3-10 of 25-31 cases, base hard-ask minus5 0 of 14-21) and guard-band
+flips (0.18 -> 0.34/min). -1.0 meets both. -0.8 kept by the user for onset (547
+cut-in asked -0.97). On-car abort: more than about a third of rule-fired minus5
+followed by plus1 within 2 s -> step back to -1.0.
 
 **Depth cap.** The landing stays within 15 km/h of the car, one km/h past the
 measured plant data where it saturates near -1.4 m/s². Worst case at -1.0
