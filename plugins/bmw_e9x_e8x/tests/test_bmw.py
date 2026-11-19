@@ -493,11 +493,13 @@ class TestCruiseBurstCounter:
     simply continues our own sequence; if it is longer, SZL takes the counter
     back and the resume has to resync to it."""
     idle    = (1.0,  0.0, 24.0, False)    # anchor SZL phase, nothing commanded
-    burst   = (0.25, -0.8, 22.0, False)   # decel burst
+    # -0.75, not -0.8: at MINUS5_HARD_ASK (-0.8) rule A lands a deep minus5 and
+    # there is nothing left to resume; this test is about the counter handoff.
+    burst   = (0.25, -0.75, 22.0, False)  # decel burst
     # v_target held at the burst's level: back up at 24 the restore branch
     # would walk the lowered setpoint back with plus1 and there is no pause.
     pause   = (pause_s, 0.0, 22.0, human) # deadzone / driver on the stalk
-    resume  = (0.20, -0.8, 22.0, False)
+    resume  = (0.20, -0.75, 22.0, False)
     events = self._replay([idle, burst, pause, resume])
     lead = 0.015 + self.STEP / 2
     surviving = [e for i, e in enumerate(events)
@@ -2846,3 +2848,153 @@ class TestSustainedAskFullLift:
                 make_stalk_carstate(i // 20 % 15, v_ego=25 * self.KPH, setpoint=26.7 * self.KPH),
                 int(i * 1e7))
     assert cc.accel_ask_age == 0.0
+
+
+class TestHardAskMinus5:
+  """Rule A (DESIGN.md: "Hard asks let minus5 land within the deadzone"): while
+  braking at accel <= MINUS5_HARD_ASK, minus5 may land up to SETPOINT_DEADZONE
+  past the current target, if the error left after pending is itself at least
+  the deadzone, the landing clears the floor and the depth cap. Shallower asks
+  keep the old guard (drop <= err)."""
+
+  KPH = 1 / 3.6
+  STEP = 0.01
+  SZL_TICK = 0.2
+  ACTION = {0: 'plus1', 1: 'plus5', 2: 'minus1', 3: 'minus5', 4: 'cancel'}
+  HARD = -1.0
+
+  @pytest.fixture(autouse=True)
+  def _mocks(self, monkeypatch):
+    from test_helpers import make_carcontroller_mocks
+    for mod_name, mod_mock in make_carcontroller_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+    for mod_name, mod_mock in make_cereal_mocks().items():
+      monkeypatch.setitem(sys.modules, mod_name, mod_mock)
+
+  def _first_slot(self, accel, err, drop, vt_below=2.0, floor_kmh=None,
+                  v_ego_override=None, commanding=False):
+    """Pin the setpoint and report the actions sent in the first ~0.5 s of
+    braking. The setpoint is chosen so minus5 would drop exactly `drop` km/h
+    (cluster = sp + 2, landing = next multiple of 10 below) and v_ego so the
+    error against the braking target is `err`; vTarget sits `vt_below` under
+    the car (the concordance gate's second estimate)."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    cc, mod = _make_cc()
+    if floor_kmh is not None:
+      cc.min_cruise_setpoint = floor_kmh * self.KPH
+    # cluster value whose minus5 drop is `drop` (cluster 10k+drop -> 10k)
+    sp = 70.0 + drop - 2.0
+    assert sp - mod.minus5_landing_kmh(sp) == pytest.approx(drop)
+    bias = min(-accel / mod.K_DCC, mod.SETPOINT_BIAS_MAX)
+    # err = sp - (v - bias + hold) when vTarget is not the binding term
+    v_ego = sp - err + bias + mod.hold_offset_kmh(accel)
+    if v_ego_override is not None:
+      v_ego = v_ego_override
+    cc.setpoint_commanding = commanding
+    acts, t = set(), 0.0
+    for i in range(50):
+      t += self.STEP
+      vt = (v_ego - vt_below) * self.KPH
+      _, msgs = cc.update(make_stalk_carcontrol(accel, vt),
+                          make_stalk_carstate(i % 15, v_ego=v_ego * self.KPH,
+                                              setpoint=sp * self.KPH),
+                          int(round(t * 1e9)))
+      for addr, dat, _bus in msgs:
+        if addr == 404:
+          acts |= {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+    return acts, cc, v_ego, sp
+
+  def test_threshold_default(self):
+    import bmw.carcontroller as mod
+    assert mod.MINUS5_HARD_ASK == -0.8
+
+  def test_hard_ask_lets_minus5_land_inside_the_deadzone(self):
+    # err 7, drop 10: overshoot 3 = SETPOINT_DEADZONE, allowed
+    acts, cc, _, _ = self._first_slot(self.HARD, err=7.0, drop=10.0)
+    assert cc.setpoint_braking
+    assert 'minus5' in acts, acts
+    assert cc.setpoint_pending == pytest.approx(10.0, abs=0.01)
+
+  def test_overshoot_beyond_the_deadzone_is_blocked(self):
+    acts, _, _, _ = self._first_slot(self.HARD, err=6.0, drop=10.0)
+    assert 'minus5' not in acts, acts
+
+  def test_shallow_ask_keeps_the_old_guard(self):
+    acts, cc, _, _ = self._first_slot(-0.5, err=7.0, drop=10.0)
+    assert cc.setpoint_braking
+    assert 'minus5' not in acts, acts
+
+  def test_old_guard_still_fires_exactly_as_before(self):
+    # drop <= err, shallow ask and hard ask both
+    for accel in (-0.5, self.HARD):
+      acts, _, _, _ = self._first_slot(accel, err=7.0, drop=5.0)
+      assert 'minus5' in acts, (accel, acts)
+
+  def test_no_plus1_within_two_seconds_of_a_rule_fired_minus5(self):
+    """Constant aT -1.0, vTarget tracking the slowing car (3 km/h/s): the
+    rule's landing sits <= deadzone past the target, and restore only acts
+    past the deadzone, so no plus1 follows."""
+    from test_helpers import make_stalk_carstate, make_stalk_carcontrol
+    import bmw.carcontroller as mod
+    cc, _ = _make_cc()
+    v0, sp_true = 80.0, 78.0     # cluster 80 -> minus5 drops 10
+    bias = -self.HARD / mod.K_DCC
+    t, szl, tobs, sp_obs = 0.0, 0, 0.0, sp_true
+    queued, slot_acts, sent = [], set(), []
+    for _ in range(int(6.0 / self.STEP)):
+      t += self.STEP
+      v = v0 - 3.0 * max(0.0, t - 1.0)              # slows 3 km/h/s from t=1
+      a = 0.0 if t < 1.0 else self.HARD
+      vt = (v - (0.0 if t < 1.0 else 1.5)) * self.KPH
+      if abs(t / self.SZL_TICK - round(t / self.SZL_TICK)) < 1e-9:
+        szl = (szl + 1) % 15
+        for n in ('minus5', 'minus1', 'plus5', 'plus1'):
+          if n in slot_acts:
+            queued.append((t + 0.13, n)); break
+        slot_acts = set()
+      while queued and queued[0][0] <= t:
+        n = queued.pop(0)[1]
+        sp_true = max(0.0, mod.minus5_landing_kmh(sp_true) if n == 'minus5'
+                      else sp_true + {'minus1': -1.0, 'plus1': 1.0, 'plus5': 5.0}[n])
+      if t - tobs >= 0.2:
+        tobs, sp_obs = t, sp_true
+      _, msgs = cc.update(make_stalk_carcontrol(a, vt),
+                          make_stalk_carstate(szl, v_ego=v * self.KPH,
+                                              setpoint=sp_obs * self.KPH),
+                          int(round(t * 1e9)))
+      for addr, dat, _bus in msgs:
+        if addr == 404 and dat[2]:
+          names = {self.ACTION[b] for b in self.ACTION if dat[2] & (1 << b)}
+          slot_acts |= names
+          sent.append((t, names))
+    m5 = [t for t, n in sent if 'minus5' in n]
+    assert m5, "expected the hard ask to draw a minus5"
+    for tm in m5:
+      late = [t for t, n in sent if 'plus1' in n and tm < t <= tm + 2.0]
+      assert not late, f"plus1 at {late} within 2 s of minus5 at {tm:.2f}"
+
+  def test_depth_cap_blocks_a_landing_past_veg_minus_15(self):
+    # vTarget 13.5 under the car pulls the target below v - 12, where only the
+    # cap stands between the rule and a deep landing. Landing 68, v 84 -> 69.
+    acts, _, v, sp = self._first_slot(self.HARD, err=0, drop=10.0,
+                                      v_ego_override=84.0, vt_below=13.5)
+    import bmw.carcontroller as mod
+    assert mod.minus5_landing_kmh(sp) < v - 15.0
+    assert 'minus5' not in acts, acts
+    # positive control: v 82 -> landing 68 >= 67, the rule fires
+    acts, _, v, sp = self._first_slot(self.HARD, err=0, drop=10.0,
+                                      v_ego_override=82.0, vt_below=13.5)
+    assert mod.minus5_landing_kmh(sp) >= v - 15.0
+    assert 'minus5' in acts, acts
+
+  def test_min_cruise_setpoint_floor_blocks(self):
+    acts, _, _, _ = self._first_slot(self.HARD, err=7.0, drop=10.0, floor_kmh=70.0)
+    assert 'minus5' not in acts, acts
+
+  def test_error_below_the_deadzone_never_fires_the_rule(self):
+    # a tap in flight leaves err 2; drop 3 <= err + 3 would pass the overshoot
+    # test but there is no evidence for a deep step
+    for commanding in (False, True):
+      acts, _, _, _ = self._first_slot(self.HARD, err=2.0, drop=3.0,
+                                       commanding=commanding)
+      assert 'minus5' not in acts, (commanding, acts)

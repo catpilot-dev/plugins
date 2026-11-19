@@ -611,6 +611,47 @@ tracking, since every wander it absorbs is a restore not made. It was briefly as
 measured, so there is one constant. The reason to keep them separable if this
 is revisited: coming down is a response, going back up is a release.
 
+#### Hard asks let minus5 land within the deadzone
+
+Route 547 (against 545/546): at aTarget below about -1.0 the setpoint did not
+get as deep as the decel law asks. The braking latch was set on every hard-ask
+tick and the remaining error was at least 3 km/h on most of them, yet the
+minus5 guard (`drop <= err`) blocked on 58-71 % of those ticks. minus1 taps
+slew the setpoint 2-3 km/h/s (tap cap), about as fast as the car slows
+(2.5-4 km/h/s), so the gap freezes short of the target, and the 10 km/h grid
+makes minus5's drop exceed the error. The plant is not the limit: delivered
+decel keeps following the gap down to about -14 km/h (-1.34..-1.40 m/s²).
+
+Rule A, while `setpoint_braking` and `accel <= MINUS5_HARD_ASK` (-0.8): minus5
+also fires when
+
+```
+err >= SETPOINT_DEADZONE
+STEP5_MIN_USEFUL_KMH <= drop <= err + SETPOINT_DEADZONE
+land >= min_cruise_setpoint
+land >= vEgo - (SETPOINT_BIAS_MAX + SETPOINT_DEADZONE)      # depth cap, 15 km/h
+```
+
+`err` is the remaining error after pending, so the rule never fires in the
+idle slot after a tap or with a tap in flight closing the error. Shallower asks
+keep the old guard; at -0.8..-0.6 most ticks already sit inside the deadzone
+and that band is unchanged.
+
+**It cannot trip restore.** The landing is at most `SETPOINT_DEADZONE` below
+the current target, and restore sends plus1 only at `setpoint_error >
+SETPOINT_DEADZONE`. While the car slows the target falls, so the overshoot
+shrinks. If the planner eases off, the target rises and restore follows the
+new ask: a real ask change, not a law loop.
+
+**Depth cap.** The landing stays within 15 km/h of the car, one km/h past the
+measured plant data where it saturates near -1.4 m/s². Worst case at -1.0
+(target gap -8.3): landing about -11.3, roughly 1.15x the ask, decaying as the
+car slows.
+
+**What it does not do.** Floor-bound events (landing under
+`min_cruise_setpoint`, e.g. 547 t=1931 at 40 km/h) are blocked by the floor as
+before, and asks beyond the plant's -1.4 m/s² ceiling are untouched.
+
 ### ±1 is a step; ±5 snaps to a grid
 
 Measured over 454/455/459/45b, isolated bursts only, setpoint read off 0x193:

@@ -113,6 +113,17 @@ MINUS5_ASSERT_FRAMES = 2      # frame budget when frame 2 may be needed, then re
 # or missing anchor falls back to two frames.
 MINUS5_PRETICK_S = 0.025      # frame 1 this close to SZL's next tick keeps frame 2
 MINUS5_ANCHOR_MAX_AGE_S = 3.0  # older anchor: predicted tick is not trusted
+# Hard asks (route 547): at aTarget <= MINUS5_HARD_ASK the setpoint slews
+# 2-3 km/h/s under the minus1 tap cap, about as fast as the car slows, so the
+# gap freezes short of the law's target while the 10 km/h grid blocks minus5
+# (its drop exceeds the error). Rule A lets minus5 land up to SETPOINT_DEADZONE
+# past the current target there, provided the error left after pending is
+# itself >= SETPOINT_DEADZONE (never in the idle slot after a tap), the landing
+# clears the floor and stays within SETPOINT_BIAS_MAX + SETPOINT_DEADZONE of
+# the car (the plant saturates near there). Restore only sends plus1 past
+# SETPOINT_DEADZONE, so our own landing cannot trip it. Shallower asks keep
+# the old guard. DESIGN.md: "Hard asks let minus5 land within the deadzone".
+MINUS5_HARD_ASK = -0.8        # m/s² — at or below this the relaxed guard applies
 MINUS1_YIELD_KMH = 1.0
 # minus1 is a tap, never a hold: at most this many consecutive slots, then one
 # idle slot releases the lever. Out of a hold of >= ~0.4 s DCC can reset a deep
@@ -521,8 +532,15 @@ class CarController(CarControllerBase):
               m5_drop_kmh = sp_eff_kmh - m5_land_kmh
               # The whole overshoot guard: minus5 only if it lands at or above
               # the target (and the floor).
-              if (STEP5_MIN_USEFUL_KMH <= m5_drop_kmh <= err_kmh
-                  and m5_land_kmh >= self.min_cruise_setpoint * 3.6):
+              m5_floor_ok = m5_land_kmh >= self.min_cruise_setpoint * 3.6
+              # Rule A: on a hard ask the landing may sit up to the deadzone
+              # past the target (and within the depth cap of the car).
+              m5_hard_ask = (accel <= MINUS5_HARD_ASK
+                             and err_kmh >= SETPOINT_DEADZONE
+                             and STEP5_MIN_USEFUL_KMH <= m5_drop_kmh <= err_kmh + SETPOINT_DEADZONE
+                             and m5_land_kmh >= v_current * 3.6 - (SETPOINT_BIAS_MAX + SETPOINT_DEADZONE))
+              if m5_floor_ok and (STEP5_MIN_USEFUL_KMH <= m5_drop_kmh <= err_kmh
+                                  or m5_hard_ask):
                 self.slot_cmd = CruiseStalk.minus5
                 self.setpoint_pending += m5_drop_kmh
                 self.setpoint_pending_ns = now_nanos
