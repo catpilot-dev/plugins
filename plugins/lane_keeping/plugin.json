@@ -9,11 +9,23 @@
   "max_openpilot": "0.11.99",
   "conflicts": [],
   "dependencies": [],
-  "params": {},
+  "params": {
+    "LaneKeepArcSmoothTest": {
+      "type": "bool",
+      "default": true,
+      "label": "Arc Smooth",
+      "desc": "Temporary: off = steer on the raw model curvature (supervised test only); read once per drive"
+    }
+  },
   "hooks": {
     "controls.curvature_correction": {
       "module": "register",
       "function": "on_curvature_correction",
+      "priority": 50
+    },
+    "ui.vehicle_settings": {
+      "module": "register",
+      "function": "on_vehicle_settings",
       "priority": 50
     }
   }

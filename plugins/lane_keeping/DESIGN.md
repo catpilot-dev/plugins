@@ -73,11 +73,22 @@ read at process start.
 |---|---|---|
 | `LaneKeepKappaFilterTau` | 0.15 | reference low-pass (s) |
 | `LaneKeepArcHorizon` | 0 (auto) | arc aim point, plan seconds ahead; > 0 forces a fixed value (A/B) |
+| `LaneKeepArcSmoothTest` | 1 | TEMPORARY (2026-11-20): only the exact string `0` = off, then the hook returns the raw input curvature; the Arc still runs and the plugin stays loaded (`HOOK_READY` True). Read once per process (next drive). BMW-only Driving-panel toggle. |
+
+The old Arc Smoothing switch key `LaneKeepArcSmooth` (removed) is deliberately not
+reused: a stale file from that era must not silently select raw tracking, so the
+old key is ignored.
+
+Raw curvature on the Direct tracker remains unsafe by default; the toggle is the
+only path, for one supervised Cheddar test drive, and is to be removed or
+re-decided after the verdict. To restore mid-drive: disengage, stop, toggle ON,
+cycle the ignition.
 
 ## Telemetry
 
 Topic `lane_keeping` on the plugin bus (recorded in rlogs), 100 Hz: `kappa_in`
-(the model's curvature), `kappa_ref` (the reference returned), `kappa_arc`,
+(the model's curvature), `kappa_ref` (the reference returned; the raw input when
+bypassed), `kappa_arc_ref` (the Arc's output, both modes), `arc_bypass`, `kappa_arc`,
 `arc_on`, `arc_h`, `k_ahead` (−1 when unavailable), `v_ego`, and the ego lane
 geometry at the car for drive analysis: `line_l`, `line_r` (m, +y right),
 `prob_l`, `prob_r`; `lc_hold` (true while the lane-change onset hand-over

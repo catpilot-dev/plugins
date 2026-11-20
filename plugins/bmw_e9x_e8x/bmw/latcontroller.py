@@ -88,7 +88,10 @@ CF_MAX_NM = 2.0            # cap (Nm); t_cap and STEER_MAX still apply
 # design.md) is the only law: no rest state, sign-guarded reversals, free-play
 # take-up. It tracks the Arc reference from lane_keeping; raw kappa_des on a
 # deadzone-free tracker is the documented-unsafe case, so without that plugin
-# the hook leaves the stock controller in place (ruling R10). The registry
+# the hook leaves the stock controller in place (ruling R10). The only path to
+# raw is the temporary Arc Smooth toggle (2026-11-20; lane_keeping stays loaded,
+# HOOK_READY True), for one supervised Cheddar test drive; to be removed or
+# re-decided after the verdict. The registry
 # inserts a module into sys.modules BEFORE executing it and leaves it there
 # when the import raises, so presence alone is not enough: HOOK_READY is the
 # module's last statement, set only when it loaded fully.

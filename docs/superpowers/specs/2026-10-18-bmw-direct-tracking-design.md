@@ -82,7 +82,9 @@ curvature can be smoothed by arc smoothing, commands stepper faithfully."*
 - Abrupt torque application — the STEP_MAX "human-style gradual torque" rule
   still holds for the *desired* torque (feedback memory: gradual torque).
 - Running the deadzone-free tracker on the **raw** model curvature (documented
-  unsafe in `lane_keeping/register.py`): this mode requires Arc Smoothing.
+  unsafe in `lane_keeping/register.py`): this mode requires Arc Smoothing. The
+  only path to raw is the temporary Arc Smooth toggle (2026-11-20), for one
+  supervised Cheddar test drive; to be removed or re-decided after the verdict.
 
 ## Behaviour
 

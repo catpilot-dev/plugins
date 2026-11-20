@@ -96,3 +96,181 @@ def test_reference_is_always_arc_and_never_position_corrected(data_dir, monkeypa
   assert register._anchor.cfg.arc_horizon == 0.0
   assert not hasattr(register, '_direct_tracking_on')
   assert not hasattr(register._anchor.cfg, 'enable')
+
+
+# ---- Arc Smooth toggle (temporary, 2026-11-20) -----------------------------
+
+def _mv():
+  return SimpleNamespace(laneLines=[], laneLineProbs=[])
+
+
+def _capture(monkeypatch):
+  out = []
+  monkeypatch.setattr(register, '_publish', lambda telem: out.append(dict(telem)))
+  return out
+
+
+def _calls():
+  """(curvature, v_ego, lane_changing): straights, a lane change, a crawl."""
+  seq = []
+  for i in range(60):
+    seq.append((0.002 * ((-1) ** (i // 10)), 25.0, False))
+  for i in range(80):
+    seq.append((0.004 + 0.0005 * i, 25.0, True))
+  for i in range(40):
+    seq.append((-0.003, 25.0, False))
+  for i in range(30):
+    seq.append((0.01, 0.5, False))   # crawl
+  return seq
+
+
+def test_arc_smooth_defaults_on(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  register.on_curvature_correction(0.01, _mv(), 25.0, False, 0.45)
+  assert tel[-1]['arc_bypass'] is False
+
+
+@pytest.mark.parametrize('bad', ['1', 'false', '', 'off', ' 0 ', '00', '0\n'])
+def test_arc_smooth_non_zero_values_are_on(data_dir, monkeypatch, bad):
+  tel = _capture(monkeypatch)
+  (data_dir / 'LaneKeepArcSmoothTest').write_text(bad)
+  register.on_curvature_correction(0.01, _mv(), 25.0, False, 0.45)
+  assert tel[-1]['arc_bypass'] is False
+
+
+def test_bypass_returns_input_every_call(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
+  for k, v, lc in _calls():
+    assert register.on_curvature_correction(k, _mv(), v, lc, 0.45) == k
+  assert all(t['arc_bypass'] is True for t in tel)
+  assert register.HOOK_READY is True
+
+
+def test_bypass_still_runs_arc_and_publishes_arc_output(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
+  for k, v, lc in _calls():
+    register.on_curvature_correction(k, _mv(), v, lc, 0.45)
+  # reference actually returned = raw input; Arc output kept separately
+  assert all(t['kappa_ref'] == t['kappa_in'] for t in tel)
+  assert any(t['kappa_arc_ref'] != t['kappa_in'] for t in tel)   # Arc is live and smoothing
+
+
+def test_default_mode_equals_lane_anchor_update(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  anchor_mod = register._anchor_module()
+  ref = anchor_mod.LaneAnchor(register._load_config())
+  for k, v, lc in _calls():
+    out = register.on_curvature_correction(k, _mv(), v, lc, 0.45)
+    exp, exp_t = ref.update(k, _mv(), v, lc)
+    assert out == exp
+    assert tel[-1]['kappa_ref'] == exp_t['kappa_ref']
+    assert tel[-1]['kappa_arc_ref'] == exp
+    assert tel[-1]['arc_bypass'] is False
+    for key, val in exp_t.items():
+      assert tel[-1][key] == val
+
+
+def test_bypass_mode_arc_state_matches_default_mode(data_dir, monkeypatch):
+  """The Arc runs identically in bypass: kappa_arc_ref equals the default-mode output."""
+  tel = _capture(monkeypatch)
+  default_out = [register.on_curvature_correction(k, _mv(), v, lc, 0.45) for k, v, lc in _calls()]
+  register._anchor = None
+  tel.clear()
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
+  for k, v, lc in _calls():
+    register.on_curvature_correction(k, _mv(), v, lc, 0.45)
+  assert [t['kappa_arc_ref'] for t in tel] == default_out
+
+
+def test_arc_smooth_read_once_per_process(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  register.on_curvature_correction(0.01, _mv(), 25.0, False, 0.45)
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
+  register.on_curvature_correction(0.01, _mv(), 25.0, False, 0.45)
+  assert tel[-1]['arc_bypass'] is False
+  register._anchor = None                      # new process
+  assert register.on_curvature_correction(0.012, _mv(), 25.0, False, 0.45) == 0.012
+  assert tel[-1]['arc_bypass'] is True
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('1')
+  assert register.on_curvature_correction(0.013, _mv(), 25.0, False, 0.45) == 0.013   # still bypass
+  assert tel[-1]['arc_bypass'] is True
+
+
+def test_telemetry_failure_does_not_break_bypass(data_dir, monkeypatch):
+  monkeypatch.setattr(register, '_publish', lambda telem: (_ for _ in ()).throw(RuntimeError('no bus')))
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
+  assert register.on_curvature_correction(0.02, _mv(), 25.0, False, 0.45) == 0.02
+
+
+def test_arc_smooth_helper_parse(data_dir):
+  f = data_dir / 'LaneKeepArcSmoothTest'
+  assert register._arc_smooth_enabled() is True            # missing
+  f.write_text('0')
+  assert register._arc_smooth_enabled() is False
+  for v in ('1', '', 'false', 'off', ' 0 '):
+    f.write_text(v)
+    assert register._arc_smooth_enabled() is True
+
+
+# ---- UI hook ----------------------------------------------------------------
+
+@pytest.fixture
+def fake_toggle(monkeypatch):
+  rows = []
+
+  def toggle_item(title, description, initial_state=False, callback=None, enabled=True):
+    row = SimpleNamespace(title=title, description=description, state=initial_state, callback=callback)
+    rows.append(row)
+    return row
+
+  mods = {}
+  for name in ('openpilot', 'openpilot.system', 'openpilot.system.ui', 'openpilot.system.ui.widgets'):
+    mods[name] = sys.modules.get(name) or type(sys)(name)
+  lv = type(sys)('openpilot.system.ui.widgets.list_view')
+  lv.toggle_item = toggle_item
+  mods['openpilot.system.ui.widgets.list_view'] = lv
+  for k, m in mods.items():
+    monkeypatch.setitem(sys.modules, k, m)
+  return rows
+
+
+def test_ui_hook_bmw_adds_one_row_default_on(data_dir, fake_toggle):
+  items = register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
+  assert len(items) == 1 and items[0].title == 'Arc Smooth'
+  assert items[0].state is True
+  d = items[0].description.lower()
+  assert 'raw model curvature' in d and 'next drive' in d and 'ignition' in d and 'supervised' in d
+
+
+def test_ui_hook_initial_state_from_file(data_dir, fake_toggle):
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
+  items = register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
+  assert items[0].state is False
+
+
+def test_ui_hook_callback_writes_file(tmp_path, monkeypatch, fake_toggle):
+  monkeypatch.setattr(register, '_PLUGIN_DIR', str(tmp_path))   # no data/ dir yet
+  items = register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
+  items[0].callback(False)
+  assert (tmp_path / 'data' / 'LaneKeepArcSmoothTest').read_text() == '0'
+  items[0].callback(True)
+  assert (tmp_path / 'data' / 'LaneKeepArcSmoothTest').read_text() == '1'
+
+
+def test_ui_hook_non_bmw_adds_no_row(data_dir, fake_toggle):
+  prior = ['x']
+  assert register.on_vehicle_settings(prior, SimpleNamespace(brand='toyota')) == ['x']
+  assert fake_toggle == []
+
+
+def test_stale_old_arc_smooth_key_is_ignored(data_dir, monkeypatch):
+  """A leftover data/LaneKeepArcSmooth='0' from the old switch must not bypass."""
+  tel = _capture(monkeypatch)
+  (data_dir / 'LaneKeepArcSmooth').write_text('0')
+  ref = register._anchor_module().LaneAnchor(register._load_config())
+  for k, v, lc in _calls():
+    out = register.on_curvature_correction(k, _mv(), v, lc, 0.45)
+    assert out == ref.update(k, _mv(), v, lc)[0]
+    assert tel[-1]['arc_bypass'] is False

@@ -299,8 +299,9 @@ if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
 fi
 # lane_keeping is required by the BMW lateral controller: it tracks the Arc
 # reference, and without the plugin the hook leaves the stock lateral
-# controller in place (ruling R10). Enforced always-on; there is no user
-# control. Clear any stale .disabled — the registry loader honors it even when
+# controller in place (ruling R10). Enforced always-on; no on/off control. The
+# only knob is the temporary Arc Smooth toggle (2026-11-20, raw curvature for one
+# supervised Cheddar test drive; remove or re-decide after the verdict). Clear any stale .disabled — the registry loader honors it even when
 # enforced.
 if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
   if $DRY_RUN; then

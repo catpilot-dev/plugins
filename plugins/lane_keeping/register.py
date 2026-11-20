@@ -27,12 +27,20 @@ def _anchor_module():
   return _anchor_mod
 
 
-def _read_param(key, default=''):
+def _read_param(key, default='', strip=True):
   try:
     with open(os.path.join(_PLUGIN_DIR, 'data', key)) as f:
-      return f.read().strip()
+      v = f.read()
+      return v.strip() if strip else v
   except (FileNotFoundError, OSError):
     return default
+
+
+def _arc_smooth_enabled():
+  """Arc Smooth toggle (temporary, 2026-11-20). Only the exact string '0'
+  means OFF; missing, unreadable or any other value is ON. Shared by the
+  controls hook and the UI toggle so both parse identically."""
+  return _read_param('LaneKeepArcSmoothTest', strip=False) != '0'
 
 
 def _load_config():
@@ -51,6 +59,7 @@ def _load_config():
 
 _anchor = None
 _pub = None
+_arc_smooth = True   # read once, at the same lazy init as _anchor
 
 
 def _publish(telem):
@@ -62,16 +71,51 @@ def _publish(telem):
 
 
 def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay=None):
-  global _anchor
+  global _anchor, _arc_smooth
   if _anchor is None:
     LaneAnchor = _anchor_module().LaneAnchor
+    _arc_smooth = _arc_smooth_enabled()
     _anchor = LaneAnchor(_load_config())
-  new_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing)   # lat_delay: hook signature only
+  arc_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing)   # lat_delay: hook signature only
+  # Arc Smooth OFF: the Arc keeps running (state, telemetry) but the raw input
+  # is returned. The plugin stays loaded so HOOK_READY and the BMW Direct
+  # controller are unaffected.
+  new_curvature = arc_curvature if _arc_smooth else curvature
+  try:
+    telem['kappa_arc_ref'] = float(arc_curvature)
+    telem['arc_bypass'] = not _arc_smooth
+    telem['kappa_ref'] = float(new_curvature)
+  except Exception:
+    pass
   try:
     _publish(telem)
   except Exception:
     pass  # telemetry must never break the control path
   return new_curvature
+
+
+def _write_param(key, value):
+  data_dir = os.path.join(_PLUGIN_DIR, 'data')
+  os.makedirs(data_dir, exist_ok=True)
+  with open(os.path.join(data_dir, key), 'w') as f:
+    f.write(value)
+
+
+def on_vehicle_settings(items, CP):
+  """ui.vehicle_settings: temporary BMW-only "Arc Smooth" toggle (2026-11-20)."""
+  if CP.brand != 'bmw':
+    return items
+
+  from openpilot.system.ui.widgets.list_view import toggle_item
+
+  items.append(toggle_item(
+    "Arc Smooth",
+    "Off = steer on the raw model curvature (supervised test only). Takes effect on the next drive. "
+    "To restore mid-drive: disengage, stop, turn ON, cycle the ignition.",
+    _arc_smooth_enabled(),
+    callback=lambda state: _write_param('LaneKeepArcSmoothTest', '1' if state else '0'),
+  ))
+  return items
 
 
 # Last statement: the BMW controller patches its lateral law only when this is
