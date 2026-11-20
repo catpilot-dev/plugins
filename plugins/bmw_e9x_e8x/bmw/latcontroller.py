@@ -91,7 +91,8 @@ CF_MAX_NM = 2.0            # cap (Nm); t_cap and STEER_MAX still apply
 # the hook leaves the stock controller in place (ruling R10). The only path to
 # raw is the Arc Smooth toggle (default ON; lane_keeping stays loaded, HOOK_READY
 # True; OFF = supervised use only; kept 2026-11-20 to evaluate new upstream
-# driving models). The registry
+# driving models). Model Centring (default OFF) adds a bounded slow term on top of
+# the Arc, not raw. The registry
 # inserts a module into sys.modules BEFORE executing it and leaves it there
 # when the import raises, so presence alone is not enough: HOOK_READY is the
 # module's last statement, set only when it loaded fully.

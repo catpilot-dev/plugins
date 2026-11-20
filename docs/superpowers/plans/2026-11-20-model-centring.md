@@ -105,7 +105,8 @@ power) <= 1.2x 548 (longer tc costs phase margin: if a slow weave appears, SHORT
 turn-exit reversals (seg 28 type) no larger than 548's / the would-be Arc's; steering rate rms <= 1.15x 548;
 lane-centre sway <= 1.2x 548; seg 7 / seg 28 type turns: no curb-side or next-lane excursion
 (inside offset in tight turns <= 548 + 10 cm); LC onset no worse than 54a; lash <= 5.5 deg.
-Frame drops / locationd alerts are recorded but are not this change's criterion.
+Offset and line-touch stats are split by bend-gate state (gate closed ~23 % of engaged time at
+40+ km/h on 54a/549, Arc-only there). Frame drops / locationd alerts are recorded but are not this change's criterion.
 
 ## Risks and cost
 - Closed-loop centring dynamics are untested: a slow term can wind up on a long bend where the

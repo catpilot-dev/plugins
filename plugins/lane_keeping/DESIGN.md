@@ -79,7 +79,7 @@ read at process start.
 | `LaneKeepCentringTau` | 4.0 | Model Centring low-pass time constant (s), file only (no UI); junk / NaN -> 4.0, clamped 1-20. |
 
 The params are deliberately not declared in `plugin.json`: connect-on-device would list
-it as an ungated web toggle on every brand. Missing file already means ON.
+it as an ungated web toggle on every brand. A missing file means ON for Arc Smooth and OFF for Model Centring.
 
 The old Arc Smoothing switch key `LaneKeepArcSmooth` (removed) is deliberately not
 reused: a stale file from that era must not silently select raw tracking, so the

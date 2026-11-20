@@ -375,12 +375,36 @@ def test_centring_on_with_raw_equal_arc_is_arc(data_dir, monkeypatch):
   tel.clear()
   assert _run(_calls()) == base          # _calls never engages (curvature != action)
   assert all(t['kappa_centring'] == 0.0 and t['centring_on'] is True for t in tel)
-  # engaged with raw == arc (plan arc 0.003 vs raw 0.003 once the Arc has settled)
+  # engaged with raw == arc on a mild plan (0.0004 * 25^2 = 0.25 m/s^2 < 0.3: bend gate open)
   register._anchor = None
   tel.clear()
-  outs = [_hook(0.003, 0.003) for _ in range(800)]
+  outs = [_hook(4e-4, 4e-4) for _ in range(800)]
   assert max(abs(t['kappa_centring']) for t in tel) < 1e-9
-  assert outs[-1] == pytest.approx(0.003, abs=1e-9)
+  assert outs[-1] == pytest.approx(4e-4, abs=1e-9)
+  # the same setup with raw != arc does charge, so the gate really was open
+  register._anchor = None
+  tel.clear()
+  for _ in range(800):
+    _hook(5e-4, 4e-4)
+  assert abs(tel[-1]['kappa_centring']) > 1e-5
+
+
+def test_centring_files_are_read_once_per_process(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir, on='1', tau='2.0')
+  for _ in range(50):
+    _hook(3e-4)
+  assert tel[-1]['centring_on'] is True and register._centring.tc == 2.0
+  _centring_files(data_dir, on='0', tau='10')
+  _hook(3e-4)
+  assert tel[-1]['centring_on'] is True and register._centring.tc == 2.0
+  register._anchor = None                      # new process
+  _hook(3e-4)
+  assert tel[-1]['centring_on'] is False
+  register._anchor = None
+  _centring_files(data_dir, on='1')
+  _hook(3e-4)
+  assert tel[-1]['centring_on'] is True and register._centring.tc == 10.0
 
 
 def test_centring_lp_step_matches_reference_filter(data_dir, monkeypatch):
