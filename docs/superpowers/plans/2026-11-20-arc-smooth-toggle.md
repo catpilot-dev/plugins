@@ -80,7 +80,7 @@ output across a scripted lane change (equality test).
 | T4 | Gate 2 Director on diff + test output. | Director | APPROVE |
 | T5 | With the user's go: push dev, deploy plugins to the C3 (install.sh), swap to Cheddar, user reboots, re-seal rootfs, verify branch/DisableUpdates, toggle visible in Driving panel, file written on tap. | PM | On-device checks; `.needs_restart` applied |
 | T6 | Drive (user): Cheddar + Arc Smooth OFF, else as 549. Analysis: offset, line touches, sway, LC onset, torque reversals, lash. | user / PM | `arc_bypass` true in the rlog for the whole drive; pass criteria below |
-| T7 | Close-out: toggle back ON (or remove per D4), swap model per verdict, reboot, confirm `arc_bypass` false on the next drive's first segment. Until then: hold rolling releases from dev (docs/RELEASE_PROCESS.md merges dev); after the verdict, revert the toggle on dev or re-decide it. | PM / user | rlog check |
+| T7 | Close-out: toggle back ON (or remove per D4), swap model per verdict, reboot, confirm `arc_bypass` false on the next drive's first segment. Until then: hold rolling releases from dev (docs/RELEASE_PROCESS.md merges dev); after the verdict, revert the toggle on dev or re-decide it; on removal delete `data/LaneKeepArcSmoothTest` on the C3. | PM / user | rlog check |
 
 ## Drive pass criteria (T6)
 Mean offset within +-15 cm of lane centre on straights (549: +38, 548: +12); 0 unsignalled line

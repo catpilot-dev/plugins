@@ -75,6 +75,9 @@ read at process start.
 | `LaneKeepArcHorizon` | 0 (auto) | arc aim point, plan seconds ahead; > 0 forces a fixed value (A/B) |
 | `LaneKeepArcSmoothTest` | 1 | TEMPORARY (2026-11-20): only the exact string `0` = off, then the hook returns the raw input curvature; the Arc still runs and the plugin stays loaded (`HOOK_READY` True). Read once per process (next drive). BMW-only Driving-panel toggle. |
 
+The param is deliberately not declared in `plugin.json`: connect-on-device would list
+it as an ungated web toggle on every brand. Missing file already means ON.
+
 The old Arc Smoothing switch key `LaneKeepArcSmooth` (removed) is deliberately not
 reused: a stale file from that era must not silently select raw tracking, so the
 old key is ignored.

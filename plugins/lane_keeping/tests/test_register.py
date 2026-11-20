@@ -1,4 +1,4 @@
-import importlib.util, os, sys
+import importlib.util, math, os, sys
 from types import SimpleNamespace
 import pytest
 
@@ -35,6 +35,7 @@ def _reset_register():
 def data_dir(tmp_path, monkeypatch):
   d = tmp_path / 'data'
   d.mkdir()
+  register._anchor_module()   # cache the sibling module before _PLUGIN_DIR is patched
   monkeypatch.setattr(register, '_PLUGIN_DIR', str(tmp_path))
   return d
 
@@ -110,18 +111,52 @@ def _capture(monkeypatch):
   return out
 
 
+def _plan_mv(k_arc, v=25.0, state='off', direction='none', n=41, t_max=10.0):
+  """Realistic modelV2 stub (as test_anchor's _lc_mv): ego lane lines, a plan on
+  a circle of curvature k_arc, and lane-change meta."""
+  ts = [t_max * i / (n - 1) for i in range(n)]
+  if k_arc == 0.0:
+    xs, ys = [v * t for t in ts], [0.0] * n
+  else:
+    xs = [math.sin(v * t * k_arc) / k_arc for t in ts]
+    ys = [(1.0 - math.cos(v * t * k_arc)) / k_arc for t in ts]
+  return SimpleNamespace(
+    laneLines=[SimpleNamespace(y=[0.0]), SimpleNamespace(y=[-1.75]),
+               SimpleNamespace(y=[1.75]), SimpleNamespace(y=[0.0])],
+    laneLineProbs=[0.0, 1.0, 1.0, 0.0],
+    position=SimpleNamespace(t=ts, x=xs, y=ys),
+    meta=SimpleNamespace(laneChangeState=state, laneChangeDirection=direction))
+
+
 def _calls():
-  """(curvature, v_ego, lane_changing): straights, a lane change, a crawl."""
+  """(curvature, model_v2, v_ego, lane_changing): settled lane keeping on a
+  0.003 plan with a wobbling raw curvature, a right lane change (raw points
+  away first -> onset hold, then toward -> hand-over to raw), lane keeping
+  again, and a crawl."""
   seq = []
   for i in range(60):
-    seq.append((0.002 * ((-1) ** (i // 10)), 25.0, False))
-  for i in range(80):
-    seq.append((0.004 + 0.0005 * i, 25.0, True))
-  for i in range(40):
-    seq.append((-0.003, 25.0, False))
-  for i in range(30):
-    seq.append((0.01, 0.5, False))   # crawl
+    seq.append((0.002 * ((-1) ** (i // 10)), _plan_mv(0.003), 25.0, False))
+  for _ in range(3):
+    seq.append((-0.0006, _plan_mv(0.003, state='laneChangeStarting', direction='right'), 25.0, True))
+  for _ in range(5):
+    seq.append((0.001, _plan_mv(0.003, state='laneChangeStarting', direction='right'), 25.0, True))
+  for _ in range(10):
+    seq.append((-0.0005, _plan_mv(0.003, state='laneChangeFinishing', direction='right'), 25.0, True))
+  for _ in range(40):
+    seq.append((-0.003, _plan_mv(-0.002), 25.0, False))
+  for _ in range(30):
+    seq.append((0.01, _plan_mv(0.01, v=0.5), 0.5, False))   # crawl
   return seq
+
+
+def _run(calls):
+  return [register.on_curvature_correction(k, mv, v, lc, 0.45) for k, mv, v, lc in calls]
+
+
+def _assert_arc_exercised(tel):
+  assert any(t['arc_on'] is True for t in tel)
+  assert any(t['lc_hold'] is True for t in tel)
+  assert any(t['arc_on'] is False and t['lc_hold'] is False for t in tel)
 
 
 def test_arc_smooth_defaults_on(data_dir, monkeypatch):
@@ -141,48 +176,45 @@ def test_arc_smooth_non_zero_values_are_on(data_dir, monkeypatch, bad):
 def test_bypass_returns_input_every_call(data_dir, monkeypatch):
   tel = _capture(monkeypatch)
   (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
-  for k, v, lc in _calls():
-    assert register.on_curvature_correction(k, _mv(), v, lc, 0.45) == k
+  calls = _calls()
+  outs = _run(calls)
+  assert outs == [k for k, _, _, _ in calls]
   assert all(t['arc_bypass'] is True for t in tel)
+  _assert_arc_exercised(tel)           # the Arc really ran underneath
   assert register.HOOK_READY is True
-
 
 def test_bypass_still_runs_arc_and_publishes_arc_output(data_dir, monkeypatch):
   tel = _capture(monkeypatch)
   (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
-  for k, v, lc in _calls():
-    register.on_curvature_correction(k, _mv(), v, lc, 0.45)
+  _run(_calls())
   # reference actually returned = raw input; Arc output kept separately
   assert all(t['kappa_ref'] == t['kappa_in'] for t in tel)
-  assert any(t['kappa_arc_ref'] != t['kappa_in'] for t in tel)   # Arc is live and smoothing
-
+  assert any(t['kappa_arc_ref'] != t['kappa_in'] for t in tel)
+  assert any(t['arc_on'] is True and t['kappa_arc_ref'] != t['kappa_in'] for t in tel)
 
 def test_default_mode_equals_lane_anchor_update(data_dir, monkeypatch):
   tel = _capture(monkeypatch)
-  anchor_mod = register._anchor_module()
-  ref = anchor_mod.LaneAnchor(register._load_config())
-  for k, v, lc in _calls():
-    out = register.on_curvature_correction(k, _mv(), v, lc, 0.45)
-    exp, exp_t = ref.update(k, _mv(), v, lc)
+  ref = register._anchor_module().LaneAnchor(register._load_config())
+  for k, mv, v, lc in _calls():
+    out = register.on_curvature_correction(k, mv, v, lc, 0.45)
+    exp, exp_t = ref.update(k, mv, v, lc)
     assert out == exp
-    assert tel[-1]['kappa_ref'] == exp_t['kappa_ref']
     assert tel[-1]['kappa_arc_ref'] == exp
     assert tel[-1]['arc_bypass'] is False
     for key, val in exp_t.items():
       assert tel[-1][key] == val
-
+  _assert_arc_exercised(tel)
 
 def test_bypass_mode_arc_state_matches_default_mode(data_dir, monkeypatch):
   """The Arc runs identically in bypass: kappa_arc_ref equals the default-mode output."""
   tel = _capture(monkeypatch)
-  default_out = [register.on_curvature_correction(k, _mv(), v, lc, 0.45) for k, v, lc in _calls()]
+  default_out = _run(_calls())
   register._anchor = None
   tel.clear()
   (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
-  for k, v, lc in _calls():
-    register.on_curvature_correction(k, _mv(), v, lc, 0.45)
+  _run(_calls())
   assert [t['kappa_arc_ref'] for t in tel] == default_out
-
+  _assert_arc_exercised(tel)
 
 def test_arc_smooth_read_once_per_process(data_dir, monkeypatch):
   tel = _capture(monkeypatch)
@@ -270,7 +302,18 @@ def test_stale_old_arc_smooth_key_is_ignored(data_dir, monkeypatch):
   tel = _capture(monkeypatch)
   (data_dir / 'LaneKeepArcSmooth').write_text('0')
   ref = register._anchor_module().LaneAnchor(register._load_config())
-  for k, v, lc in _calls():
-    out = register.on_curvature_correction(k, _mv(), v, lc, 0.45)
-    assert out == ref.update(k, _mv(), v, lc)[0]
+  for k, mv, v, lc in _calls():
+    out = register.on_curvature_correction(k, mv, v, lc, 0.45)
+    assert out == ref.update(k, mv, v, lc)[0]
     assert tel[-1]['arc_bypass'] is False
+  _assert_arc_exercised(tel)
+
+
+def test_manifest_declares_no_params_and_both_hooks():
+  """No manifest params: connect-on-device would list any param with `desc` as an
+  ungated web toggle on every brand. Missing file already means ON."""
+  import json
+  with open(os.path.join(_PLUGIN_DIR, 'plugin.json')) as f:
+    m = json.load(f)
+  assert m.get('params', {}) == {}
+  assert set(m['hooks']) == {'controls.curvature_correction', 'ui.vehicle_settings'}
