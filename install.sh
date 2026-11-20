@@ -300,8 +300,8 @@ fi
 # lane_keeping is required by the BMW lateral controller: it tracks the Arc
 # reference, and without the plugin the hook leaves the stock lateral
 # controller in place (ruling R10). Enforced always-on; no on/off control. The
-# only knob is the temporary Arc Smooth toggle (2026-11-20, raw curvature for one
-# supervised Cheddar test drive; remove or re-decide after the verdict). Clear any stale .disabled — the registry loader honors it even when
+# only knob is the BMW-only Arc Smooth toggle (default ON; OFF = raw curvature,
+# supervised use only; kept 2026-11-20 to evaluate new upstream models). Clear any stale .disabled — the registry loader honors it even when
 # enforced.
 if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
   if $DRY_RUN; then

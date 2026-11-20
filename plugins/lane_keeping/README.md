@@ -28,8 +28,8 @@ its own; the model still decides where the car goes.
 The BMW lateral controller is built for this reference and requires the
 plugin: with it disabled the stock openpilot steering controller runs
 instead. The plugin cannot be switched off; the only Driving-panel control is the
-temporary BMW-only "Arc Smooth" test toggle (2026-11-20, raw curvature, supervised
-test only, takes effect next drive; see DESIGN.md).
+BMW-only "Arc Smooth" toggle (default ON; OFF = raw model curvature for supervised
+evaluation of new driving models, takes effect next drive; see DESIGN.md).
 
 ## More
 

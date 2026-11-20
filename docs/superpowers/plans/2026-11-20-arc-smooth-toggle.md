@@ -1,6 +1,6 @@
 # Arc Smooth toggle (lane_keeping bypass) — spec + plan
 
-Date: 2026-11-20. Owner: PM (bmw session). Status: rev 2 after Director gate 1 REVISE. User decisions 2026-11-20: Q1 override accepted for ONE supervised drive; Q2 (D1) next drive start; Q3 (D4) temporary, BMW-only, dev only, off the release channel.
+Date: 2026-11-20. Owner: PM (bmw session). Status: rev 2 after Director gate 1 REVISE. User decisions 2026-11-20: Q1 override accepted for ONE supervised drive; Q2 (D1) next drive start; Q3 (D4) temporary, BMW-only, dev only, off the release channel. 2026-11-20 later: user KEEPS the toggle (with Pace Lift) in the Driving panel to evaluate new upstream models; daily = POP + Arc ON + Pace Lift ON; T7 removal dropped.
 
 ## Goal
 A Driving-panel toggle "Arc Smooth" (default ON) that lets the BMW track the model's raw

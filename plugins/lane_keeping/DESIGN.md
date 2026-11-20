@@ -73,7 +73,7 @@ read at process start.
 |---|---|---|
 | `LaneKeepKappaFilterTau` | 0.15 | reference low-pass (s) |
 | `LaneKeepArcHorizon` | 0 (auto) | arc aim point, plan seconds ahead; > 0 forces a fixed value (A/B) |
-| `LaneKeepArcSmoothTest` | 1 | TEMPORARY (2026-11-20): only the exact string `0` = off, then the hook returns the raw input curvature; the Arc still runs and the plugin stays loaded (`HOOK_READY` True). Read once per process (next drive). BMW-only Driving-panel toggle. |
+| `LaneKeepArcSmoothTest` | 1 | Arc Smooth (kept by user decision 2026-11-20 to evaluate new upstream driving models): only the exact string `0` = off, then the hook returns the raw input curvature; the Arc still runs and the plugin stays loaded (`HOOK_READY` True). Read once per process (next drive). BMW-only Driving-panel toggle. |
 
 The param is deliberately not declared in `plugin.json`: connect-on-device would list
 it as an ungated web toggle on every brand. Missing file already means ON.
@@ -83,8 +83,8 @@ reused: a stale file from that era must not silently select raw tracking, so the
 old key is ignored.
 
 Raw curvature on the Direct tracker remains unsafe by default; the toggle is the
-only path, for one supervised Cheddar test drive, and is to be removed or
-re-decided after the verdict. To restore mid-drive: disengage, stop, toggle ON,
+only path; OFF is for supervised evaluation of new driving models only (kept by user decision 2026-11-20 to evaluate new upstream driving models;
+first used on Cheddar, routes 549/54a). To restore mid-drive: disengage, stop, toggle ON,
 cycle the ignition.
 
 ## Telemetry

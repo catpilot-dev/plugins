@@ -83,8 +83,8 @@ curvature can be smoothed by arc smoothing, commands stepper faithfully."*
   still holds for the *desired* torque (feedback memory: gradual torque).
 - Running the deadzone-free tracker on the **raw** model curvature (documented
   unsafe in `lane_keeping/register.py`): this mode requires Arc Smoothing. The
-  only path to raw is the temporary Arc Smooth toggle (2026-11-20), for one
-  supervised Cheddar test drive; to be removed or re-decided after the verdict.
+  only path to raw is the BMW-only Arc Smooth toggle (default ON; kept by user decision 2026-11-20 to evaluate new upstream driving models;
+  OFF = supervised use only).
 
 ## Behaviour
 

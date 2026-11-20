@@ -37,7 +37,7 @@ def _read_param(key, default='', strip=True):
 
 
 def _arc_smooth_enabled():
-  """Arc Smooth toggle (temporary, 2026-11-20). Only the exact string '0'
+  """Arc Smooth toggle (kept 2026-11-20 for evaluating new models). Only the exact string '0'
   means OFF; missing, unreadable or any other value is ON. Shared by the
   controls hook and the UI toggle so both parse identically."""
   return _read_param('LaneKeepArcSmoothTest', strip=False) != '0'
@@ -102,7 +102,7 @@ def _write_param(key, value):
 
 
 def on_vehicle_settings(items, CP):
-  """ui.vehicle_settings: temporary BMW-only "Arc Smooth" toggle (2026-11-20)."""
+  """ui.vehicle_settings: BMW-only "Arc Smooth" toggle (default ON)."""
   if CP.brand != 'bmw':
     return items
 
