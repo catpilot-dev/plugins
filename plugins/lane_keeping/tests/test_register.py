@@ -111,7 +111,7 @@ def _capture(monkeypatch):
   return out
 
 
-def _plan_mv(k_arc, v=25.0, state='off', direction='none', n=41, t_max=10.0):
+def _plan_mv(k_arc, v=25.0, state='off', direction='none', n=41, t_max=10.0, raw=0.0):
   """Realistic modelV2 stub (as test_anchor's _lc_mv): ego lane lines, a plan on
   a circle of curvature k_arc, and lane-change meta."""
   ts = [t_max * i / (n - 1) for i in range(n)]
@@ -125,7 +125,8 @@ def _plan_mv(k_arc, v=25.0, state='off', direction='none', n=41, t_max=10.0):
                SimpleNamespace(y=[1.75]), SimpleNamespace(y=[0.0])],
     laneLineProbs=[0.0, 1.0, 1.0, 0.0],
     position=SimpleNamespace(t=ts, x=xs, y=ys),
-    meta=SimpleNamespace(laneChangeState=state, laneChangeDirection=direction))
+    meta=SimpleNamespace(laneChangeState=state, laneChangeDirection=direction),
+    action=SimpleNamespace(desiredCurvature=raw))
 
 
 def _calls():
@@ -270,7 +271,7 @@ def fake_toggle(monkeypatch):
 
 def test_ui_hook_bmw_adds_one_row_default_on(data_dir, fake_toggle):
   items = register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
-  assert len(items) == 1 and items[0].title == 'Arc Smooth'
+  assert [i.title for i in items] == ['Arc Smooth', 'Model Centring']
   assert items[0].state is True
   d = items[0].description.lower()
   assert 'raw model curvature' in d and 'next drive' in d and 'ignition' in d and 'supervised' in d
@@ -317,3 +318,285 @@ def test_manifest_declares_no_params_and_both_hooks():
     m = json.load(f)
   assert m.get('params', {}) == {}
   assert set(m['hooks']) == {'controls.curvature_correction', 'ui.vehicle_settings'}
+
+
+# ---- Model Centring (2026-11-20) ---------------------------------------------
+
+
+def _anchor_mod():
+  return register._anchor_module()
+
+
+def _centring_files(data_dir, on='1', tau=None):
+  if on is not None:
+    (data_dir / 'LaneKeepModelCentring').write_text(on)
+  if tau is not None:
+    (data_dir / 'LaneKeepCentringTau').write_text(tau)
+
+
+def _hook(k_raw, k_arc_plan=0.0, v=25.0, state='off', direction='none', lc=False, curvature=None):
+  """One engaged hook call (curvature == action.desiredCurvature unless given)."""
+  mv = _plan_mv(k_arc_plan, v=v, state=state, direction=direction, raw=k_raw)
+  return register.on_curvature_correction(k_raw if curvature is None else curvature, mv, v, lc, 0.45)
+
+
+def _lp_ref(xs, tc=4.0, dt=0.01):
+  """Reference 1st-order filter for a hook run that engages on the first call:
+  that tick outputs exactly 0 (engage), the filter charges from the second."""
+  a = 1.0 - math.exp(-dt / tc)
+  s, out = 0.0, [0.0]
+  for x in xs[1:]:
+    s += a * (x - s)
+    out.append(s)
+  return out
+
+
+def test_centring_off_is_bit_identical_in_both_arc_modes(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  base = _run(_calls())
+  for off in ('0', '', 'true', ' 1', '1\n', '2'):
+    register._anchor = None
+    _centring_files(data_dir, on=off)
+    assert _run(_calls()) == base
+  # Arc Smooth OFF: raw as today, centring ignored even when ON
+  register._anchor = None
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
+  _centring_files(data_dir, on='1')
+  calls = _calls()
+  assert _run(calls) == [k for k, _, _, _ in calls]
+  assert all(t['centring_on'] is False and t['kappa_centring'] == 0.0 for t in tel[-len(calls):])
+
+
+def test_centring_on_with_raw_equal_arc_is_arc(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  base = _run(_calls())
+  register._anchor = None
+  _centring_files(data_dir)
+  tel.clear()
+  assert _run(_calls()) == base          # _calls never engages (curvature != action)
+  assert all(t['kappa_centring'] == 0.0 and t['centring_on'] is True for t in tel)
+  # engaged with raw == arc (plan arc 0.003 vs raw 0.003 once the Arc has settled)
+  register._anchor = None
+  tel.clear()
+  outs = [_hook(0.003, 0.003) for _ in range(800)]
+  assert max(abs(t['kappa_centring']) for t in tel) < 1e-9
+  assert outs[-1] == pytest.approx(0.003, abs=1e-9)
+
+
+def test_centring_lp_step_matches_reference_filter(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir)
+  n = 1500
+  for _ in range(n):
+    _hook(3e-4)
+  ref = _lp_ref([3e-4] * n)
+  assert [t['kappa_centring'] for t in tel] == pytest.approx(ref, rel=0, abs=1e-9)
+  assert tel[-1]['kappa_centring'] == pytest.approx(3e-4 * (1 - math.exp(-3.7475)), abs=1e-9)
+
+
+def test_centring_lp_sine_matches_reference_filter(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir)
+  xs = [2e-4 * math.sin(2 * math.pi * 0.1 * i * 0.01) for i in range(2000)]
+  for x in xs:
+    _hook(x)
+  assert [t['kappa_centring'] for t in tel] == pytest.approx(_lp_ref(xs), rel=0, abs=1e-9)
+  assert any(abs(t['kappa_centring']) > 1e-5 for t in tel)
+
+
+def test_centring_tau_file(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir, tau='2.0')
+  for _ in range(300):
+    _hook(3e-4)
+  assert [t['kappa_centring'] for t in tel] == pytest.approx(_lp_ref([3e-4] * 300, tc=2.0), rel=0, abs=1e-9)
+
+
+@pytest.mark.parametrize('val,expect', [('junk', 4.0), ('nan', 4.0), ('inf', 4.0), ('', 4.0),
+                                        ('0.2', 1.0), ('-3', 1.0), ('100', 20.0), ('7.5', 7.5)])
+def test_centring_tau_parse(data_dir, val, expect):
+  (data_dir / 'LaneKeepCentringTau').write_text(val)
+  assert register._centring_tau() == expect
+  assert register._centring_tau.__name__          # file-only: no param declared (manifest test)
+
+
+def test_centring_missing_tau_file_is_default(data_dir):
+  assert register._centring_tau() == 4.0
+
+
+def test_centring_state_clamp_and_speed_gate_units():
+  A = _anchor_mod()
+  t = A.CentringTerm(1.0)
+  v = 25.0
+  for _ in range(5000):
+    out = t.step(1e-2, 0.0, v, True, False)
+  assert t.s == pytest.approx(0.3 / v ** 2)
+  assert out == pytest.approx(0.3 / v ** 2)
+  t = A.CentringTerm(1.0)
+  for _ in range(5000):
+    t.step(-1e-2, 0.0, 20.0, True, False)
+  assert t.s == pytest.approx(-0.3 / 20.0 ** 2)
+
+
+def test_centring_speed_gate():
+  A = _anchor_mod()
+  assert A.centring_speed_gate(25 / 3.6) == 0.0
+  assert A.centring_speed_gate(35 / 3.6) == pytest.approx(0.5)
+  assert A.centring_speed_gate(45 / 3.6) == 1.0
+  t = A.CentringTerm(1.0)
+  outs = []
+  for v_kmh in (25, 35, 45):
+    t = A.CentringTerm(1.0)
+    for _ in range(3000):
+      out = t.step(4e-4, 0.0, v_kmh / 3.6, True, False)
+    outs.append(out / t.s)
+  assert outs == pytest.approx([0.0, 0.5, 1.0])
+  # the state itself still charges below the gate (only the output is gated)
+  t = A.CentringTerm(1.0)
+  for _ in range(500):
+    t.step(4e-4, 0.0, 6.0, True, False)
+  assert t.s != 0.0
+
+
+def test_centring_bend_gate_decays_and_straight_charges():
+  A = _anchor_mod()
+  t = A.CentringTerm(1.0)
+  v = 20.0
+  for _ in range(500):
+    t.step(1e-4, 0.0, v, True, False)
+  s0 = t.s
+  assert s0 > 0
+  bend = 0.31 / v ** 2                   # |arc| v^2 just above 0.3 m/s^2
+  for _ in range(50):
+    t.step(1e-4, bend, v, True, False)   # 0.5 s of bend
+  assert t.s == pytest.approx(s0 * math.exp(-1.0), rel=1e-9)
+  s1 = t.s
+  t.step(0.29 / v ** 2 + 1e-4, 0.29 / v ** 2, v, True, False)   # below the gate: charges again
+  assert t.s > s1 * math.exp(-0.01 / 0.5)
+  # never charges while in a bend
+  t = A.CentringTerm(1.0)
+  for _ in range(500):
+    t.step(5e-4, bend, v, True, False)
+  assert t.s == 0.0
+
+
+def test_centring_engage_transient(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir)
+  # not engaged: handed the measured curvature (!= action): output == Arc, term 0
+  base = []
+  for _ in range(300):
+    out = _hook(3e-4, curvature=1e-3)
+    base.append(out)
+  assert all(t['kappa_centring'] == 0.0 for t in tel)
+  assert register._centring.s == 0.0
+  # first engaged tick == Arc, then the term builds from 0
+  out = _hook(3e-4)
+  assert tel[-1]['kappa_centring'] == 0.0 and out == tel[-1]['kappa_arc_ref']
+  _hook(3e-4)
+  assert tel[-1]['kappa_centring'] == pytest.approx(3e-4 * (1 - math.exp(-0.0025)), abs=1e-12)
+  for _ in range(400):
+    _hook(3e-4)
+  assert tel[-1]['kappa_centring'] > 1e-5
+  # latActive drops: state reset at once
+  _hook(3e-4, curvature=1e-3)
+  assert tel[-1]['kappa_centring'] == 0.0 and register._centring.s == 0.0
+
+
+def test_centring_lane_change_onset_decays_and_resets(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir)
+  for _ in range(800):
+    _hook(3e-4)
+  s0 = register._centring.s
+  assert s0 > 1e-5
+  # preLaneChange (lane_changing True) alone does not touch it
+  for _ in range(50):
+    _hook(3e-4, state='preLaneChange', direction='right', lc=True)
+  assert register._centring.s > s0
+  s1 = register._centring.s
+  for _ in range(50):                         # 0.5 s in laneChangeStarting: one tau
+    _hook(3e-4, state='laneChangeStarting', direction='right', lc=True)
+  assert register._centring.s == pytest.approx(s1 * math.exp(-1.0), rel=1e-9)
+  for _ in range(20):
+    _hook(3e-4, state='laneChangeFinishing', direction='right', lc=True)
+  assert register._centring.s > 0
+  _hook(3e-4)                                  # change over: reset, then 1 tick of charging
+  a = 1 - math.exp(-0.0025)
+  assert register._centring.s == pytest.approx(a * (3e-4 - tel[-1]['kappa_arc_ref']), abs=1e-12)
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf')])
+def test_centring_non_finite_raw_falls_back_to_arc(data_dir, monkeypatch, bad):
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir)
+  for _ in range(300):
+    _hook(3e-4)
+  mv = _plan_mv(0.0, raw=bad)
+  out = register.on_curvature_correction(bad, mv, 25.0, False, 0.45)
+  assert tel[-1]['kappa_centring'] == 0.0 and register._centring.s == 0.0
+  assert out == tel[-1]['kappa_arc_ref']
+  # missing action: not engaged, no crash
+  mv2 = _plan_mv(0.0)
+  del mv2.action
+  out = register.on_curvature_correction(3e-4, mv2, 25.0, False, 0.45)
+  assert out == tel[-1]['kappa_arc_ref']
+
+
+def test_centring_telemetry_all_modes(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  _hook(3e-4)
+  assert tel[-1]['centring_on'] is False and tel[-1]['kappa_centring'] == 0.0
+  register._anchor = None
+  _centring_files(data_dir)
+  _hook(3e-4)
+  assert tel[-1]['centring_on'] is True and 'kappa_centring' in tel[-1]
+  register._anchor = None
+  (data_dir / 'LaneKeepArcSmoothTest').write_text('0')
+  _hook(3e-4)
+  assert tel[-1]['centring_on'] is False and tel[-1]['arc_bypass'] is True
+  assert tel[-1]['kappa_ref'] == 3e-4
+  assert register.HOOK_READY is True
+
+
+def test_centring_applied_term_is_in_kappa_ref(data_dir, monkeypatch):
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir)
+  for _ in range(800):
+    out = _hook(3e-4)
+  assert out == tel[-1]['kappa_arc_ref'] + tel[-1]['kappa_centring']
+  assert tel[-1]['kappa_ref'] == out
+  assert tel[-1]['kappa_centring'] > 1e-5
+
+
+def test_centring_ui_rows(data_dir, fake_toggle):
+  items = register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
+  assert [i.title for i in items] == ['Arc Smooth', 'Model Centring']
+  assert items[1].state is False
+  d = items[1].description.lower()
+  assert 'lane-centring' in d and 'arc smooth' in d and 'next drive' in d and 'supervised' in d
+  (data_dir / 'LaneKeepModelCentring').write_text('1')
+  fake_toggle.clear()
+  items = register.on_vehicle_settings([], SimpleNamespace(brand='bmw'))
+  assert items[1].state is True
+  items[1].callback(False)
+  assert (data_dir / 'LaneKeepModelCentring').read_text() == '0'
+  items[1].callback(True)
+  assert (data_dir / 'LaneKeepModelCentring').read_text() == '1'
+  fake_toggle.clear()
+  assert register.on_vehicle_settings([], SimpleNamespace(brand='toyota')) == []
+  assert fake_toggle == []
+
+
+def test_replay_helper_uses_the_hook_law(data_dir, monkeypatch):
+  import importlib.util as ilu
+  spec = ilu.spec_from_file_location('lk_replay', os.path.join(_PLUGIN_DIR, 'tools', 'replay_centring.py'))
+  m = ilu.module_from_spec(spec)
+  spec.loader.exec_module(m)
+  tel = _capture(monkeypatch)
+  _centring_files(data_dir)
+  raws = [3e-4 + 1e-4 * math.sin(i * 0.01) for i in range(600)]
+  for r in raws:
+    _hook(r)
+  series = m.centring_series(raws, [0.0] * 600, [25.0] * 600, [True] * 600, [False] * 600)
+  assert series == [t['kappa_centring'] for t in tel]

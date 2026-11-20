@@ -13,6 +13,7 @@ modelV2 plan ──► k_ahead = max |plan curvature| within 2.5 s
              ──► κ_arc = 2y/(x²+y²) at the plan point H seconds ahead
 κ_src = κ_arc (or the model's desiredCurvature when there is no usable plan)
 κ_ref = LPF(κ_src, τ = kappa_filter_tau)           lane change: κ_ref = raw input (after the onset hand-over)
+Model Centring ON (optional): κ_ref += g(v)·LP(raw − κ_arc), see below
 hook returns κ_ref ──► vehicle lateral controller
 ```
 
@@ -74,8 +75,10 @@ read at process start.
 | `LaneKeepKappaFilterTau` | 0.15 | reference low-pass (s) |
 | `LaneKeepArcHorizon` | 0 (auto) | arc aim point, plan seconds ahead; > 0 forces a fixed value (A/B) |
 | `LaneKeepArcSmoothTest` | 1 | Arc Smooth (kept by user decision 2026-11-20 to evaluate new upstream driving models): only the exact string `0` = off, then the hook returns the raw input curvature; the Arc still runs and the plugin stays loaded (`HOOK_READY` True). Read once per process (next drive). BMW-only Driving-panel toggle. |
+| `LaneKeepModelCentring` | 0 | Model Centring (2026-11-20): only the exact string `1` = ON (missing / anything else OFF). Needs Arc Smooth ON (Arc Smooth OFF = raw, centring ignored). Read once per process. BMW-only Driving-panel toggle. |
+| `LaneKeepCentringTau` | 4.0 | Model Centring low-pass time constant (s), file only (no UI); junk / NaN -> 4.0, clamped 1-20. |
 
-The param is deliberately not declared in `plugin.json`: connect-on-device would list
+The params are deliberately not declared in `plugin.json`: connect-on-device would list
 it as an ungated web toggle on every brand. Missing file already means ON.
 
 The old Arc Smoothing switch key `LaneKeepArcSmooth` (removed) is deliberately not
@@ -87,6 +90,32 @@ only path; OFF is for supervised evaluation of new driving models only (kept by 
 first used on Cheddar, routes 549/54a). To restore mid-drive: disengage, stop, toggle ON,
 cycle the ignition.
 
+## Model Centring (2026-11-20)
+
+Action-head models (Cheddar) centre the car through their own `desiredCurvature`, but the
+Arc is built on the plan, which follows the car, so it drops that slow correction.
+With Arc Smooth ON and Model Centring ON:
+
+    out = arc + g(v) * s,   s = 1st-order low-pass (tc, fixed dt = DT_CTRL) of (raw - arc)
+
+`raw` = `model_v2.action.desiredCurvature`; `arc` = the Arc output (`kappa_arc_ref`).
+The term lives in `anchor.py` (`CentringTerm`), the hook only wires it.
+
+- **Engaged only.** controlsd hands the hook the measured curvature when latActive is
+  false, so engaged <=> `curvature == action.desiredCurvature`. Not engaged: s = 0, term 0.
+  The first engaged tick is exactly the Arc; the term builds from 0.
+- **Lane change.** While the anchor's `lc_active` (laneChangeStarting / Finishing; not
+  preLaneChange) s decays with tau 0.5 s; reset to 0 when the change ends. So after the
+  onset hand-over the output is raw plus a fading term for ~1.5 s, then raw.
+- **Bend gate.** While |arc| * v^2 > 0.3 m/s^2 s does not charge and decays with tau 0.5 s
+  (tight-turn over-asks and turn exits stay the Arc).
+- **Bound.** |s| <= 0.3 / max(v, 1)^2 on the state (anti-windup). Output speed gate g(v):
+  0 below 30 km/h, linear to 1 at 40 km/h.
+- NaN / inf raw, Arc or speed: s = 0, output = Arc. Any exception in the term: output = Arc.
+- Offline replay: `tools/replay_centring.py` `centring_series(...)` runs the same `CentringTerm`.
+
+Evidence and decisions: docs/superpowers/plans/2026-11-20-model-centring.md.
+
 ## Telemetry
 
 Topic `lane_keeping` on the plugin bus (recorded in rlogs), 100 Hz: `kappa_in`
@@ -95,7 +124,8 @@ bypassed), `kappa_arc_ref` (the Arc's output, both modes), `arc_bypass`, `kappa_
 `arc_on`, `arc_h`, `k_ahead` (−1 when unavailable), `v_ego`, and the ego lane
 geometry at the car for drive analysis: `line_l`, `line_r` (m, +y right),
 `prob_l`, `prob_r`; `lc_hold` (true while the lane-change onset hand-over
-holds the Arc).
+holds the Arc); `centring_on` (Model Centring effective: toggle ON and Arc Smooth ON) and
+`kappa_centring` (the applied term g*s, 0 otherwise), every call in all modes.
 
 ## Relation to the BMW controller
 

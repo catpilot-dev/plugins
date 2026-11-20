@@ -60,6 +60,19 @@ def _load_config():
 _anchor = None
 _pub = None
 _arc_smooth = True   # read once, at the same lazy init as _anchor
+_centring_on = False  # Model Centring, read once at the same init
+_centring = None
+
+
+def _model_centring_enabled():
+  """Model Centring toggle (default OFF). Only the exact string '1' means ON."""
+  return _read_param('LaneKeepModelCentring', strip=False) == '1'
+
+
+def _centring_tau():
+  """Time constant (s) from data/LaneKeepCentringTau (file only); junk/NaN ->
+  default, clamped to the anchor's range."""
+  return _anchor_module().sanitize_centring_tau(_read_param('LaneKeepCentringTau', '4.0'))
 
 
 def _publish(telem):
@@ -71,17 +84,35 @@ def _publish(telem):
 
 
 def on_curvature_correction(curvature, model_v2, v_ego, lane_changing, lat_delay=None):
-  global _anchor, _arc_smooth
+  global _anchor, _arc_smooth, _centring_on, _centring
   if _anchor is None:
     LaneAnchor = _anchor_module().LaneAnchor
     _arc_smooth = _arc_smooth_enabled()
+    _centring_on = _model_centring_enabled()
+    _centring = _anchor_module().CentringTerm(_centring_tau())
     _anchor = LaneAnchor(_load_config())
   arc_curvature, telem = _anchor.update(curvature, model_v2, v_ego, lane_changing)   # lat_delay: hook signature only
   # Arc Smooth OFF: the Arc keeps running (state, telemetry) but the raw input
   # is returned. The plugin stays loaded so HOOK_READY and the BMW Direct
   # controller are unaffected.
   new_curvature = arc_curvature if _arc_smooth else curvature
+  # Model Centring (needs Arc Smooth ON): arc + slow low-passed (raw - arc).
+  # engaged <=> controlsd passed the model's own desiredCurvature (it passes the
+  # measured curvature when latActive is false); not engaged -> term 0.
+  centring_on = _centring_on and _arc_smooth
+  term = 0.0
+  if centring_on:
+    try:
+      raw = float(model_v2.action.desiredCurvature)
+      term = _centring.step(raw, arc_curvature, v_ego, curvature == raw, _anchor.lc_active)
+      new_curvature = arc_curvature + term
+    except Exception:
+      _centring.s = 0.0
+      term = 0.0
+      new_curvature = arc_curvature
   try:
+    telem['centring_on'] = bool(centring_on)
+    telem['kappa_centring'] = float(term)
     telem['kappa_arc_ref'] = float(arc_curvature)
     telem['arc_bypass'] = not _arc_smooth
     telem['kappa_ref'] = float(new_curvature)
@@ -102,7 +133,7 @@ def _write_param(key, value):
 
 
 def on_vehicle_settings(items, CP):
-  """ui.vehicle_settings: BMW-only "Arc Smooth" toggle (default ON)."""
+  """ui.vehicle_settings: BMW-only "Arc Smooth" (default ON) and "Model Centring" (default OFF)."""
   if CP.brand != 'bmw':
     return items
 
@@ -114,6 +145,13 @@ def on_vehicle_settings(items, CP):
     "To restore mid-drive: disengage, stop, turn ON, cycle the ignition.",
     _arc_smooth_enabled(),
     callback=lambda state: _write_param('LaneKeepArcSmoothTest', '1' if state else '0'),
+  ))
+  items.append(toggle_item(
+    "Model Centring",
+    "Adds the model's slow lane-centring correction on top of Arc Smooth (for action-head models "
+    "such as Cheddar). Takes effect on the next drive. Supervised evaluation.",
+    _model_centring_enabled(),
+    callback=lambda state: _write_param('LaneKeepModelCentring', '1' if state else '0'),
   ))
   return items
 

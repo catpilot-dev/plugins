@@ -198,3 +198,64 @@ class LaneAnchor:
       'lc_hold': bool(self.lc_hold),
     }
     return kappa_ref, telem
+
+
+# --- Model Centring (2026-11-20) ----------------------------------------------
+# Action-head models (Cheddar) centre the car in the lane through their own
+# desiredCurvature, but the Arc is built on the plan, which follows the car, so
+# it drops that slow correction. CentringTerm adds back a 1st-order low-pass of
+# (raw - arc): output = arc + g(v) * s. Docs: DESIGN.md "Model Centring".
+CENTRING_TC_DEFAULT = 4.0     # s
+CENTRING_TC_RANGE = (1.0, 20.0)
+CENTRING_A_MAX = 0.3          # m/s^2: state clamp |s| <= A_MAX / v^2
+CENTRING_BEND_A = 0.3         # m/s^2: |arc| * v^2 above this -> no charging
+CENTRING_DECAY_TAU = 0.5      # s: decay in bends and lane changes
+CENTRING_V_GATE = (30.0 / 3.6, 40.0 / 3.6)   # m/s: output 0 -> 1
+
+
+def centring_speed_gate(v):
+  lo, hi = CENTRING_V_GATE
+  return min(1.0, max(0.0, (v - lo) / (hi - lo)))
+
+
+def sanitize_centring_tau(tau):
+  """Junk / NaN / inf -> default; otherwise clamped to CENTRING_TC_RANGE."""
+  try:
+    tau = float(tau)
+  except (TypeError, ValueError):
+    return CENTRING_TC_DEFAULT
+  if not math.isfinite(tau):
+    return CENTRING_TC_DEFAULT
+  return min(CENTRING_TC_RANGE[1], max(CENTRING_TC_RANGE[0], tau))
+
+
+class CentringTerm:
+  def __init__(self, tc=CENTRING_TC_DEFAULT):
+    self.tc = sanitize_centring_tau(tc)
+    self.s = 0.0
+    self.lc_prev = False
+    self.engaged_prev = False
+
+  def step(self, raw, arc, v, engaged, lc_active):
+    """One 100 Hz tick; returns the applied term g(v) * s. `engaged` is True
+    only when the lateral controller is active (not tracking measured curvature)."""
+    lc_ended = self.lc_prev and not lc_active
+    first = not self.engaged_prev
+    self.lc_prev = bool(lc_active)
+    self.engaged_prev = bool(engaged) and all(math.isfinite(x) for x in (raw, arc, v))
+    if not self.engaged_prev:
+      self.s = 0.0
+      return 0.0
+    if first:
+      self.s = 0.0   # engage: the first engaged tick is exactly the Arc
+      return 0.0
+    if lc_ended:
+      self.s = 0.0   # the new lane starts fresh
+    v2 = max(v, 1.0) ** 2
+    if lc_active or abs(arc) * v * v > CENTRING_BEND_A:
+      self.s *= math.exp(-DT_CTRL / CENTRING_DECAY_TAU)
+    else:
+      self.s += (1.0 - math.exp(-DT_CTRL / self.tc)) * ((raw - arc) - self.s)
+    bound = CENTRING_A_MAX / v2
+    self.s = min(bound, max(-bound, self.s))
+    return centring_speed_gate(v) * self.s
