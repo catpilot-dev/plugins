@@ -21,7 +21,7 @@ _REPO_ROOT = os.path.dirname(_PLUGINS_DIR)
 if _REPO_ROOT not in sys.path:
   sys.path.insert(0, _REPO_ROOT)
 
-# speedlimitd.py imports its siblings (osm_query, mapd_source) by bare name,
+# speedlimitd.py imports its sibling osm_query by bare name,
 # matching the device's flat runtime layout. Put that directory on sys.path
 # explicitly — relying on test_osm_query.py having been collected first makes
 # this suite depend on collection order.
@@ -34,12 +34,8 @@ if _SLD_DIR not in sys.path:
 def mock_openpilot(monkeypatch):
   """Mock openpilot + cereal imports."""
   mock_services = MagicMock()
-  # mapdOut is present here because install.sh injects it into cereal/services.py
-  # on a healthy device. TestMapdPhase1Telemetry removes it to cover the
-  # injection-missing device state.
   mock_services.SERVICE_LIST = {'modelV2': MagicMock(), 'gpsLocationExternal': MagicMock(),
-                                'deviceMotion': MagicMock(), 'mapdOut': MagicMock(),
-                                'mapdExtendedOut': MagicMock()}
+                                'deviceMotion': MagicMock()}
   mock_plugin_bus = MagicMock()
   # PluginSub().drain() must return None to avoid infinite loop in __init__
   mock_plugin_bus.PluginSub.return_value.drain.return_value = None
@@ -268,8 +264,8 @@ class TestSnapToStandardSpeed:
     assert sld.snap_to_standard_speed(75) == 80
     assert sld.snap_to_standard_speed(83) == 80
 
-  def test_mapd_raw_curve_values(self, sld):
-    # Values seen from mapd visionCurveSpeed on Shanghai expressways
+  def test_raw_vision_curve_values(self, sld):
+    # Raw vision curve-speed values seen on Shanghai expressways
     assert sld.snap_to_standard_speed(99) == 100
     assert sld.snap_to_standard_speed(105) == 100
     assert sld.snap_to_standard_speed(46) == 50
@@ -554,38 +550,6 @@ class TestPriorityCascade:
       mw = mod.SpeedLimitMiddleware()
     mw._sl_pub = MagicMock()
     return mw
-
-  def test_min_of_all_sources(self, sld):
-    """Speed limit is the minimum across mapd, inference, and YOLO."""
-    # mapd=105 (highway max), inference=80 → min=80
-    inferred = sld.infer_speed_from_road_type('primary', 2, 'city')
-    mapd = 105
-    result = min(mapd, inferred)
-    assert result == inferred
-    assert result < mapd
-
-  def test_mapd_curve_wins_over_inference(self, sld):
-    """When mapd gives a curve constraint lower than inference, mapd wins."""
-    inferred = sld.infer_speed_from_road_type('motorway', 6, 'freeway')  # high-speed road
-    mapd = 70  # sharp curve
-    result = min(mapd, inferred)
-    assert result == 70
-    assert inferred > 70  # confirm inference is higher
-
-  def test_yolo_wins_when_lowest(self, sld):
-    """YOLO sign (e.g. 60) beats both mapd and inference when it's lowest."""
-    inferred = sld.infer_speed_from_road_type('primary', 3, 'city')  # 3-lane primary → 60
-    mapd = 105
-    yolo = 60
-    result = min(yolo, mapd, inferred)
-    assert result == 60
-
-  def test_mapd_unconstrained_excluded(self, sld):
-    """mapd suggestedSpeed >= 130 km/h is excluded from candidates."""
-    raw = 145
-    MAPD_UNCONSTRAINED = 130
-    mapd_suggested = raw if raw < MAPD_UNCONSTRAINED else 0
-    assert mapd_suggested == 0  # not included in min()
 
   def test_lane_count_locked_after_2s_stable(self, sld):
     """lane_count_locked becomes True after 2 s of stable lane detection."""
@@ -1885,7 +1849,7 @@ class TestLaneCountFirstInference:
 
   def test_gs_motorway_type_no_ref_freeway_context_still_demotes_to_80(self, sld):
     # Re-review precision item: the ON-CAR elevated-expressway case is
-    # roadContext=0 (mapd tags elevated ways 'freeway'). The ref-less
+    # roadContext=0 (an elevated way tagged 'freeway'). The ref-less
     # motorway demote must hold there too — 80 via the freeway-demote
     # branch, NOT 100 via the motorway+freeway promote.
     mw = self._mw(sld)
@@ -3732,528 +3696,60 @@ class TestOsmGateTelemetry:
     assert pub['inferenceMode'] == 'osm'
 
 
-class TestMapdPhase1Telemetry:
-  """Phase 1 publishes mapd observations and changes NOTHING else.
+# ============================================================
+# mapd removal (2026-11-21): the tile reader is the sole OSM source
+# ============================================================
 
-  The point of the phase is to compare mapd's road context against the tile
-  reader's on a real drive while the tile reader still drives every control
-  path. If any mapd value reached actuation, the comparison would be measuring
-  itself.
-  """
+class TestNoMapdConsumers:
+  """speedlimitd reads OSM only through osm_query.OsmTileReader. The mapd
+  binary's services, telemetry keys and map-curve look-ahead are gone."""
 
-  def test_mapd_out_is_subscribed(self, sld):
-    import inspect
-    src = inspect.getsource(sld.SpeedLimitMiddleware.__init__)
-    assert "'mapdOut'" in src or '"mapdOut"' in src
+  MAPD_SERVICES = ('mapdOut', 'mapdExtendedOut')
+  LOOKAHEAD_PARAM = 'MapdCurveLookahead'
 
-  def test_telemetry_keys_published(self, sld, monkeypatch):
-    mw = sld.SpeedLimitMiddleware()
-    sent = {}
-    mw._sl_pub.send = lambda payload: sent.update(payload)
-    mw.update()
-    for key in ('mapdAlive', 'mapdWayRef', 'mapdWayId', 'mapdSpeedLimit',
-                'mapdHwClass', 'mapdLanes', 'mapdSelType', 'mapdTileLoaded',
-                'mapdDistance', 'mapdRefAgree', 'mapdRoadContext'):
-      assert key in sent, f'{key} missing from published telemetry'
+  # The 20 speedLimitState keys this change removes: 11 Phase 1 mapd telemetry
+  # keys and 9 map-curve look-ahead keys.
+  REMOVED_KEYS = frozenset({
+    'mapdAlive', 'mapdWayRef', 'mapdWayId', 'mapdSpeedLimit', 'mapdHwClass',
+    'mapdLanes', 'mapdSelType', 'mapdTileLoaded', 'mapdDistance',
+    'mapdRefAgree', 'mapdRoadContext',
+    'mapCurveCap', 'mapCurveActive', 'mapCurveDist', 'mapCurveKappa',
+    'mapCurveLatLon', 'mapCurvePathAhead', 'mapCurveLat', 'mapCurveGate',
+    'mapCurveShaped',
+  })
+  # The keys that stay, from the payload a fresh instance published after one
+  # update() at baseline 73b20ac (44 keys = these 24 + the 20 above).
+  REMAINING_KEYS = frozenset({
+    'confidence', 'confirmed', 'curvatureCap', 'highwayType', 'inferenceMode',
+    'inferredSpeed', 'laneCount', 'laneWidth', 'laneWidthClass', 'osmHwType',
+    'osmRejectReason', 'osmSpeedLimit', 'osmTilesMissing', 'osmTrusted',
+    'reactCap', 'reactCapEngaged', 'reactLatAccel', 'roadName', 'safetyCap',
+    'safetyCapped', 'source', 'speedLimit', 'wayRef', 'yoloSpeed',
+  })
+  BASELINE_KEYS = REMAINING_KEYS | REMOVED_KEYS
 
-  def test_publishes_even_when_mapd_absent(self, sld):
-    # A drive with a dead mapd must still yield an analysable rlog.
-    mw = sld.SpeedLimitMiddleware()
-    sent = {}
-    mw._sl_pub.send = lambda payload: sent.update(payload)
-    mw.update()
-    assert sent['mapdAlive'] is False
-    assert sent['mapdWayRef'] == ''
-
-  @staticmethod
-  def _drop_mapd_service():
-    """Simulate a device whose cereal has no injected mapdOut service.
-
-    Reachable three ways: a catpilot `git reset --hard` wiping the injection,
-    an install that touched the enforcement markers after overlay_cereal, and a
-    user's .disabled on mapd at the next install. SubMaster raises on an unknown
-    service, so an unguarded subscribe crash-loops speedlimitd and the car
-    drives with NO speed-limit data — a far worse failure than losing Phase 1
-    telemetry. The mock sys.modules entry is restored by mock_openpilot's
-    monkeypatch.
-    """
+  def test_never_subscribes_mapd_services_even_when_present(self, sld):
     services = sys.modules['openpilot.cereal.services']
-    services.SERVICE_LIST = {k: v for k, v in services.SERVICE_LIST.items()
-                             if k != 'mapdOut'}
-
-  def test_builds_without_mapd_service_in_service_list(self, sld):
-    self._drop_mapd_service()
-    mw = sld.SpeedLimitMiddleware()
-    assert mw._mapd_service_available is False
+    services.SERVICE_LIST = {**services.SERVICE_LIST,
+                             **{name: MagicMock() for name in self.MAPD_SERVICES}}
+    sld.SpeedLimitMiddleware()
     subs = sld.messaging.SubMaster.call_args[0][0]
-    assert 'mapdOut' not in subs
-    assert 'modelV2' in subs and 'deviceMotion' in subs
+    assert not set(self.MAPD_SERVICES) & set(subs)
+    assert set(subs) == {'modelV2', 'gpsLocationExternal', 'deviceMotion'}
 
-  def test_update_runs_and_still_publishes_absent_shape_without_service(self, sld):
-    self._drop_mapd_service()
-    mw = self._armed(sld)          # armed: the 5 s sampling block really runs
-    sent = {}
-    mw._sl_pub.send = lambda payload: sent.update(payload)
-    mw.update()
-    assert mw._osm_last_query_t > 0.0   # the sampling block was entered
-    assert sent['mapdAlive'] is False
-    assert sent['mapdWayRef'] == ''
-    assert sent['mapdRoadContext'] == ''
-
-  @staticmethod
-  def _armed(sld):
-    """An instance whose 5 s OSM/mapd sampling block will actually run.
-
-    A fresh instance has _gps_valid False, so the sampling block is skipped
-    entirely — a containment test built on one would pass trivially without ever
-    injecting anything.
-    """
-    mw = sld.SpeedLimitMiddleware()
-    mw._gps_valid = True
-    mw._gps_lat, mw._gps_lon = 31.3137, 121.5395
-    mw._osm_last_query_t = 0.0
-    return mw
-
-  def test_sampling_block_actually_runs(self, sld):
-    # Guards the containment test below: proves _armed() reaches the sampling
-    # path, so a passing containment result means something.
-    mw = self._armed(sld)
-    mw.update()
-    assert mw._osm_last_query_t > 0.0
-
-  def test_mapd_values_do_not_reach_control_state(self, sld):
-    """Containment: injecting mapd data must not move any control variable.
-
-    Runs update() from identical armed state twice — once with no mapd data,
-    once with a full mapd message reporting a DIFFERENT road at a DIFFERENT
-    speed — and asserts every control-bearing attribute is unchanged. The tile
-    reader sees no tiles in either run, so it contributes identically.
-
-    Two complementary assertions:
-    - `control_attrs` is a fixed, named list — it FAILS FAST and localises
-      exactly which attribute leaked.
-    - the full published payload (minus the eleven `mapd*` keys) must also be
-      identical between the two runs. That is the actual "actuation stays
-      byte-identical" claim — `speedLimit` (planner_hook's input) and
-      `laneCount` live here, not in `control_attrs`, and unlike a hand-picked
-      attribute list this can't go stale as speedlimitd grows new published
-      fields.
-    """
-    control_attrs = ('last_way_ref', 'last_road_name', 'last_osm_hwtype',
-                     'last_osm_speed_kph', 'last_road_context',
-                     'last_highway_type', 'last_road_id', 'curvature_cap',
-                     'inference_mode', '_gs_limit_kph')
-
-    baseline = self._armed(sld)
-    baseline_sent = {}
-    baseline._sl_pub.send = lambda payload: baseline_sent.update(payload)
-    baseline.update()
-    before = {a: getattr(baseline, a) for a in control_attrs}
-
-    fake = MagicMock()
-    fake.wayRef = 'G1503'
-    fake.wayName = 'injected'
-    fake.roadName = 'injected'
-    fake.speedLimit = 33.3
-    fake.lanes = 5
-    fake.highwayClass = 'motorway'
-    fake.wayId = 999
-    fake.tileLoaded = True
-    fake.distanceFromWayCenter = 0.4
-    fake.waySelectionType = 'current'
-
-    injected = self._armed(sld)
-    real_sm = injected.sm
-    injected.sm = MagicMock()
-    injected.sm.__getitem__ = lambda _s, k: fake if k == 'mapdOut' else real_sm[k]
-    injected.sm.valid = {'mapdOut': True}
-    # alive must be explicit too (2nd review round): the freshness conjunct
-    # added at the speedlimitd.py call site reads sm.alive, not just sm.valid.
-    injected.sm.alive = {'mapdOut': True}
-    # Route to real_sm.updated (not a bare {}) so every OTHER key (modelV2,
-    # gpsLocationExternal, deviceMotion) behaves exactly as it does in the
-    # baseline run above — the containment comparison is only meaningful if
-    # mapdOut is the sole difference between the two update() calls. A literal
-    # {} here made speedlimitd.py's unrelated `self.sm.updated['modelV2']`
-    # direct-index read KeyError, which is a mocking-parity bug, not a leak.
-    injected.sm.updated = real_sm.updated
-    sent = {}
-    injected._sl_pub.send = lambda payload: sent.update(payload)
-    injected.update()
-
-    after = {a: getattr(injected, a) for a in control_attrs}
-    assert after == before, 'mapd data leaked into a control variable'
-
-    # Structural containment over the WHOLE published payload, not just the
-    # named control_attrs above.
-    baseline_rest = {k: v for k, v in baseline_sent.items() if not k.startswith('mapd')}
-    injected_rest = {k: v for k, v in sent.items() if not k.startswith('mapd')}
-    assert injected_rest == baseline_rest, 'mapd data leaked into the published payload'
-
-    # ...and the injected data really did arrive, so the assertions above are
-    # testing containment rather than an absent message.
-    assert sent['mapdWayRef'] == 'G1503'
-    assert sent['mapdAlive'] is True
-
-
-# ============================================================
-# G/S map curve look-ahead (2026-11-09 spec) — telemetry wiring
-# ============================================================
-
-_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _TESTS_DIR not in sys.path:
-  sys.path.insert(0, _TESTS_DIR)
-
-
-class _FakeSM:
-  """Just enough SubMaster: per-service updated/alive/valid flags and data."""
-
-  def __init__(self):
-    self.updated = {'modelV2': False, 'gpsLocationExternal': False, 'deviceMotion': False}
-    self.alive = {}
-    self.valid = {}
-    self.data = {}
-
-  def update(self, *a, **k):
-    pass
-
-  def __getitem__(self, key):
-    return self.data.get(key, MagicMock())
-
-  def put(self, key, msg):
-    self.data[key] = msg
-    self.alive[key] = self.valid[key] = msg is not None
-
-
-class TestMapCurveTelemetry:
-  """The map curve cap is computed on G/S, published as mapCurve* telemetry,
-  and — with the toggle off — never moves the speed decision."""
-
-  MC_KEYS = ('mapCurveCap', 'mapCurveActive', 'mapCurveDist', 'mapCurveKappa',
-             'mapCurveLatLon', 'mapCurvePathAhead', 'mapCurveLat', 'mapCurveGate')
-
-  @staticmethod
-  def _s20_result(**kw):
-    r = {'wayRef': 'S20', 'wayName': '外环高速', 'speedLimit': 0.0, 'lanes': 4,
-         'roadContext': 0, 'roadName': '外环高速', 'highwayType': 'motorway',
-         'distance': 2.0, 'refDistances': {'S20': 2.0}}
-    r.update(kw)
-    return r
-
-  @staticmethod
-  def _mapd_out(ref='S20', sel='current'):
-    from types import SimpleNamespace
-    return SimpleNamespace(wayRef=ref, wayName='外环高速', roadName='外环高速', wayId=1,
-                           speedLimit=0.0, highwayClass='motorway', lanes=4,
-                           waySelectionType=sel, tileLoaded=True,
-                           distanceFromWayCenter=1.0, roadContext='freeway')
-
-  @staticmethod
-  def _extended(points, pos):
-    from types import SimpleNamespace
-    return SimpleNamespace(
-      path=[SimpleNamespace(latitude=la, longitude=lo, curvature=0.0, targetVelocity=0.0)
-            for la, lo in points],
-      position=SimpleNamespace(latitude=pos[0], longitude=pos[1]))
-
-  def _scenario(self, sld, monkeypatch, curved=True, with_path=True, car_s=0.0, gs=True,
-                v_ego=None):
-    """An S20 G/S hold, mapd on S20, the car at the start of a 400 m straight
-    followed by an R=300 arc. Tile queries are frozen so the test drives the
-    tile reader's state through _ingest_osm_result, like the G/S suites."""
-    import test_map_curve as tmc
-    import plugins.speedlimitd.speedlimitd as mod
-    with patch.object(mod.messaging, 'SubMaster'):
-      mw = mod.SpeedLimitMiddleware()
-    mw._sl_pub = MagicMock()
-    mw._cmd_sub = None
-    mw._lc_sub = None
-    mw.sm = _FakeSM()
-    mw.lane_count = mw.lane_count_stable = 4
-    mw._osm_query_interval = 1e9            # no auto tile queries
-    clock = {'t': 9000.0}
-    monkeypatch.setattr(mod.time, 'monotonic', lambda: clock['t'])
-    seg = tmc.straight_then_arc(400, radius=300) if curved else tmc.straight(1200)
-    points = tmc.path_of(seg, 10)
-    car = tmc.car_on(seg, car_s)
-    mw._gps_valid = True
-    mw._gps_lat, mw._gps_lon = car
-    mw.sm.put('mapdOut', self._mapd_out())
-    state = {'pos_n': 0}
-
-    def tick(dt=0.2, move_path=True, gps_fix=True):
-      clock['t'] += dt
-      if gps_fix:
-        mw._gps_fix_t = clock['t']                       # a fresh fix this tick
-      if v_ego is not None:
-        from types import SimpleNamespace
-        mw.sm.updated['deviceMotion'] = True
-        mw.sm.data['deviceMotion'] = SimpleNamespace(
-          velocityDevice=SimpleNamespace(x=v_ego, valid=True),
-          angularVelocityDevice=SimpleNamespace(z=0.0, valid=True))
-      if with_path:
-        if move_path:
-          state['pos_n'] += 1
-        mw.sm.put('mapdExtendedOut',
-                  self._extended(points, (car[0] + 1e-7 * state['pos_n'], car[1])))
-      mw.update()
-      return mw._sl_pub.send.call_args[0][0]
-
-    if gs:
-      mw._ingest_osm_result(self._s20_result())
-    else:
-      mw._ingest_osm_result(self._s20_result(wayRef='', roadName='金海路', highwayType='primary',
-                                             roadContext=1, refDistances={}))
-    return mw, tick, clock
-
-  def test_extended_out_subscribed_when_service_present(self, sld):
-    sld.SpeedLimitMiddleware()
-    assert 'mapdExtendedOut' in sld.messaging.SubMaster.call_args[0][0]
-
-  def test_builds_without_extended_service(self, sld, monkeypatch):
-    services = sys.modules['openpilot.cereal.services']
-    services.SERVICE_LIST = {k: v for k, v in services.SERVICE_LIST.items()
-                             if k != 'mapdExtendedOut'}
-    sld.SpeedLimitMiddleware()
-    assert 'mapdExtendedOut' not in sld.messaging.SubMaster.call_args[0][0]
-    mw, tick, _ = self._scenario(sld, monkeypatch, with_path=False)
-    assert mw._map_curve_service_available is False
-    pub = tick()
-    assert pub['mapCurveGate'] == 'mapd_absent' and pub['mapCurveCap'] == 0
-
-  def test_telemetry_keys_always_published(self, sld):
+  def test_published_keys_drop_exactly_the_mapd_keys(self, sld):
+    assert len(self.REMOVED_KEYS) == 20 and len(self.BASELINE_KEYS) == 44
     mw = sld.SpeedLimitMiddleware()
     sent = {}
     mw._sl_pub.send = lambda payload: sent.update(payload)
     mw.update()
-    for key in self.MC_KEYS:
-      assert key in sent, key
-    assert sent['mapCurveGate'] == 'off_gs' and sent['mapCurveCap'] == 0
+    keys = set(sent)
+    assert not [k for k in keys if k.startswith('mapd') or k.startswith('mapCurve')]
+    assert self.BASELINE_KEYS - keys == self.REMOVED_KEYS
+    assert keys == self.REMAINING_KEYS
 
-  def test_cap_computed_on_gs_with_curved_path(self, sld, monkeypatch):
-    mw, tick, _ = self._scenario(sld, monkeypatch)
-    pub = tick()
-    assert pub['inferenceMode'] in ('gs_osm', 'osm')
-    assert pub['mapCurveGate'] == 'ok'
-    assert pub['mapCurveCap'] > 0 and 375 <= pub['mapCurveDist'] <= 450
-    assert len(pub['mapCurveLatLon']) == 2 and pub['mapCurveActive'] is False
-
-  def test_toggle_off_actuation_identical(self, sld, monkeypatch):
-    """Load-bearing: with the toggle off a curve ahead that WOULD bind changes
-    nothing but the mapCurve* keys, tick after tick (review Important #4: the
-    first version sat at s=0, where the cap is above the limit, so it passed
-    even with the toggle check deleted)."""
-    import config
-    monkeypatch.setattr(config, 'read_plugin_param', lambda pid, key, default='': '')
-    _, tick_a, _ = self._scenario(sld, monkeypatch, with_path=True, car_s=390)
-    _, tick_b, _ = self._scenario(sld, monkeypatch, with_path=False, car_s=390)
-    strip = lambda p: {k: v for k, v in p.items() if not k.startswith('mapCurve')}
-    for _ in range(10):
-      pub_a, pub_b = tick_a(), tick_b()
-      assert 30 < pub_a['mapCurveShaped'] < pub_b['speedLimit']   # it WOULD bind
-      assert strip(pub_a) == strip(pub_b)
-
-  def test_frozen_path_position_goes_stale(self, sld, monkeypatch):
-    mw, tick, _ = self._scenario(sld, monkeypatch)
-    assert tick()['mapCurveGate'] == 'ok'
-    assert tick(dt=2.4, move_path=False)['mapCurveGate'] == 'ok'
-    assert tick(dt=0.2, move_path=False)['mapCurveGate'] == 'path_stale'
-
-  def test_tile_lapse_closes_gate_after_2s(self, sld, monkeypatch):
-    mw, tick, _ = self._scenario(sld, monkeypatch)
-    assert tick()['mapCurveGate'] == 'ok'
-    mw._ingest_osm_result(self._s20_result(wayRef='', roadName='', highwayType='',
-                                           refDistances={}))
-    assert tick(dt=1.9)['mapCurveGate'] == 'ok'        # 1.9 s since the last S20 tick
-    pub = tick(dt=0.2)                                  # 2.1 s
-    assert pub['mapCurveGate'] == 'tile_lapsed'
-    assert pub['inferenceMode'] == 'gs_osm'            # G/S mode itself still held
-
-  def test_cap_function_exception_is_contained(self, sld, monkeypatch):
-    mw_b, tick_b, _ = self._scenario(sld, monkeypatch)
-    base = tick_b()
-    mw, tick, _ = self._scenario(sld, monkeypatch)
-    monkeypatch.setattr(mw._map_curve, 'map_curve_cap', MagicMock(side_effect=ValueError))
-    pub = tick()
-    assert pub['mapCurveGate'] == 'error' and pub['mapCurveCap'] == 0
-    assert pub['speedLimit'] == base['speedLimit'] and pub['source'] == base['source']
-
-
-class TestMapCurveToggle:
-  """MapdCurveLookahead lets the G/S map cap enter the speed decision as a
-  source-4 safety cap. Default off; off is identical to no feature."""
-
-  _s20_result = staticmethod(TestMapCurveTelemetry._s20_result)
-  _mapd_out = staticmethod(TestMapCurveTelemetry._mapd_out)
-  _extended = staticmethod(TestMapCurveTelemetry._extended)
-  _scenario = TestMapCurveTelemetry._scenario
-
-  @staticmethod
-  def _toggle(monkeypatch, state):
-    import config
-    monkeypatch.setattr(config, 'read_plugin_param',
-                        lambda pid, key, default='': state['v'] if key == 'MapdCurveLookahead' else '')
-
-  def test_param_declared_default_off(self):
+  def test_plugin_json_has_no_lookahead_param(self):
     import json
-    manifest = os.path.join(os.path.dirname(__file__), '..', 'plugin.json')
-    with open(manifest) as f:
-      p = json.load(f)['params']['MapdCurveLookahead']
-    assert p['type'] == 'bool' and p['default'] is False
-
-  def test_read_params_wires_toggle(self, sld, monkeypatch):
-    state = {'v': '1'}
-    self._toggle(monkeypatch, state)
-    mw = sld.SpeedLimitMiddleware()
-    mw._read_params()
-    assert mw.map_curve_enabled is True
-    state['v'] = ''
-    mw._read_params()
-    assert mw.map_curve_enabled is False
-
-  def test_toggle_on_lowers_limit_as_source_4(self, sld, monkeypatch):
-    self._toggle(monkeypatch, {'v': ''})
-    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=390)
-    off = tick_off()
-    self._toggle(monkeypatch, {'v': '1'})
-    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=390)
-    on = tick_on()
-    assert 30 < on['mapCurveCap'] < off['speedLimit']   # the curve really binds
-    assert on['source'] == 4 and on['safetyCapped'] is True
-    assert on['speedLimit'] == sld.snap_to_standard_speed(on['mapCurveCap'])
-    assert on['mapCurveActive'] is True and off['source'] != 4
-
-  def test_cap_above_limit_changes_nothing(self, sld, monkeypatch):
-    self._toggle(monkeypatch, {'v': ''})
-    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=0)
-    off = tick_off()
-    self._toggle(monkeypatch, {'v': '1'})
-    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=0)
-    on = tick_on()
-    assert on['mapCurveCap'] > off['speedLimit']        # far curve: cap above the limit
-    assert (on['speedLimit'], on['source']) == (off['speedLimit'], off['source'])
-
-  def test_safety_cap_published_for_a_cap_above_the_limit(self, sld, monkeypatch):
-    """Toggle on, far curve: the cap is above the limit (nothing changes in the
-    limit) but IS published as safetyCap; toggle off publishes 0."""
-    self._toggle(monkeypatch, {'v': ''})
-    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=0)
-    assert tick_off()['safetyCap'] == 0
-    self._toggle(monkeypatch, {'v': '1'})
-    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=0)
-    on = tick_on()
-    assert on['mapCurveCap'] > on['speedLimit']
-    assert on['safetyCap'] == sld.snap_to_standard_speed(
-      int(max(round(on['mapCurveCap']), 30)))
-
-  def test_toggle_has_no_effect_off_gs(self, sld, monkeypatch):
-    self._toggle(monkeypatch, {'v': ''})
-    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=390, gs=False)
-    off = tick_off()
-    self._toggle(monkeypatch, {'v': '1'})
-    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=390, gs=False)
-    on = tick_on()
-    assert on['mapCurveGate'] == 'off_gs'
-    assert (on['speedLimit'], on['source']) == (off['speedLimit'], off['source'])
-
-  def test_toggle_off_after_on_removes_cap(self, sld, monkeypatch):
-    state = {'v': '1'}
-    self._toggle(monkeypatch, state)
-    mw, tick, _ = self._scenario(sld, monkeypatch, car_s=390)
-    assert tick()['source'] == 4
-    state['v'] = ''
-    pub = tick(dt=5.0)                                   # next 5 s param read
-    assert pub['mapCurveActive'] is False and pub['source'] != 4
-
-  def test_toggle_on_without_extended_service_changes_nothing(self, sld, monkeypatch):
-    services = sys.modules['openpilot.cereal.services']
-    services.SERVICE_LIST = {k: v for k, v in services.SERVICE_LIST.items()
-                             if k != 'mapdExtendedOut'}
-    self._toggle(monkeypatch, {'v': ''})
-    _, tick_off, _ = self._scenario(sld, monkeypatch, car_s=390, with_path=False)
-    off = tick_off()
-    self._toggle(monkeypatch, {'v': '1'})
-    _, tick_on, _ = self._scenario(sld, monkeypatch, car_s=390, with_path=False)
-    on = tick_on()
-    assert on['mapCurveGate'] == 'mapd_absent'
-    assert (on['speedLimit'], on['source']) == (off['speedLimit'], off['source'])
-
-
-class TestMapCurveShaping:
-  """Review Important #2: the cap may not step the target down when the gate
-  opens with a curve already near, nor flicker off for a one-tick dropout."""
-
-  _s20_result = staticmethod(TestMapCurveTelemetry._s20_result)
-  _mapd_out = staticmethod(TestMapCurveTelemetry._mapd_out)
-  _extended = staticmethod(TestMapCurveTelemetry._extended)
-  _scenario = TestMapCurveTelemetry._scenario
-  _toggle = staticmethod(TestMapCurveToggle._toggle)
-
-  def test_gate_opening_near_curve_ramps_from_current_speed(self, sld, monkeypatch):
-    self._toggle(monkeypatch, {'v': '1'})
-    _, tick, _ = self._scenario(sld, monkeypatch, car_s=390, v_ego=30.0)   # 108 km/h
-    first = tick()
-    assert first['mapCurveCap'] < 90                    # the raw cap is near the curve...
-    assert first['mapCurveShaped'] >= 107                # ...but the shaped cap starts at v_ego
-    prev = first['mapCurveShaped']
-    for _ in range(50):                                  # 10 s at 5 Hz (108→83 needs 8.7 s)
-      pub = tick()
-      assert prev - pub['mapCurveShaped'] <= 0.8 * 3.6 * 0.2 + 1.0   # ≤ COMFORT_BRAKE (+rounding)
-      prev = pub['mapCurveShaped']
-    assert pub['mapCurveShaped'] == pub['mapCurveCap']   # converged onto the raw cap
-
-  def test_one_tick_gate_dropout_holds_the_cap(self, sld, monkeypatch):
-    self._toggle(monkeypatch, {'v': '1'})
-    mw, tick, _ = self._scenario(sld, monkeypatch, car_s=390)
-    assert tick()['source'] == 4
-    mw.sm.put('mapdOut', self._mapd_out(sel='fail'))     # mapd loses the road for a tick
-    pub = tick()
-    assert pub['mapCurveGate'] == 'sel_type' and pub['source'] == 4   # held
-    pub = tick(dt=3.0)                                   # 3.2 s without a valid cap
-    assert pub['source'] != 4                            # released
-
-
-class TestMapCurveTileRefMemory:
-  """Review Important #3: the 2 s tolerance must also cover a one-query tile
-  snap to a CROSSING G/S road, not only a snap to a non-G/S one."""
-
-  _s20_result = staticmethod(TestMapCurveTelemetry._s20_result)
-  _mapd_out = staticmethod(TestMapCurveTelemetry._mapd_out)
-  _extended = staticmethod(TestMapCurveTelemetry._extended)
-  _scenario = TestMapCurveTelemetry._scenario
-
-  def test_snap_to_crossing_gs_within_2s_keeps_gate_open(self, sld, monkeypatch):
-    mw, tick, _ = self._scenario(sld, monkeypatch)
-    assert tick()['mapCurveGate'] == 'ok'
-    mw._ingest_osm_result(self._s20_result(wayRef='G15', roadName='沈海高速',
-                                           refDistances={'G15': 2.0, 'S20': 6.0}))
-    assert tick()['mapCurveGate'] == 'ok'               # S20 was seen 0.2 s ago
-    pub = tick(dt=2.0)                                   # 2.2 s since S20, still G15
-    assert pub['mapCurveGate'] == 'ref_mismatch'
-
-
-class TestMapCurveGpsFreshness:
-  """Review Important #5: _gps_valid latches on the first fix, so a frozen
-  speedlimitd fix must close the gate rather than project a stale position."""
-
-  _s20_result = staticmethod(TestMapCurveTelemetry._s20_result)
-  _mapd_out = staticmethod(TestMapCurveTelemetry._mapd_out)
-  _extended = staticmethod(TestMapCurveTelemetry._extended)
-  _scenario = TestMapCurveTelemetry._scenario
-
-  def test_stale_gps_fix_closes_gate(self, sld, monkeypatch):
-    mw, tick, _ = self._scenario(sld, monkeypatch)
-    assert tick()['mapCurveGate'] == 'ok'
-    assert tick(dt=1.4, gps_fix=False)['mapCurveGate'] == 'ok'
-    assert tick(dt=0.2, gps_fix=False)['mapCurveGate'] == 'no_gps'   # 1.6 s old
-
-  def test_valid_fix_records_its_time(self, sld, monkeypatch):
-    from types import SimpleNamespace
-    mw = sld.SpeedLimitMiddleware()
-    clock = {'t': 4321.0}
-    monkeypatch.setattr(sld.time, 'monotonic', lambda: clock['t'])
-    mw.sm = _FakeSM()
-    mw.sm.updated['gpsLocationExternal'] = True
-    mw.sm.data['gpsLocationExternal'] = SimpleNamespace(flags=1, latitude=31.27, longitude=121.64)
-    mw.update()
-    assert mw._gps_fix_t == 4321.0
+    with open(os.path.join(os.path.dirname(__file__), '..', 'plugin.json')) as f:
+      manifest = json.load(f)
+    assert self.LOOKAHEAD_PARAM not in manifest.get('params', {})

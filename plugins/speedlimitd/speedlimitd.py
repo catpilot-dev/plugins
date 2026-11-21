@@ -18,8 +18,9 @@ NOT WIRED — do not read these as live inputs:
   - YOLO sign reading: self.yolo_speed is never assigned (permanently 0), so
     the tier-1 branch in update() is unreachable. Sign vision is in
     development; assigning yolo_speed is the only hook it needs.
-  - mapd suggestedSpeed: no runtime path. 'mapdSuggested' survives only in
-    cereal/slot0.capnp, which is itself out of sync with what is published.
+  - cereal/slot0.capnp: out of sync with what is published (speedLimitState
+    goes over the plugin bus). Its 'mapdSuggested' field and enum value are
+    dead capnp ordinals, kept only so old rlogs still parse.
 """
 import math
 import os
@@ -103,7 +104,7 @@ _STANDARD_SPEEDS = [30, 40, 50, 60, 80, 100, 120]
 def snap_to_standard_speed(speed: int) -> int:
   """Snap a computed speed to the nearest standard speed limit value.
 
-  mapd visionCurveSpeed produces raw values like 47, 75, 83 km/h.
+  The vision curve cap produces raw values like 47, 75, 83 km/h.
   Speed limit signs always display standard values, so we snap for
   clean display and consistent planner behaviour.
   """
@@ -261,8 +262,10 @@ def infer_lane_count(model_msg) -> int:
 
 # --- Lateral-acceleration params (2026-07-28 layer contract) ---------------
 # speedlimitd owns lateral acceleration via vEgo. Two knobs, both read from the
-# persisted plugin param store (same store mapd_runner uses) and parsed as a raw
-# m/s² value per the README contract:
+# persisted plugin param store (config.read_plugin_param) and parsed as a raw
+# m/s² value per the README contract. The "Mapd" prefix in both names is
+# legacy only: they tune the vision curve caps, and renaming them would orphan
+# the values already stored on devices.
 #   MapdCurveTargetLatAccel — proactive vision-curve target a_y (default 1.5)
 #   MapdReactLatAccel       — reactive measured-a_y threshold (default 2.5, 0=off)
 CURVE_LAT_ACCEL_DEFAULT = 1.5
@@ -330,9 +333,9 @@ TIGHT_CURVE_FACTOR = 0.75  # a_y target derate at hairpin-class curvature. Route
                            # buys margin around it.
 
 
-# Curvature below this is a straight road (~330 m radius). Shared by the vision
-# curve cap and the G/S map curve cap so both use one definition.
-MAP_CURVE_GATE_KAPPA = 0.003
+# Curvature below this is a straight road (~330 m radius); the vision curve
+# cap's gate.
+CURVE_GATE_KAPPA = 0.003
 
 
 def _interp(x: float, xp: list, fp: list) -> float:
@@ -371,8 +374,8 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5, kappa_meas: float
   original distance-less behaviour — exactly.
 
   The target lateral acceleration is `max_lat_accel` (m/s²), wired from the
-  MapdCurveTargetLatAccel param by the middleware (default 1.5, clamped
-  [1.0, 3.0]).
+  MapdCurveTargetLatAccel param (a vision-curve param; the name is legacy) by
+  the middleware (default 1.5, clamped [1.0, 3.0]).
 
   The return value is the RAW ramp value (rounded to 1 km/h, floored at
   30 km/h) — it is NOT snapped to a standard speed. Snapping the enforcement
@@ -420,7 +423,7 @@ def curvature_speed_cap(model_msg, max_lat_accel: float = 1.5, kappa_meas: float
       conf_dist = min(MAX_VISION, positions_x[i])
       break
 
-  CURVE_GATE = MAP_CURVE_GATE_KAPPA  # negligible curvature (~330 m radius)
+  CURVE_GATE = CURVE_GATE_KAPPA  # negligible curvature (~330 m radius)
 
   # T_IDXS = 10 * (i/32)^2:  i=10 → 1.0s   i=22 → 4.7s   i=30 → 8.8s
   # Per-point pass within both time AND distance bounds. d_i is position.x[i]
@@ -533,7 +536,8 @@ def infer_speed_from_road_type(highway_type: str, lane_count: int, road_context:
     return 40
 
   # Secondary and below are almost never nonurban high-speed roads (especially
-  # in China). Override mapd's roadContext to urban when highway type is low.
+  # in China). Override the tile reader's roadContext to urban when highway
+  # type is low.
   URBAN_ONLY_TYPES = {'secondary', 'tertiary', 'residential', 'unclassified', 'living_street', 'service'}
   osm_demotes_context = osm_type in URBAN_ONLY_TYPES and highway_type not in ('motorway', 'trunk')
   if road_context == 'freeway' and (highway_type in URBAN_ONLY_TYPES or osm_demotes_context):
@@ -730,29 +734,14 @@ class SpeedLimitMiddleware:
     # measured lateral accel — forward speed (velocityDevice.x) and yaw rate
     # (angularVelocityDevice.z) both come from the localizer, no car sensor or
     # steering ratio involved. a_y_meas = v · yaw_rate.
-    # mapdOut is INJECTED into cereal by install.sh (plugins/services.py), not
-    # stock — so it can legitimately be absent: a catpilot `git reset --hard`
-    # wipes the injection, and a user's .disabled on mapd removes it at the next
-    # install. SubMaster raises on an unknown service, which would crash-loop
-    # this daemon and leave the car with NO speed-limit data at all. Phase 1
-    # telemetry is not worth that, so subscribe conditionally and degrade to the
-    # dead-mapd telemetry shape.
-    from openpilot.cereal.services import SERVICE_LIST
-    _subs = ['modelV2', 'gpsLocationExternal', 'deviceMotion']
-    self._mapd_service_available = 'mapdOut' in SERVICE_LIST
-    if self._mapd_service_available:
-      _subs.append('mapdOut')
-    # mapdExtendedOut carries mapd's road-ahead path for the G/S map curve cap.
-    # Injected the same way as mapdOut and absent for the same reasons, so it is
-    # subscribed on the same condition: an unknown service crash-loops SubMaster.
-    self._map_curve_service_available = 'mapdExtendedOut' in SERVICE_LIST
-    if self._map_curve_service_available:
-      _subs.append('mapdExtendedOut')
-    self.sm = messaging.SubMaster(_subs)
+    # Stock services only. OSM road data comes from the local tile reader
+    # below, never from a cereal service.
+    self.sm = messaging.SubMaster(['modelV2', 'gpsLocationExternal', 'deviceMotion'])
     from openpilot.selfdrive.plugins.plugin_bus import PluginPub
     self._sl_pub = PluginPub('speedLimitState')
 
-    # OSM tile reader — reads offline tiles directly, no mapd binary needed
+    # OSM tile reader — speedlimitd's sole OSM source; reads the offline tiles
+    # directly.
     _pkg_dir = os.path.dirname(os.path.abspath(__file__))
     if _pkg_dir not in __import__('sys').path:
       __import__('sys').path.insert(0, _pkg_dir)
@@ -765,31 +754,6 @@ class SpeedLimitMiddleware:
                                     # densest Shanghai tile (12,349 ways), so
                                     # 1 Hz costs ~2.5% of one core.
     self._osm_last_query_t = 0.0
-
-    import mapd_source
-    self._mapd_source = mapd_source
-    # Phase 1: mapd road context is OBSERVED ONLY. These values are published
-    # to pluginBusLog for the cutover comparison and must never be read by any
-    # control path — the tile reader above still drives everything.
-    self._mapd_telemetry = mapd_source.telemetry_from_mapd(None, False, '')
-    self._mapd_sample_error_logged = False  # log the sampling except: once, not every 5 s
-
-    # G/S map curve cap (docs/superpowers/specs/2026-11-09-mapd-gs-curve-lookahead-design.md).
-    # Computed only in G/S mode, always published as mapCurve* telemetry, and
-    # entering the speed decision only when the MapdCurveLookahead toggle is on.
-    import map_curve
-    self._map_curve = map_curve
-    self.map_curve_enabled = False
-    self._mc_tile_refs: dict[str, float] = {}   # G/S refs the tile reader matched → when
-    self._mc_path_pos = None        # mapdExtendedOut.position last seen...
-    self._mc_path_pos_t = 0.0       # ...and when it last changed (freshness)
-    self._map_curve_gate = 'off_gs'
-    self._map_curve_result = None
-    self._map_curve_error_logged = False
-    self._mc_shaped_ms = None       # cap as applied: ramped and held (see _shape_map_curve)
-    self._gps_fix_t = 0.0           # last valid fix; _gps_valid itself latches on the first
-    self._mc_hold_until = 0.0
-    self._mc_last_t = 0.0
 
     self.country_bboxes = load_country_bboxes()
     self.country_detected = False
@@ -937,7 +901,7 @@ class SpeedLimitMiddleware:
   def _read_params(self):
     """Refresh lateral-accel params from the persisted plugin store.
 
-    Uses the same store mapd_runner reads (config.read_plugin_param, env-
+    Uses the persisted plugin param store (config.read_plugin_param, env-
     overridable). Values are interpreted as raw m/s² per the README contract.
     Import is lazy + guarded so a missing config module just keeps the current
     (default) values rather than crashing the daemon.
@@ -955,8 +919,6 @@ class SpeedLimitMiddleware:
       zero_disables=True)
     self.osm_integration_enabled = read_plugin_param(
       'speedlimitd', 'OsmDataIntegration', '') == '1'
-    self.map_curve_enabled = read_plugin_param(
-      'speedlimitd', 'MapdCurveLookahead', '') == '1'
 
   def _resolve_osm_default(self, country: str) -> bool:
     """One-time region default for OsmDataIntegration (first GPS fix).
@@ -1112,111 +1074,6 @@ class SpeedLimitMiddleware:
         self._react_cap_ms = min(self._react_cap_ms, max(v_react, REACT_MIN_SPEED))
     return self._react_cap_ms
 
-  def _update_map_curve(self, now: float, gs_mode: bool) -> None:
-    """Refresh the G/S map curve gate and cap. Never raises into update()."""
-    try:
-      mc = self._map_curve
-      # Every G/S ref the tile reader matched in the last 2 s, not only the
-      # latest: a one-query snap to a crossing G/S (S20 → G15 → S20) must not
-      # read as "mapd is on a different road".
-      if is_gs_expressway_ref(self.last_way_ref):
-        self._mc_tile_refs[self.last_way_ref] = now
-      recent = {r: t for r, t in self._mc_tile_refs.items()
-                if now - t <= mc.TILE_BLIP_TOLERANCE_S}
-      self._mc_tile_refs = recent
-      tile_ref = max(recent, key=recent.get) if recent else ''
-      tile_ref_age = now - recent[tile_ref] if recent else math.inf
-
-      # Both mapd services must exist: without the path there is no cap to
-      # compute, and that is "mapd absent", not "path stale".
-      mapd_ok = (self._mapd_service_available and self._map_curve_service_available
-                 and bool(self.sm.alive.get('mapdOut', False))
-                 and bool(self.sm.valid.get('mapdOut', False)))
-      mapd_ref, sel = '', ''
-      if mapd_ok:
-        mapd_out = self.sm['mapdOut']
-        mapd_ref, sel = mapd_out.wayRef or '', str(mapd_out.waySelectionType)
-
-      path_ok = (self._map_curve_service_available
-                 and bool(self.sm.alive.get('mapdExtendedOut', False))
-                 and bool(self.sm.valid.get('mapdExtendedOut', False)))
-      ext = None
-      if path_ok:
-        ext = self.sm['mapdExtendedOut']
-        pos = (float(ext.position.latitude), float(ext.position.longitude))
-        if pos != self._mc_path_pos:
-          self._mc_path_pos, self._mc_path_pos_t = pos, now
-
-      gate = mc.map_curve_gate(
-        gs_mode=gs_mode,
-        gps_valid=self._gps_valid and now - self._gps_fix_t <= self.MAP_CURVE_GPS_FRESH_S,
-        tile_ref=tile_ref, tile_ref_age_s=tile_ref_age,
-        mapd_ok=mapd_ok, mapd_sel_type=sel,
-        refs_match=any(mc.refs_share_gs(mapd_ref, r, is_gs_expressway_ref) for r in recent),
-        path_ok=path_ok, path_age_s=now - self._mc_path_pos_t)
-      result = None
-      if gate == 'ok':
-        result = mc.map_curve_cap(
-          [(p.latitude, p.longitude) for p in ext.path], self._gps_lat, self._gps_lon,
-          max_lat_accel=self.curve_target_lat_accel, comfort_brake=COMFORT_BRAKE,
-          tight_curve_factor=TIGHT_CURVE_FACTOR, curve_gate=MAP_CURVE_GATE_KAPPA)
-        if result is None:
-          gate = 'no_path_ahead'
-      self._map_curve_gate, self._map_curve_result = gate, result
-    except Exception:
-      self._map_curve_gate, self._map_curve_result = 'error', None
-      if not self._map_curve_error_logged:
-        self._map_curve_error_logged = True
-        try:
-          from openpilot.common.swaglog import cloudlog
-          cloudlog.warning("speedlimitd: map curve cap failed")
-        except Exception:
-          pass
-
-  MAP_CURVE_HOLD_S = 3.0
-  MAP_CURVE_GPS_FRESH_S = 1.5   # gpsLocationExternal is ~10 Hz; older means frozen
-
-  def _shape_map_curve(self, now: float, v_ego: float) -> None:
-    """Turn the raw map cap into the value the speed decision may use.
-
-    The raw cap jumps whenever the gate opens with a curve already near (G/S
-    entry, mapd recovering, a tile lapse ending), and vanishes for any one-tick
-    gate failure. Safety caps reach the planner un-ramped, so both would land on
-    the setpoint as a step. Shaped: when it first appears it starts from the
-    current speed and descends no faster than COMFORT_BRAKE; it holds for
-    MAP_CURVE_HOLD_S across gate dropouts, like the vision cap; it rises at once.
-    """
-    dt = min(max(now - self._mc_last_t, 0.0), 1.0)
-    self._mc_last_t = now
-    r = self._map_curve_result if self._map_curve_gate == 'ok' else None
-    raw = r.cap_kph / 3.6 if r is not None and r.cap_kph > 0 else None
-    if raw is not None:
-      if self._mc_shaped_ms is None:
-        self._mc_shaped_ms = max(raw, v_ego)
-      elif raw < self._mc_shaped_ms:
-        self._mc_shaped_ms = max(raw, self._mc_shaped_ms - COMFORT_BRAKE * dt)
-      else:
-        self._mc_shaped_ms = raw
-      self._mc_hold_until = now + self.MAP_CURVE_HOLD_S
-    elif self._mc_shaped_ms is not None and now >= self._mc_hold_until:
-      self._mc_shaped_ms = None
-
-  def _map_curve_telemetry(self) -> dict:
-    """mapCurve* keys for speedLimitState — published every tick, toggle on or off."""
-    r = self._map_curve_result if self._map_curve_gate == 'ok' else None
-    has_cap = r is not None and r.cap_kph > 0
-    return {
-      'mapCurveCap': int(round(r.cap_kph)) if has_cap else 0,
-      'mapCurveActive': self.map_curve_enabled,
-      'mapCurveDist': round(r.dist_m, 1) if has_cap else 0.0,
-      'mapCurveKappa': round(r.kappa, 5) if has_cap else 0.0,
-      'mapCurveLatLon': [round(r.lat, 6), round(r.lon, 6)] if has_cap else [],
-      'mapCurvePathAhead': int(round(r.path_ahead_m)) if r is not None else 0,
-      'mapCurveLat': round(r.lateral_m, 1) if r is not None else 0.0,
-      'mapCurveGate': self._map_curve_gate,
-      'mapCurveShaped': int(round(self._mc_shaped_ms * 3.6)) if self._mc_shaped_ms else 0,
-    }
-
   def _ingest_osm_result(self, result: dict | None):
     """Update road identity state from an OSM tile query result.
 
@@ -1342,7 +1199,6 @@ class SpeedLimitMiddleware:
         self._gps_lat = gps.latitude
         self._gps_lon = gps.longitude
         self._gps_valid = True
-        self._gps_fix_t = now
         if not self.country_detected:
           country = country_from_gps(gps.latitude, gps.longitude, self.country_bboxes)
           if country:
@@ -1376,37 +1232,6 @@ class SpeedLimitMiddleware:
           write_plugin_param('speedlimitd', 'OsmTilesMissing', '1' if tiles_missing else '0')
         except Exception:
           pass
-
-      # --- Phase 1 mapd observation (telemetry only) ---
-      # Sampled on the SAME cadence as the tile query above so each rlog row
-      # compares mapd and the tile reader at the same instant. Nothing below
-      # reads these values.
-      # Skipped entirely when mapdOut was never subscribed (see __init__) —
-      # the absent-shape default telemetry from __init__ still publishes, so
-      # the rlog stays analysable.
-      if self._mapd_service_available:
-        try:
-          # sm.valid[s] latches True on first receipt and is never cleared, and
-          # sm.data[s] retains the last message — so valid alone can't tell a
-          # live mapd from one that died or wedged mid-drive; every subsequent
-          # sample would silently report the frozen way as "alive", corrupting
-          # mapdRefAgree (the cutover metric) and the rlog uptime count. sm.alive
-          # is the recomputed freshness signal (0.5 s window at 20 Hz) — require
-          # both.
-          mapd_ok = bool(self.sm.valid.get('mapdOut', False) and
-                         self.sm.alive.get('mapdOut', False))
-          self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(
-            self.sm['mapdOut'], mapd_ok, self.last_way_ref)
-        except Exception:
-          if not self._mapd_sample_error_logged:
-            self._mapd_sample_error_logged = True
-            try:
-              from openpilot.common.swaglog import cloudlog
-              cloudlog.warning("speedlimitd: mapd telemetry sampling failed — "
-                                "check mapdOut schema injection")
-            except Exception:
-              pass
-          self._mapd_telemetry = self._mapd_source.telemetry_from_mapd(None, False, '')
 
     # --- Reactive measured-a_y cap + measured-curvature apex point (2026-07-28) ---
     # Read ahead of the modelV2 block below so this tick's measured curvature
@@ -1638,8 +1463,8 @@ class SpeedLimitMiddleware:
     is_gs_now = (is_gs_expressway_ref(self.last_way_ref)
                  or self.last_osm_hwtype == 'motorway')
     if is_gs_now:
-      # Urban elevated expressways without a G/S ref (中环路, 北翟高架路) are tagged
-      # 'freeway' by mapd but are trunk-class (80), not motorway (120) — demote
+      # Urban elevated expressways without a G/S ref (中环路, 北翟高架路) can carry
+      # a 'freeway' context but are trunk-class (80), not motorway (120) — demote
       # their context to 'city' for the promote, exactly as before.
       road_ctx_for_infer = self.last_road_context
       if not self.last_way_ref and road_ctx_for_infer == 'freeway':
@@ -1700,8 +1525,6 @@ class SpeedLimitMiddleware:
     gs_mode = not gs_released
     if gs_released:
       self._gs_limit_kph = 0              # next G/S stretch promotes afresh
-    self._update_map_curve(now, gs_mode)
-    self._shape_map_curve(now, v_ego_meas)
 
     # OSM Data Integration: a fresh posted limit replaces the base inference
     # entirely (vision stays the fallback; safety caps below still min() over
@@ -1764,12 +1587,6 @@ class SpeedLimitMiddleware:
     if react_active:
       candidates.append((react_cap_kph, 4, 0.7))  # reactiveLatAccel (safety class)
       safety_vals.append(react_cap_kph)
-    # G/S map curve cap (2026-11-09): same safety class as the vision curve cap,
-    # and only when the MapdCurveLookahead toggle is on. Off, it is telemetry only.
-    if self.map_curve_enabled and self._mc_shaped_ms is not None:
-      mc_cap_kph = float(max(round(self._mc_shaped_ms * 3.6), MIN_SPEED_LIMIT))
-      candidates.append((mc_cap_kph, 4, 0.7))  # mapCurveLookahead
-      safety_vals.append(mc_cap_kph)
     candidates.append((float(max(inferred_speed, MIN_SPEED_LIMIT)), 2, round(self.lane_conf, 2)))  # base inference (lane-count / gs_osm), source 2
 
     speed_limit, source, confidence = min(candidates, key=lambda x: x[0])
@@ -1844,14 +1661,6 @@ class SpeedLimitMiddleware:
 
     # --- Publish ---
     self._sl_pub.send({
-      # --- Phase 1 mapd observation (see mapd_source.telemetry_from_mapd) ---
-      # Read-only comparison against the tile-derived fields below.
-      # mapdRefAgree is the cutover decision metric. Spread FIRST (not last):
-      # this is the one structural channel by which adapter output could
-      # reach planner_hook, so any accidental key collision below must win
-      # over these keys, not silently override them.
-      **self._mapd_telemetry,
-      **self._map_curve_telemetry(),
       'speedLimit': self._displayed_speed_limit,
       'source': source,
       'confirmed': self.confirmed,

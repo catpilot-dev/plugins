@@ -5,13 +5,11 @@
 `speedLimitState` message on the plugin bus, plus a set of UI/planner **hooks**
 that read that message to draw the on-screen sign and cap cruise speed. It has
 no required process dependencies (`dependencies: []`) — it reads pre-downloaded
-offline OSM tiles directly (`osm_query.py`) for road identity. When the mapd
-plugin runs, speedlimitd also observes `mapdOut` (telemetry only, see [mapd
-observation](#mapd-observation-phase-1-2026-08-18)) and, on G/S expressways
-only, reads `mapdExtendedOut`'s road-ahead path for the [G/S map curve
-look-ahead](#gs-map-curve-look-ahead-map_curvepy-2026-11-09). Both subscriptions
-are conditional on the services being injected, so speedlimitd runs unchanged
-without mapd.
+offline OSM tiles directly (`osm_query.OsmTileReader`). That tile reader is
+speedlimitd's **sole OSM source**: road identity, highway class and posted
+`maxspeed` all come from it, and no OSM data arrives over a cereal service.
+speedlimitd subscribes only to stock services (`modelV2`,
+`gpsLocationExternal`, `deviceMotion`).
 
 The governing constraint is **vision-only by default in China**: OSM
 *maxspeed* and OSM *geometry* are treated as unreliable there (roads stack in
@@ -33,7 +31,6 @@ gpsLocationExternal ─► country auto-detect (bbox) ─► per-country speed t
 modelV2 ─► infer_lane_count ─► lane_count_stable ─► lane_count_limit ─┐
         ├► vision_speed_cap (≤2-lane narrow cap) ────────────────────┤
         └► curvature_speed_cap (distance-aware curve cap) ───────────┤
-mapdExtendedOut.path ─► map_curve_cap (G/S only, toggle) ────────────┤
                                                                       ├─► min() ─► speedLimitState (5 Hz, plugin bus)
 deviceMotion ─► measured a_y ─► reactive-a_y cap ─────────────────────────┤            │
         └► measured κ ─► curve-cap virtual apex point ────────────────┘            │
@@ -59,7 +56,6 @@ OSM/YOLO/inference *priority*, the live logic (`update()`) is a
 | YOLO sign reading | 1 | 0.80 | `yolo_speed ≥ 30` — **placeholder, currently always 0** |
 | Curvature look-ahead cap | 4 | 0.70 | `curvature_cap ≥ 30` |
 | Reactive measured-a_y cap | 4 | 0.70 | `react_cap ≥ 30` |
-| G/S map curve cap | 4 | 0.70 | `MapdCurveLookahead` ON and a shaped map cap exists (gate `ok`, see [below](#gs-map-curve-look-ahead-map_curvepy-2026-11-09)) |
 | Base inference (OSM / G-S promote / lane-count) | 2 | `lane_conf` | always (`max(inferred, 30)`) |
 
 OSM *maxspeed* is **not** a candidate in its own right — it never gets its own
@@ -347,33 +343,6 @@ toggle state:
 `inferenceMode` gains a third value, `'osm'` (OSM base active), alongside the
 existing `'gs_osm'` and `'lane_count'`.
 
-### mapd observation (Phase 1, 2026-08-18)
-
-speedlimitd subscribes to `mapdOut` and publishes eleven `mapd*` fields into
-`speedLimitState` for comparison against the tile-derived values beside them.
-This is telemetry only: `mapd_source.telemetry_from_mapd` output is published
-and discarded, and the offline tile reader still drives every control path.
-
-The subscription is conditional on `mapdOut` being present in the injected
-`SERVICE_LIST`: the schema/service injection is not stock, so a catpilot
-`git reset --hard` or a `.disabled` on mapd can remove it, and an unguarded
-`SubMaster` would crash-loop speedlimitd — leaving the car with no speed-limit
-data at all. When absent, the same eleven keys still publish in their
-dead-mapd shape (`mapdAlive: False`).
-
-`mapdRoadContext` is mapd's own urban/rural verdict, observed alongside
-`mapdHwClass` so the S100+ reclassification concern can be checked from the
-rlog.
-
-`mapdRefAgree` — mapd's bearing-aware way match versus our nearest-polyline
-match — was the metric for the planned Phase 2 identity cutover. Route 531
-(2026-11-09) showed the two matchers fail in complementary ways (mapd holds the
-old way after exits and drops out at ~25 m GPS offset; the tile reader snaps to
-cross streets at junctions), so the cutover was dropped: the tile reader keeps
-road identity, and Phase 2 became the G/S-only map curve look-ahead below. See
-`docs/superpowers/specs/2026-08-18-mapd-integration-design.md` and
-`docs/superpowers/specs/2026-11-09-mapd-gs-curve-lookahead-design.md`.
-
 ## Curve caps
 
 ### Proactive: `curvature_speed_cap` (distance-aware braking)
@@ -429,62 +398,10 @@ Both curve caps enter the same `min()` as **safety-class** (source 4) sources:
 they inherit the planner hook's gas-suspend and are in the lead-override-
 protected class — a faster lead never lifts a curve cap (route 2fd). Since
 2026-11-12 the daemon also publishes `safetyCap` (km/h, snapped): the lowest
-safety-class candidate (curve cap ≥ 30, reactive cap when engaged, map-curve cap
-when enabled and shaped), 0 when none, published **even when a guessed limit is
+safety-class candidate (curve cap ≥ 30, reactive cap when engaged), 0 when none, published **even when a guessed limit is
 lower than it**. `speedLimit`/`safetyCapped` alone hide a cap above the guess,
 and a lead override of that guess would lift it; under an override the hook
 outputs `min(v_cruise, safetyCap)` (no offset, immediate) — see Lead override.
-
-### G/S map curve look-ahead (`map_curve.py`, 2026-11-09)
-
-On G/S expressways vision's confident path ends at ~100 m, short of what a
-comfortable slowdown from 100–120 km/h needs. There, and only there (OSM
-geometry is trustworthy on G/S expressways, not on Chinese city roads),
-speedlimitd computes its own curve cap from mapd's road-ahead path
-(`mapdExtendedOut.path`, 1 Hz, mapd's current way plus predicted next ways).
-
-**Gate** (`map_curve_gate`, first failing reason wins, published as
-`mapCurveGate`): `off_gs` (not in G/S mode) → `no_gps` (speedlimitd's fix older
-than 1.5 s) → `tile_lapsed` (no G/S ref from the tile reader within
-`TILE_BLIP_TOLERANCE_S = 2 s`) → `mapd_absent` → `sel_type` (mapd's way
-selection not `current`/`predicted`) → `ref_mismatch` (mapd's way shares no G/S
-ref part with any tile ref of the last 2 s) → `path_stale` (path position
-unchanged for `PATH_FRESH_S = 2.5 s`) → `ok`. The caller adds `no_path_ahead`
-(car past the path end or > 5 m before its start) and `error` (any exception,
-logged once). The tile reader keeps road identity: mapd's path is used only
-while it agrees.
-
-**Cap** (`map_curve_cap`, pure): the path is projected into local metres,
-resampled every `MAP_CURVE_RESAMPLE_M = 20 m`, and each vertex's curvature is
-the net chord-heading change across a `MAP_CURVE_WINDOW_M = 50 m` window
-divided by the chord-midpoint separation — recomputed from geometry rather than
-mapd's per-node `curvature`, so a single misplaced OSM node cancels instead of
-reading as a sharp curve. Vertices within `MAP_CURVE_MAX_LOOKAHEAD_M = 800 m`
-with κ ≥ `MAP_CURVE_GATE_KAPPA = 0.003` (shared with the vision cap) get the
-vision cap's law with its own budget: `target_ay` from `MapdCurveTargetLatAccel`
-derated toward `TIGHT_CURVE_FACTOR`, `v_now = √(target_ay/κ + 2·COMFORT_BRAKE·d)`.
-The minimum is the cap — unrounded and with **no ≥100 km/h cut-off**, unlike
-the vision cap.
-
-**Shaping** (`_shape_map_curve`): a cap that first appears starts from the
-current speed and descends no faster than `COMFORT_BRAKE`; it rises at once and
-holds `MAP_CURVE_HOLD_S = 3 s` across gate dropouts. Safety caps reach the
-planner un-ramped, so this keeps a gate opening with a curve already near from
-landing as a setpoint step.
-
-**Toggle**: `MapdCurveLookahead` (Driving panel *Map Curve Look-ahead (G/S)*,
-default OFF). Off, the cap is computed and published as telemetry only; on, the
-shaped value enters `min()` as source 4. `mapdExtendedOut` is not logged; the
-`mapCurve*` keys in `speedLimitState` are the record.
-
-**Field notes.** Routes 532/534 (toggle ON, 148 s gate `ok` on S20): no cap
-ever bound. S20 mainline curvature peaked at ~0.0016 (R ≈ 620 m), below the
-0.003 gate; above it, an R ≈ 620 m curve's comfort speed is ~110 km/h anyway.
-On gentle expressways like S20 the look-ahead therefore never binds; it matters
-only on tighter G/S geometry. Known gap: there is no lateral-offset gate — on
-534 the gate read `ok` for 4 s while the car drove an R ≈ 120 m interchange loop
-17–33 m off mapd's S20 path (`mapCurveLat`); harmless there (straight mainline
-ahead, cap 0), but the path did not describe the car's road.
 
 ## Temporal accumulators
 
@@ -654,7 +571,7 @@ returns the target, otherwise `v_cruise` is unchanged. Key rules:
   is below target the ceiling is untouched. While ON (override and hold) the
   output is `min(v_cruise, max(safetyCap, held gas floor))`
   whenever the daemon's `safetyCap` > 0 (no gas floor counts as 0), so a fast
-  lead never lifts a curve/reactive/map-curve cap, including one above the
+  lead never lifts a curve/reactive cap, including one above the
   guessed limit. The gas floor term keeps a masked cap below it from stepping the
   output down under the driver (the floor is <= v_ego, so it never accelerates).
   The baseline floor is deliberately excluded: it is `min(baseline, v_ego)` and
@@ -691,8 +608,9 @@ appearing below the current output steps it to the cap at once (curve caps stay
 immediate). Telemetry `safetyBound` marks those ticks. A missing field or
 `safetyCap` 0 leaves the path unchanged (the override path still fails closed).
 Side effect: a safety cap at or below the guess that the daemon does not flag
-`safetyCapped` (a map-curve cap snapped to the guess, e.g. guess 40 / cap 40) now
-binds without the comfort offset (46 -> 40), as a visible safety cap does.
+`safetyCapped` (e.g. guess 40 / cap 40; at the time only the G/S map-curve
+look-ahead cap, since removed, could produce one) now binds without the comfort
+offset (46 -> 40), as a visible safety cap does.
 Masked-to-visible hand-over: while the cap is masked, the clamped ceiling keeps
 descending toward the guess at <= 0.5 m/s2, so the output can sit below the cap
 (after ~12 s masked it reaches the guess target, e.g. 46). When the cap later
@@ -772,30 +690,25 @@ with an older subset; the live dict is the authoritative payload:
 | `osmTilesMissing` | no offline tile file for the current area |
 | `osmTrusted` | `_osm_gate` verdict — whether `osmSpeedLimit` is driving the base inference |
 | `osmRejectReason` | `''｜disabled｜no_data｜stale｜not_gs｜low_value` — why the gate rejected it, when it did |
-| `mapd*` (11 keys) | mapd observation, telemetry only — see [mapd observation](#mapd-observation-phase-1-2026-08-18) |
-| `mapCurveGate` | map curve gate verdict: `ok` or the first failing reason (`off_gs`, `no_gps`, `tile_lapsed`, `mapd_absent`, `sel_type`, `ref_mismatch`, `path_stale`, `no_path_ahead`, `error`) |
-| `mapCurveActive` | the `MapdCurveLookahead` toggle (the cap may act) |
-| `mapCurveCap` | raw map curve cap (km/h, 0 = no curve above the gate in the look-ahead) |
-| `mapCurveShaped` | shaped cap — the value that enters `min()` when active (km/h, 0 = none) |
-| `mapCurveDist` / `mapCurveKappa` / `mapCurveLatLon` | binding point: along-path distance (m), curvature (1/m), `[lat, lon]` |
-| `mapCurvePathAhead` | mapd path length ahead of the car, capped at 800 m |
-| `mapCurveLat` | car's perpendicular distance from mapd's path (m; not gated) |
 
 ## Configuration
 
 Params are files in the plugin's `data/` dir (runtime
 `/data/plugins-runtime/speedlimitd/data/`), read via `config.read_plugin_param`;
-`_read_params` (the two lateral-accel params, `OsmDataIntegration`,
-`MapdCurveLookahead`) re-reads every 5 s so a UI change applies without a
+`_read_params` (the two lateral-accel params and `OsmDataIntegration`)
+re-reads every 5 s so a UI change applies without a
 restart.
 
 | Param | Default | Note |
 |---|---|---|
 | `ShowSpeedLimitSign` | `1` (true) | Draw the on-screen sign (enforcement unaffected); re-checked ~every 2 s by the overlay |
-| `MapdCurveTargetLatAccel` | `1.5` | Proactive curve-cap target a_y (m/s²), clamp [1.0, 3.0] |
+| `MapdCurveTargetLatAccel` | `1.5` | Proactive vision curve-cap target a_y (m/s²), clamp [1.0, 3.0] |
 | `MapdReactLatAccel` | `2.5` | Reactive measured-a_y threshold (m/s²), clamp [1.8, 3.0]; **0 disables** the reactive cap |
+
+The two lateral-accel params keep a legacy `Mapd` prefix: they tune the vision
+and reactive curve caps only, and renaming them would orphan the values already
+stored on devices.
 | `OsmDataIntegration` | `'0'` (China) / `'1'` (elsewhere), region-resolved once on first GPS fix | Use OSM `maxspeed` as the base speed source when fresh — see [OSM Data Integration](#osm-data-integration-opportunistic-base-source) |
-| `MapdCurveLookahead` | `'0'` (off) | Let the G/S map curve cap act (source 4); off = telemetry only — see [G/S map curve look-ahead](#gs-map-curve-look-ahead-map_curvepy-2026-11-09) |
 | `OsmTilesMissing` | daemon-written only, no default file | Last `OsmTileReader.tile_missing` reading; consumed by ui_mod's Driving-panel warning, not read back by speedlimitd |
 
 The whole plugin is enabled/disabled from **Settings → Plugins** (framework
