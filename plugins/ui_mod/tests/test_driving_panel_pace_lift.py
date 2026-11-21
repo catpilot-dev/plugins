@@ -1,6 +1,6 @@
 """Driving panel: the Pace Lift toggle (spec R11).
 
-test_source_* inspect the source (as test_driving_panel_map_curve does) and run
+test_source_* inspect the source (as test_driving_panel_osm does) and run
 anywhere. The behavioural tests build the real item list through the panel's
 _build_scroller; they need openpilot importable (raylib UI widgets) and skip
 without it. Every param read/write is pointed at a pytest tmp dir.
