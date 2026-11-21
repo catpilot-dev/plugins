@@ -28,7 +28,7 @@ ESSENTIAL_PLUGINS = {'bus_logger'}
 SORT_ORDER = {
   'model_selector': -3, 'lane_centering': -2, 'network_settings': -1,
   'bmw_e9x_e8x': 0,
-  'speedlimitd': 10, 'bus_logger': 11, 'mapd': 12, 'c3_compat': 13,
+  'speedlimitd': 10, 'bus_logger': 11, 'c3_compat': 13,
 }
 
 

@@ -39,7 +39,7 @@ installed/removed plugins appear). The rows, in order:
    control.
 2. **Lane Centering in Turns** — if `lane_centering` present; toggles
    `LaneCenteringEnabled`.
-3. **Speed Limit Sign**, **Road Info**, **Mapd/OSM Data Integration** — if
+3. **Speed Limit Sign**, **Road Info**, **OSM Data Integration** — if
    `speedlimitd` present; toggle `speedlimitd`'s `ShowSpeedLimitSign` and
    `OsmDataIntegration`, and ui_mod's own `RoadInfoOverlay`. The OSM toggle
    can add a conditional missing-tiles warning row directly under it — see
@@ -243,5 +243,5 @@ ui_mod/
   route_map_widget.py  # RouteMapWidget — home left column wrapper
   exp_button.py        # ExpButton — branded emblem
   road_info_overlay.py # ui.render_overlay — road name/ref from speedlimitd
-  tests/               # test_drive_tracker.py, test_driving_panel_map_curve.py, test_road_info_overlay.py, test_route_map.py
+  tests/               # test_drive_tracker.py, test_driving_panel_osm.py, test_road_info_overlay.py, test_route_map.py
 ```
