@@ -25,7 +25,7 @@ A plugin architecture that turns forks into composable, drop-in modules:
 | Fork opendbc + panda for unsupported car | Car interface plugin (BMW, Rivian, Porsche, ...) |
 | Fork selfdrive for custom features | Hook plugins (lane centering, speed limits, ...) |
 | Fork UI for custom HUD elements | UI overlay plugin |
-| Fork manager for custom processes | Process plugin (mapd, dashcam manager, ...) |
+| Fork manager for custom processes | Process plugin (speedlimitd, dashcam manager, ...) |
 | Maintain N diverging forks | One upstream + N plugins |
 
 ## Hook Points
@@ -140,8 +140,8 @@ Proven on Comma 3 (AGNOS 12.8) and Orange Pi 5 Plus (RK3588):
 - bmw_e9x_e8x (car interface + safety + DCC control)
 - c3_compat (AGNOS 12.8 compat: Raylib UI, venv_sync, boot patches, watchdog)
 - lane_keeping (AC wander damper on the curvature hook — vehicle-agnostic)
-- mapd (OSM data; currently disabled by default)
-- speedlimitd (speed limit fusion + curve speed control)
+- speedlimitd (speed limit fusion + curve speed control; OSM data from its local
+  tile reader. The separate mapd plugin was removed on 2026-11-21)
 - model_selector (runtime model swapping)
 - bus_logger (plugin bus capture for logging)
 - screen_capture (tap-to-capture screenshots)

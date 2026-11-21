@@ -73,3 +73,92 @@ class TestInject:
     assert services.inject_services(str(p), {'mapdOut': [True, 20.0, 20, 2097152]}) == 2
     assert _sl(p)['mapdOut'] == (True, 20.0, 20, 2097152)
     assert '(True, 20.0, 20),' not in p.read_text()
+
+
+class TestRemove:
+  """remove_services() drops stale single-line entries (used by the mapd migration)."""
+
+  _STALE = _STOCK.replace('}\n',
+      '  "mapdOut": (True, 20.0, 20, 2097152),\n'
+      '  "mapdExtendedOut": (False, 1.0, None, 2097152),\n'
+      '  "pluginBusLog": (True, 100.0, None),\n'
+      '  # plugin services (auto-generated)\n'
+      '  "mapdOut": (True, 20.0, 20, 2097152),\n'
+      '  "mapdExtendedOut": (False, 1.0, None, 2097152),\n'
+      '  "pluginBusLog": (True, 100.0, None),\n'
+      '}\n')
+
+  def test_removes_every_entry_for_the_names(self, tmp_path):
+    p = _write(tmp_path, self._STALE)
+    assert services.remove_services(str(p), ['mapdOut', 'mapdExtendedOut']) == 4
+    sl = _sl(p)
+    assert 'mapdOut' not in sl and 'mapdExtendedOut' not in sl
+    assert '"mapd' not in p.read_text()
+
+  def test_other_entries_and_layout_are_kept(self, tmp_path):
+    p = _write(tmp_path, self._STALE)
+    services.remove_services(str(p), ['mapdOut', 'mapdExtendedOut'])
+    want = _STOCK.replace('}\n',
+        '  "pluginBusLog": (True, 100.0, None),\n'
+        '  # plugin services (auto-generated)\n'
+        '  "pluginBusLog": (True, 100.0, None),\n'
+        '}\n')
+    assert p.read_text() == want
+    sl = _sl(p)
+    assert sl['carState'] == (True, 100., 10)
+    assert sl['pluginBusLog'] == (True, 100.0, None)
+
+  def test_absent_names_are_a_noop_and_do_not_rewrite(self, tmp_path):
+    p = _write(tmp_path, _STOCK)
+    p.chmod(0o444)  # any write attempt would raise PermissionError
+    try:
+      assert services.remove_services(str(p), ['mapdOut', 'mapdExtendedOut']) == 0
+    finally:
+      p.chmod(0o644)
+    assert p.read_text() == _STOCK
+
+  def test_prefix_names_and_other_forms_are_untouched(self, tmp_path):
+    text = _STOCK.replace('}\n',
+        '  "mapdOutX": (True, 20.0, 20),\n'
+        '  # "mapdOut": (True, 20.0, 20),\n'
+        '  "mapdOut": (True,\n'
+        '              20.0, 20),\n'
+        '}\n')
+    p = _write(tmp_path, text)
+    assert services.remove_services(str(p), ['mapdOut']) == 0
+    assert p.read_text() == text
+
+  def test_cli_remove(self, tmp_path):
+    import subprocess
+    p = _write(tmp_path, self._STALE)
+    script = os.path.join(PLUGINS_DIR, 'services.py')
+    r = subprocess.run([sys.executable, '-B', script, '--remove', str(p), 'mapdOut', 'mapdExtendedOut'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert 'Removed 4' in r.stdout
+    assert '"mapd' not in p.read_text()
+    r = subprocess.run([sys.executable, '-B', script, '--remove', str(p), 'mapdOut', 'mapdExtendedOut'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert 'Removed' not in r.stdout
+
+  def test_cli_remove_needs_a_name(self, tmp_path):
+    import subprocess
+    p = _write(tmp_path, self._STALE)
+    r = subprocess.run([sys.executable, '-B', os.path.join(PLUGINS_DIR, 'services.py'), '--remove', str(p)],
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    assert p.read_text() == self._STALE
+
+  def test_cli_inject_still_works(self, tmp_path):
+    """The positional `services.py <services_py> <plugins_dir>` form is unchanged."""
+    import json
+    import subprocess
+    p = _write(tmp_path, _STOCK)
+    plug = tmp_path / 'runtime' / 'foo'
+    plug.mkdir(parents=True)
+    (plug / 'plugin.json').write_text(json.dumps({'id': 'foo', 'services': {'fooOut': [True, 20.0, None]}}))
+    r = subprocess.run([sys.executable, '-B', os.path.join(PLUGINS_DIR, 'services.py'), str(p), str(tmp_path / 'runtime')],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert _sl(p)['fooOut'] == (True, 20.0, None)

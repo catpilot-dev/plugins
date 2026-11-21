@@ -32,19 +32,25 @@ Hooks-only plugins. No framework code, no overlays. Works on both C3 and RK3588 
 ```
 plugins/
   install.sh              # Deploy plugins to /data/plugins-runtime/; install cereal slots
+  install.d/              # Helpers sourced by install.sh (mapd_migration.sh)
   plugins/
     config.py             # Shared path config; deployed to /data/plugins-runtime/config.py
     bmw_e9x_e8x/          # BMW E8x/E9x car interface (monkey-patch registration)
     bus_logger/           # Plugin bus capture for logging
     c3_compat/            # Comma 3 AGNOS compatibility (boot patches, venv_sync)
     lane_keeping/         # AC wander damper on controls.curvature_correction
-    mapd/                 # OSM map data process (disabled by default)
     model_selector/       # Runtime driving model swapping
     screen_capture/       # Tap-to-capture screenshots
-    speedlimitd/          # Speed limit fusion (process + hook)
+    speedlimitd/          # Speed limit fusion (process + hook); reads OSM data from local tiles
     ui_mod/               # Custom UI panels: Driving, Plugins, drive stats, route map
   docs/                   # This documentation
 ```
+
+OSM data comes only from speedlimitd's local tile reader (`osm_query.OsmTileReader`).
+The `mapd` plugin, which ran the external pfeiferj/mapd binary, was removed on
+2026-11-21; install.sh migrates devices that still carry it
+(`install.d/mapd_migration.sh`: revert its cereal slots 17-19, then delete the
+runtime dir).
 
 ### connect-on-device (`~/catpilot-dev/connect-on-device/` → `catpilot-dev/connect-on-device`)
 
@@ -68,7 +74,6 @@ Web app for device management. Served on port 8082 (redirected from port 80 via 
   bus_logger/
   c3_compat/
   lane_keeping/
-  mapd/
   model_selector/
   screen_capture/
   speedlimitd/
@@ -181,7 +186,7 @@ openpilot manager
             └─ inject EventName entries into log.capnp
             └─ register services in services.py
             └─ write param defaults to /data/params/d/
-       └─ start plugin processes (mapd, speedlimitd, phone_watchdog, ...)
+       └─ start plugin processes (speedlimitd, phone_watchdog, ...)
   └─ controlsd, plannerd, card, ui, ...
        └─ hooks._ensure_loaded() on first hooks.run() call
             └─ PluginRegistry.discover() + load_enabled()

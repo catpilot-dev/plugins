@@ -29,7 +29,6 @@ device.
 | Plugin | What it does for you |
 |--------|----------------------|
 | `c3_compat` | Keeps the comma three fully supported on current catpilot (display, panda, OS compatibility) |
-| `mapd` | Manages an external OpenStreetMap data binary. Currently inactive (unwired in its manifest) — speed limits come through `speedlimitd` instead |
 | `bus_logger` | Saves the plugins' status messages into the drive logs, so problems can be diagnosed after a drive |
 
 ## Turning things on and off

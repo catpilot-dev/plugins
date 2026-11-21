@@ -41,6 +41,11 @@ log()  { echo "[install] $*"; }
 warn() { echo "[install] WARNING: $*" >&2; }
 err()  { echo "[install] ERROR: $*" >&2; exit 1; }
 
+# One-way migration off the removed mapd plugin (mapd_migrate, used around
+# overlay_cereal below). Function definitions only.
+# shellcheck source=install.d/mapd_migration.sh
+source "$SCRIPT_DIR/install.d/mapd_migration.sh"
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -288,8 +293,10 @@ install_plugins
 # .disabled — custom_capnp.py even reverts their slot back to the
 # CustomReservedN stub. Clearing .disabled after the injection would leave an
 # enforced plugin running against a cereal tree that has no schema or service
-# for it (mapd up, mapdOut absent, speedlimitd crash-looping) until a second
-# install run happened to fix it.
+# for it (plugin up, its slot struct and services absent, its consumers
+# crash-looping) until a second install run happened to fix it. The mapd
+# migration below relies on the same rule in reverse: it sets mapd's .disabled
+# BEFORE the cereal step so that step reverts mapd's slots 17-19.
 if [[ -f /TICI ]] && [[ -d "$PLUGINS_DEST/c3_compat" ]]; then
   if $DRY_RUN; then
     echo "  ENFORCE c3_compat (touch .enforced)"
@@ -311,47 +318,17 @@ if [[ -d "$PLUGINS_DEST/lane_keeping" ]]; then
     rm -f "$PLUGINS_DEST/lane_keeping/.disabled"
   fi
 fi
-# mapd RUNS AGAIN as of 2026-11-09 (v2.4.0): plugin.json declares the process
-# and services.py registers mapdOut at mapd's own 2 MB queue size (the size
-# mismatch is the suspected cause of the v2.3.1 SIGBUS). First drives (routes
-# 532/534, 39 min): mapdOut continuous at 20 Hz in every segment, no mapd error
-# in the logs. speedlimitd's control path is still the offline tile reader
-# (osm_query.OsmTileReader); mapdOut is Phase-1 observation telemetry
-# (mapd_source.telemetry_from_mapd) that degrades to (None, False) when the
-# service is absent, and mapdExtendedOut.path feeds the G/S map curve cap
-# behind a Driving-panel toggle. ENFORCED (not .disabled) on purpose: .disabled
-# makes custom_capnp.py revert slots 17-19 to the CustomReservedN stub and
-# services.py drop mapdOut, which tears down the interface those consumers are
-# built against. Interface-only (no process) from 2026-08-19 to 2026-11-09.
-# History: v2.0.6-v2.2.0 hardcoded a slotless ("shadow") carState subscription
-# whose torn reads panic gomsgq; v2.3.0 made shadow per-queue but shipped the
-# OTHER queues slotted, and mapd's panic-restarts leak reader slots until the
-# table wipes — that killed loggerd on route 410 (see mapd_defaults.json, which
-# now sets every queue shadow).
-if [[ -d "$PLUGINS_DEST/mapd" ]]; then
-  if $DRY_RUN; then
-    echo "  ENFORCE mapd (touch .enforced, rm .disabled)"
-  else
-    touch "$PLUGINS_DEST/mapd/.enforced"
-    rm -f "$PLUGINS_DEST/mapd/.disabled"
-  fi
-  # Settings go to mapd via the MapdSettings PARAM (written by mapd_runner on
-  # every start), NOT via /data/openpilot/mapd_defaults.json. The custom-file
-  # path is fatal on mapd v2.3.0: settings.go Default() parses the file with
-  # gabs (numbers → float64) but version-checks against uint64, so ANY custom
-  # defaults file — version present or absent — panics mapd at startup
-  # (interface-conversion crash, verified on-device 2026-08-18). Remove any
-  # stray copy so mapd can boot.
-  if [[ -f "$OPENPILOT_ROOT/mapd_defaults.json" ]]; then
-    if $DRY_RUN; then
-      echo "  REMOVE $OPENPILOT_ROOT/mapd_defaults.json (panics mapd v2.3.0)"
-    else
-      rm -f "$OPENPILOT_ROOT/mapd_defaults.json"
-    fi
-  fi
-fi
-
-overlay_cereal
+# The mapd plugin was removed from the repo (2026-11-21; OSM data now comes only
+# from speedlimitd's local tile reader). install_plugins never deletes a runtime
+# dir that vanished from the repo, and deleting it outright would break cereal
+# at the next boot (slots 17-19 keep referencing mapd's standalone types, which
+# catpilot's builder.py strips). mapd_migrate wraps the cereal step: disable
+# mapd, run overlay_cereal (which reverts slots 17-19), verify the revert, and
+# only then delete $PLUGINS_DEST/mapd; on any failure it restores mapd and
+# warns. The mapd binary and tiles under the media dir are left in place.
+# See install.d/mapd_migration.sh and
+# docs/superpowers/plans/2026-11-21-remove-mapd.md (R5).
+mapd_migrate overlay_cereal
 
 # Copy shared modules to plugins-runtime root so all plugins can import them
 for shared_mod in config.py fonts.py; do

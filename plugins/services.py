@@ -91,9 +91,50 @@ def inject_services(services_py: str, services: dict) -> int:
   return added
 
 
+def remove_services(services_py: str, names) -> int:
+  """Remove every single-line entry for `names` from cereal/services.py.
+
+  Returns the count of removed lines. Matches entries the same way
+  inject_services() does (`"name": (...),` on one line), so it removes both
+  the line install.sh injected and the copy in builder.py's auto-generated
+  block. A name present in any other form (multi-line, commented out) is left
+  alone. The file is only rewritten when something was removed.
+
+  Used by install.d/mapd_migration.sh: once the mapd plugin is gone nothing
+  re-injects mapdOut / mapdExtendedOut, but services.py is never reset, so
+  their old lines would stay forever.
+  """
+  with open(services_py) as f:
+    content = f.read()
+
+  patterns = [re.compile(rf'^\s*"{re.escape(name)}"\s*:\s*\(.*\),\s*$') for name in names]
+  lines = content.split("\n")
+  kept = [line for line in lines if not any(p.match(line) for p in patterns)]
+  removed = len(lines) - len(kept)
+
+  if removed:
+    with open(services_py, "w") as f:
+      f.write("\n".join(kept))
+
+  return removed
+
+
 def main():
+  if len(sys.argv) >= 2 and sys.argv[1] == "--remove":
+    if len(sys.argv) < 4:
+      print(f"Usage: {sys.argv[0]} --remove <path/to/cereal/services.py> <name> [name ...]", file=sys.stderr)
+      sys.exit(1)
+    services_py, names = sys.argv[2], sys.argv[3:]
+    removed = remove_services(services_py, names)
+    if removed:
+      print(f"[services] Removed {removed} stale entr{'y' if removed == 1 else 'ies'} ({', '.join(names)}) from {services_py}")
+    else:
+      print(f"[services] No stale entries for {', '.join(names)}")
+    return
+
   if len(sys.argv) < 2:
     print(f"Usage: {sys.argv[0]} <path/to/cereal/services.py> [plugins_dir]", file=sys.stderr)
+    print(f"       {sys.argv[0]} --remove <path/to/cereal/services.py> <name> [name ...]", file=sys.stderr)
     sys.exit(1)
 
   services_py = sys.argv[1]
